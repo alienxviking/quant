@@ -176,11 +176,33 @@ The recorder is not done when it prints JSON. It is done when:
       complete frame — no partial-frame corruption.
 - [ ] Replaying every recorded file shows `ingest_seq` contiguous within each
       session, with every discontinuity explained by a recorded `Gap`.
-- [ ] Book reconstruction over the full capture holds its invariants at
-      every tick: `best_bid < best_ask`, levels monotone, no unexplained
-      update-id discontinuity.
+- [ ] Replaying every recorded file shows the depth **update-id chain**
+      contiguous — each message's `first_update_id` continuing the previous
+      message's `final_update_id` — with every discontinuity explained by a
+      recorded `Gap`.
 - [ ] Recorder-side metrics exist for: messages/sec, bytes/sec, queue depth,
       venue latency percentiles, gap count by cause.
 
 The last one is not optional polish. If we cannot see queue depth we cannot
 tell the difference between a quiet market and a stalled consumer.
+
+### What is deliberately *not* an M1 criterion
+
+Full **book reconstruction** — `best_bid < best_ask`, levels monotone, depth
+invariants holding at every tick — belongs to **M2**, with the normalizer that
+builds the book. It is not an M1 criterion, because M1 has no book: the
+recorder writes bytes and never maintains order-book state.
+
+The distinction is worth being precise about, because the two checks are not
+the same strength:
+
+- **Update-id chain contiguity** (M1) is verifiable from raw alone. It answers
+  "did we receive every message the venue sent?" — a *completeness* property
+  of the capture.
+- **Book invariants** (M2) answer "does applying those messages in order
+  produce a sane book?" — a *correctness* property of the reconstruction.
+
+A capture can be complete and still reconstruct into a nonsense book if the
+normalizer is wrong, and a book can look sane while built from a capture with
+a silent hole in it. Attributing each check to the milestone that can actually
+falsify it is what keeps "done" meaning something.
