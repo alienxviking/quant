@@ -52,6 +52,8 @@ These are enforced by the compiler and the test suite, not by discipline:
 ```
 crates/
   quant-core/       types, time, instruments, the event contract  [M0]
+  quant-storage/    the raw capture format: framing, blocks, torn-tail
+                    recovery. Knows no venue and no network.       [M1a]
 docs/
   data-contract.md  the on-disk format and its acceptance criteria
 ```

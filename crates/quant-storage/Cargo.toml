@@ -1,0 +1,32 @@
+[package]
+name = "quant-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Deliberately knows nothing about any venue and nothing about the network.
+# This crate's whole job is bytes-on-disk, so it is testable end to end with
+# synthetic input -- which is why it is built before the recorder that will
+# feed it. See the module docs in src/lib.rs.
+[dependencies]
+quant-core = { workspace = true }
+serde = { workspace = true }
+
+# Control frames (our synthesized gap records) are persisted as JSON so a raw
+# file stays greppable after decompression. Not used for venue payloads, which
+# are written verbatim, and not on any hot path.
+serde_json = "1"
+
+# Block compression. The bulk (non-streaming) API is the point: each block is
+# independently decompressable, so damage to one block cannot destroy the rest
+# of the file.
+zstd = "0.13"
+
+# Per-block integrity. CRC32 rather than a cryptographic hash because we are
+# detecting disk and truncation faults, not defending against an adversary who
+# can rewrite the file.
+crc32fast = "1"
+
+[lints]
+workspace = true

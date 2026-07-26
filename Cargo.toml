@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/quant-core"]
+members = ["crates/quant-core", "crates/quant-storage"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,7 @@ repository = "https://github.com/alienxviking/quant"
 # only shows up in production.
 [workspace.dependencies]
 quant-core = { path = "crates/quant-core" }
+quant-storage = { path = "crates/quant-storage" }
 serde = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]

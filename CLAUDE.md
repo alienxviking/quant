@@ -100,17 +100,42 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   `MarketEvent` contract), CI, docker-compose for Postgres, data contract
   written *before* the recorder exists. 19 tests green in debug and release,
   clippy and fmt clean.
-- **M1 next**: the Binance market data recorder. Acceptance criteria are in
+- **M1 in progress**: the Binance recorder. Acceptance criteria are in
   `docs/data-contract.md` §7 and are deliberately harsher than "it connects".
+  Sliced into five independently shippable commits:
 
-Planned M1 shape: a read task that does nothing but stamp `local_recv_ts` and
-push bytes into a **bounded** channel, plus a writer task that frames and
-compresses. Bounded because an unbounded channel does not prevent overload,
-it converts it into an OOM kill an hour later; on a full channel we drop and
-emit `Gap{LocalOverflow}` rather than blocking the socket read. The fiddly
-part is depth-stream resync (buffer deltas → REST snapshot → discard stale
-deltas → verify the update-id chain joins → resume), correct on every
-reconnect, unattended, at 3am.
+  | | Slice | Status |
+  |---|---|---|
+  | a | `quant-storage`: raw frame format, writer, reader | **done** |
+  | b | `quant-binance`: WS ingress, bounded channel, `Gap{LocalOverflow}` | next |
+  | c | Session lifecycle: date rotation, Postgres `capture_sessions` | |
+  | d | Depth resync + offline verifier binary | |
+  | e | Metrics: msgs/sec, bytes/sec, queue depth, latency pcts, gaps by cause | |
+
+  Built in this order because the raw tier is the only irreversible artifact in
+  the project. The format was specified and tested against synthetic bytes
+  before a socket existed, which is what makes "a `SIGKILL` mid-write leaves the
+  file readable up to the last complete frame" an ordinary unit test — it cuts a
+  capture at every byte offset — rather than an operational anecdote.
+
+- **M1.a decisions** (all reasoned out in `crates/quant-storage/src/lib.rs`):
+  compression is per ~256 KiB **block**, so damage stays local and a ratio is
+  still achievable; frames are **typed**, because a synthesized `Gap` is not
+  venue bytes and a sidecar gap file could disagree with the stream;
+  `ingest_seq` is stamped at ingress so **holes are legal and are the evidence**
+  of a drop (the writer enforces strictly increasing, not contiguous); a torn
+  tail is a **report, not an error**, and is distinguished from corruption; and
+  a 32-byte **trailer** lets a file account for itself, so completeness is a
+  two-sided check rather than an absence of complaints.
+
+- **Still M1's fiddly part**: a read task that does nothing but stamp
+  `local_recv_ts` and push bytes into a **bounded** channel, plus a writer task.
+  Bounded because an unbounded channel does not prevent overload, it converts it
+  into an OOM kill an hour later; on a full channel we drop and emit
+  `Gap{LocalOverflow}` rather than blocking the socket read. Then depth-stream
+  resync (buffer deltas → REST snapshot → discard stale deltas → verify the
+  update-id chain joins → resume), correct on every reconnect, unattended, at
+  3am.
 
 Milestone table: see `README.md`.
 
@@ -131,4 +156,10 @@ Milestone table: see `README.md`.
 - Windows: cargo may not be on `PATH` in shells opened before Rust was
   installed. Prefix with
   `$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"` if `cargo` is missing.
+- Windows Smart App Control is **enforcing** on this machine. It intermittently
+  blocks freshly downloaded crates' build scripts and proc-macro DLLs with
+  `An Application Control policy has blocked this file. (os error 4551)`. It
+  clears on retry, so re-run the build rather than switching dependencies. Keep
+  the target dir inside the repo — a target dir under `AppData\Local\Temp` gets
+  blocked far more aggressively.
 - Rust 1.97, edition 2021, stable channel (pinned in `rust-toolchain.toml`).
