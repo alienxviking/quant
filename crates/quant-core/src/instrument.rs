@@ -44,6 +44,51 @@ pub enum Exchange {
     Simulated,
 }
 
+impl Exchange {
+    /// Stable numeric code for persisting a venue.
+    ///
+    /// These numbers are stamped into every recorded raw file header, so they
+    /// are **permanent**: a code may never be reused for a different venue and
+    /// never renumbered. The enum's declaration order is therefore free to
+    /// change, and the variants can be reordered alphabetically later without
+    /// making last year's capture unreadable.
+    ///
+    /// The match is exhaustive on purpose. Adding a venue is then a compile
+    /// error here until someone assigns it a number, rather than a runtime
+    /// surprise the first time we try to read the file back.
+    #[must_use]
+    pub const fn wire_code(self) -> u16 {
+        match self {
+            Self::Binance => 1,
+            Self::BinanceUsdFutures => 2,
+            Self::Coinbase => 3,
+            Self::Kraken => 4,
+            // Deliberately far from the real venues: a simulated file showing
+            // up in a directory of production capture should look obviously
+            // different, not adjacent to Kraken.
+            Self::Simulated => 1_000,
+        }
+    }
+
+    /// Inverse of [`Exchange::wire_code`].
+    ///
+    /// Returns `None` for an unknown code rather than a default. Reading a
+    /// file recorded by a newer build that knows a venue we do not is a
+    /// stop-and-look moment: we cannot know what its fee model, tick rules or
+    /// payload dialect are, so guessing is worse than refusing.
+    #[must_use]
+    pub const fn from_wire_code(code: u16) -> Option<Self> {
+        match code {
+            1 => Some(Self::Binance),
+            2 => Some(Self::BinanceUsdFutures),
+            3 => Some(Self::Coinbase),
+            4 => Some(Self::Kraken),
+            1_000 => Some(Self::Simulated),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for Exchange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -266,6 +311,33 @@ mod tests {
             lot_size: "0.00001".parse().unwrap(),
             min_notional: "5".parse().unwrap(),
         }
+    }
+
+    #[test]
+    fn wire_codes_round_trip_and_are_pinned() {
+        for ex in [
+            Exchange::Binance,
+            Exchange::BinanceUsdFutures,
+            Exchange::Coinbase,
+            Exchange::Kraken,
+            Exchange::Simulated,
+        ] {
+            assert_eq!(Exchange::from_wire_code(ex.wire_code()), Some(ex));
+        }
+
+        // Pinned literals. These values are in recorded files; if this test
+        // starts failing because someone reordered the enum, the fix is to
+        // restore the numbers, not to update the test.
+        assert_eq!(Exchange::Binance.wire_code(), 1);
+        assert_eq!(Exchange::BinanceUsdFutures.wire_code(), 2);
+        assert_eq!(Exchange::Coinbase.wire_code(), 3);
+        assert_eq!(Exchange::Kraken.wire_code(), 4);
+        assert_eq!(Exchange::Simulated.wire_code(), 1_000);
+
+        // An unknown venue is refused, not defaulted.
+        assert_eq!(Exchange::from_wire_code(0), None);
+        assert_eq!(Exchange::from_wire_code(5), None);
+        assert_eq!(Exchange::from_wire_code(u16::MAX), None);
     }
 
     #[test]
