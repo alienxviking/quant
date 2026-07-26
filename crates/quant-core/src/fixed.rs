@@ -369,7 +369,10 @@ mod tests {
         // Binance pads to 8dp; that must not be mistaken for extra precision.
         assert_eq!("12.10000000".parse::<Px>().unwrap().raw(), 1_210_000_000);
         // Padding beyond our scale is dropped only when it is all zeros.
-        assert_eq!("12.100000000000".parse::<Px>().unwrap().raw(), 1_210_000_000);
+        assert_eq!(
+            "12.100000000000".parse::<Px>().unwrap().raw(),
+            1_210_000_000
+        );
     }
 
     #[test]
@@ -378,12 +381,18 @@ mod tests {
             "0.000000001".parse::<Px>(),
             Err(ParseFixedError::PrecisionLoss { max_decimals: 8 })
         );
-        assert_eq!("1.2.3".parse::<Px>(), Err(ParseFixedError::MultipleDecimalPoints));
+        assert_eq!(
+            "1.2.3".parse::<Px>(),
+            Err(ParseFixedError::MultipleDecimalPoints)
+        );
         assert_eq!("1e5".parse::<Px>(), Err(ParseFixedError::InvalidChar('e')));
         assert_eq!("".parse::<Px>(), Err(ParseFixedError::Empty));
         assert_eq!("-".parse::<Px>(), Err(ParseFixedError::Empty));
         assert_eq!("nan".parse::<Px>(), Err(ParseFixedError::InvalidChar('n')));
-        assert_eq!("99999999999999999999".parse::<Px>(), Err(ParseFixedError::Overflow));
+        assert_eq!(
+            "99999999999999999999".parse::<Px>(),
+            Err(ParseFixedError::Overflow)
+        );
     }
 
     #[test]

@@ -47,7 +47,9 @@ pub mod fixed;
 pub mod instrument;
 pub mod time;
 
-pub use event::{BookDelta, BookSnapshot, EventMeta, Gap, GapCause, Level, MarketEvent, Side, Trade};
+pub use event::{
+    BookDelta, BookSnapshot, EventMeta, Gap, GapCause, Level, MarketEvent, Side, Trade,
+};
 pub use fixed::{Notional, ParseFixedError, Px, Qty, SCALE, SCALE_DECIMALS};
 pub use instrument::{
     Exchange, Instrument, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,

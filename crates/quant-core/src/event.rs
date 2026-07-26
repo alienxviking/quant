@@ -23,8 +23,7 @@ use crate::instrument::InstrumentId;
 use crate::time::Ts;
 
 /// Which side of the book, or which side initiated a trade.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
     Buy,
@@ -56,8 +55,7 @@ impl Side {
 /// A `qty` of zero in a *delta* means "remove this level" -- that is the
 /// convention every major venue uses, and preserving it means the delta
 /// stream stays a faithful record of what the venue sent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Level {
     pub px: Px,
     pub qty: Qty,
@@ -79,8 +77,7 @@ impl Level {
 ///
 /// Factored into its own struct so that adding a field (say, a gateway hop
 /// timestamp when we colocate) is one change rather than one per event type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EventMeta {
     pub instrument: InstrumentId,
     /// The venue's timestamp, as reported. May be coarse or skewed.
@@ -106,8 +103,7 @@ impl EventMeta {
 }
 
 /// A public trade print.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Trade {
     pub meta: EventMeta,
     pub px: Px,
@@ -122,8 +118,7 @@ pub struct Trade {
 }
 
 /// An incremental order book update.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BookDelta {
     pub meta: EventMeta,
     /// Venue update-id range this delta covers.
@@ -145,8 +140,7 @@ pub struct BookDelta {
 /// Recorded periodically as well as on resync. Periodic snapshots are what
 /// make a recorded day *seekable* -- without them, replaying an hour from
 /// the middle of a file means applying every delta since midnight.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BookSnapshot {
     pub meta: EventMeta,
     /// The venue update id this snapshot is current as of.
@@ -158,8 +152,7 @@ pub struct BookSnapshot {
 }
 
 /// Why a stream was interrupted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GapCause {
     /// The transport dropped.
@@ -182,8 +175,7 @@ pub enum GapCause {
 /// disconnected for 40 seconds" -- and a strategy will happily learn to
 /// trade the gap. Recording the gap lets the backtester refuse to trade
 /// across it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Gap {
     pub meta: EventMeta,
     pub cause: GapCause,
@@ -192,8 +184,7 @@ pub struct Gap {
 }
 
 /// Everything a strategy can observe about the market.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MarketEvent {
     Trade(Trade),

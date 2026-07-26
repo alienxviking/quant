@@ -29,8 +29,9 @@ use crate::fixed::{Notional, Px, Qty};
 /// An enum rather than a string because the set is small, closed, and
 /// exhaustively matching on it is how we will catch "you added Kraken but
 /// forgot to implement its fee schedule" at compile time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Exchange {
     Binance,
@@ -61,8 +62,7 @@ impl fmt::Display for Exchange {
 /// Present from day one even though we start with spot, because the
 /// distinction changes P&L accounting (funding payments, margin, expiry) and
 /// retrofitting it into a position model later is invasive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InstrumentKind {
     Spot,
@@ -76,8 +76,9 @@ pub enum InstrumentKind {
 /// Ids are assigned in registration order and are stable for the life of a
 /// process, but they are **not** stable across runs -- never persist one.
 /// Persist the (exchange, symbol) pair instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(transparent)]
 pub struct InstrumentId(u32);
 
@@ -284,10 +285,19 @@ mod tests {
         let id = reg.register(btcusdt());
         let inst = reg.expect(id);
 
-        assert_eq!(inst.round_price("68123.459".parse().unwrap()).to_string(), "68123.45");
-        assert_eq!(inst.round_qty("0.000019".parse().unwrap()).to_string(), "0.00001");
+        assert_eq!(
+            inst.round_price("68123.459".parse().unwrap()).to_string(),
+            "68123.45"
+        );
+        assert_eq!(
+            inst.round_qty("0.000019".parse().unwrap()).to_string(),
+            "0.00001"
+        );
         // Negative (short) sizes round toward zero too -- i.e. smaller size.
-        assert_eq!(inst.round_qty("-0.000019".parse().unwrap()).to_string(), "-0.00001");
+        assert_eq!(
+            inst.round_qty("-0.000019".parse().unwrap()).to_string(),
+            "-0.00001"
+        );
     }
 
     #[test]
