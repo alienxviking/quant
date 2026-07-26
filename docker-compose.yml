@@ -1,0 +1,29 @@
+# Local infrastructure. Nothing in here holds market data -- see
+# docs/data-contract.md for why that lives on disk as Parquet.
+#
+# Postgres holds metadata only: instruments, capture sessions, runs, orders,
+# fills, backtest results. Small, relational, transactional.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: quant-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: quant
+      POSTGRES_PASSWORD: quant_local_dev
+      POSTGRES_DB: quant
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Compose waits on this before dependents start, so the recorder never
+      # races the database on a cold boot.
+      test: ["CMD-SHELL", "pg_isready -U quant -d quant"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:

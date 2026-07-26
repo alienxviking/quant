@@ -1,0 +1,22 @@
+[package]
+name = "quant-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# quant-core is deliberately dependency-light. Every crate in the system
+# depends on it, so anything added here is added to the whole platform --
+# including the live trading binary.
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+# Test-only: proves the event contract round-trips through a self-describing
+# format. The engine itself does not serialize to JSON on any hot path.
+serde_json = "1"
+
+# Inherits the workspace lint table, which denies floating-point arithmetic.
+# See the comment in the root Cargo.toml for why.
+[lints]
+workspace = true

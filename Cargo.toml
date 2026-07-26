@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = ["crates/quant-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/alienxviking/quant"
+
+# Every crate pins its shared deps here so versions can never drift between
+# the engine, the recorder and the backtester. A version skew between two
+# crates that both parse exchange payloads is exactly the kind of bug that
+# only shows up in production.
+[workspace.dependencies]
+quant-core = { path = "crates/quant-core" }
+serde = { version = "1", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# Mechanical enforcement of the "no floating point in the engine" invariant.
+# Prices, quantities and P&L are fixed-point integers; a stray f64 is a
+# position-drift bug waiting to happen, and it will only surface as a
+# reconciliation mismatch against the exchange weeks later.
+#
+# Note: Cargo does not allow a member crate to inherit `[lints] workspace =
+# true` AND add its own rules, so the strict default lives here. A future
+# analytics/research crate that legitimately needs floats opts out by
+# declaring its own `[lints]` table instead of inheriting this one.
+float_arithmetic = "deny"
+
+[profile.release]
+# The engine is latency-sensitive; we accept slow builds for a fast binary.
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1

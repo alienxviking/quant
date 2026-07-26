@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are build failures in CI. A codebase that tolerates warnings
+  # accumulates them until nobody reads the output, and then a real one
+  # slips through.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      - name: Test (release)
+        # Overflow checks are off by default in release. The money types
+        # panic explicitly instead of wrapping, but running the suite in
+        # release catches anything that depends on debug-only behaviour --
+        # which is exactly the class of bug that only appears in production.
+        run: cargo test --workspace --all-features --release

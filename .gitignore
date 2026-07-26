@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+
+# Captured market data never goes in git. It is large, it is reproducible
+# only by re-recording (i.e. not at all), and it belongs on disk/object
+# storage with its own retention policy.
+/data/
+/var/
+*.parquet
+*.zst
+
+.env
+.env.*
+!.env.example
+
+# Python research environment
+.venv/
+__pycache__/
+.ipynb_checkpoints/

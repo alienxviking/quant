@@ -1,0 +1,186 @@
+# Data Contract v1
+
+**Status:** active · **Applies from:** M0 · **Owner:** the recorder
+
+This document is the reason M0 exists. Recorded market data is the one asset
+in this project that cannot be regenerated: a bug in the backtester costs an
+afternoon, a bug in the recorder costs however many weeks of capture we did
+before noticing. So the format is decided, written down, and tested *before*
+the recorder is switched on.
+
+---
+
+## 1. The three tiers
+
+| Tier | Contents | Format | Mutability | Lifetime |
+|---|---|---|---|---|
+| **Raw** | Exactly the bytes the venue sent, plus our receive timestamp and ingest sequence | Framed, length-prefixed, zstd-compressed | **Immutable, append-only** | Forever |
+| **Normalized** | `MarketEvent` values derived from raw | Parquet, partitioned | **Disposable** | Rebuilt on demand |
+| **Metadata** | Instruments, capture sessions, runs, orders, fills, backtest results | PostgreSQL | Mutable, transactional | Forever, backed up |
+
+### Why raw is never parsed
+
+The recorder does not interpret payloads beyond what it needs to route them.
+It writes the venue's bytes verbatim. This costs disk and buys three things:
+
+1. **Parser bugs become recoverable.** When we discover in month four that
+   we mis-handled a field, we re-derive four months of Parquet overnight
+   instead of losing four months.
+2. **The contract can evolve.** Adding a field to `MarketEvent` does not
+   require re-recording, because the source bytes still contain it.
+3. **Disputes are settleable.** "Did the venue really print that?" has an
+   answer.
+
+### Why normalized is disposable
+
+Because raw exists. Treating Parquet as derived state means we can change
+partitioning, compression, column layout or even the storage engine
+(→ ClickHouse) without a migration — we just rebuild. Anything that cannot be
+rebuilt from raw does not belong in the normalized tier.
+
+### Why metadata is Postgres and market data is not
+
+Postgres is for data we JOIN, UPDATE and need transactions on: which
+instruments exist, which capture session produced which file, which backtest
+run used which config, which orders got which fills. That is thousands to
+millions of rows with a relational shape — exactly what it is good at.
+
+Market data is hundreds of millions of append-only rows scanned in ranges and
+never updated. Putting it in Postgres works for about two weeks and then
+teaches you a set of habits (row-at-a-time access, indexes on timestamps,
+`SELECT *` over ticks) that have to be unlearned later. Columnar from the
+start.
+
+---
+
+## 2. Timestamps
+
+Every event carries **both**:
+
+| Field | Source | Use |
+|---|---|---|
+| `exchange_ts` | The venue's payload | Venue-side analysis, latency measurement, cross-venue comparison |
+| `local_recv_ts` | Our process, stamped once at ingress | **The only timestamp anything may act on** |
+
+- `i64` nanoseconds since the Unix epoch, UTC. No local time anywhere.
+- `local_recv_ts` is stamped as early as possible — immediately on read from
+  the socket, before parsing — and never recomputed.
+- `local_recv_ts - exchange_ts` is our observed venue latency. It is signed;
+  a negative value means clock skew, which is an alert, not something to
+  clamp to zero.
+
+**The rule that matters:** the engine orders and dispatches events by
+`local_recv_ts`, in every mode. Dispatching on `exchange_ts` in a backtest
+lets a strategy react to information before it could have arrived. That is
+lookahead bias, it is invisible, and it inflates every performance metric.
+It is the most common reason a good-looking backtest loses money live.
+
+---
+
+## 3. Sequencing and completeness
+
+Three independent counters, all recorded:
+
+| Counter | Whose | Answers |
+|---|---|---|
+| `ingest_seq` | Ours, per (recorder process, instrument) | "Is this file complete and in order?" |
+| `venue_trade_id` | The venue's | "Did we double-count this trade across a reconnect?" |
+| `first_update_id` / `final_update_id` | The venue's | "Is our order book still correct?" |
+
+We record the venue's counters rather than only our own conclusion about
+them, so book correctness can be **re-verified offline** against recorded
+data. A recorder that checks sequencing but does not persist the evidence
+gives us no way to audit it later.
+
+### Gaps are events
+
+`MarketEvent::Gap` is written whenever data is known to be missing:
+`Disconnect`, `SequenceGap`, `LocalOverflow`, `RecorderRestart`.
+
+This is the piece most homegrown recorders omit, and its absence is what
+makes their data quietly untrustworthy. Without it a backtest cannot tell
+"the market was silent for 40 seconds" from "we were blind for 40 seconds" —
+and a strategy will cheerfully learn to trade the hole. With it, the
+backtester can refuse to trade across a gap and report how much of the
+sample it discarded.
+
+`LocalOverflow` in particular must be recorded honestly. It means *we* could
+not keep up. Suppressing it does not fix the capacity problem, it just
+guarantees we find out about it in production.
+
+---
+
+## 4. Numbers
+
+- Prices, quantities and notionals are `i64` scaled by `1e8`
+  (`quant_core::fixed`).
+- Venue decimal strings are parsed directly to fixed-point. **Never via
+  `f64`.**
+- Parse failures are loud. A malformed price means our model of the venue is
+  wrong; that is a stop-and-look moment, not a default-to-zero moment.
+- The workspace sets `clippy::float_arithmetic = "deny"`, so this is enforced
+  by the build rather than by discipline.
+
+---
+
+## 5. Layout on disk
+
+```
+data/
+  raw/
+    exchange=binance/symbol=BTCUSDT/date=2026-07-26/
+      session=<uuid>/part-00000.bin.zst
+  normalized/
+    trades/exchange=binance/symbol=BTCUSDT/date=2026-07-26/part-*.parquet
+    book_deltas/...
+    book_snapshots/...
+    gaps/...
+```
+
+Partitioning by `exchange / symbol / date` is chosen because every query the
+backtester makes is "this instrument, this date range". Hive-style
+directories are readable by DuckDB, Polars, pandas, Spark and ClickHouse
+without any of them being told about our schema — which keeps the research
+side of the project free to use whatever tool fits.
+
+One file per capture session, never appended across a restart, so a crashed
+process can never corrupt a file another process is reading.
+
+---
+
+## 6. Versioning
+
+`EVENT_SCHEMA_VERSION` is stamped in every raw file header.
+
+Rules:
+
+- **The normalizer must retain the ability to read every version it has ever
+  written.** A migration that cannot read last year's capture is a data-loss
+  event.
+- Additive changes (new optional field) bump the version but stay readable by
+  the previous reader.
+- Breaking changes require a written migration note in this file *and* a
+  successful re-derive of the full normalized tier before the old reader is
+  removed.
+
+---
+
+## 7. Acceptance criteria for M1
+
+The recorder is not done when it prints JSON. It is done when:
+
+- [ ] It runs **7 consecutive days** unattended.
+- [ ] Killing the network mid-stream produces a `Gap{Disconnect}`, an
+      automatic reconnect with backoff, and a fresh snapshot resync.
+- [ ] `SIGKILL` mid-write leaves the last file readable up to the last
+      complete frame — no partial-frame corruption.
+- [ ] Replaying every recorded file shows `ingest_seq` contiguous within each
+      session, with every discontinuity explained by a recorded `Gap`.
+- [ ] Book reconstruction over the full capture holds its invariants at
+      every tick: `best_bid < best_ask`, levels monotone, no unexplained
+      update-id discontinuity.
+- [ ] Recorder-side metrics exist for: messages/sec, bytes/sec, queue depth,
+      venue latency percentiles, gap count by cause.
+
+The last one is not optional polish. If we cannot see queue depth we cannot
+tell the difference between a quiet market and a stalled consumer.
