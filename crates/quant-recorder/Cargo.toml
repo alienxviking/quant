@@ -6,9 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 # Venue-agnostic recorder plumbing: ingress stamping, sequencing, backpressure
-# policy, and the writer loop. A venue adapter supplies bytes; everything about
-# what happens to them afterwards lives here, so a second venue inherits the
-# overload and gap-accounting behaviour rather than reimplementing it.
+# policy, day rolling, and the writer loop. A venue adapter supplies bytes;
+# everything about what happens to them afterwards lives here, so a second venue
+# inherits the overload, rolling and gap-accounting behaviour rather than
+# reimplementing it.
 #
 # Deliberately no async runtime and no network dependency. The subtle logic in
 # this crate -- what happens when the channel is full -- is then testable

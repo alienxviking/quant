@@ -109,7 +109,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   | a | `quant-storage`: raw frame format, writer, reader | **done** |
   | b | `quant-recorder`: ingress, bounded channel, `Gap{LocalOverflow}`, writer loop | **done** |
   | b2 | `quant-binance`: WS connect, reconnect/backoff, stall detection, `record` bin | **done** |
-  | c | Session lifecycle: date rotation, Postgres `capture_sessions` | next |
+  | c1 | UTC day rolling: `CaptureSession`, `SegmentStore`, per-segment reports | **done** |
+  | c2 | Postgres `capture_sessions` + `capture_segments` | next |
   | d | Depth resync + offline verifier binary | |
   | e | Metrics: msgs/sec, bytes/sec, queue depth, latency pcts, gaps by cause | |
 
@@ -183,6 +184,24 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 - **Still M1's fiddly part**: depth-stream resync (buffer deltas → REST snapshot
   → discard stale deltas → verify the update-id chain joins → resume), correct
   on every reconnect, unattended, at 3am.
+
+- **M1.c1 decisions** (reasoned out in `crates/quant-recorder/src/segment.rs`):
+  day rolling is driven by the **record's `local_recv_ts`**, not the writer's
+  clock — the writer runs behind by design, so rolling on its clock would file a
+  23:59:59.9 message under the next day whenever our disk happened to be busy,
+  making the partition a property of our load rather than of the data. The
+  exception is an **idle stream**: timestamp-driven rolling alone leaves
+  yesterday's file unsealed until the next message, and a trailerless file reads
+  as "killed", so a healthy quiet symbol would look crashed —
+  `roll_if_day_elapsed` closes it on the flush tick. It only *closes*; the next
+  record opens the next segment, so a day with no data leaves **no empty file**.
+  We never roll **backwards**: a record stamped before the open segment's day
+  (an NTP step) is written to the open segment and counted as `backdated_records`
+  rather than reopening a sealed day. `ingest_seq` spans the **session**, not the
+  file, so a hole straddling midnight is still a hole — which means verification
+  joins a session's files in order. `SegmentStore` is a trait so rolling is
+  testable without waiting for midnight (`MemoryStore`); `FileStore` fsyncs once
+  per sealed segment.
 
 - **Known follow-up for M1.e**: `std::sync::mpsc` exposes no queue length, so
   "queue depth" from §7 needs an `AtomicUsize` incremented on send and

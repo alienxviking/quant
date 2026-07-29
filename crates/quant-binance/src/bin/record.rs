@@ -25,7 +25,6 @@
 //! and a clean-shutdown path that is never exercised end to end is a clean-shutdown
 //! path that does not work. It is also useful in its own right for bounded capture.
 
-use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -37,9 +36,10 @@ use quant_core::event::GapCause;
 use quant_core::instrument::Exchange;
 use quant_core::time::{Clock, SystemClock};
 use quant_recorder::{
-    channel, run_writer, CaptureTarget, Ingress, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
+    channel, format_session_id, run_writer, CaptureSession, FileStore, Ingress,
+    DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
 };
-use quant_storage::{FileHeader, RawWriter, WriterOptions};
+use quant_storage::WriterOptions;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -82,34 +82,32 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let started = clock.now();
 
-    let target = CaptureTarget {
-        exchange: Exchange::Binance,
-        symbol: symbol.clone(),
-        date: started.utc_date(),
-        session_id: *uuid::Uuid::new_v4().as_bytes(),
-        part: 0,
-    };
-    let path = target.file(&root);
-    fs::create_dir_all(target.directory(&root))?;
+    let session_id = *uuid::Uuid::new_v4().as_bytes();
 
-    // create_new, not create: a session owns its file exclusively. Two recorders
-    // pointed at one path would interleave frames and produce a file whose
-    // sequence numbers are nonsense, and the reader would reject it -- better to
-    // fail here, loudly, at startup.
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-
-    let header = FileHeader::new(Exchange::Binance, symbol.clone(), target.session_id);
-    let writer = RawWriter::create(file, header, WriterOptions::default())?;
+    // The session owns file creation and day rolling. No file is opened here: the
+    // first record decides which day it belongs to, so a recorder started at
+    // 23:59:59.9 does not create a file it will never write to.
+    let mut session = CaptureSession::new(
+        FileStore::new(&root),
+        Exchange::Binance,
+        symbol.clone(),
+        session_id,
+        Arc::clone(&clock),
+        WriterOptions::default(),
+    );
 
     let (tx, rx) = channel(DEFAULT_CHANNEL_CAPACITY);
     // A plain thread, not spawn_blocking: this runs for the life of the process,
     // and parking a tokio blocking-pool slot forever is not what that pool is for.
+    //
+    // The session moves in and comes back out, because sealing the final segment
+    // has to happen after the loop returns and must be able to report an error.
     let writer_thread = thread::Builder::new()
         .name(format!("capture-writer-{symbol}"))
-        .spawn(move || run_writer(&rx, writer, DEFAULT_FLUSH_INTERVAL))?;
+        .spawn(move || {
+            let outcome = run_writer(&rx, &mut session, DEFAULT_FLUSH_INTERVAL);
+            (outcome, session)
+        })?;
 
     let mut ingress = Ingress::new(tx, Arc::clone(&clock));
 
@@ -119,7 +117,15 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
 
     let spec = StreamSpec::market_data(&symbol);
     let policy = ConnectionPolicy::default();
-    info!(%symbol, path = %path.display(), "recording; ctrl-c to stop");
+    // The session id, not a path: with day rolling a run can produce several
+    // files, and the session is what identifies them all. Each is logged as it
+    // is sealed.
+    info!(
+        %symbol,
+        root = %root.display(),
+        session = %format_session_id(&session_id),
+        "recording; ctrl-c to stop"
+    );
 
     let outcome = tokio::select! {
         result = connection::run(&spec, SPOT_WS, &mut ingress, &policy) => {
@@ -141,9 +147,29 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
     // Closes the channel, which is how the writer knows to seal the trailer.
     drop(ingress);
 
-    let written = writer_thread
+    let (written, session) = writer_thread
         .join()
-        .map_err(|_| "capture writer thread panicked")??;
+        .map_err(|_| "capture writer thread panicked")?;
+    let written = written?;
+
+    let backdated = session.backdated_records();
+    let rolls = session.rolls();
+    // Seals the final segment with its trailer. This is the step that makes a
+    // clean shutdown distinguishable from a kill.
+    let (segments, store) = session.finish()?;
+
+    for segment in &segments {
+        info!(
+            path = %segment.target.file(store.root()).display(),
+            date = %segment.target.date,
+            frames = segment.stats.frames,
+            blocks = segment.stats.blocks,
+            file_bytes = segment.stats.file_bytes,
+            venue_bytes = segment.stats.frame_bytes,
+            ingest_seq = ?(segment.first_ingest_seq, segment.last_ingest_seq),
+            "segment sealed"
+        );
+    }
 
     info!(
         messages = stats.messages,
@@ -151,13 +177,22 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
         dropped = stats.dropped,
         gaps = stats.gaps_recorded,
         gaps_abandoned = stats.gaps_abandoned,
-        frames = written.stats.frames,
-        blocks = written.stats.blocks,
-        file_bytes = written.stats.file_bytes,
+        segments = segments.len(),
+        day_rolls = rolls,
+        records = written.records,
         timed_flushes = written.timed_flushes,
         seconds = clock.now().delta_nanos(started) / 1_000_000_000,
         "capture closed"
     );
+    if backdated > 0 {
+        // The host clock stepped backwards across a midnight boundary. Nothing was
+        // lost, but some records are filed under the following day -- and a machine
+        // whose clock jumps is a machine whose latency measurements are suspect.
+        error!(
+            backdated,
+            "records arrived stamped before the open segment's day: check the host clock"
+        );
+    }
     if stats.dropped > 0 {
         // Not an error -- it is recorded honestly and the hole proves how much --
         // but it means the channel or the disk needs sizing, so it must not be
@@ -167,12 +202,8 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
             "messages were dropped: recorder could not keep up"
         );
     }
-    // The one place durability is worth paying for: at close, once, rather than
-    // per block. quant-storage never calls fsync because a per-block flush would
-    // cost more throughput than we have to spare for a guarantee we do not need
-    // against process death -- but a file we are done with should be on the disk.
-    written.sink.sync_all()?;
-
+    // Durability is FileStore's job now: it fsyncs each segment as it is sealed,
+    // once per file rather than per block.
     outcome
 }
 

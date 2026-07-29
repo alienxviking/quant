@@ -90,6 +90,18 @@
 //! is deliberate: async where there is waiting on the network to overlap,
 //! threads where there is CPU and blocking I/O to get out of the way.
 //!
+//! # One session, many files
+//!
+//! The writer does not own a file, it owns a [`CaptureSession`]: a sequence of
+//! day-partitioned segments for one instrument. Rolling to the next segment is
+//! driven by the *record's* timestamp rather than the writer's clock, so which
+//! partition a message lands in is a property of the data and not of how busy our
+//! disk was. [`segment`] has the full argument, including why an idle stream needs
+//! a second, clock-driven rule to avoid leaving yesterday's file unsealed.
+//!
+//! `ingest_seq` spans the whole session rather than restarting per file, so a
+//! sequence hole that straddles midnight is still visible as a hole.
+//!
 //! [`GapCause::LocalOverflow`]: quant_core::GapCause::LocalOverflow
 //! [`try_send`]: std::sync::mpsc::SyncSender::try_send
 //! [`recv_timeout`]: std::sync::mpsc::Receiver::recv_timeout
@@ -98,6 +110,7 @@ pub mod backoff;
 pub mod ingress;
 pub mod layout;
 pub mod record;
+pub mod segment;
 pub mod sink;
 pub mod writer;
 
@@ -105,5 +118,6 @@ pub use backoff::{Backoff, BackoffPolicy};
 pub use ingress::{Accepted, GapOutcome, Ingress, IngressStats, WriterGone, MAX_PENDING_GAPS};
 pub use layout::{format_session_id, CaptureTarget};
 pub use record::CaptureRecord;
+pub use segment::{CaptureSession, FileStore, MemoryStore, SegmentReport, SegmentStore};
 pub use sink::{channel, RecordSink, SinkError, DEFAULT_CHANNEL_CAPACITY};
 pub use writer::{run_writer, WriterOutcome, DEFAULT_FLUSH_INTERVAL};
