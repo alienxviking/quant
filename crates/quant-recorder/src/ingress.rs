@@ -11,18 +11,22 @@ use std::sync::Arc;
 
 use quant_core::event::GapCause;
 use quant_core::time::{Clock, Ts};
-use quant_storage::ControlRecord;
+use quant_storage::{ControlRecord, SnapshotFailure, SnapshotPurpose};
 
 use crate::record::CaptureRecord;
 use crate::sink::{RecordSink, SinkError};
 
-/// How many gap records may be held pending before we start counting losses.
+/// How many control records may be held pending before we start counting losses.
 ///
 /// Reaching this would require gap *events* to outpace the writer, which means
 /// dozens of disconnects with no intervening drain. It is a backstop against
 /// unbounded growth in a pathological case, not a limit anything normal
 /// approaches -- consecutive overflow drops coalesce into one record, and the
 /// events that generate the others are ones where inflow has stopped.
+///
+/// Snapshot-failure records share this budget. They are rarer still, and losing
+/// one has the same shape of consequence as losing a gap record: the file stops
+/// accounting for something it should account for.
 pub const MAX_PENDING_GAPS: usize = 64;
 
 /// The writer is gone, so nothing we record can reach disk.
@@ -62,18 +66,33 @@ pub enum GapOutcome {
 /// Counters the recorder needs to expose (M1.e) and tests need to assert on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IngressStats {
-    /// Messages that arrived from the venue.
+    /// Stream messages that arrived from the venue.
     pub messages: u64,
-    /// Venue bytes that arrived, before framing or compression.
+    /// Venue stream bytes that arrived, before framing or compression.
     pub bytes: u64,
     pub enqueued: u64,
     /// Messages we dropped because we could not keep up. The number that
     /// matters; see the crate docs.
     pub dropped: u64,
+    /// Gap records written. Counts gaps *only* -- a snapshot failure is not a gap
+    /// and reporting them together would overstate how blind we were.
     pub gaps_recorded: u64,
-    /// Gap records lost to [`MAX_PENDING_GAPS`]. Should always be zero; if it is
-    /// not, the capture has unexplained holes and we need to know.
+    /// [`ControlRecord::SnapshotFailed`] records written.
+    pub snapshot_failures: u64,
+    /// Control records lost to [`MAX_PENDING_GAPS`]. Should always be zero; if it
+    /// is not, the capture has something it cannot account for and we need to
+    /// know. Named for the case that dominates it.
     pub gaps_abandoned: u64,
+    /// Book snapshots that arrived, enqueued or not.
+    ///
+    /// Counted apart from `messages` because a snapshot is a megabyte arriving
+    /// once an hour, and folding it into a stream throughput figure would make
+    /// bytes/sec spike for reasons that have nothing to do with the market.
+    pub snapshots: u64,
+    pub snapshot_bytes: u64,
+    /// Snapshots we could not enqueue. The caller's cue to fetch a fresh one --
+    /// see [`Ingress::accept_snapshot`].
+    pub snapshots_dropped: u64,
 }
 
 /// A pending gap, holding the time we *noticed* rather than the time we manage
@@ -83,15 +102,18 @@ pub struct IngressStats {
 /// still describes an event that happened thirty seconds ago, and stamping it at
 /// flush time would misattribute our own backlog to the venue.
 #[derive(Debug, Clone, Copy)]
-struct PendingGap {
+struct PendingControl {
     local_recv_ts: Ts,
     record: ControlRecord,
 }
 
-impl PendingGap {
-    const fn cause(&self) -> GapCause {
+impl PendingControl {
+    /// `None` for a control record that is not a gap, so the coalescing check
+    /// below cannot mistake one for a gap of some unrelated cause.
+    const fn cause(&self) -> Option<GapCause> {
         match self.record {
-            ControlRecord::Gap { cause, .. } => cause,
+            ControlRecord::Gap { cause, .. } => Some(cause),
+            ControlRecord::SnapshotFailed { .. } => None,
         }
     }
 }
@@ -106,7 +128,7 @@ pub struct Ingress<S> {
     sink: S,
     clock: Arc<dyn Clock>,
     next_seq: u64,
-    pending: VecDeque<PendingGap>,
+    pending: VecDeque<PendingControl>,
     /// Last local time we are confident the stream was intact, i.e. the receive
     /// time of the last record we actually got into the channel.
     last_good_ts: Ts,
@@ -186,6 +208,83 @@ impl<S: RecordSink> Ingress<S> {
         }
     }
 
+    /// Take a book snapshot the caller fetched over REST.
+    ///
+    /// # Why a dropped snapshot does not consume a sequence number
+    ///
+    /// For a stream message the opposite is true, and deliberately so: burning
+    /// the sequence number is the entire mechanism by which a hole records how
+    /// much was lost. But a hole means *the venue sent us something and we lost
+    /// it*, and the offline verifier reads it that way. A snapshot we fetched
+    /// ourselves and failed to enqueue lost no venue stream data, so leaving a
+    /// hole for it would manufacture evidence of a drop that did not happen --
+    /// and there would be no gap record to explain it.
+    ///
+    /// # Why the caller should re-fetch rather than retry these bytes
+    ///
+    /// Gap records are held and retried, because a gap describes a moment in the
+    /// past and its timestamp must not move. A snapshot is the opposite: its
+    /// whole value is being *current*, so a fresh fetch is a strictly better
+    /// record than the one we are holding, and holding a megabyte to retry it
+    /// would consume memory precisely when we are already behind.
+    /// [`Accepted::Dropped`] therefore means "fetch another one", and the caller
+    /// counts attempts so it can eventually record
+    /// [`SnapshotFailure::Overflow`].
+    ///
+    /// [`SnapshotFailure::Overflow`]: quant_storage::SnapshotFailure::Overflow
+    pub fn accept_snapshot(&mut self, payload: Vec<u8>) -> Result<Accepted, WriterGone> {
+        let now = self.clock.now();
+        self.stats.snapshots += 1;
+        self.stats.snapshot_bytes += payload.len() as u64;
+        self.pump()?;
+
+        let record = CaptureRecord::Snapshot {
+            local_recv_ts: now,
+            ingest_seq: self.next_seq,
+            payload,
+        };
+        match self.sink.try_send(record) {
+            Ok(()) => {
+                self.next_seq += 1;
+                self.last_good_ts = now;
+                Ok(Accepted::Enqueued)
+            }
+            Err(SinkError::Full(_)) => {
+                self.stats.snapshots_dropped += 1;
+                Ok(Accepted::Dropped)
+            }
+            Err(SinkError::Disconnected) => Err(WriterGone),
+        }
+    }
+
+    /// Record that a snapshot we wanted could not be obtained.
+    ///
+    /// Held and retried like a gap record, for the same reason: an absent
+    /// snapshot frame is ambiguous, and the record that disambiguates it must not
+    /// be the thing that gets dropped.
+    pub fn record_snapshot_failure(
+        &mut self,
+        purpose: SnapshotPurpose,
+        reason: SnapshotFailure,
+        attempts: u32,
+    ) -> Result<GapOutcome, WriterGone> {
+        let now = self.clock.now();
+        self.enqueue_control(
+            now,
+            ControlRecord::SnapshotFailed {
+                purpose,
+                reason,
+                attempts,
+            },
+        );
+        self.pump()?;
+        Ok(if self.pending.is_empty() {
+            GapOutcome::Recorded
+        } else {
+            GapOutcome::Deferred
+        })
+    }
+
     /// Record that data is missing for a reason the caller knows about:
     /// a disconnect, a recorder restart, a detected sequence break.
     ///
@@ -226,7 +325,12 @@ impl<S: RecordSink> Ingress<S> {
                     self.next_seq += 1;
                     self.last_good_ts = pending.local_recv_ts;
                     self.pending.pop_front();
-                    self.stats.gaps_recorded += 1;
+                    match pending.record {
+                        ControlRecord::Gap { .. } => self.stats.gaps_recorded += 1,
+                        ControlRecord::SnapshotFailed { .. } => {
+                            self.stats.snapshot_failures += 1;
+                        }
+                    }
                 }
                 Err(SinkError::Full(_)) => return Ok(()),
                 Err(SinkError::Disconnected) => return Err(WriterGone),
@@ -245,7 +349,7 @@ impl<S: RecordSink> Ingress<S> {
         let already_pending = self
             .pending
             .back()
-            .is_some_and(|p| p.cause() == GapCause::LocalOverflow);
+            .is_some_and(|p| p.cause() == Some(GapCause::LocalOverflow));
         if already_pending {
             return;
         }
@@ -253,19 +357,26 @@ impl<S: RecordSink> Ingress<S> {
     }
 
     fn enqueue_gap(&mut self, cause: GapCause, now: Ts) {
-        if self.pending.len() >= MAX_PENDING_GAPS {
-            self.stats.gaps_abandoned += 1;
-            return;
-        }
-        self.pending.push_back(PendingGap {
-            local_recv_ts: now,
-            record: ControlRecord::Gap {
+        self.enqueue_control(
+            now,
+            ControlRecord::Gap {
                 cause,
                 // A gap is ours, not the venue's; it never reported anything, so
                 // our own observation time is the only honest value here.
                 exchange_ts: now,
                 last_good_ts: self.last_good_ts,
             },
+        );
+    }
+
+    fn enqueue_control(&mut self, now: Ts, record: ControlRecord) {
+        if self.pending.len() >= MAX_PENDING_GAPS {
+            self.stats.gaps_abandoned += 1;
+            return;
+        }
+        self.pending.push_back(PendingControl {
+            local_recv_ts: now,
+            record,
         });
     }
 
@@ -322,7 +433,9 @@ mod tests {
                     record: ControlRecord::Gap { cause, .. },
                     ..
                 } => Some(*cause),
-                CaptureRecord::Venue { .. } => None,
+                CaptureRecord::Control { .. }
+                | CaptureRecord::Venue { .. }
+                | CaptureRecord::Snapshot { .. } => None,
             })
             .collect()
     }
@@ -575,13 +688,144 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_takes_its_place_in_the_sequence_between_deltas() {
+        // The position is the point: it tells the book builder which deltas
+        // precede the snapshot and are therefore stale. A snapshot delivered out
+        // of band, or stamped with a sequence number from before the deltas it
+        // followed, would make that undecidable.
+        let (mut ing, clock) = ingress(16);
+        ing.accept(b"delta 1".to_vec()).unwrap();
+        tick(&clock);
+        assert_eq!(
+            ing.accept_snapshot(b"{\"lastUpdateId\":42}".to_vec())
+                .unwrap(),
+            Accepted::Enqueued
+        );
+        tick(&clock);
+        ing.accept(b"delta 2".to_vec()).unwrap();
+
+        let accepted = &ing.sink().accepted;
+        assert_eq!(
+            accepted
+                .iter()
+                .map(CaptureRecord::ingest_seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(matches!(accepted[1], CaptureRecord::Snapshot { .. }));
+        assert_eq!(
+            accepted[1].local_recv_ts(),
+            Ts::from_millis(1_700_000_000_001),
+            "stamped when the REST body arrived, not when the connection opened"
+        );
+        assert_eq!(ing.stats().snapshots, 1);
+        assert_eq!(ing.stats().snapshot_bytes, 19);
+        assert_eq!(
+            ing.stats().messages,
+            2,
+            "a snapshot is not a stream message and must not inflate throughput"
+        );
+    }
+
+    #[test]
+    fn a_dropped_snapshot_leaves_no_hole_because_nothing_was_lost() {
+        // A hole in ingest_seq means the venue sent us something and we lost it,
+        // and that is how the verifier reads one. A snapshot we fetched ourselves
+        // and could not enqueue lost no stream data, so burning a sequence number
+        // would manufacture evidence of a drop -- and leave it unexplained, since
+        // there is no gap record to pair it with.
+        let (mut ing, clock) = ingress(1);
+        ing.accept(b"delta".to_vec()).unwrap();
+        tick(&clock);
+
+        let before = ing.next_ingest_seq();
+        assert_eq!(
+            ing.accept_snapshot(vec![0; 1024]).unwrap(),
+            Accepted::Dropped
+        );
+        assert_eq!(ing.next_ingest_seq(), before, "no sequence number consumed");
+        assert_eq!(ing.stats().snapshots_dropped, 1);
+        assert_eq!(
+            ing.pending_gaps(),
+            0,
+            "and no gap record, because the stream is intact"
+        );
+
+        // The caller's remedy is a fresh fetch, which then sequences normally.
+        ing.sink_mut().drain();
+        ing.accept_snapshot(vec![1; 512]).unwrap();
+        assert_eq!(ing.sink().accepted[0].ingest_seq(), before);
+    }
+
+    #[test]
+    fn a_snapshot_we_could_not_get_is_recorded_rather_than_left_as_a_silence() {
+        // Otherwise an absent snapshot frame cannot be told from a build that
+        // never fetched one, and those mean opposite things.
+        let (mut ing, _clock) = ingress(8);
+        assert_eq!(
+            ing.record_snapshot_failure(SnapshotPurpose::Resync, SnapshotFailure::Status, 3)
+                .unwrap(),
+            GapOutcome::Recorded
+        );
+        match ing.sink().accepted[0] {
+            CaptureRecord::Control {
+                record:
+                    ControlRecord::SnapshotFailed {
+                        purpose,
+                        reason,
+                        attempts,
+                    },
+                ..
+            } => {
+                assert_eq!(purpose, SnapshotPurpose::Resync);
+                assert_eq!(reason, SnapshotFailure::Status);
+                assert_eq!(attempts, 3);
+            }
+            ref other => panic!("expected a snapshot failure, got {other:?}"),
+        }
+        // Not a gap: no messages were lost, and treating it as one would make
+        // "refuse to trade across a gap" reject data that is perfectly good.
+        assert!(causes(&ing.sink().accepted).is_empty());
+        assert_eq!(
+            ing.stats().gaps_recorded,
+            0,
+            "a snapshot failure must not be counted as a gap: it would overstate \
+             how blind we were, in the log line an operator reads first"
+        );
+        assert_eq!(ing.stats().snapshot_failures, 1);
+    }
+
+    #[test]
+    fn a_snapshot_failure_is_held_and_retried_like_a_gap() {
+        // Same reasoning as a gap record: the record that explains an absence must
+        // not itself be the thing that goes missing.
+        let (mut ing, _clock) = ingress(1);
+        ing.accept(b"delta".to_vec()).unwrap();
+        assert_eq!(
+            ing.record_snapshot_failure(SnapshotPurpose::Periodic, SnapshotFailure::Timeout, 2)
+                .unwrap(),
+            GapOutcome::Deferred
+        );
+
+        ing.sink_mut().drain();
+        ing.pump().unwrap();
+        assert!(ing.sink().accepted[0].is_control());
+        assert_eq!(ing.pending_gaps(), 0);
+    }
+
+    #[test]
     fn a_dead_writer_is_fatal_rather_than_a_silent_data_sink() {
         let (mut ing, _clock) = ingress(8);
         ing.accept(b"kept".to_vec()).unwrap();
         ing.sink_mut().disconnected = true;
 
         assert_eq!(ing.accept(b"nowhere".to_vec()), Err(WriterGone));
+        assert_eq!(ing.accept_snapshot(b"nowhere".to_vec()), Err(WriterGone));
         assert_eq!(ing.record_gap(GapCause::Disconnect), Err(WriterGone));
+        assert_eq!(
+            ing.record_snapshot_failure(SnapshotPurpose::Resync, SnapshotFailure::Transport, 1),
+            Err(WriterGone)
+        );
         assert_eq!(ing.pump(), Err(WriterGone));
     }
 

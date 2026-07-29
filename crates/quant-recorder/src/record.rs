@@ -13,7 +13,7 @@ use quant_storage::ControlRecord;
 /// venue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureRecord {
-    /// Venue bytes, verbatim and uninterpreted.
+    /// Venue stream bytes, verbatim and uninterpreted.
     Venue {
         local_recv_ts: Ts,
         ingest_seq: u64,
@@ -25,22 +25,35 @@ pub enum CaptureRecord {
         ingest_seq: u64,
         record: ControlRecord,
     },
+    /// A book snapshot the venue returned to a request of ours, verbatim.
+    ///
+    /// Travels the same channel as everything else rather than on a side path, so
+    /// its `ingest_seq` places it exactly where in the delta stream it arrived.
+    /// That position *is* the information the book builder needs: which deltas
+    /// precede the snapshot and are therefore stale.
+    Snapshot {
+        local_recv_ts: Ts,
+        ingest_seq: u64,
+        payload: Vec<u8>,
+    },
 }
 
 impl CaptureRecord {
     #[must_use]
     pub const fn ingest_seq(&self) -> u64 {
         match self {
-            Self::Venue { ingest_seq, .. } | Self::Control { ingest_seq, .. } => *ingest_seq,
+            Self::Venue { ingest_seq, .. }
+            | Self::Control { ingest_seq, .. }
+            | Self::Snapshot { ingest_seq, .. } => *ingest_seq,
         }
     }
 
     #[must_use]
     pub const fn local_recv_ts(&self) -> Ts {
         match self {
-            Self::Venue { local_recv_ts, .. } | Self::Control { local_recv_ts, .. } => {
-                *local_recv_ts
-            }
+            Self::Venue { local_recv_ts, .. }
+            | Self::Control { local_recv_ts, .. }
+            | Self::Snapshot { local_recv_ts, .. } => *local_recv_ts,
         }
     }
 

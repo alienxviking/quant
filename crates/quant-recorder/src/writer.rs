@@ -214,7 +214,9 @@ mod tests {
             .map(|f| f.control().unwrap().unwrap())
             .collect();
         assert_eq!(gaps.len(), 1);
-        let ControlRecord::Gap { cause, .. } = gaps[0];
+        let ControlRecord::Gap { cause, .. } = gaps[0] else {
+            panic!("expected a gap, got {:?}", gaps[0]);
+        };
         assert_eq!(cause, GapCause::LocalOverflow);
 
         // And the hole in the sequence accounts for every dropped message,

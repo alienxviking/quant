@@ -43,6 +43,22 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
 ] }
 
+# REST, for the one thing the WebSocket cannot give us: an order-book snapshot to
+# anchor the depth deltas against. See `rest.rs`.
+#
+# `-no-provider` matters: the plain `rustls-tls-webpki-roots` feature enables
+# rustls' aws-lc-rs backend, which needs cmake and nasm on Windows *and* would
+# fight the `ring` provider we install at startup. This variant defers the choice
+# to the process-level default, which is precisely the one we set ourselves.
+#
+# Written by hand instead of taking this dependency was considered and rejected:
+# HTTP/1.1 with chunked encoding, redirects and content negotiation is a lot of
+# surface to get subtly wrong, and the payload it would be guarding is the one
+# artifact in the whole capture that cannot be re-fetched later.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots-no-provider",
+] }
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

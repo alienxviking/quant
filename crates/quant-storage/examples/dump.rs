@@ -50,52 +50,34 @@ fn dump(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         quant_recorder_session_text(&reader.header().session_id)
     );
 
-    let mut first_seq = None;
-    let mut last_seq = None;
-    let mut holes = 0_u64;
-    let mut missing = 0_u64;
-    let mut venue = 0_u64;
-    let mut gaps: Vec<(u64, String)> = Vec::new();
-
-    while let Some(frame) = reader.next_frame() {
-        let frame = frame?;
-        if let Some(previous) = last_seq {
-            let skipped = frame.ingest_seq - previous - 1;
-            if skipped > 0 {
-                holes += 1;
-                missing += skipped;
-            }
-        }
-        first_seq.get_or_insert(frame.ingest_seq);
-        last_seq = Some(frame.ingest_seq);
-
-        match frame.kind {
-            FrameKind::VenuePayload => venue += 1,
-            FrameKind::Control => {
-                if let Some(ControlRecord::Gap { cause, .. }) = frame.control()? {
-                    gaps.push((frame.ingest_seq, format!("{cause:?}")));
-                }
-            }
-        }
-    }
+    let scan = scan(&mut reader)?;
 
     let stats = reader.stats();
     println!(
-        "frames    {} ({venue} venue, {} control)",
+        "frames    {} ({} stream, {} snapshot, {} control)",
         stats.frames,
-        gaps.len()
+        scan.venue,
+        scan.snapshots,
+        scan.control.len()
     );
     println!("blocks    {}", stats.blocks);
     println!("bytes     {} consumed", stats.bytes_consumed);
+    println!("snapshot  {} bytes of book anchors", scan.snapshot_bytes);
     println!(
         "ingest    {}..={}",
-        first_seq.unwrap_or(0),
-        last_seq.unwrap_or(0)
+        scan.first_seq.unwrap_or(0),
+        scan.last_seq.unwrap_or(0)
     );
-    println!("holes     {holes} ({missing} messages unaccounted by sequence)");
+    println!(
+        "holes     {} ({} messages unaccounted by sequence)",
+        scan.holes, scan.missing
+    );
 
-    for (seq, cause) in &gaps {
-        println!("gap       seq {seq}: {cause}");
+    for (seq, head) in &scan.snapshot_seqs {
+        println!("anchor    seq {seq}: {head}...");
+    }
+    for (seq, what) in &scan.control {
+        println!("control   seq {seq}: {what}");
     }
 
     match reader.truncation() {
@@ -112,7 +94,7 @@ fn dump(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
 
     // The two-sided completeness check: every dropped message must be explained
     // by a recorded gap, and the writer must have declared the file closed.
-    let explained = missing == 0 || !gaps.is_empty();
+    let explained = scan.missing == 0 || scan.gaps > 0;
     match reader.trailer() {
         Some(t) => println!(
             "trailer   present: {} frames, {} blocks, last seq {:?}",
@@ -137,6 +119,81 @@ fn dump(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         && reader
             .truncation()
             .map_or(true, |t| !t.reason.is_corruption()))
+}
+
+/// What one pass over the frames saw.
+#[derive(Default)]
+struct Scan {
+    first_seq: Option<u64>,
+    last_seq: Option<u64>,
+    /// Discontinuities in `ingest_seq`, and how many messages they account for.
+    holes: u64,
+    missing: u64,
+    venue: u64,
+    snapshots: u64,
+    snapshot_bytes: u64,
+    /// Where the book anchors sit. Worth printing: a snapshot's position in the
+    /// sequence is what tells the book builder which deltas precede it and are
+    /// therefore stale, so "is it in a sensible place" is a real question.
+    ///
+    /// The prefix comes along because the other real question is whether the
+    /// bytes are a book at all. A venue that answers a snapshot request with an
+    /// error document returns HTTP 200 often enough that "the request succeeded"
+    /// is not the same claim as "this is a book", and sixty characters settles it
+    /// by eye.
+    snapshot_seqs: Vec<(u64, String)>,
+    /// Gap records only, counted separately: they are what *explains* a hole,
+    /// which a snapshot-failure record does not.
+    gaps: u64,
+    control: Vec<(u64, String)>,
+}
+
+fn scan<R: std::io::Read>(reader: &mut RawReader<R>) -> Result<Scan, Box<dyn std::error::Error>> {
+    let mut scan = Scan::default();
+
+    while let Some(frame) = reader.next_frame() {
+        let frame = frame?;
+        if let Some(previous) = scan.last_seq {
+            let skipped = frame.ingest_seq - previous - 1;
+            if skipped > 0 {
+                scan.holes += 1;
+                scan.missing += skipped;
+            }
+        }
+        scan.first_seq.get_or_insert(frame.ingest_seq);
+        scan.last_seq = Some(frame.ingest_seq);
+
+        match frame.kind {
+            FrameKind::VenuePayload => scan.venue += 1,
+            FrameKind::VenueSnapshot => {
+                scan.snapshots += 1;
+                scan.snapshot_bytes += frame.payload.len() as u64;
+                let head = String::from_utf8_lossy(&frame.payload)
+                    .chars()
+                    .take(60)
+                    .collect();
+                scan.snapshot_seqs.push((frame.ingest_seq, head));
+            }
+            FrameKind::Control => match frame.control()? {
+                Some(ControlRecord::Gap { cause, .. }) => {
+                    scan.gaps += 1;
+                    scan.control
+                        .push((frame.ingest_seq, format!("gap {cause:?}")));
+                }
+                Some(ControlRecord::SnapshotFailed {
+                    purpose,
+                    reason,
+                    attempts,
+                }) => scan.control.push((
+                    frame.ingest_seq,
+                    format!("snapshot failed: {purpose:?}/{reason:?} after {attempts} attempts"),
+                )),
+                None => {}
+            },
+        }
+    }
+
+    Ok(scan)
 }
 
 /// Canonical UUID text. Duplicated from `quant-recorder::layout` rather than

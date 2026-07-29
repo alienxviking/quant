@@ -92,6 +92,46 @@ them, so book correctness can be **re-verified offline** against recorded
 data. A recorder that checks sequencing but does not persist the evidence
 gives us no way to audit it later.
 
+### Book snapshots are recorded, not derived
+
+Binance's depth stream is incremental, and an incremental stream is meaningless
+without a book to apply it to. That book comes from `GET /api/v3/depth`, and
+that endpoint serves only the **current** state.
+
+This is the single exception to "the recorder does not talk to anything but the
+stream", and it exists for exactly the reason the raw tier exists. Every other
+interpretation of the venue is recoverable — the bytes are still on disk, so we
+re-derive. A snapshot *not taken* at the moment of a reconnect can never be
+taken, and every delta after that reconnect is unanchored forever.
+
+So the recorder fetches one on every (re)connect, and hourly while connected,
+and writes the response body verbatim into the same file and the same
+`ingest_seq` sequence as everything else. Two consequences worth being explicit
+about:
+
+- **The snapshot's position in the sequence is data.** It is fetched
+  concurrently with draining the socket, so it lands *between* the deltas it
+  arrived between — which is precisely what tells the book builder which deltas
+  precede the anchor and are therefore stale.
+- **Nothing is discarded at capture time.** Buffering deltas, dropping the
+  stale ones, and checking that the update-id chain joins are steps in
+  Binance's *local order book* algorithm. They are pure functions of bytes we
+  are about to write down, so they belong to the normalizer (M2), where a
+  mistake is fixed by re-deriving rather than by re-recording a week. The one
+  irreversible step is the fetch; only that step is M1's.
+
+Periodic snapshots are not an optimization. Without them a single lost delta
+invalidates the book for the remainder of the session, permanently; with an
+hourly anchor the book re-synchronizes at the next one. Same reasoning as
+per-block compression: keep damage local.
+
+A snapshot we wanted and could not get is recorded as such
+(`SnapshotFailed{purpose, reason, attempts}`). An absent snapshot frame is
+otherwise ambiguous between "the venue refused us" and "this build never
+fetched snapshots", and those mean opposite things. It is deliberately *not* a
+`Gap`: no messages were lost, and only a failed **resync** is serious — a
+failed periodic snapshot costs a recovery point and nothing else.
+
 ### Gaps are events
 
 `MarketEvent::Gap` is written whenever data is known to be missing:
@@ -163,6 +203,23 @@ Rules:
   successful re-derive of the full normalized tier before the old reader is
   removed.
 
+### Migration notes
+
+**Container v1 → v2** (M1.d). Adds frame kind `2 = VenueSnapshot` and the
+`SnapshotFailed` control record. A v2 reader reads v1 files unchanged; a v1
+reader refuses a v2 file at the header.
+
+The version was bumped rather than the frame kind quietly added, even though
+nothing but the kind byte changed, because the alternative is worse
+diagnostically: a v1 reader would get most of the way through a perfectly good
+file and then report `UnknownFrameKind`, which is indistinguishable from
+corruption. Refusing at the header says what is actually wrong.
+
+No re-derive was required, because no archival capture had been written when the
+change landed — the format was still inside the window §7 exists to protect. That
+window is now closing, and the next container change will need the full
+procedure.
+
 ---
 
 ## 7. Acceptance criteria for M1
@@ -172,6 +229,10 @@ The recorder is not done when it prints JSON. It is done when:
 - [ ] It runs **7 consecutive days** unattended.
 - [ ] Killing the network mid-stream produces a `Gap{Disconnect}`, an
       automatic reconnect with backoff, and a fresh snapshot resync.
+- [ ] Every recorded depth delta is preceded, somewhere in its session, by a
+      book snapshot — or by a `SnapshotFailed` record saying why not. A capture
+      whose deltas can never be turned into a book is not a usable capture,
+      however complete it is.
 - [ ] `SIGKILL` mid-write leaves the last file readable up to the last
       complete frame — no partial-frame corruption.
 - [ ] Replaying every recorded file shows `ingest_seq` contiguous within each

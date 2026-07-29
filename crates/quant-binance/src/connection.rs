@@ -1,16 +1,21 @@
 //! The read loop: connect, drain, reconnect, forever.
 
 use core::fmt;
+use core::future::Future;
+use core::pin::Pin;
 use core::time::Duration;
+use std::time::Instant;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use quant_core::event::GapCause;
-use quant_recorder::{Backoff, BackoffPolicy, Ingress, RecordSink, WriterGone};
+use quant_recorder::{Accepted, Backoff, BackoffPolicy, Ingress, RecordSink, WriterGone};
+use quant_storage::{SnapshotFailure, SnapshotPurpose};
 use tokio::time::{sleep, timeout};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
+use crate::rest::{SnapshotClient, SnapshotError};
 use crate::stream::StreamSpec;
 
 /// How the recorder behaves around a connection.
@@ -21,6 +26,14 @@ pub struct ConnectionPolicy {
     pub idle_timeout: Duration,
     /// Emit a progress line every this many messages.
     pub log_every: u64,
+    /// How often to take a book snapshot while connected, on top of the one
+    /// taken at every (re)connect.
+    pub snapshot_interval: Duration,
+    /// How many times to try for one snapshot before recording that we could not
+    /// get it.
+    pub snapshot_attempts: u32,
+    /// Wait between those attempts.
+    pub snapshot_retry_delay: Duration,
 }
 
 impl Default for ConnectionPolicy {
@@ -47,11 +60,39 @@ impl Default for ConnectionPolicy {
     /// spurious reconnect corrupts the sample whereas a slow-detected stall only
     /// delays noticing. For a liquid symbol on 100 ms depth this never fires:
     /// silence for even a few seconds is already anomalous.
+    ///
+    /// # Why snapshots repeat on a timer
+    ///
+    /// A resync snapshot at every connect is what makes the book buildable at
+    /// all. Repeating hourly buys two more things.
+    ///
+    /// It bounds the work to reach an arbitrary point: without periodic
+    /// snapshots, replaying 16:00 on a day whose session began at midnight means
+    /// applying sixteen hours of deltas first. And it bounds the *damage* of a
+    /// single lost delta -- one hole otherwise invalidates the book for the rest
+    /// of the session, permanently, whereas with an hourly anchor the book
+    /// re-synchronizes at the next one. That is the same reason compression is
+    /// per block rather than per file: keep damage local.
+    ///
+    /// An hour is cheap. A 5000-level snapshot is about a megabyte against
+    /// several hundred megabytes a day of deltas for a liquid symbol, and it
+    /// compresses well.
+    ///
+    /// # Why four attempts, two seconds apart
+    ///
+    /// The realistic failure is a 429: a momentary rate limit that clears in
+    /// seconds. Four attempts over about six seconds rides that out. What we must
+    /// not do is hammer an endpoint that has just asked us to stop, because the
+    /// venue's escalation from 429 to a timed IP ban would take the *WebSocket*
+    /// down with it -- turning a missing snapshot into a real hole in the deltas.
     fn default() -> Self {
         Self {
             backoff: BackoffPolicy::default(),
             idle_timeout: Duration::from_secs(120),
             log_every: 50_000,
+            snapshot_interval: Duration::from_secs(3600),
+            snapshot_attempts: 4,
+            snapshot_retry_delay: Duration::from_secs(2),
         }
     }
 }
@@ -88,6 +129,14 @@ impl fmt::Display for EndReason {
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// A snapshot request in flight.
+///
+/// Boxed and held as a plain future rather than run as a spawned task, so that
+/// dropping the drain loop cancels the request. A task would outlive the
+/// connection it belongs to and could deliver a snapshot into the *next* one,
+/// where its position in the sequence would be a lie.
+type SnapshotFetch<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, SnapshotError>> + Send + 'a>>;
+
 /// Record `spec` until the writer goes away or the caller cancels.
 ///
 /// Returns only on a fatal condition. A normal disconnect is not fatal: it is
@@ -96,11 +145,16 @@ type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// `record` binary, which races it against ctrl-c) and the borrowed `ingress`
 /// becomes droppable, which closes the channel and makes the writer seal the
 /// file with a trailer.
+///
+/// `snapshots` is optional so that a run against a fake WebSocket has no reason
+/// to reach a real REST endpoint. In production it is always present: without it
+/// the depth deltas are recorded but can never be turned into a book.
 pub async fn run<S: RecordSink>(
     spec: &StreamSpec,
     base_url: &str,
     ingress: &mut Ingress<S>,
     policy: &ConnectionPolicy,
+    snapshots: Option<&SnapshotClient>,
 ) -> Result<(), WriterGone> {
     let url = spec.url(base_url);
     let mut backoff = Backoff::for_key(policy.backoff, &spec.symbol);
@@ -120,7 +174,7 @@ pub async fn run<S: RecordSink>(
                 // unrelated outage last week.
                 backoff.reset();
 
-                let reason = drain(socket, ingress, policy).await?;
+                let reason = drain(socket, ingress, policy, &spec.symbol, snapshots).await?;
                 warn!(symbol = %spec.symbol, %reason, "connection ended");
 
                 // One gap per blind episode, recorded here rather than per failed
@@ -147,20 +201,113 @@ pub async fn run<S: RecordSink>(
     }
 }
 
-/// Pull messages until the connection stops being useful.
+/// What the drain loop woke up for.
+enum Event {
+    /// The socket produced something, or did not, within the idle timeout.
+    Socket(Result<Option<Result<Message, tungstenite::Error>>, tokio::time::error::Elapsed>),
+    /// A snapshot request finished, one way or the other.
+    Fetched(Result<Vec<u8>, SnapshotError>),
+}
+
+/// Pull messages until the connection stops being useful, taking book snapshots
+/// alongside.
+///
+/// # Why the snapshot is concurrent rather than awaited first
+///
+/// The order is forced from both sides. It must be fetched *after* the
+/// subscription is live, or the venue's book advances between the snapshot and
+/// our first delta and nothing can bridge the difference. And it must not be
+/// awaited *before* the first `socket.next()`, because that would stop draining
+/// the socket for a full round trip -- reintroducing exactly the coupling between
+/// our latency and the venue's patience that the split between this task and the
+/// writer thread exists to remove.
+///
+/// Running it concurrently also gets the useful property for free: the snapshot's
+/// `ingest_seq` lands *between* the deltas it arrived between, so the file itself
+/// records which deltas precede the anchor and are therefore stale. That is the
+/// input to Binance's book algorithm, and the alternative -- a snapshot on a side
+/// channel with no position in the sequence -- would leave it undecidable.
 async fn drain<S: RecordSink>(
     mut socket: Socket,
     ingress: &mut Ingress<S>,
     policy: &ConnectionPolicy,
+    symbol: &str,
+    snapshots: Option<&SnapshotClient>,
 ) -> Result<EndReason, WriterGone> {
     let mut since_log = 0_u64;
 
+    // Every connection starts by wanting a resync snapshot. `None` means nothing
+    // is wanted right now; `fetch` holds the attempt in flight.
+    let mut want = snapshots.and(Some(SnapshotPurpose::Resync));
+    let mut attempts = 0_u32;
+    let mut fetch: Option<SnapshotFetch<'_>> = None;
+    let mut next_periodic = Instant::now() + policy.snapshot_interval;
+
     loop {
-        let next = match timeout(policy.idle_timeout, socket.next()).await {
-            Err(_elapsed) => return Ok(EndReason::IdleTimeout),
-            Ok(None) => return Ok(EndReason::ServerClosed),
-            Ok(Some(Err(e))) => return Ok(EndReason::Transport(e.to_string())),
-            Ok(Some(Ok(message))) => message,
+        // A periodic snapshot is only noticed when the loop turns, which on a
+        // silent symbol is once per idle timeout. Being up to two minutes late for
+        // a recovery point is not worth a dedicated timer in the hot path.
+        if want.is_none() && snapshots.is_some() && Instant::now() >= next_periodic {
+            want = Some(SnapshotPurpose::Periodic);
+            attempts = 0;
+        }
+
+        if let (Some(purpose), None, Some(client)) = (want, fetch.as_ref(), snapshots) {
+            let delay = if attempts == 0 {
+                Duration::ZERO
+            } else {
+                policy.snapshot_retry_delay
+            };
+            attempts += 1;
+            debug!(symbol, ?purpose, attempts, "requesting a book snapshot");
+            fetch = Some(Box::pin(fetch_snapshot(client, symbol, delay)));
+        }
+
+        let event = match fetch.as_mut() {
+            // Biased with the socket first: draining it is the job, and a
+            // snapshot arriving a few microseconds later costs nothing.
+            Some(pending) => tokio::select! {
+                biased;
+                next = timeout(policy.idle_timeout, socket.next()) => Event::Socket(next),
+                got = pending => Event::Fetched(got),
+            },
+            None => Event::Socket(timeout(policy.idle_timeout, socket.next()).await),
+        };
+
+        let next = match event {
+            Event::Fetched(result) => {
+                fetch = None;
+                let purpose = want.unwrap_or(SnapshotPurpose::Periodic);
+                match snapshot_outcome(result, ingress, symbol, purpose)? {
+                    Ok(()) => {
+                        want = None;
+                        attempts = 0;
+                        next_periodic = Instant::now() + policy.snapshot_interval;
+                    }
+                    Err(reason) if attempts >= policy.snapshot_attempts => {
+                        warn!(
+                            symbol,
+                            ?purpose,
+                            attempts,
+                            ?reason,
+                            "giving up on a book snapshot; recording that we could not get it"
+                        );
+                        ingress.record_snapshot_failure(purpose, reason, attempts)?;
+                        want = None;
+                        // Deliberately not re-armed immediately: the next periodic
+                        // deadline applies, so a venue that is refusing us is left
+                        // alone for an hour rather than asked again at once.
+                        next_periodic = Instant::now() + policy.snapshot_interval;
+                    }
+                    // Attempts remain; the top of the loop re-arms with a delay.
+                    Err(_) => {}
+                }
+                continue;
+            }
+            Event::Socket(Err(_elapsed)) => return Ok(EndReason::IdleTimeout),
+            Event::Socket(Ok(None)) => return Ok(EndReason::ServerClosed),
+            Event::Socket(Ok(Some(Err(e)))) => return Ok(EndReason::Transport(e.to_string())),
+            Event::Socket(Ok(Some(Ok(message)))) => message,
         };
 
         match next {
@@ -193,6 +340,62 @@ async fn drain<S: RecordSink>(
             }
             Message::Close(_) => return Ok(EndReason::ServerClosed),
             Message::Pong(_) | Message::Frame(_) => {}
+        }
+    }
+}
+
+/// One snapshot attempt, after an optional delay.
+///
+/// The delay lives inside the future rather than as a `sleep` in the loop so that
+/// waiting for a retry does not stop the socket being drained. A rate limit we are
+/// backing off from must not cost us market data.
+async fn fetch_snapshot(
+    client: &SnapshotClient,
+    symbol: &str,
+    delay: Duration,
+) -> Result<Vec<u8>, SnapshotError> {
+    if !delay.is_zero() {
+        sleep(delay).await;
+    }
+    client.depth(symbol).await
+}
+
+/// Route a finished snapshot attempt into the capture, or report why not.
+///
+/// `Ok(Ok(()))` means it is on its way to disk. `Ok(Err(reason))` means this
+/// attempt failed and the caller may try again. The outer `Result` is the only
+/// genuinely fatal case, a writer that is gone.
+fn snapshot_outcome<S: RecordSink>(
+    result: Result<Vec<u8>, SnapshotError>,
+    ingress: &mut Ingress<S>,
+    symbol: &str,
+    purpose: SnapshotPurpose,
+) -> Result<Result<(), SnapshotFailure>, WriterGone> {
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(symbol, ?purpose, error = %e, "book snapshot request failed");
+            return Ok(Err(e.reason()));
+        }
+    };
+
+    let len = bytes.len();
+    match ingress.accept_snapshot(bytes)? {
+        Accepted::Enqueued => {
+            info!(symbol, ?purpose, bytes = len, "book snapshot captured");
+            Ok(Ok(()))
+        }
+        // We have the bytes and cannot enqueue them. Throwing them away and
+        // asking again is better than holding a megabyte: a fresher snapshot is a
+        // better record, and we are already short of capacity.
+        Accepted::Dropped => {
+            warn!(
+                symbol,
+                ?purpose,
+                bytes = len,
+                "capture channel full; discarding this snapshot and refetching"
+            );
+            Ok(Err(SnapshotFailure::Overflow))
         }
     }
 }

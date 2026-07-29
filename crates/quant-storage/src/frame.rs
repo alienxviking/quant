@@ -25,7 +25,17 @@ pub const MAGIC: [u8; 8] = *b"QUANTRAW";
 /// They move independently: adding a field to `MarketEvent` does not change how
 /// bytes are framed, and switching compression codec does not change what an
 /// event means. Conflating them would force a re-record for either change.
-pub const CONTAINER_VERSION: u16 = 1;
+///
+/// # History
+///
+/// - **v1** -- frame kinds `VenuePayload` and `Control`.
+/// - **v2** -- adds [`FrameKind::VenueSnapshot`] and
+///   [`ControlRecord::SnapshotFailed`]. A v2 reader reads v1 files unchanged;
+///   a v1 reader refuses a v2 file at the header, which is why the version is
+///   bumped rather than the kind quietly added -- the alternative is a v1 reader
+///   getting halfway through a good file and reporting `UnknownFrameKind`, which
+///   looks like corruption. See `docs/data-contract.md` §6.
+pub const CONTAINER_VERSION: u16 = 2;
 
 /// Marks the start of a block: ASCII `QRAB`.
 ///
@@ -94,10 +104,34 @@ const OFF_HEADER_CRC: usize = 64;
 /// contradict -- see the crate docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameKind {
-    /// Venue bytes, verbatim. Never parsed by this crate.
+    /// Venue bytes from the subscribed stream, verbatim. Never parsed by this
+    /// crate.
     VenuePayload,
     /// A [`ControlRecord`] we synthesized, as JSON.
     Control,
+    /// Venue bytes from a request we made, verbatim -- today a REST order-book
+    /// snapshot.
+    ///
+    /// # Why this is not just a `VenuePayload`
+    ///
+    /// It is equally venue bytes, but it answers a different question and has a
+    /// different JSON shape. A single kind would force the normalizer to
+    /// try-parse two shapes for every frame in the file, forever, to work out
+    /// which it is holding -- and a snapshot misread as a delta silently corrupts
+    /// a book rather than failing. One byte of frame kind buys a total
+    /// discrimination, which is the same argument that made [`Self::Control`]
+    /// typed rather than sniffed.
+    ///
+    /// # Why the payload stays verbatim
+    ///
+    /// The obvious alternative is to wrap the body in an envelope naming the
+    /// endpoint, mirroring the `{"stream":..,"data":..}` wrapper the combined WS
+    /// endpoint gives us. It is not done, because the envelope would be *our*
+    /// bytes labelled as the venue's, and for one snapshot kind per venue the
+    /// file header's `(exchange, symbol)` plus this frame kind already determine
+    /// the endpoint exactly. A second REST-sourced artifact is when an envelope
+    /// earns itself.
+    VenueSnapshot,
 }
 
 impl FrameKind {
@@ -106,6 +140,7 @@ impl FrameKind {
         match self {
             Self::VenuePayload => 0,
             Self::Control => 1,
+            Self::VenueSnapshot => 2,
         }
     }
 
@@ -114,8 +149,19 @@ impl FrameKind {
         match code {
             0 => Some(Self::VenuePayload),
             1 => Some(Self::Control),
+            2 => Some(Self::VenueSnapshot),
             _ => None,
         }
+    }
+
+    /// Whether the payload is uninterpreted venue bytes.
+    ///
+    /// The distinction that matters for provenance: everything except
+    /// [`Self::Control`] is what the venue said, and nothing in this crate has
+    /// looked at it.
+    #[must_use]
+    pub const fn is_venue_bytes(self) -> bool {
+        matches!(self, Self::VenuePayload | Self::VenueSnapshot)
     }
 }
 
@@ -420,6 +466,68 @@ pub enum ControlRecord {
         /// Last local time we are confident the stream was intact.
         last_good_ts: Ts,
     },
+    /// We wanted a book snapshot here and could not get one.
+    ///
+    /// # Why an absent snapshot is not self-explanatory
+    ///
+    /// Nothing else distinguishes "the recorder tried and the venue refused"
+    /// from "this build never fetched snapshots at all". Both look like a
+    /// [`FrameKind::VenueSnapshot`] frame that is not there, and the two have
+    /// opposite operational meanings. Same reasoning as [`FileTrailer`]:
+    /// completeness has to be something the file states, not something a reader
+    /// infers from a silence.
+    ///
+    /// # Why this is not a `Gap`
+    ///
+    /// A gap means *messages were lost*, and here none were -- the delta stream
+    /// is intact. What is missing is the book's anchor, and only for
+    /// [`SnapshotPurpose::Resync`] is that serious; a failed periodic snapshot
+    /// costs a recovery point and nothing else. Recording both as gaps would cry
+    /// wolf on the harmless case and make "refuse to trade across a gap" reject
+    /// data that is perfectly good.
+    ///
+    /// What the normalizer should do about it is M2's decision, made with the
+    /// book builder. This tier's job is to state the fact.
+    SnapshotFailed {
+        purpose: SnapshotPurpose,
+        reason: SnapshotFailure,
+        /// How many times we tried before giving up.
+        attempts: u32,
+    },
+}
+
+/// What a snapshot was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotPurpose {
+    /// Taken right after a (re)connect, to anchor the delta stream that follows.
+    /// Losing this one means the book cannot be built from here at all.
+    Resync,
+    /// Taken on a timer while connected, so a replay does not have to apply
+    /// every delta since the session began to reach the middle of it. Losing one
+    /// costs seek granularity, not correctness.
+    Periodic,
+}
+
+/// Why a snapshot could not be recorded.
+///
+/// Deliberately a closed set of coarse categories rather than the venue's error
+/// text. It keeps [`ControlRecord`] `Copy` and keeps unbounded strings from a
+/// remote server out of the immutable tier; the detailed error belongs in the
+/// log, where it can be as verbose as it likes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotFailure {
+    /// The request did not complete in time.
+    Timeout,
+    /// Connection, TLS or DNS failure.
+    Transport,
+    /// The venue answered, with something other than success -- a rate limit or
+    /// a ban, most likely.
+    Status,
+    /// We fetched it, but the capture channel was full every time we tried to
+    /// enqueue it. Our fault, not the venue's.
+    Overflow,
 }
 
 impl ControlRecord {
@@ -442,19 +550,25 @@ impl ControlRecord {
     /// `instrument` comes from looking up the file header's
     /// `(exchange, symbol)` in the current process's registry; `local_recv_ts`
     /// and `ingest_seq` come from the frame header.
+    ///
+    /// Returns `None` for records that are recorder telemetry rather than
+    /// something a strategy could observe. Mapping those onto a `MarketEvent`
+    /// anyway would mean inventing an event type for our own operational
+    /// troubles, and `quant_core::event` is explicit that nothing venue- or
+    /// implementation-specific leaks into that vocabulary.
     #[must_use]
     pub fn into_market_event(
         self,
         instrument: InstrumentId,
         local_recv_ts: Ts,
         ingest_seq: u64,
-    ) -> MarketEvent {
+    ) -> Option<MarketEvent> {
         match self {
             Self::Gap {
                 cause,
                 exchange_ts,
                 last_good_ts,
-            } => MarketEvent::Gap(Gap {
+            } => Some(MarketEvent::Gap(Gap {
                 meta: EventMeta {
                     instrument,
                     exchange_ts,
@@ -463,7 +577,8 @@ impl ControlRecord {
                 },
                 cause,
                 last_good_ts,
-            }),
+            })),
+            Self::SnapshotFailed { .. } => None,
         }
     }
 }
@@ -479,6 +594,25 @@ mod tests {
 
     fn header() -> FileHeader {
         FileHeader::new(Exchange::Binance, "BTCUSDT", SESSION)
+    }
+
+    /// An id from a real registry, since only a registry can issue one -- the
+    /// same restriction that keeps `InstrumentId` off the disk in the first place.
+    fn an_instrument() -> (quant_core::instrument::InstrumentRegistry, InstrumentId) {
+        use quant_core::instrument::{InstrumentDef, InstrumentKind, InstrumentRegistry};
+
+        let mut reg = InstrumentRegistry::new();
+        let id = reg.register(InstrumentDef {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+            base: "BTC".to_owned(),
+            quote: "USDT".to_owned(),
+            kind: InstrumentKind::Spot,
+            tick_size: "0.01".parse().unwrap(),
+            lot_size: "0.00001".parse().unwrap(),
+            min_notional: "5".parse().unwrap(),
+        });
+        (reg, id)
     }
 
     #[test]
@@ -589,6 +723,49 @@ mod tests {
     }
 
     #[test]
+    fn frame_kind_codes_are_pinned_and_provenance_is_explicit() {
+        // These codes are in every recorded file. Reusing or renumbering one
+        // would silently reinterpret history, so the fix for a failure here is to
+        // restore the code, not to update the expectation.
+        for (kind, code) in [
+            (FrameKind::VenuePayload, 0),
+            (FrameKind::Control, 1),
+            (FrameKind::VenueSnapshot, 2),
+        ] {
+            assert_eq!(kind.code(), code);
+            assert_eq!(FrameKind::from_code(code), Some(kind));
+        }
+        // A control frame is the only thing in the raw tier we authored.
+        assert!(FrameKind::VenuePayload.is_venue_bytes());
+        assert!(FrameKind::VenueSnapshot.is_venue_bytes());
+        assert!(!FrameKind::Control.is_venue_bytes());
+    }
+
+    #[test]
+    fn a_failed_snapshot_is_recorded_but_is_not_a_market_event() {
+        // It has to reach the file: an absent snapshot frame otherwise cannot be
+        // told apart from a build that never fetched one. It must not reach a
+        // strategy: our inability to reach a REST endpoint is not market data.
+        let rec = ControlRecord::SnapshotFailed {
+            purpose: SnapshotPurpose::Resync,
+            reason: SnapshotFailure::Status,
+            attempts: 3,
+        };
+        let json = rec.to_json().unwrap();
+        let text = core::str::from_utf8(&json).unwrap();
+        assert!(text.contains("\"type\":\"snapshot_failed\""), "{text}");
+        assert!(text.contains("\"purpose\":\"resync\""), "{text}");
+        assert!(text.contains("\"reason\":\"status\""), "{text}");
+        assert_eq!(ControlRecord::from_json(&json).unwrap(), rec);
+
+        let (_reg, id) = an_instrument();
+        assert!(
+            rec.into_market_event(id, Ts::EPOCH, 1).is_none(),
+            "recorder telemetry must not enter the event vocabulary"
+        );
+    }
+
+    #[test]
     fn unknown_frame_kind_is_refused() {
         let mut bytes = FrameHeader {
             kind: FrameKind::VenuePayload,
@@ -624,26 +801,16 @@ mod tests {
 
     #[test]
     fn control_record_reattaches_identity_on_read() {
-        use quant_core::instrument::{InstrumentDef, InstrumentKind, InstrumentRegistry};
-
-        let mut reg = InstrumentRegistry::new();
-        let id = reg.register(InstrumentDef {
-            exchange: Exchange::Binance,
-            symbol: "BTCUSDT".to_owned(),
-            base: "BTC".to_owned(),
-            quote: "USDT".to_owned(),
-            kind: InstrumentKind::Spot,
-            tick_size: "0.01".parse().unwrap(),
-            lot_size: "0.00001".parse().unwrap(),
-            min_notional: "5".parse().unwrap(),
-        });
+        let (_reg, id) = an_instrument();
 
         let rec = ControlRecord::Gap {
             cause: GapCause::Disconnect,
             exchange_ts: Ts::from_millis(1_700_000_000_000),
             last_good_ts: Ts::from_millis(1_699_999_999_000),
         };
-        let ev = rec.into_market_event(id, Ts::from_millis(1_700_000_000_000), 99);
+        let ev = rec
+            .into_market_event(id, Ts::from_millis(1_700_000_000_000), 99)
+            .expect("a gap is observable");
 
         let MarketEvent::Gap(gap) = ev else {
             panic!("expected a gap");

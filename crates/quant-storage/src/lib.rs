@@ -43,7 +43,9 @@
 //!   compressed            [compressed_len]  zstd of: Frame*
 //!
 //! Frame (21-byte header, inside a block's uncompressed bytes)
-//!   kind                  u8    0 = venue payload, 1 = control
+//!   kind                  u8    0 = venue stream payload
+//!                               1 = control record (ours, JSON)
+//!                               2 = venue snapshot (REST body, verbatim)
 //!   local_recv_ts         i64   epoch nanos, stamped at socket read
 //!   ingest_seq            u64   ours, strictly increasing within the file
 //!   payload_len           u32
@@ -88,6 +90,12 @@
 //!
 //! Hence [`FrameKind`]: `VenuePayload` frames are opaque bytes we never
 //! interpret, `Control` frames are ours. See [`ControlRecord`].
+//!
+//! The same argument gives book snapshots their own kind rather than sharing
+//! `VenuePayload`. A REST snapshot body is equally the venue's bytes, but it is a
+//! different JSON shape answering a different question, and a snapshot misread as
+//! a delta corrupts a book silently instead of failing. One byte of frame kind
+//! replaces a try-parse-both on every frame in the file, forever.
 //!
 //! ## 3. Holes in `ingest_seq` are legal, and they are evidence
 //!
@@ -169,9 +177,10 @@ pub mod writer;
 
 pub use error::{StorageError, StorageResult};
 pub use frame::{
-    ControlRecord, FileHeader, FileTrailer, FrameHeader, FrameKind, RawFrame, BLOCK_HEADER_LEN,
-    BLOCK_SYNC, CONTAINER_VERSION, FILE_HEADER_LEN, FRAME_HEADER_LEN, MAGIC,
-    MAX_BLOCK_UNCOMPRESSED, MAX_PAYLOAD_LEN, SYMBOL_FIELD_LEN, TRAILER_LEN, TRAILER_SYNC,
+    ControlRecord, FileHeader, FileTrailer, FrameHeader, FrameKind, RawFrame, SnapshotFailure,
+    SnapshotPurpose, BLOCK_HEADER_LEN, BLOCK_SYNC, CONTAINER_VERSION, FILE_HEADER_LEN,
+    FRAME_HEADER_LEN, MAGIC, MAX_BLOCK_UNCOMPRESSED, MAX_PAYLOAD_LEN, SYMBOL_FIELD_LEN,
+    TRAILER_LEN, TRAILER_SYNC,
 };
 pub use reader::{RawReader, ReaderStats, Truncation, TruncationReason};
 pub use writer::{RawWriter, WriterOptions, WriterStats};

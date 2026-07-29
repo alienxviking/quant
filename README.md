@@ -56,8 +56,9 @@ crates/
                     recovery. Knows no venue and no network.       [M1a]
   quant-recorder/   ingress stamping, sequencing, bounded-channel
                     overload policy, writer loop. Venue-agnostic.  [M1b]
-  quant-binance/    the Binance WebSocket dialect, plus the `record`
-                    binary. The only crate that knows a venue.     [M1b]
+  quant-binance/    the Binance WebSocket dialect, the REST snapshot
+                    fetch, plus the `record` binary. The only crate
+                    that knows a venue.                            [M1b]
   quant-meta/       Postgres: capture sessions and segments. Sits
                     above the recorder; optional and best-effort.   [M1c]
 docs/
@@ -106,6 +107,16 @@ how "complete" and "interrupted" stay distinguishable from the bytes alone.
 Capture files roll at the UTC day boundary, driven by each record's own receive
 timestamp rather than the writer's clock — so which partition a message lands in
 is a property of the data, not of how busy the disk was.
+
+A book snapshot is fetched over REST on every connect and hourly thereafter, and
+written into the same file and the same sequence as the deltas. This is the one
+thing the recorder cannot defer to the normalizer: Binance's depth stream is
+incremental, `GET /api/v3/depth` serves only the book's *current* state, and a
+snapshot not taken at a reconnect can never be taken. The fetch runs concurrently
+with draining the socket, so the snapshot's `ingest_seq` lands between the deltas
+it arrived between — which is what tells a book builder which deltas precede the
+anchor and are stale. Nothing is discarded at capture time; that is M2's job,
+where a mistake costs a re-derive rather than a re-record.
 
 ### Metadata (optional)
 

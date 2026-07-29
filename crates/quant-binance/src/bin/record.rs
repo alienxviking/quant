@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use quant_binance::{connection, ConnectionPolicy, StreamSpec, SPOT_WS};
+use quant_binance::{connection, ConnectionPolicy, SnapshotClient, StreamSpec, SPOT_REST, SPOT_WS};
 use quant_core::event::GapCause;
 use quant_core::instrument::Exchange;
 use quant_core::time::{Clock, SystemClock, Ts};
@@ -56,6 +56,14 @@ use tokio::sync::mpsc::Sender as MetaSender;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Ceiling on one snapshot request.
+///
+/// A 5000-level book is around a megabyte, so this has to allow for a real
+/// transfer, not just a round trip. Generous rather than tight: an abandoned
+/// snapshot costs a book anchor, while a slow one costs nothing at all -- the
+/// socket keeps draining throughout, by construction.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The metadata tier, if one is configured.
 ///
@@ -186,12 +194,10 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    // Installed explicitly rather than left to rustls' feature-based detection.
-    // That detection panics on first use if it cannot decide, so a dependency
-    // change elsewhere in the tree would surface as a crash at the first TLS
-    // handshake -- in production, looking exactly like a venue outage. An error
-    // here means something already installed a provider, which is fine.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Before anything opens a socket. Left to rustls' own feature-based detection
+    // this panics at the first TLS handshake -- in production, during a reconnect,
+    // looking exactly like a venue outage.
+    quant_binance::install_crypto_provider();
 
     match record().await {
         Ok(()) => ExitCode::SUCCESS,
@@ -273,6 +279,12 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
 
     let spec = StreamSpec::market_data(&symbol);
     let policy = ConnectionPolicy::default();
+    // Built once, up front, and a failure here is fatal rather than warned about.
+    // Unlike the metadata tier, this is not optional: without snapshots the depth
+    // deltas are recorded faithfully and can never be turned into a book, so a
+    // recorder that quietly ran without one would produce a week of data that
+    // looks complete and is not usable.
+    let snapshots = SnapshotClient::new(SPOT_REST, SNAPSHOT_TIMEOUT)?;
     // The session id, not a path: with day rolling a run can produce several
     // files, and the session is what identifies them all. Each is logged as it
     // is sealed.
@@ -284,7 +296,7 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let outcome = tokio::select! {
-        result = connection::run(&spec, SPOT_WS, &mut ingress, &policy) => {
+        result = connection::run(&spec, SPOT_WS, &mut ingress, &policy, Some(&snapshots)) => {
             // Only returns on a fatal condition -- normal disconnects are gaps.
             result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
         }
@@ -368,6 +380,10 @@ fn report_capture(
         dropped = stats.dropped,
         gaps = stats.gaps_recorded,
         gaps_abandoned = stats.gaps_abandoned,
+        snapshot_failures = stats.snapshot_failures,
+        snapshots = stats.snapshots,
+        snapshot_bytes = stats.snapshot_bytes,
+        snapshots_dropped = stats.snapshots_dropped,
         segments = segments.len(),
         day_rolls = rolls,
         records = written.records,

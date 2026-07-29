@@ -331,6 +331,13 @@ impl<S: SegmentStore> CaptureSession<S> {
             } => open
                 .writer
                 .write_control(local_recv_ts, ingest_seq, &record),
+            CaptureRecord::Snapshot {
+                local_recv_ts,
+                ingest_seq,
+                payload,
+            } => open
+                .writer
+                .write_venue_snapshot(local_recv_ts, ingest_seq, &payload),
         }
     }
 

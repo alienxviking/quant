@@ -139,7 +139,21 @@ impl<W: Write> RawWriter<W> {
         self.write_frame(FrameKind::VenuePayload, local_recv_ts, ingest_seq, payload)
     }
 
-    /// Append a record we authored -- currently only gaps.
+    /// Append a snapshot the venue returned to a request of ours, verbatim.
+    ///
+    /// Separate from [`RawWriter::write_venue_payload`] only in the frame kind it
+    /// stamps; the bytes are just as uninterpreted. See
+    /// [`FrameKind::VenueSnapshot`] for why the kind is worth a byte.
+    pub fn write_venue_snapshot(
+        &mut self,
+        local_recv_ts: Ts,
+        ingest_seq: u64,
+        payload: &[u8],
+    ) -> StorageResult<()> {
+        self.write_frame(FrameKind::VenueSnapshot, local_recv_ts, ingest_seq, payload)
+    }
+
+    /// Append a record we authored -- a gap, or a snapshot we failed to get.
     pub fn write_control(
         &mut self,
         local_recv_ts: Ts,

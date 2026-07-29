@@ -111,7 +111,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   | b2 | `quant-binance`: WS connect, reconnect/backoff, stall detection, `record` bin | **done** |
   | c1 | UTC day rolling: `CaptureSession`, `SegmentStore`, per-segment reports | **done** |
   | c2 | Postgres `capture_sessions` + `capture_segments` | **done** |
-  | d | Depth resync + offline verifier binary | next |
+  | d1 | Depth snapshot capture (resync + periodic) | **done** |
+  | d2 | Offline verifier binary | next |
   | e | Metrics: msgs/sec, bytes/sec, queue depth, latency pcts, gaps by cause | |
 
   **It records.** `cargo run -p quant-binance --bin record -- BTCUSDT data 35`
@@ -181,9 +182,85 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   `a_steady_trickle_is_sealed_even_though_it_never_goes_idle`. The general
   lesson: a timeout on the *wait* is not a timeout on the *work*.
 
-- **Still M1's fiddly part**: depth-stream resync (buffer deltas → REST snapshot
-  → discard stale deltas → verify the update-id chain joins → resume), correct
-  on every reconnect, unattended, at 3am.
+- **M1.d1 decisions** — and first, a re-scoping. The plan said "depth resync:
+  buffer deltas → REST snapshot → discard stale deltas → verify the chain joins →
+  resume". That is Binance's *local order book* algorithm, and the recorder has no
+  book. Sorted by which milestone can actually falsify each step, only **one** step
+  is a capture-time obligation: the **fetch**, because the venue serves only the
+  book's current state and a snapshot not taken at a reconnect can never be taken.
+  Buffering is what the file already is; discarding stale deltas destroys evidence
+  and is a pure function of raw; chain verification is offline. So M1.d split into
+  d1 (capture the snapshot) and d2 (the verifier), and the discard/verify steps
+  moved to M2 where a mistake costs a re-derive instead of a re-record.
+
+  Snapshots get their own `FrameKind::VenueSnapshot` rather than sharing
+  `VenuePayload` — same argument that made gap frames typed. Sniffing would mean a
+  try-parse of two JSON shapes on every frame, forever, and a snapshot misread as
+  a delta corrupts a book *silently* instead of failing. The payload stays
+  **verbatim**: an envelope naming the endpoint would be our bytes labelled as the
+  venue's, and `(exchange, symbol)` + kind already determine it for one snapshot
+  kind per venue. Container version bumped **1 → 2**, migration note in
+  `docs/data-contract.md` §6 — a v1 reader would otherwise get most of the way
+  through a good v2 file and report `UnknownFrameKind`, indistinguishable from
+  corruption; refusing at the header says what is actually wrong.
+
+  The fetch is **concurrent with the drain**, not before it. Awaiting it first
+  would stop reading the socket for a round trip, restoring exactly the coupling
+  the read/write split exists to remove; fetching before the subscription is live
+  would leave an unbridgeable hole between snapshot and first delta. Concurrency
+  also buys the property that matters for free: **the snapshot's position in the
+  sequence is the information** — it lands between the deltas it arrived between,
+  which is what tells the book builder which deltas are stale. Verified live:
+  anchors at `ingest_seq` 4, 371, 562, 1024. It is a plain boxed future, not a
+  spawned task, so dropping the connection cancels it — a task could outlive its
+  connection and deliver a snapshot into the *next* one, where its position would
+  be a lie.
+
+  A **dropped snapshot consumes no sequence number**, unlike a dropped message.
+  A hole means "the venue sent something and we lost it" and the verifier reads it
+  that way; a snapshot we fetched ourselves lost no stream data, so a hole would
+  manufacture evidence of a drop *and* leave it unexplained. And the remedy for a
+  full channel is to **re-fetch, not to retry the bytes** — a gap record must keep
+  its original timestamp, but a snapshot's whole value is being current, so a fresh
+  fetch is a strictly better record and holding a megabyte is the last thing to do
+  when already behind.
+
+  **Periodic snapshots (hourly) are not an optimization.** Without them one lost
+  delta invalidates the book for the rest of the session, permanently; with an
+  hourly anchor it re-synchronizes at the next one. Same "keep damage local"
+  reasoning as per-block compression, and `BookSnapshot`'s M0 doc comment already
+  anticipated it. Cost is ~320 KB/hour against several hundred MB/day of deltas.
+
+  `SnapshotFailed{purpose, reason, attempts}` is recorded rather than left as a
+  silence, because an absent snapshot frame cannot otherwise be told from a build
+  that never fetched one. It is **not** a `Gap`: no messages were lost, and only a
+  failed *resync* is serious — treating a failed periodic snapshot as a gap would
+  make "refuse to trade across a gap" reject good data. `reason` is a closed set of
+  coarse categories, not the venue's error text, which keeps `ControlRecord` `Copy`
+  and keeps unbounded remote strings out of the immutable tier.
+
+- **Two things running it taught us** (worth remembering): `reqwest` **panics**
+  inside `Client::build` when no process-global rustls provider is installed — not
+  at first handshake, so merely constructing a client in a unit test brought the
+  test down. Hence `install_crypto_provider()`, called from both startup and
+  `SnapshotClient::new`; a library constructor that panics unless its caller knew
+  to install a cryptography backend first is a worse trade than a global side
+  effect. Use the `rustls-tls-webpki-roots-no-provider` feature, or reqwest pulls
+  `aws-lc-rs` (cmake + nasm on Windows) and fights the `ring` provider we install.
+  And `gaps_recorded` initially counted snapshot-failure records too, so a run with
+  one gap logged `gaps=2` — misleading in exactly the log line an operator reads
+  first. Split into `gaps_recorded` and `snapshot_failures`.
+
+- **Still M1's fiddly part**, now scoped to d2: the offline verifier. It must join
+  a session's segments **in order** (`ingest_seq` is session-scoped, not per-file,
+  so a hole straddling midnight is still a hole), check holes are explained by
+  recorded gaps, check the depth update-id chain (`U == previous u + 1`) with every
+  break explained, and check that every delta run is anchored by a preceding
+  snapshot or an explicit `SnapshotFailed`. Note the edge case a live test turned
+  up: a connection that dies before any delta arrives legitimately has no anchor
+  and no failure record, so the rule is "a `Disconnect` followed by *any* delta
+  needs an intervening anchor", not "every `Disconnect` needs one".
+  `examples/dump.rs` is a single-file debugging aid, not this.
 
 - **M1.c1 decisions** (reasoned out in `crates/quant-recorder/src/segment.rs`):
   day rolling is driven by the **record's `local_recv_ts`**, not the writer's
