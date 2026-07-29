@@ -173,6 +173,56 @@ impl SegmentStore for MemoryStore {
     }
 }
 
+/// Wraps a store and notifies an observer as each segment is sealed.
+///
+/// This is the seam that keeps the metadata tier out of this crate. The recorder
+/// knows only "call this when a segment is sealed"; that a `Postgres` row gets
+/// written is entirely the caller's business, which is what makes a recorder with
+/// no database configured a fully functional recorder.
+///
+/// The observer is called **after** the inner store has sealed the segment, so it
+/// never reports a file as durable before the fsync that makes it so.
+///
+/// It must not block. Whatever it does happens on the writer thread, so a slow
+/// observer stalls block sealing, backs up the capture channel and drops market
+/// data -- a secondary concern damaging the primary one. Hand work to a channel.
+pub struct ObservedStore<S, F> {
+    inner: S,
+    observe: F,
+}
+
+impl<S, F> ObservedStore<S, F> {
+    pub fn new(inner: S, observe: F) -> Self {
+        Self { inner, observe }
+    }
+
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: fmt::Debug, F> fmt::Debug for ObservedStore<S, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObservedStore")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: SegmentStore, F: FnMut(&SegmentReport)> SegmentStore for ObservedStore<S, F> {
+    type Sink = S::Sink;
+
+    fn create(&mut self, target: &CaptureTarget) -> StorageResult<Self::Sink> {
+        self.inner.create(target)
+    }
+
+    fn sealed(&mut self, report: &SegmentReport, sink: Self::Sink) -> StorageResult<()> {
+        self.inner.sealed(report, sink)?;
+        (self.observe)(report);
+        Ok(())
+    }
+}
+
 /// The segment currently being written.
 struct Open<W: Write> {
     target: CaptureTarget,

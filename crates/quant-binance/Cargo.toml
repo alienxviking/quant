@@ -11,6 +11,7 @@ license.workspace = true
 # framing -- lives in the venue-agnostic crates so a second venue inherits it.
 [dependencies]
 quant-core = { workspace = true }
+quant-meta = { workspace = true }
 quant-recorder = { workspace = true }
 quant-storage = { workspace = true }
 

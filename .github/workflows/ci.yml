@@ -15,6 +15,29 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+
+    # The metadata tests skip themselves when QUANT_DATABASE_URL is unset, which
+    # keeps `cargo test` usable without Docker running locally. That is only
+    # acceptable because CI always provides a database -- a test that skips
+    # everywhere is worse than no test.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: quant
+          POSTGRES_PASSWORD: quant_local_dev
+          POSTGRES_DB: quant
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quant -d quant"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      QUANT_DATABASE_URL: postgres://quant:quant_local_dev@localhost:5432/quant
+
     steps:
       - uses: actions/checkout@v4
 

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/quant-binance",
     "crates/quant-core",
+    "crates/quant-meta",
     "crates/quant-recorder",
     "crates/quant-storage",
 ]
@@ -21,6 +22,7 @@ repository = "https://github.com/alienxviking/quant"
 [workspace.dependencies]
 quant-binance = { path = "crates/quant-binance" }
 quant-core = { path = "crates/quant-core" }
+quant-meta = { path = "crates/quant-meta" }
 quant-recorder = { path = "crates/quant-recorder" }
 quant-storage = { path = "crates/quant-storage" }
 serde = { version = "1", features = ["derive"] }

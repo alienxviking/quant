@@ -58,6 +58,8 @@ crates/
                     overload policy, writer loop. Venue-agnostic.  [M1b]
   quant-binance/    the Binance WebSocket dialect, plus the `record`
                     binary. The only crate that knows a venue.     [M1b]
+  quant-meta/       Postgres: capture sessions and segments. Sits
+                    above the recorder; optional and best-effort.   [M1c]
 docs/
   data-contract.md  the on-disk format and its acceptance criteria
 ```
@@ -100,3 +102,27 @@ cargo run -p quant-storage --example dump -- \
 A clean shutdown writes a trailer, so the file states its own frame and block
 counts and the reader cross-checks them. A `SIGKILL` leaves no trailer, which is
 how "complete" and "interrupted" stay distinguishable from the bytes alone.
+
+Capture files roll at the UTC day boundary, driven by each record's own receive
+timestamp rather than the writer's clock — so which partition a message lands in
+is a property of the data, not of how busy the disk was.
+
+### Metadata (optional)
+
+Set `QUANT_DATABASE_URL` and the recorder indexes itself into Postgres: one
+`capture_sessions` row per run, one `capture_segments` row per sealed file.
+
+```bash
+docker compose up -d
+export QUANT_DATABASE_URL=postgres://quant:quant_local_dev@localhost:5432/quant
+cargo run -p quant-binance --bin record -- BTCUSDT data 60
+```
+
+Unset, or a database that will not answer, logs a warning and records anyway.
+Market data cannot be regenerated and an index row can, so the index is allowed
+to be missing and the capture is not allowed to stop. Everything in those tables
+is reconstructible from the capture files themselves — otherwise Postgres would
+quietly have become the source of truth for it.
+
+The `quant-meta` tests need a database and skip themselves without one. CI always
+provides it, which is the only reason skipping is acceptable.

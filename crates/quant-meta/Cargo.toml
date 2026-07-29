@@ -1,0 +1,38 @@
+[package]
+name = "quant-meta"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The metadata tier: Postgres. Sits *above* the recorder and knows about it;
+# nothing below knows this crate exists, which is what makes a recorder with no
+# database configured a fully functional recorder. See src/lib.rs.
+[dependencies]
+quant-core = { workspace = true }
+quant-recorder = { workspace = true }
+quant-storage = { workspace = true }
+
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+
+# Hand-written SQL over tokio-postgres rather than an ORM or sqlx's compile-time
+# checking. The schema is small and the queries are the interesting part -- worth
+# reading directly. sqlx would additionally need either a live database at build
+# time or a checked-in offline cache, which is a real cost for six statements.
+tokio-postgres = { version = "0.7", features = [
+    "with-time-0_3",
+    "with-uuid-1",
+] }
+
+# Real `date` and `timestamptz` column types rather than text. Range queries on
+# capture dates are the whole point of this index, and a text column that only
+# happens to sort correctly is a constraint the database is not enforcing.
+time = "0.3"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -110,8 +110,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   | b | `quant-recorder`: ingress, bounded channel, `Gap{LocalOverflow}`, writer loop | **done** |
   | b2 | `quant-binance`: WS connect, reconnect/backoff, stall detection, `record` bin | **done** |
   | c1 | UTC day rolling: `CaptureSession`, `SegmentStore`, per-segment reports | **done** |
-  | c2 | Postgres `capture_sessions` + `capture_segments` | next |
-  | d | Depth resync + offline verifier binary | |
+  | c2 | Postgres `capture_sessions` + `capture_segments` | **done** |
+  | d | Depth resync + offline verifier binary | next |
   | e | Metrics: msgs/sec, bytes/sec, queue depth, latency pcts, gaps by cause | |
 
   **It records.** `cargo run -p quant-binance --bin record -- BTCUSDT data 35`
@@ -202,6 +202,34 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   joins a session's files in order. `SegmentStore` is a trait so rolling is
   testable without waiting for midnight (`MemoryStore`); `FileStore` fsyncs once
   per sealed segment.
+
+- **M1.c2 decisions** (reasoned out in `crates/quant-meta/src/lib.rs`): the
+  metadata tier is **best-effort and optional**. No `QUANT_DATABASE_URL`, or a
+  database that will not answer, logs a warning and records anyway — market data
+  is irreplaceable and an index row is not, so `run_metadata` returns stats
+  rather than a `Result` and nothing in it can fail the recorder. The paired
+  obligation: everything stored must be **reconstructible from raw**, or Postgres
+  quietly becomes the source of truth for it. Segment rows are reported over a
+  bounded `tokio::sync::mpsc` with `try_send` from the writer thread, *never*
+  inline — a hung DB connection would otherwise stall block sealing, back up the
+  capture channel and drop ticks, letting a secondary concern damage the primary
+  one. `quant-recorder` stays DB-free via `ObservedStore`, a plain on-seal
+  callback, so the arrows only point down. `(session_id, capture_date, part)` is
+  the segment PK because that triple *is* a file's identity in §5, which makes a
+  retry an upsert rather than a duplicate. Migrations are versioned in
+  `schema_migrations` (not `CREATE TABLE IF NOT EXISTS`) and hold a
+  **`pg_advisory_lock`** — concurrent starters otherwise race between "which
+  versions are applied" and "apply this one", which is real for two recorders
+  launched together and showed up first as flaky tests. Timestamps are
+  `timestamptz` (microseconds) and documented as **operational only**; the
+  nanosecond `Ts` values never leave the raw tier.
+
+- **Two bugs found by running it** (worth remembering): the recorder hung at
+  shutdown because the observer closure inside the store held a metadata sender
+  clone, so `recv()` never saw the channel close — all data written correctly, but
+  the process never exited. Dropping `store` before awaiting the task fixes it.
+  General lesson: with channel-driven shutdown, enumerate *every* holder of a
+  sender. And concurrent `migrate()` calls raced, per above.
 
 - **Known follow-up for M1.e**: `std::sync::mpsc` exposes no queue length, so
   "queue depth" from §7 needs an `AtomicUsize` incremented on send and
