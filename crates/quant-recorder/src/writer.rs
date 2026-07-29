@@ -2,23 +2,45 @@
 
 use std::io::Write;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quant_storage::{RawWriter, StorageResult, WriterStats};
 
 use crate::record::CaptureRecord;
 
-/// How often a quiet instrument still gets its pending block sealed.
+/// Maximum age of an unsealed block.
 ///
-/// Without a timed flush, block sealing would be driven purely by volume, and a
-/// thinly traded symbol could hold frames in memory for hours -- frames a crash
-/// would take with it. Two seconds bounds that exposure at roughly two seconds
-/// of data regardless of how slow the market is.
+/// # What this bounds
 ///
-/// The cost of flushing early is a smaller block and therefore a worse
-/// compression ratio, which is exactly the right thing to trade away: the
-/// instruments this affects are the ones producing almost no data.
-pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+/// Frames accumulate in memory until a block is sealed, and unsealed frames are
+/// **our** memory, not the kernel's -- so a panic or a `SIGKILL` loses them,
+/// unlike a sealed block, which survives process death in the page cache. This
+/// interval is therefore the worst-case data loss when the process dies, and the
+/// only reason it is not simply "as small as possible" is compression.
+///
+/// # Why it is an age and not an idle timeout
+///
+/// The obvious implementation -- seal after this much silence -- is wrong, and
+/// wrong in a way that hides itself. A stream that trickles steadily never goes
+/// silent, so it never triggers an idle flush, while at a few KB/s it also takes
+/// a minute or more to reach the block-size threshold. The result is a recorder
+/// that appears to be running, is receiving data, and has written nothing to
+/// disk. Bounding the *age of the pending block* covers both the quiet stream and
+/// the slow one.
+///
+/// # Why five seconds
+///
+/// It is a straight trade against compression ratio. zstd needs a window wide
+/// enough to see redundancy between messages, so sealing early means smaller
+/// blocks and a worse ratio: at a few KB/s, five seconds is tens of kilobytes,
+/// which still compresses well on near-identical depth messages, where half a
+/// second would be a few hundred bytes and barely compress at all.
+///
+/// The metric that says whether this is set wrong is
+/// [`WriterOutcome::timed_flushes`] against `stats.blocks`: mostly timed flushes
+/// means volume never reaches the threshold and the ratio is being left on the
+/// table.
+pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// What the writer did, once the channel closed.
 #[derive(Debug)]
@@ -52,18 +74,35 @@ pub fn run_writer<W: Write>(
 ) -> StorageResult<WriterOutcome<W>> {
     let mut records = 0_u64;
     let mut timed_flushes = 0_u64;
+    // Deadline for the *pending block*, not for the next message. Waiting
+    // `flush_interval` per `recv` would only ever fire on an idle stream; a
+    // steady trickle would reset the wait on every message and never seal.
+    //
+    // `Instant`, deliberately, rather than the injected `Clock`. That trait
+    // exists so recorded data is reproducible, and a flush deadline never
+    // appears in the data -- it only decides when bytes reach the disk. Driving
+    // it from an injected clock would also mean a `ManualClock` that nobody
+    // advances never flushes at all.
+    let mut deadline = Instant::now() + flush_interval;
 
     loop {
-        match rx.recv_timeout(flush_interval) {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(wait) {
             Ok(record) => {
                 write_one(&mut writer, record)?;
                 records += 1;
+                // A single message can arrive right on the deadline; check rather
+                // than assuming only a timeout can reach it.
+                if Instant::now() >= deadline {
+                    writer.flush()?;
+                    timed_flushes += 1;
+                    deadline = Instant::now() + flush_interval;
+                }
             }
             Err(RecvTimeoutError::Timeout) => {
-                // Nothing arrived for a whole interval. Seal what we have rather
-                // than holding it indefinitely.
                 writer.flush()?;
                 timed_flushes += 1;
+                deadline = Instant::now() + flush_interval;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -222,6 +261,54 @@ mod tests {
 
         let mut reader = RawReader::open(outcome.sink.as_slice()).unwrap();
         assert_eq!(reader.read_all().unwrap().0.len(), 1);
+    }
+
+    /// Regression test for a flush policy that bounded idle time instead of
+    /// block age.
+    ///
+    /// A stream that trickles steadily never goes idle, so an idle-based flush
+    /// never fires; at a few KB/s it also takes a minute to reach the 256 KiB
+    /// block threshold. The recorder then looks healthy, receives data, and writes
+    /// nothing at all -- which is exactly what a live Binance feed did.
+    #[test]
+    fn a_steady_trickle_is_sealed_even_though_it_never_goes_idle() {
+        let (tx, rx) = channel(64);
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Ts::from_millis(1_700_000_000_000)));
+        let mut ing = Ingress::new(tx, clock);
+
+        // Payloads far too small to ever reach the block-size threshold, arriving
+        // faster than the flush interval so the channel is never empty for long.
+        let producer = thread::spawn(move || {
+            for i in 0..60 {
+                ing.accept(depth(i)).unwrap();
+                thread::sleep(Duration::from_millis(5));
+            }
+            ing.stats()
+        });
+
+        let writer = RawWriter::create(Vec::new(), header(), WriterOptions::default()).unwrap();
+        let outcome = run_writer(&rx, writer, Duration::from_millis(25)).unwrap();
+        let stats = producer.join().unwrap();
+
+        assert_eq!(outcome.records, 60);
+        assert_eq!(stats.dropped, 0);
+        assert!(
+            outcome.timed_flushes >= 2,
+            "a trickling stream must still be sealed periodically, got {}",
+            outcome.timed_flushes
+        );
+        assert!(
+            outcome.stats.blocks >= 2,
+            "expected several sealed blocks, got {}",
+            outcome.stats.blocks
+        );
+
+        // And it is all readable, in order, with nothing lost.
+        let mut reader = RawReader::open(outcome.sink.as_slice()).unwrap();
+        let (frames, truncation) = reader.read_all().unwrap();
+        assert_eq!(frames.len(), 60);
+        assert_eq!(truncation, None);
+        assert!(reader.is_finalized());
     }
 
     #[test]

@@ -56,6 +56,8 @@ crates/
                     recovery. Knows no venue and no network.       [M1a]
   quant-recorder/   ingress stamping, sequencing, bounded-channel
                     overload policy, writer loop. Venue-agnostic.  [M1b]
+  quant-binance/    the Binance WebSocket dialect, plus the `record`
+                    binary. The only crate that knows a venue.     [M1b]
 docs/
   data-contract.md  the on-disk format and its acceptance criteria
 ```
@@ -82,3 +84,19 @@ cargo test --workspace        # all tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
+
+### Recording
+
+```bash
+# Record BTCUSDT until ctrl-c, or for a fixed number of seconds.
+cargo run -p quant-binance --bin record -- BTCUSDT data
+cargo run -p quant-binance --bin record -- BTCUSDT data 60
+
+# Inspect what landed: frames, sequence holes, gap records, tail, trailer.
+cargo run -p quant-storage --example dump -- \
+  data/raw/exchange=binance/symbol=BTCUSDT/date=*/session=*/part-00000.bin.zst
+```
+
+A clean shutdown writes a trailer, so the file states its own frame and block
+counts and the reader cross-checks them. A `SIGKILL` leaves no trailer, which is
+how "complete" and "interrupted" stay distinguishable from the bytes alone.

@@ -1,0 +1,54 @@
+[package]
+name = "quant-binance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The Binance adapter, and nothing else. Its whole job is to speak this venue's
+# WebSocket dialect and hand bytes to quant-recorder; every decision about what
+# happens to those bytes afterwards -- sequencing, overload, gap accounting,
+# framing -- lives in the venue-agnostic crates so a second venue inherits it.
+[dependencies]
+quant-core = { workspace = true }
+quant-recorder = { workspace = true }
+quant-storage = { workspace = true }
+
+# Async only on this side of the seam. The read path is pure waiting on a
+# network, which is what async is actually good for; the write path is blocking
+# CPU and file I/O and stays on a thread. See quant-recorder's crate docs.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
+# rustls rather than native-tls: no OpenSSL, no C toolchain, no build script, and
+# webpki-roots means the trust store ships with the binary instead of depending
+# on whatever the host machine happens to have configured.
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
+
+# rustls 0.23 refuses to guess a crypto backend and panics at first use if none
+# is selected. Named here explicitly, and installed explicitly at startup, rather
+# than left to Cargo feature unification: if some future dependency also pulls in
+# aws-lc-rs, automatic detection breaks again and it breaks at the first TLS
+# handshake -- i.e. in production, at 3am, looking like a venue outage.
+#
+# `ring` rather than `aws-lc-rs` because aws-lc-rs needs cmake and nasm on
+# Windows and this has to build on a stock developer machine.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Session identity. A v4 UUID rather than something derived from the clock,
+# because it becomes a primary key in the metadata database at M1.c and two
+# recorders started in the same millisecond must not collide.
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

@@ -108,10 +108,16 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   |---|---|---|
   | a | `quant-storage`: raw frame format, writer, reader | **done** |
   | b | `quant-recorder`: ingress, bounded channel, `Gap{LocalOverflow}`, writer loop | **done** |
-  | b2 | `quant-binance`: WS connect, subscribe, reconnect/backoff, `Gap{Disconnect}` | next |
-  | c | Session lifecycle: date rotation, Postgres `capture_sessions` | |
+  | b2 | `quant-binance`: WS connect, reconnect/backoff, stall detection, `record` bin | **done** |
+  | c | Session lifecycle: date rotation, Postgres `capture_sessions` | next |
   | d | Depth resync + offline verifier binary | |
   | e | Metrics: msgs/sec, bytes/sec, queue depth, latency pcts, gaps by cause | |
+
+  **It records.** `cargo run -p quant-binance --bin record -- BTCUSDT data 35`
+  captured 1485 frames in 35 s at ~7x compression, `ingest_seq` 1..=1485 with
+  zero holes, and closed with a trailer. `cargo run -p quant-storage --example
+  dump -- <file>` summarises any capture file (frames, holes, gaps, tail,
+  trailer) — a debugging aid, not the M1.d verifier.
 
   Built in this order because the raw tier is the only irreversible artifact in
   the project. The format was specified and tested against synthetic bytes
@@ -150,13 +156,37 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   still gets its block sealed on a timer. `RawWriter::finish` now returns
   `(sink, WriterStats)` so the trailer's own bytes are counted.
 
+- **M1.b2 decisions**: one WS connection **per symbol**, not a combined stream —
+  routing a combined stream means a JSON parse per message on the hot path just
+  to find the symbol, and per-symbol sockets make the socket *be* the route,
+  isolate failure, and keep `ingest_seq` naturally per-instrument. Revisit past
+  ~50 symbols where connection rate limits bite; the change is contained in
+  `quant-binance`. An **idle timeout** (120 s) exists because the failure that
+  ruins a 7-day run is not a socket that closes but one that stays open and
+  stops delivering; it must exceed the venue ping interval, since a spurious
+  reconnect punches a real hole in good data while a slow-detected stall only
+  delays noticing. Backoff jitter is **seeded per symbol** so a venue restart
+  does not make every connection retry in lockstep. rustls' crypto provider is
+  **installed explicitly** — its feature-based auto-detection panics at the
+  first TLS handshake, i.e. in production, looking like a venue outage.
+  `@trade` not `@aggTrade` and `depth@100ms` not `@depth`: detail the venue
+  never sent cannot be recovered from raw capture later.
+
+- **Bug found by running it** (worth remembering): the first flush policy sealed
+  a block after N seconds of *silence*. A steady trickle never goes silent, and
+  at ~4 KB/s never reaches the 256 KiB block threshold either — so the recorder
+  connected, received data, and wrote nothing but a 68-byte header. Fixed by
+  bounding **block age** instead of idle time. Regression test:
+  `a_steady_trickle_is_sealed_even_though_it_never_goes_idle`. The general
+  lesson: a timeout on the *wait* is not a timeout on the *work*.
+
 - **Still M1's fiddly part**: depth-stream resync (buffer deltas → REST snapshot
   → discard stale deltas → verify the update-id chain joins → resume), correct
-  on every reconnect, unattended, at 3am. One WS connection **per symbol** is
-  the plan, not a combined stream: routing a combined stream means parsing
-  payloads on the hot path to find the symbol, and per-symbol connections give
-  independent reconnect and a natural one-file-per-symbol seam. Revisit past
-  ~50 symbols, where connection limits start to bite.
+  on every reconnect, unattended, at 3am.
+
+- **Known follow-up for M1.e**: `std::sync::mpsc` exposes no queue length, so
+  "queue depth" from §7 needs an `AtomicUsize` incremented on send and
+  decremented on receive. Deliberately deferred, not forgotten.
 
 Milestone table: see `README.md`.
 

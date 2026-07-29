@@ -94,12 +94,16 @@
 //! [`try_send`]: std::sync::mpsc::SyncSender::try_send
 //! [`recv_timeout`]: std::sync::mpsc::Receiver::recv_timeout
 
+pub mod backoff;
 pub mod ingress;
+pub mod layout;
 pub mod record;
 pub mod sink;
 pub mod writer;
 
-pub use ingress::{Accepted, GapOutcome, Ingress, IngressStats, MAX_PENDING_GAPS};
+pub use backoff::{Backoff, BackoffPolicy};
+pub use ingress::{Accepted, GapOutcome, Ingress, IngressStats, WriterGone, MAX_PENDING_GAPS};
+pub use layout::{format_session_id, CaptureTarget};
 pub use record::CaptureRecord;
 pub use sink::{channel, RecordSink, SinkError, DEFAULT_CHANNEL_CAPACITY};
 pub use writer::{run_writer, WriterOutcome, DEFAULT_FLUSH_INTERVAL};
