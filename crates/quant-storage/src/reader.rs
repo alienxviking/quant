@@ -565,7 +565,7 @@ mod tests {
             payload: gap.to_json().unwrap(),
         });
 
-        (writer.finish().unwrap(), expected)
+        (writer.finish().unwrap().0, expected)
     }
 
     #[test]
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn a_deliberately_empty_capture_is_distinguishable_from_a_killed_one() {
         let writer = RawWriter::create(Vec::new(), header(), WriterOptions::default()).unwrap();
-        let closed = writer.finish().unwrap();
+        let closed = writer.finish().unwrap().0;
         assert_eq!(closed.len(), FILE_HEADER_LEN + TRAILER_LEN);
 
         let mut reader = RawReader::open(closed.as_slice()).unwrap();
@@ -667,7 +667,7 @@ mod tests {
             stats.file_bytes * 2 < stats.frame_bytes,
             "expected better than 2x on depth messages, got {stats:?}"
         );
-        writer.finish().unwrap();
+        let _ = writer.finish().unwrap();
     }
 
     /// The headline test for `docs/data-contract.md` §7.
@@ -836,7 +836,7 @@ mod tests {
             )
             .unwrap();
         writer.write_venue_payload(Ts::EPOCH, 5, b"kept").unwrap();
-        let bytes = writer.finish().unwrap();
+        let bytes = writer.finish().unwrap().0;
 
         let mut reader = RawReader::open(bytes.as_slice()).unwrap();
         let (frames, truncation) = reader.read_all().unwrap();

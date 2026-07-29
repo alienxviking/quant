@@ -107,7 +107,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   | | Slice | Status |
   |---|---|---|
   | a | `quant-storage`: raw frame format, writer, reader | **done** |
-  | b | `quant-binance`: WS ingress, bounded channel, `Gap{LocalOverflow}` | next |
+  | b | `quant-recorder`: ingress, bounded channel, `Gap{LocalOverflow}`, writer loop | **done** |
+  | b2 | `quant-binance`: WS connect, subscribe, reconnect/backoff, `Gap{Disconnect}` | next |
   | c | Session lifecycle: date rotation, Postgres `capture_sessions` | |
   | d | Depth resync + offline verifier binary | |
   | e | Metrics: msgs/sec, bytes/sec, queue depth, latency pcts, gaps by cause | |
@@ -128,14 +129,34 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   a 32-byte **trailer** lets a file account for itself, so completeness is a
   two-sided check rather than an absence of complaints.
 
-- **Still M1's fiddly part**: a read task that does nothing but stamp
-  `local_recv_ts` and push bytes into a **bounded** channel, plus a writer task.
-  Bounded because an unbounded channel does not prevent overload, it converts it
-  into an OOM kill an hour later; on a full channel we drop and emit
-  `Gap{LocalOverflow}` rather than blocking the socket read. Then depth-stream
-  resync (buffer deltas → REST snapshot → discard stale deltas → verify the
-  update-id chain joins → resume), correct on every reconnect, unattended, at
-  3am.
+- **M1.b decisions** (reasoned out in `crates/quant-recorder/src/lib.rs`): the
+  ingress logic is **venue-agnostic**, so it lives in `quant-recorder`, not in
+  the Binance adapter — a second venue inherits the overload behaviour instead
+  of reinventing it. Read side and write side are split because framing plus
+  zstd is blocking work of unbounded duration, and any time not spent draining
+  the socket closes the TCP receive window until the venue disconnects us for
+  being slow; a busy disk must not be able to make Binance hang up on us.
+  A **full channel drops** rather than blocks — blocking would restore exactly
+  that coupling *and* be dishonest, since the data would show no gap and
+  `local_recv_ts` would record our stall as venue timing. Sequence numbers are
+  consumed even by dropped messages, so **the width of the hole is the count**
+  and no count field is needed on disk. Consecutive drops **coalesce** into one
+  pending gap record, because one-record-per-lost-message would contend for the
+  very capacity we just ran out of. Gap records are **never dropped**: they are
+  held and retried, which terminates because every situation that generates one
+  is a situation where inflow has stopped. Channel is
+  `std::sync::mpsc::sync_channel`, chosen for exactly the two operations the
+  design needs — non-blocking `try_send`, and `recv_timeout` so a quiet symbol
+  still gets its block sealed on a timer. `RawWriter::finish` now returns
+  `(sink, WriterStats)` so the trailer's own bytes are counted.
+
+- **Still M1's fiddly part**: depth-stream resync (buffer deltas → REST snapshot
+  → discard stale deltas → verify the update-id chain joins → resume), correct
+  on every reconnect, unattended, at 3am. One WS connection **per symbol** is
+  the plan, not a combined stream: routing a combined stream means parsing
+  payloads on the hot path to find the symbol, and per-symbol connections give
+  independent reconnect and a natural one-file-per-symbol seam. Revisit past
+  ~50 symbols, where connection limits start to bite.
 
 Milestone table: see `README.md`.
 
@@ -156,10 +177,12 @@ Milestone table: see `README.md`.
 - Windows: cargo may not be on `PATH` in shells opened before Rust was
   installed. Prefix with
   `$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"` if `cargo` is missing.
-- Windows Smart App Control is **enforcing** on this machine. It intermittently
-  blocks freshly downloaded crates' build scripts and proc-macro DLLs with
-  `An Application Control policy has blocked this file. (os error 4551)`. It
-  clears on retry, so re-run the build rather than switching dependencies. Keep
-  the target dir inside the repo — a target dir under `AppData\Local\Temp` gets
-  blocked far more aggressively.
+- Windows Smart App Control was **disabled** by the user on 2026-07-29 and the
+  build is clean without it. While it was enforcing it intermittently blocked
+  freshly downloaded crates' build scripts and proc-macro DLLs with
+  `An Application Control policy has blocked this file. (os error 4551)`. If
+  that error ever reappears: it clears on retry, so re-run the build rather than
+  switching dependencies, and keep the target dir inside the repo — one under
+  `AppData\Local\Temp` was blocked far more aggressively. SAC cannot be
+  re-enabled without a Windows reinstall, so this should not recur.
 - Rust 1.97, edition 2021, stable channel (pinned in `rust-toolchain.toml`).

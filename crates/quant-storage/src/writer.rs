@@ -256,7 +256,11 @@ impl<W: Write> RawWriter<W> {
     /// writer says it wrote exactly this much" -- see [`FileTrailer`]. It is
     /// written only here, never by [`RawWriter::flush`], because flush runs on a
     /// timer and a file may be flushed thousands of times before it closes.
-    pub fn finish(mut self) -> StorageResult<W> {
+    ///
+    /// Returns the final [`WriterStats`] as well as the sink. Reading them
+    /// beforehand would miss the trailer's own bytes, and "what did this file
+    /// actually cost" is a question worth being able to answer exactly.
+    pub fn finish(mut self) -> StorageResult<(W, WriterStats)> {
         self.seal_block()?;
         let trailer = FileTrailer {
             frames: self.stats.frames,
@@ -266,7 +270,7 @@ impl<W: Write> RawWriter<W> {
         self.out.write_all(&trailer.encode())?;
         self.stats.file_bytes += as_u64(TRAILER_LEN);
         self.out.flush()?;
-        Ok(self.out)
+        Ok((self.out, self.stats))
     }
 
     #[must_use]
