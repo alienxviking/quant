@@ -247,6 +247,44 @@ The recorder is not done when it prints JSON. It is done when:
 The last one is not optional polish. If we cannot see queue depth we cannot
 tell the difference between a quiet market and a stalled consumer.
 
+### How the replay criteria are actually checked
+
+```bash
+cargo run -p quant-verify --bin verify -- <data root>   # exit 0, or a report
+```
+
+Every check has the same shape: **find a discontinuity, then ask whether the
+capture already explains it.** An explanation is never inferred.
+
+| Discontinuity | Explained by |
+|---|---|
+| a skipped `ingest_seq` | the frame *immediately after* the hole is a gap record |
+| `U != previous u + 1` | any gap record between the two deltas |
+| deltas with no book behind them | a snapshot anywhere in that connection episode, or a recorded `SnapshotFailed{Resync}` |
+| no file trailer | being the last segment, i.e. still open or killed |
+
+Two things about it are worth stating, because both were mistakes first.
+
+The unit of verification is the **session**, not the file. `ingest_seq` spans a
+session, so a hole straddling midnight is invisible to a per-file check — each
+file is internally contiguous. The segments have to be joined in write order,
+which is why the layout uses ISO dates and zero-padded parts: sorting the paths
+as text *is* sorting them chronologically.
+
+The anchoring check counts by **episode**, not by delta. Requiring a snapshot
+before each delta flags every healthy capture, because the snapshot is fetched
+concurrently with the drain and a handful of deltas legitimately arrive first —
+Binance's algorithm discards the stale ones. A verifier that cries wolf on good
+data is worse than no verifier.
+
+Errors fail the run; warnings do not. A torn tail on a file still being written
+is the archetypal warning, and making it fail would train everyone to ignore the
+exit code.
+
+`--reconcile` additionally cross-checks the metadata index, and is a flag rather
+than the default because §1 makes raw the source of truth: a capture that could
+only be validated with Postgres running would have inverted that.
+
 ### What is deliberately *not* an M1 criterion
 
 Full **book reconstruction** — `best_bid < best_ask`, levels monotone, depth

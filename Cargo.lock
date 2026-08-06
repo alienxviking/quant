@@ -769,6 +769,8 @@ dependencies = [
  "quant-storage",
  "reqwest",
  "rustls",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -815,6 +817,21 @@ dependencies = [
  "serde",
  "serde_json",
  "zstd",
+]
+
+[[package]]
+name = "quant-verify"
+version = "0.1.0"
+dependencies = [
+ "quant-binance",
+ "quant-core",
+ "quant-meta",
+ "quant-recorder",
+ "quant-storage",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

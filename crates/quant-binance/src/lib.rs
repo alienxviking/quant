@@ -57,6 +57,7 @@
 
 pub mod connection;
 pub mod rest;
+pub mod sequence;
 pub mod stream;
 
 /// Install the TLS backend, if the process has not already chosen one.
@@ -84,4 +85,5 @@ pub fn install_crypto_provider() {
 
 pub use connection::{ConnectionPolicy, EndReason};
 pub use rest::{SnapshotClient, SnapshotError, DEPTH_LIMIT, SPOT_REST};
+pub use sequence::{classify, snapshot_last_update_id, SequenceError, StreamMessage};
 pub use stream::{StreamKind, StreamSpec, SPOT_WS};

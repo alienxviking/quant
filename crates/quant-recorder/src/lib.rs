@@ -116,7 +116,7 @@ pub mod writer;
 
 pub use backoff::{Backoff, BackoffPolicy};
 pub use ingress::{Accepted, GapOutcome, Ingress, IngressStats, WriterGone, MAX_PENDING_GAPS};
-pub use layout::{format_session_id, CaptureTarget};
+pub use layout::{format_session_id, parse_session_id, parse_utc_date, CaptureTarget};
 pub use record::CaptureRecord;
 pub use segment::{
     CaptureSession, FileStore, MemoryStore, ObservedStore, SegmentReport, SegmentStore,

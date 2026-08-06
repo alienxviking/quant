@@ -87,18 +87,46 @@ impl Exchange {
             _ => None,
         }
     }
-}
 
-impl fmt::Display for Exchange {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
+    /// The venue's name as it appears in a partition directory and a database
+    /// column.
+    ///
+    /// A published interface, like [`Exchange::wire_code`] but readable: it is
+    /// `exchange=binance` on disk and `binance` in Postgres, and changing one of
+    /// these strings orphans every partition recorded under the old spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
             Self::Binance => "binance",
             Self::BinanceUsdFutures => "binance_usdm",
             Self::Coinbase => "coinbase",
             Self::Kraken => "kraken",
             Self::Simulated => "simulated",
-        };
-        f.write_str(s)
+        }
+    }
+
+    /// Inverse of [`Exchange::name`], for reading a partition path back.
+    ///
+    /// `None` rather than a default, for the same reason as
+    /// [`Exchange::from_wire_code`]: a directory naming a venue this build does
+    /// not know is a stop-and-look moment, not something to guess at.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Self::Binance,
+            Self::BinanceUsdFutures,
+            Self::Coinbase,
+            Self::Kraken,
+            Self::Simulated,
+        ]
+        .into_iter()
+        .find(|venue| venue.name() == name)
+    }
+}
+
+impl fmt::Display for Exchange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -338,6 +366,31 @@ mod tests {
         assert_eq!(Exchange::from_wire_code(0), None);
         assert_eq!(Exchange::from_wire_code(5), None);
         assert_eq!(Exchange::from_wire_code(u16::MAX), None);
+    }
+
+    #[test]
+    fn venue_names_round_trip_and_match_what_is_on_disk() {
+        for ex in [
+            Exchange::Binance,
+            Exchange::BinanceUsdFutures,
+            Exchange::Coinbase,
+            Exchange::Kraken,
+            Exchange::Simulated,
+        ] {
+            assert_eq!(Exchange::from_name(ex.name()), Some(ex));
+            // Display and `name` must not drift: the directory is written from
+            // one and read back with the other.
+            assert_eq!(ex.to_string(), ex.name());
+        }
+
+        // Pinned, because these strings are directory names in recorded data and
+        // values in the metadata database.
+        assert_eq!(Exchange::Binance.name(), "binance");
+        assert_eq!(Exchange::BinanceUsdFutures.name(), "binance_usdm");
+
+        assert_eq!(Exchange::from_name("BINANCE"), None, "case is significant");
+        assert_eq!(Exchange::from_name("bitmex"), None);
+        assert_eq!(Exchange::from_name(""), None);
     }
 
     #[test]

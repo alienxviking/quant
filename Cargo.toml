@@ -6,6 +6,7 @@ members = [
     "crates/quant-meta",
     "crates/quant-recorder",
     "crates/quant-storage",
+    "crates/quant-verify",
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ quant-core = { path = "crates/quant-core" }
 quant-meta = { path = "crates/quant-meta" }
 quant-recorder = { path = "crates/quant-recorder" }
 quant-storage = { path = "crates/quant-storage" }
+quant-verify = { path = "crates/quant-verify" }
 serde = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]

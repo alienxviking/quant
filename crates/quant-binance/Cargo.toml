@@ -59,6 +59,13 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-webpki-roots-no-provider",
 ] }
 
+# For `sequence.rs` only, which reads the venue's update ids out of *recorded*
+# payloads for the offline verifier. Nothing on the capture path parses anything:
+# the raw tier's whole value is that our understanding of the dialect can be wrong
+# and fixed later.
+serde = { workspace = true }
+serde_json = "1"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

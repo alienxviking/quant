@@ -1,0 +1,34 @@
+[package]
+name = "quant-verify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The offline verifier: it turns docs/data-contract.md §7 from a list of claims
+# into a command with an exit code.
+#
+# This crate sits at the *top* of the graph -- it is the only one allowed to
+# depend on both the venue-agnostic tiers and a venue adapter, because checking
+# "is the venue's update-id chain contiguous" needs both the file format and the
+# venue's idea of sequencing. Nothing may ever depend on this crate; if something
+# wants to, the thing it wants belongs lower down.
+[dependencies]
+quant-core = { workspace = true }
+quant-storage = { workspace = true }
+quant-recorder = { workspace = true }
+quant-binance = { workspace = true }
+
+# Only for `--reconcile`, which cross-checks the index against the files. The
+# verification that matters needs no database, by design: raw is the source of
+# truth, and a capture that could only be validated with Postgres running would
+# have inverted that.
+quant-meta = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1" }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

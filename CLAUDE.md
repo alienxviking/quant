@@ -112,8 +112,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   | c1 | UTC day rolling: `CaptureSession`, `SegmentStore`, per-segment reports | **done** |
   | c2 | Postgres `capture_sessions` + `capture_segments` | **done** |
   | d1 | Depth snapshot capture (resync + periodic) | **done** |
-  | d2 | Offline verifier binary | next |
-  | e | Metrics: msgs/sec, bytes/sec, queue depth, latency pcts, gaps by cause | |
+  | d2 | `quant-verify`: offline verifier binary | **done** |
+  | e | Metrics: msgs/sec, bytes/sec, queue depth, latency pcts, gaps by cause | next |
 
   **It records.** `cargo run -p quant-binance --bin record -- BTCUSDT data 35`
   captured 1485 frames in 35 s at ~7x compression, `ingest_seq` 1..=1485 with
@@ -251,16 +251,80 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   one gap logged `gaps=2` — misleading in exactly the log line an operator reads
   first. Split into `gaps_recorded` and `snapshot_failures`.
 
-- **Still M1's fiddly part**, now scoped to d2: the offline verifier. It must join
-  a session's segments **in order** (`ingest_seq` is session-scoped, not per-file,
-  so a hole straddling midnight is still a hole), check holes are explained by
-  recorded gaps, check the depth update-id chain (`U == previous u + 1`) with every
-  break explained, and check that every delta run is anchored by a preceding
-  snapshot or an explicit `SnapshotFailed`. Note the edge case a live test turned
-  up: a connection that dies before any delta arrives legitimately has no anchor
-  and no failure record, so the rule is "a `Disconnect` followed by *any* delta
-  needs an intervening anchor", not "every `Disconnect` needs one".
-  `examples/dump.rs` is a single-file debugging aid, not this.
+- **M1.d2 decisions** (`quant-verify`, reasoned out in its `lib.rs`). One design
+  idea: **find a discontinuity, then ask whether the capture already explains it**,
+  and never infer an explanation. Every check has that shape, and the explanations
+  are exactly the records M1 was built to write. Exit code, not prose, so it runs
+  from cron *during* the 7-day run and from CI.
+
+  The unit of verification is the **session**, not the file — `ingest_seq` is
+  session-scoped, so a hole straddling midnight is invisible per-file because each
+  file is internally contiguous. Segments are joined by **sorting their paths as
+  text**, which is chronological only because the layout uses ISO dates and
+  zero-padded parts; `CaptureTarget::parse` is the inverse of `::file` and lives
+  beside it so the two cannot drift. Both the path and the header are read, and a
+  disagreement is an error: a capture filed under the wrong instrument is worse than
+  a missing one, because every downstream tool reads the directory.
+
+  Findings are **capped at 5 per (code, session)** with the remainder counted. One
+  systematic defect over hundreds of millions of frames would otherwise bury every
+  other finding — the failure mode where a verifier is worse than none. The count is
+  never dropped, because "and 3,201,884 more" is what says systematic rather than
+  one-off. Warnings **do not fail the run**: a torn tail on a file still being
+  written is normal, and failing on it teaches everyone to ignore the exit code.
+
+  **No venue-abstraction trait, deliberately** — against this project's usual
+  instinct, and worth re-reading before adding one. Three of the four checks need
+  only the container format; the update-id chain needs Binance knowledge, so it went
+  in `quant-binance::sequence` and `quant-verify` calls it. A trait designed from
+  one implementation encodes one venue's assumptions and calls them universal;
+  extracting it from two real ones later gives a better trait. A capture from an
+  unknown venue is **reported as unchecked**, which is the part that matters.
+  `sequence.rs` is also the first payload parsing in the project: strict about the
+  four fields it claims to understand, tolerant of everything else, so a new Binance
+  field cannot make a recorded file unverifiable.
+
+  `--reconcile` is a flag, not the default, because §1 makes raw the source of truth
+  and `FileTrailer`'s own docs commit to it. It compares frame counts, which two
+  independent writers claim — the file's trailer and the `capture_segments` row —
+  and would catch the metadata tier silently dropping reports under load, which its
+  `try_send` design makes possible on purpose. It does *not* audit the index for
+  rows whose files are missing: on any machine that has run the `quant-meta`
+  integration tests that would report every fixture, and a tool that is noisy on a
+  dev box gets ignored on a production one.
+
+- **The verifier's first act was to find a bug in itself** (the most useful thing
+  that happened this milestone): 296 errors against captures known to be good. The
+  rule "every delta must be preceded by a snapshot" is **wrong**. The snapshot is
+  fetched concurrently with the drain, so a handful of deltas always arrive before
+  it — and Binance's algorithm discards deltas with `u <= lastUpdateId` and bridges
+  the straddler, so a snapshot anchors the deltas *around* it, not only after it.
+  The correct unit is the **episode**: one connection's worth of stream, bounded by
+  the gaps that begin and end it. An episode with deltas needs an anchor somewhere
+  inside it; an episode with none needs nothing — which is also the live edge case
+  where a connection dies before delivering anything. Regression test:
+  `deltas_before_the_snapshot_are_normal_and_not_a_defect`. General lesson: a
+  verifier that cries wolf on good data is worse than no verifier, and the first
+  thing to check when it fires is the rule, not the data.
+
+  Two smaller things it taught: `deltas_before_anchor` is now a reported *total*
+  rather than a finding, because it is the difference between "recorded" and
+  "reconstructible" and a rising number means snapshots are landing late. And the
+  "NOTHING VERIFIED" verdict had to be ordered *after* the error verdict — a file
+  corrupt in its first block reads zero frames, and saying "no files found" about it
+  sends whoever is on call to the wrong place.
+
+- **Known follow-up the verifier surfaced**: the recorder does not re-snapshot after
+  a `LocalOverflow`. Dropping messages invalidates the book exactly as a disconnect
+  does, but only reconnects trigger a resync, so the book stays unusable until the
+  next hourly anchor. Reported as `unanchored-after-overflow` at **warning** level,
+  because the capture is telling the whole truth — there is a gap record and a hole
+  of exactly the right width. Not fixed in d1 on purpose: under overload, fetching
+  320 KB is the worst possible moment to add work and the channel that is full would
+  drop the snapshot too, so a correct fix has to trigger *after* recovery. Worth
+  doing if `dropped` is ever non-zero in practice; it has been 0 in every run.
+
+- `examples/dump.rs` remains a single-file debugging aid, not the verifier.
 
 - **M1.c1 decisions** (reasoned out in `crates/quant-recorder/src/segment.rs`):
   day rolling is driven by the **record's `local_recv_ts`**, not the writer's

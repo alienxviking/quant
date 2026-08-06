@@ -61,6 +61,9 @@ crates/
                     that knows a venue.                            [M1b]
   quant-meta/       Postgres: capture sessions and segments. Sits
                     above the recorder; optional and best-effort.   [M1c]
+  quant-verify/     the offline verifier: turns the acceptance
+                    criteria into a command with an exit code.
+                    Top of the dependency graph.                   [M1d]
 docs/
   data-contract.md  the on-disk format and its acceptance criteria
 ```
@@ -117,6 +120,32 @@ with draining the socket, so the snapshot's `ingest_seq` lands between the delta
 it arrived between — which is what tells a book builder which deltas precede the
 anchor and are stale. Nothing is discarded at capture time; that is M2's job,
 where a mistake costs a re-derive rather than a re-record.
+
+### Verifying
+
+```bash
+cargo run -p quant-verify --bin verify -- data
+cargo run -p quant-verify --bin verify -- data --reconcile   # also check the index
+```
+
+Exit 0 means every discontinuity in every session is explained by a record in the
+capture; non-zero means it is not. That is what makes it runnable from cron
+*during* a long capture rather than something a person reads afterwards.
+
+Every check has the same shape — find a discontinuity, then ask whether the file
+already explains it, and never infer an explanation:
+
+| Discontinuity | Explained by |
+|---|---|
+| a skipped `ingest_seq` | the frame immediately after the hole is a gap record |
+| a break in the venue's depth update-id chain | any gap record between the two deltas |
+| depth deltas with no book behind them | a snapshot anywhere in that connection episode, or a recorded `SnapshotFailed` |
+| no file trailer | being the last segment, i.e. still open or killed |
+
+The unit is the **session**, not the file: `ingest_seq` spans a session, so a hole
+straddling midnight is invisible to a per-file check. Errors fail the run and
+warnings do not, because a torn tail on a file still being written is normal and
+failing on it would train everyone to ignore the exit code.
 
 ### Metadata (optional)
 
