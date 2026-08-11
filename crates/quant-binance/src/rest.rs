@@ -133,6 +133,51 @@ impl SnapshotClient {
         )
     }
 
+    /// How far our clock is from the venue's, in milliseconds. Positive means we
+    /// are ahead.
+    ///
+    /// # Why this is worth a request at startup
+    ///
+    /// Venue latency is `local_recv_ts - exchange_ts`, so a host clock that is two
+    /// seconds fast reports two seconds of latency on a link that is actually
+    /// fine. That is not a hypothetical: it is what the first run of the latency
+    /// metric on this project's own development machine showed, and without this
+    /// check the only way to tell it from real network trouble is to go and
+    /// measure the clock by hand.
+    ///
+    /// It costs one request at startup and turns an ambiguous number into a stated
+    /// fact. The round trip is included in the measurement, which biases the
+    /// answer by a few milliseconds -- irrelevant against the threshold that
+    /// matters, and correcting for it would mean pretending to a precision this
+    /// does not have.
+    pub async fn clock_offset_millis(&self, local_millis: i64) -> Result<i64, SnapshotError> {
+        #[derive(serde::Deserialize)]
+        struct ServerTime {
+            #[serde(rename = "serverTime")]
+            server_time: i64,
+        }
+
+        let url = format!("{}/api/v3/time", self.base.trim_end_matches('/'));
+        let response = self.http.get(url).send().await.map_err(|e| {
+            if e.is_timeout() {
+                SnapshotError::Timeout
+            } else {
+                SnapshotError::Transport(e.to_string())
+            }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(SnapshotError::Status(status.as_u16()));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| SnapshotError::Body(e.to_string()))?;
+        let parsed: ServerTime =
+            serde_json::from_slice(&body).map_err(|e| SnapshotError::Body(e.to_string()))?;
+        Ok(local_millis - parsed.server_time)
+    }
+
     /// Fetch one depth snapshot, returning the response body verbatim.
     ///
     /// The bytes are not looked at. They go to disk as

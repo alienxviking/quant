@@ -1,12 +1,12 @@
-//! The blocking consumer that turns records into a capture file.
+﻿//! The blocking consumer that turns records into a capture file.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use quant_storage::StorageResult;
 
-use crate::record::CaptureRecord;
 use crate::segment::{CaptureSession, SegmentStore};
+use crate::sink::CaptureReceiver;
 
 /// Maximum age of an unsealed block.
 ///
@@ -67,7 +67,7 @@ pub struct WriterOutcome {
 /// segment with its trailer, so a clean shutdown stays distinguishable from a kill
 /// by inspection of the files alone.
 pub fn run_writer<S: SegmentStore>(
-    rx: &Receiver<CaptureRecord>,
+    rx: &CaptureReceiver,
     session: &mut CaptureSession<S>,
     flush_interval: Duration,
 ) -> StorageResult<WriterOutcome> {
@@ -131,8 +131,9 @@ mod tests {
 
     use super::*;
     use crate::ingress::{Accepted, Ingress};
+    use crate::metrics::Metrics;
     use crate::segment::MemoryStore;
-    use crate::sink::channel;
+    use crate::sink::{channel, CaptureSender};
 
     /// 2026-07-29T23:59:59Z: one second before a UTC day boundary.
     const BEFORE_MIDNIGHT: i64 = 1_785_369_599;
@@ -146,6 +147,14 @@ mod tests {
             clock,
             WriterOptions::default(),
         )
+    }
+
+    /// A wired-up channel and ingress sharing one set of counters, which is how
+    /// the recorder builds them and therefore what these tests should exercise.
+    fn wire(capacity: usize, clock: &Arc<dyn Clock>) -> (Ingress<CaptureSender>, CaptureReceiver) {
+        let metrics = Metrics::new(capacity);
+        let (tx, rx) = channel(capacity, Arc::clone(&metrics));
+        (Ingress::new(tx, Arc::clone(clock), metrics), rx)
     }
 
     fn depth(n: u64) -> Vec<u8> {
@@ -163,9 +172,8 @@ mod tests {
     #[test]
     fn overload_survives_the_round_trip_to_disk_as_a_hole_and_a_gap() {
         // Capacity 4 so the burst below genuinely cannot fit, deterministically.
-        let (tx, rx) = channel(4);
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Ts::from_millis(1_700_000_000_000)));
-        let mut ing = Ingress::new(tx, Arc::clone(&clock));
+        let (mut ing, rx) = wire(4, &clock);
 
         // Nobody is draining yet, so the channel fills and then overflows.
         let mut enqueued = 0_u64;
@@ -237,9 +245,8 @@ mod tests {
 
     #[test]
     fn a_quiet_stream_still_gets_its_block_sealed_on_the_timer() {
-        let (tx, rx) = channel(16);
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Ts::from_millis(1_700_000_000_000)));
-        let mut ing = Ingress::new(tx, Arc::clone(&clock));
+        let (mut ing, rx) = wire(16, &clock);
 
         // Far below the 256 KiB block threshold: only a timed flush can seal it.
         let mut session = new_session(clock);
@@ -275,9 +282,8 @@ mod tests {
     /// nothing at all -- which is exactly what a live Binance feed did.
     #[test]
     fn a_steady_trickle_is_sealed_even_though_it_never_goes_idle() {
-        let (tx, rx) = channel(64);
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Ts::from_millis(1_700_000_000_000)));
-        let mut ing = Ingress::new(tx, Arc::clone(&clock));
+        let (mut ing, rx) = wire(64, &clock);
 
         // Payloads far too small to ever reach the block-size threshold, arriving
         // faster than the flush interval so the channel is never empty for long.
@@ -317,9 +323,8 @@ mod tests {
 
     #[test]
     fn dropping_the_sender_closes_the_file_cleanly() {
-        let (tx, rx) = channel(16);
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Ts::from_millis(1_700_000_000_000)));
-        let mut ing = Ingress::new(tx, Arc::clone(&clock));
+        let (mut ing, rx) = wire(16, &clock);
         for i in 0..10 {
             ing.accept(depth(i)).unwrap();
         }
@@ -343,10 +348,9 @@ mod tests {
     /// symbol is indistinguishable from a crashed one.
     #[test]
     fn the_flush_tick_closes_a_finished_day_with_no_traffic_at_all() {
-        let (tx, rx) = channel(16);
         let clock = Arc::new(ManualClock::new(Ts::from_secs(BEFORE_MIDNIGHT)));
         let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
-        let mut ing = Ingress::new(tx, Arc::clone(&dyn_clock));
+        let (mut ing, rx) = wire(16, &dyn_clock);
 
         let mut session = new_session(dyn_clock);
         let handle = thread::spawn(move || {

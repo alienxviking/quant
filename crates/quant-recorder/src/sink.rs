@@ -1,8 +1,11 @@
 //! The non-blocking seam between ingress and the writer.
 
 use core::fmt;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use core::time::Duration;
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::Arc;
 
+use crate::metrics::Metrics;
 use crate::record::CaptureRecord;
 
 /// Default channel depth, in messages.
@@ -67,14 +70,76 @@ impl RecordSink for SyncSender<CaptureRecord> {
     }
 }
 
+/// The sending half of a capture channel, counting what is in flight.
+///
+/// # Why the counter lives here rather than in `Ingress`
+///
+/// Because this is where the queue is. `std::sync::mpsc` exposes no length --
+/// which is the one thing it does not give us and the reason this wrapper exists
+/// at all -- so depth has to be tracked by whoever pushes and pops. Putting it on
+/// the channel means every user of the channel is counted, including any future
+/// producer that is not `Ingress`.
+#[derive(Debug, Clone)]
+pub struct CaptureSender {
+    inner: SyncSender<CaptureRecord>,
+    metrics: Arc<Metrics>,
+}
+
+impl RecordSink for CaptureSender {
+    fn try_send(&mut self, record: CaptureRecord) -> Result<(), SinkError> {
+        // Counted *before* the send, and undone if it fails. The other order is a
+        // race: the instant a record is in the channel the writer thread can take
+        // it out and decrement, which on an unsigned counter that has not been
+        // incremented yet wraps to `usize::MAX`.
+        self.metrics.queue_pushed();
+        let result = RecordSink::try_send(&mut self.inner, record);
+        if result.is_err() {
+            self.metrics.queue_push_failed();
+        }
+        result
+    }
+}
+
+/// The receiving half, decrementing what the sender counted up.
+///
+/// Wraps only the one operation the writer loop uses. `recv_timeout` is not
+/// incidental: it is why this design uses a std channel at all, because it is what
+/// lets a quiet instrument still get its pending block sealed on a timer.
+#[derive(Debug)]
+pub struct CaptureReceiver {
+    inner: Receiver<CaptureRecord>,
+    metrics: Arc<Metrics>,
+}
+
+impl CaptureReceiver {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<CaptureRecord, RecvTimeoutError> {
+        let result = self.inner.recv_timeout(timeout);
+        if result.is_ok() {
+            self.metrics.queue_popped();
+        }
+        result
+    }
+}
+
 /// A bounded capture channel.
 ///
 /// Thin wrapper over [`sync_channel`] so callers do not have to remember which
 /// of std's channel constructors is the bounded one -- `channel` is unbounded
 /// and would silently undo the entire backpressure design.
+///
+/// `metrics` carries the queue-depth counter, which both halves need: the
+/// producer runs on the async side and the consumer on the writer thread, so this
+/// is the one counter that genuinely crosses a thread boundary.
 #[must_use]
-pub fn channel(capacity: usize) -> (SyncSender<CaptureRecord>, Receiver<CaptureRecord>) {
-    sync_channel(capacity)
+pub fn channel(capacity: usize, metrics: Arc<Metrics>) -> (CaptureSender, CaptureReceiver) {
+    let (tx, rx) = sync_channel(capacity);
+    (
+        CaptureSender {
+            inner: tx,
+            metrics: Arc::clone(&metrics),
+        },
+        CaptureReceiver { inner: rx, metrics },
+    )
 }
 
 #[cfg(test)]

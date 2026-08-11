@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use quant_core::event::GapCause;
+use quant_core::time::Ts;
 use quant_recorder::{Accepted, Backoff, BackoffPolicy, Ingress, RecordSink, WriterGone};
 use quant_storage::{SnapshotFailure, SnapshotPurpose};
 use tokio::time::{sleep, timeout};
@@ -314,7 +315,7 @@ async fn drain<S: RecordSink>(
             // `into_data` rather than matching the payload type, so a tungstenite
             // release that changes Text's representation does not change this.
             message @ (Message::Text(_) | Message::Binary(_)) => {
-                ingress.accept(message.into_data().to_vec())?;
+                accept_and_measure(message, ingress)?;
                 since_log += 1;
                 if since_log >= policy.log_every {
                     since_log = 0;
@@ -342,6 +343,59 @@ async fn drain<S: RecordSink>(
             Message::Pong(_) | Message::Frame(_) => {}
         }
     }
+}
+
+/// Stamp, enqueue, and then measure how long the venue took to reach us.
+///
+/// # Why the order is stamp, enqueue, parse
+///
+/// The data contract requires `local_recv_ts` to be stamped *"immediately on read
+/// from the socket, before parsing"*, and it is the only timestamp anything
+/// downstream may act on. Reading the venue's own `E` field first -- which is what
+/// a latency measurement needs -- would put a JSON parse between the socket and
+/// the stamp, quietly folding our own parsing time into every recorded receive
+/// time. So the clock is read first, the bytes go to the channel, and the parse
+/// happens afterwards where it can cost nothing but a metric.
+///
+/// # Why every message is parsed rather than a sample of them
+///
+/// This is a JSON parse per message on the read path, which is the cost that
+/// argued *against* combined streams in this crate's docs -- so it deserves an
+/// answer rather than a shrug. The difference is consequence: routing needed the
+/// parse to decide where bytes go, so a slow or failed parse would have damaged
+/// the capture, whereas here a failure costs one data point and a slow one delays
+/// only the next `socket.next()`. At the order of a hundred messages a second per
+/// symbol that this milestone targets, a microsecond parse is a rounding error.
+///
+/// If that stops being true, the signal is queue depth climbing -- which is
+/// precisely one of the metrics this function feeds. Sampling every Nth message
+/// would then be the fix, and the number to sample from is already here.
+fn accept_and_measure<S: RecordSink>(
+    message: Message,
+    ingress: &mut Ingress<S>,
+) -> Result<(), WriterGone> {
+    let local_recv_ts = ingress.clock().now();
+    let payload = message.into_data().to_vec();
+    let venue_latency = venue_latency_nanos(&payload, local_recv_ts);
+
+    // Recorded before the accept so the metric is not lost when the message is
+    // dropped: a message we could not keep up with still tells us how long the
+    // venue took to send it.
+    if let Some(nanos) = venue_latency {
+        ingress.metrics().record_latency(nanos);
+    }
+    ingress.accept_at(payload, local_recv_ts)?;
+    Ok(())
+}
+
+/// `local_recv_ts - exchange_ts` in nanoseconds, if the payload carries one.
+///
+/// Signed: the data contract says a negative value means clock skew and is an
+/// alert rather than something to clamp, and [`Metrics::record_latency`] counts
+/// those separately.
+fn venue_latency_nanos(payload: &[u8], local_recv_ts: Ts) -> Option<i64> {
+    let millis = crate::sequence::event_time_millis(payload)?;
+    Some(local_recv_ts.delta_nanos(Ts::from_millis(millis)))
 }
 
 /// One snapshot attempt, after an optional delay.

@@ -113,7 +113,7 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   | c2 | Postgres `capture_sessions` + `capture_segments` | **done** |
   | d1 | Depth snapshot capture (resync + periodic) | **done** |
   | d2 | `quant-verify`: offline verifier binary | **done** |
-  | e | Metrics: msgs/sec, bytes/sec, queue depth, latency pcts, gaps by cause | next |
+  | e | Metrics: msgs/sec, bytes/sec, queue depth, latency pcts, gaps by cause | **done** |
 
   **It records.** `cargo run -p quant-binance --bin record -- BTCUSDT data 35`
   captured 1485 frames in 35 s at ~7x compression, `ingest_seq` 1..=1485 with
@@ -372,9 +372,58 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   General lesson: with channel-driven shutdown, enumerate *every* holder of a
   sender. And concurrent `migrate()` calls raced, per above.
 
-- **Known follow-up for M1.e**: `std::sync::mpsc` exposes no queue length, so
-  "queue depth" from §7 needs an `AtomicUsize` incremented on send and
-  decremented on receive. Deliberately deferred, not forgotten.
+- **M1.e decisions** (`quant-recorder/src/metrics.rs`). Counters are **atomic not
+  because of contention** — ingress is the only writer of most — but because they
+  must be *read* by a reporter while the connection loop holds `Ingress` borrowed
+  forever. Queue depth is the one genuinely cross-thread counter, which is what
+  M1.c2's note anticipated. `IngressStats` survives as a **snapshot type** built
+  from the atomics, so quant-meta and the shutdown summary were untouched.
+
+  `MetricsReporter` is a **plain struct, not a task or a thread**: rate computation
+  is the only logic, and keeping it a pure function of two samples makes it
+  testable without waiting for wall-clock seconds. The *when* stays in the binary,
+  which already has a runtime — so `quant-recorder` is still async-free, as its
+  crate docs promise.
+
+  Latency percentiles need `exchange_ts`, which means **parsing on the read path** —
+  the very cost that argued against combined streams. The distinction is
+  consequence, not cost: routing needed the parse to decide *where bytes go*, so a
+  failure damaged the capture; here a failure costs one data point. Every message
+  is parsed rather than sampled, because at ~100 msg/s a microsecond parse is a
+  rounding error — and the signal that this stopped being true is queue depth,
+  which is one of the metrics being added.
+
+  Ordering is load-bearing: §2 requires `local_recv_ts` stamped **before parsing**,
+  so the adapter reads the clock, hands the stamp to the new `Ingress::accept_at`,
+  and parses afterwards. Parsing first would fold our own parse time into the one
+  timestamp everything dispatches on.
+
+  The histogram is hand-rolled (16 sub-buckets per octave, ~6% error, pinned by a
+  test) rather than `hdrhistogram`: it is forty lines and a metric that will drive
+  an alert is worth understanding exactly. Reported values are each bucket's
+  **upper** bound, so a percentile never understates. Window histogram resets per
+  report (a degradation on day five must not be averaged away); a second lifetime
+  histogram gives the whole-run number.
+
+- **A real race, found by an existing test** (worth remembering): `CaptureSender`
+  counted a record into the queue *after* handing it to the channel. The writer
+  thread could receive and decrement first, so an unsigned depth went below zero,
+  wrapped to `usize::MAX`, and panicked on the next increment — killing the
+  recorder. Found by `a_steady_trickle_is_sealed_even_though_it_never_goes_idle`,
+  which is multi-threaded, within minutes. Fix: count **before** the send and undo
+  on failure, plus saturating arithmetic, because *a metric must never be able to
+  take down a capture*. Regression test:
+  `a_pop_that_beats_its_push_cannot_wrap_the_counter`.
+
+- **The latency metric's first act was to find a broken clock** — this machine's is
+  ~2 s **ahead** of Binance, so p50 "venue latency" read 2883 ms. The metric was
+  right; the host was wrong. Hence a startup check against `/api/v3/time` warning
+  above **1000 ms**, which is Binance's own tolerance for a signed request rather
+  than a number invented here — so the clock this warns about is the same clock
+  that would get an order rejected at M8. Not fatal: a wrong clock shifts every
+  `local_recv_ts` equally, so ordering and dispatch are unaffected and only latency
+  and cross-venue comparison break; refusing to start would cost data over a metric.
+  **Before the 7-day run, sync the host clock.**
 
 Milestone table: see `README.md`.
 

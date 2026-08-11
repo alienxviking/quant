@@ -167,6 +167,50 @@ pub enum GapCause {
     RecorderRestart,
 }
 
+impl GapCause {
+    /// Every cause, for iterating without a match that can silently miss one.
+    ///
+    /// Adding a variant makes [`GapCause::index`] fail to compile until it is
+    /// given a slot, and this array is what "gap count **by cause**" in
+    /// `docs/data-contract.md` §7 is counted over. A cause that existed but was
+    /// never counted would make the metric quietly understate blindness.
+    pub const ALL: [Self; 4] = [
+        Self::Disconnect,
+        Self::SequenceGap,
+        Self::LocalOverflow,
+        Self::RecorderRestart,
+    ];
+
+    /// Dense index into a per-cause counter array.
+    ///
+    /// Unlike a wire code this is *not* persisted anywhere, so it is free to
+    /// change; it exists only so a metrics array can be indexed without a hash
+    /// lookup on a path that runs per gap.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Disconnect => 0,
+            Self::SequenceGap => 1,
+            Self::LocalOverflow => 2,
+            Self::RecorderRestart => 3,
+        }
+    }
+
+    /// Label for logs and metric field names.
+    ///
+    /// The same spelling `serde` uses, so a gap in a capture file and a gap in a
+    /// log line are greppable with one string.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Disconnect => "disconnect",
+            Self::SequenceGap => "sequence_gap",
+            Self::LocalOverflow => "local_overflow",
+            Self::RecorderRestart => "recorder_restart",
+        }
+    }
+}
+
 /// An explicit marker that data is missing.
 ///
 /// This is the event type most homegrown recorders lack, and its absence is
@@ -281,6 +325,27 @@ mod tests {
         assert!(json.contains("\"cause\":\"sequence_gap\""));
         let back: MarketEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn every_gap_cause_has_its_own_counter_slot_and_label() {
+        // A duplicated index would make two causes share a counter, so "gap count
+        // by cause" would silently merge them -- and a duplicated label would make
+        // the log lie about which one happened.
+        let mut indices: Vec<usize> = GapCause::ALL.iter().map(|c| c.index()).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..GapCause::ALL.len()).collect::<Vec<_>>());
+
+        for (i, a) in GapCause::ALL.iter().enumerate() {
+            for b in GapCause::ALL.iter().skip(i + 1) {
+                assert_ne!(a.name(), b.name());
+            }
+        }
+
+        // The label matches the serde spelling, so one grep finds both the
+        // recorded control frame and the log line about it.
+        let json = serde_json::to_string(&GapCause::LocalOverflow).unwrap();
+        assert_eq!(json, format!("\"{}\"", GapCause::LocalOverflow.name()));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use quant_core::event::GapCause;
 use quant_core::time::{Clock, Ts};
 use quant_storage::{ControlRecord, SnapshotFailure, SnapshotPurpose};
 
+use crate::metrics::{Metrics, MetricsSample};
 use crate::record::CaptureRecord;
 use crate::sink::{RecordSink, SinkError};
 
@@ -63,7 +64,11 @@ pub enum GapOutcome {
     Deferred,
 }
 
-/// Counters the recorder needs to expose (M1.e) and tests need to assert on.
+/// Ingress counters, read out of the shared [`Metrics`] at a moment in time.
+///
+/// A snapshot rather than the storage itself: the numbers live in atomics because
+/// a reporter on another task has to read them, and a value type is what the
+/// session-close row and the shutdown summary actually want.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IngressStats {
     /// Stream messages that arrived from the venue.
@@ -93,6 +98,23 @@ pub struct IngressStats {
     /// Snapshots we could not enqueue. The caller's cue to fetch a fresh one --
     /// see [`Ingress::accept_snapshot`].
     pub snapshots_dropped: u64,
+}
+
+impl From<&MetricsSample> for IngressStats {
+    fn from(sample: &MetricsSample) -> Self {
+        Self {
+            messages: sample.messages,
+            bytes: sample.bytes,
+            enqueued: sample.enqueued,
+            dropped: sample.dropped,
+            gaps_recorded: sample.gaps_recorded,
+            snapshot_failures: sample.snapshot_failures,
+            gaps_abandoned: sample.gaps_abandoned,
+            snapshots: sample.snapshots,
+            snapshot_bytes: sample.snapshot_bytes,
+            snapshots_dropped: sample.snapshots_dropped,
+        }
+    }
 }
 
 /// A pending gap, holding the time we *noticed* rather than the time we manage
@@ -132,7 +154,9 @@ pub struct Ingress<S> {
     /// Last local time we are confident the stream was intact, i.e. the receive
     /// time of the last record we actually got into the channel.
     last_good_ts: Ts,
-    stats: IngressStats,
+    /// Shared rather than owned, because something other than this task has to be
+    /// able to read them while the connection loop runs. See [`Metrics`].
+    metrics: Arc<Metrics>,
 }
 
 impl<S> fmt::Debug for Ingress<S> {
@@ -141,7 +165,10 @@ impl<S> fmt::Debug for Ingress<S> {
             .field("next_seq", &self.next_seq)
             .field("pending_gaps", &self.pending.len())
             .field("last_good_ts", &self.last_good_ts)
-            .field("stats", &self.stats)
+            // Read from the metrics directly: `stats()` needs `S: RecordSink`,
+            // and a `Debug` impl that only works for some `S` is worse than one
+            // that shows the same numbers.
+            .field("stats", &IngressStats::from(&self.metrics.sample()))
             .finish_non_exhaustive()
     }
 }
@@ -150,7 +177,7 @@ impl<S: RecordSink> Ingress<S> {
     /// Sequence numbers start at 1, so that 0 is never a valid `ingest_seq` and
     /// a zeroed or defaulted field cannot masquerade as the first message.
     #[must_use]
-    pub fn new(sink: S, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(sink: S, clock: Arc<dyn Clock>, metrics: Arc<Metrics>) -> Self {
         let now = clock.now();
         Self {
             sink,
@@ -160,8 +187,21 @@ impl<S: RecordSink> Ingress<S> {
             // Before anything has been recorded, the last moment we can honestly
             // claim the stream was intact is the moment we started.
             last_good_ts: now,
-            stats: IngressStats::default(),
+            metrics,
         }
+    }
+
+    /// The shared counters, for a reporter or a shutdown summary.
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
+    /// The one clock. Exposed so a caller using [`Ingress::accept_at`] stamps
+    /// from the same source rather than introducing a second one.
+    #[must_use]
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
     }
 
     /// Take a message from the venue.
@@ -175,8 +215,30 @@ impl<S: RecordSink> Ingress<S> {
     /// losing the message.
     pub fn accept(&mut self, payload: Vec<u8>) -> Result<Accepted, WriterGone> {
         let now = self.clock.now();
-        self.stats.messages += 1;
-        self.stats.bytes += payload.len() as u64;
+        self.accept_at(payload, now)
+    }
+
+    /// Take a message that the caller has already stamped.
+    ///
+    /// Exists for one reason, and it is the data contract's: §2 requires
+    /// `local_recv_ts` to be stamped *"immediately on read from the socket,
+    /// before parsing"*. A venue adapter that wants to measure venue latency has
+    /// to parse the payload for the exchange timestamp, and doing that before
+    /// handing the bytes over would put a JSON parse between the socket read and
+    /// the stamp -- making the one timestamp everything dispatches on include our
+    /// own parsing time.
+    ///
+    /// So the adapter reads the clock first, hands the stamp in here, and parses
+    /// afterwards at its leisure. The clock is the same one, via
+    /// [`Ingress::clock`], so there is still exactly one source of truth for when
+    /// we saw the bytes.
+    pub fn accept_at(
+        &mut self,
+        payload: Vec<u8>,
+        local_recv_ts: Ts,
+    ) -> Result<Accepted, WriterGone> {
+        let now = local_recv_ts;
+        self.metrics.record_message(payload.len() as u64);
 
         // Any pending gap goes out ahead of this message, so the record of the
         // hole always precedes the evidence that we recovered from it.
@@ -196,11 +258,11 @@ impl<S: RecordSink> Ingress<S> {
         match self.sink.try_send(record) {
             Ok(()) => {
                 self.last_good_ts = now;
-                self.stats.enqueued += 1;
+                self.metrics.record_enqueued();
                 Ok(Accepted::Enqueued)
             }
             Err(SinkError::Full(_)) => {
-                self.stats.dropped += 1;
+                self.metrics.record_dropped();
                 self.queue_overflow_gap(now);
                 Ok(Accepted::Dropped)
             }
@@ -234,8 +296,7 @@ impl<S: RecordSink> Ingress<S> {
     /// [`SnapshotFailure::Overflow`]: quant_storage::SnapshotFailure::Overflow
     pub fn accept_snapshot(&mut self, payload: Vec<u8>) -> Result<Accepted, WriterGone> {
         let now = self.clock.now();
-        self.stats.snapshots += 1;
-        self.stats.snapshot_bytes += payload.len() as u64;
+        self.metrics.record_book_snapshot(payload.len() as u64);
         self.pump()?;
 
         let record = CaptureRecord::Snapshot {
@@ -250,7 +311,7 @@ impl<S: RecordSink> Ingress<S> {
                 Ok(Accepted::Enqueued)
             }
             Err(SinkError::Full(_)) => {
-                self.stats.snapshots_dropped += 1;
+                self.metrics.record_snapshot_dropped();
                 Ok(Accepted::Dropped)
             }
             Err(SinkError::Disconnected) => Err(WriterGone),
@@ -326,9 +387,9 @@ impl<S: RecordSink> Ingress<S> {
                     self.last_good_ts = pending.local_recv_ts;
                     self.pending.pop_front();
                     match pending.record {
-                        ControlRecord::Gap { .. } => self.stats.gaps_recorded += 1,
+                        ControlRecord::Gap { cause, .. } => self.metrics.record_gap(cause),
                         ControlRecord::SnapshotFailed { .. } => {
-                            self.stats.snapshot_failures += 1;
+                            self.metrics.record_snapshot_failure();
                         }
                     }
                 }
@@ -371,7 +432,7 @@ impl<S: RecordSink> Ingress<S> {
 
     fn enqueue_control(&mut self, now: Ts, record: ControlRecord) {
         if self.pending.len() >= MAX_PENDING_GAPS {
-            self.stats.gaps_abandoned += 1;
+            self.metrics.record_gap_abandoned();
             return;
         }
         self.pending.push_back(PendingControl {
@@ -382,7 +443,7 @@ impl<S: RecordSink> Ingress<S> {
 
     #[must_use]
     pub fn stats(&self) -> IngressStats {
-        self.stats
+        IngressStats::from(&self.metrics.sample())
     }
 
     /// Gap records currently held because the channel was full.
@@ -417,7 +478,11 @@ mod tests {
 
     fn ingress(capacity: usize) -> (Ingress<TestSink>, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new(Ts::from_millis(1_700_000_000_000)));
-        let ing = Ingress::new(TestSink::with_capacity(capacity), clock.clone());
+        let ing = Ingress::new(
+            TestSink::with_capacity(capacity),
+            clock.clone(),
+            Metrics::new(capacity),
+        );
         (ing, clock)
     }
 

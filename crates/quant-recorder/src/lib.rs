@@ -109,6 +109,7 @@
 pub mod backoff;
 pub mod ingress;
 pub mod layout;
+pub mod metrics;
 pub mod record;
 pub mod segment;
 pub mod sink;
@@ -117,9 +118,12 @@ pub mod writer;
 pub use backoff::{Backoff, BackoffPolicy};
 pub use ingress::{Accepted, GapOutcome, Ingress, IngressStats, WriterGone, MAX_PENDING_GAPS};
 pub use layout::{format_session_id, parse_session_id, parse_utc_date, CaptureTarget};
+pub use metrics::{LatencySummary, Metrics, MetricsReport, MetricsReporter, MetricsSample};
 pub use record::CaptureRecord;
 pub use segment::{
     CaptureSession, FileStore, MemoryStore, ObservedStore, SegmentReport, SegmentStore,
 };
-pub use sink::{channel, RecordSink, SinkError, DEFAULT_CHANNEL_CAPACITY};
+pub use sink::{
+    channel, CaptureReceiver, CaptureSender, RecordSink, SinkError, DEFAULT_CHANNEL_CAPACITY,
+};
 pub use writer::{run_writer, WriterOutcome, DEFAULT_FLUSH_INTERVAL};

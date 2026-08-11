@@ -49,7 +49,8 @@ use quant_meta::{
 };
 use quant_recorder::{
     channel, format_session_id, run_writer, CaptureSession, FileStore, Ingress, IngressStats,
-    ObservedStore, SegmentReport, WriterOutcome, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
+    Metrics, MetricsReporter, ObservedStore, SegmentReport, WriterOutcome,
+    DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
 };
 use quant_storage::WriterOptions;
 use tokio::sync::mpsc::Sender as MetaSender;
@@ -64,6 +65,24 @@ use tracing_subscriber::EnvFilter;
 /// snapshot costs a book anchor, while a slow one costs nothing at all -- the
 /// socket keeps draining throughout, by construction.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often the recorder says how it is doing.
+///
+/// Sixty seconds is a compromise between two failure modes over a seven-day run.
+/// Shorter and a week of logs is mostly noise, so nobody reads them and the one
+/// line that mattered goes unseen. Longer and a transient stall -- the exact thing
+/// queue depth exists to catch -- can begin and end inside one interval and never
+/// appear at all. The peak figures are cumulative precisely so that a spike
+/// between two readings is still visible in the next one.
+const METRICS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How far the host clock may drift from the venue's before it is a problem.
+///
+/// Binance's own number: it rejects a signed request whose timestamp is more than
+/// a second from server time. Borrowing the venue's threshold rather than
+/// inventing one means that when M8 places a real order, a clock this recorder
+/// already warned about is the same clock that would have had the order refused.
+const MAX_CLOCK_OFFSET_MS: i64 = 1_000;
 
 /// The metadata tier, if one is configured.
 ///
@@ -258,7 +277,10 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
         WriterOptions::default(),
     );
 
-    let (tx, rx) = channel(DEFAULT_CHANNEL_CAPACITY);
+    // One set of counters, shared by the connection task that fills them, the
+    // writer thread that drains the queue, and the reporter that reads them.
+    let metrics = Metrics::new(DEFAULT_CHANNEL_CAPACITY);
+    let (tx, rx) = channel(DEFAULT_CHANNEL_CAPACITY, Arc::clone(&metrics));
     // A plain thread, not spawn_blocking: this runs for the life of the process,
     // and parking a tokio blocking-pool slot forever is not what that pool is for.
     //
@@ -271,7 +293,12 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
             (outcome, session)
         })?;
 
-    let mut ingress = Ingress::new(tx, Arc::clone(&clock));
+    let mut ingress = Ingress::new(tx, Arc::clone(&clock), Arc::clone(&metrics));
+
+    // A separate task, because the connection future borrows `ingress` for the
+    // life of the run and nothing else can reach it. Aborted at shutdown; the
+    // final numbers are logged below from the same counters.
+    let reporter = tokio::spawn(report_periodically(Arc::clone(&metrics), symbol.clone()));
 
     // First record in every file. Without it, a capture that resumes after a crash
     // would silently abut the previous one and look like continuous coverage.
@@ -285,6 +312,7 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
     // recorder that quietly ran without one would produce a week of data that
     // looks complete and is not usable.
     let snapshots = SnapshotClient::new(SPOT_REST, SNAPSHOT_TIMEOUT)?;
+    check_host_clock(&snapshots, clock.as_ref()).await;
     // The session id, not a path: with day rolling a run can produce several
     // files, and the session is what identifies them all. Each is logged as it
     // is sealed.
@@ -311,6 +339,7 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    reporter.abort();
     let stats = ingress.stats();
     // Closes the channel, which is how the writer knows to seal the trailer.
     drop(ingress);
@@ -335,6 +364,7 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
         backdated,
         clock.now().delta_nanos(started) / 1_000_000_000,
     );
+    report_lifetime(&metrics);
 
     // The observer closure inside the store holds a clone of the metadata sender.
     // It has to be dropped before we await the metadata task below, or `recv`
@@ -349,6 +379,104 @@ async fn record() -> Result<(), Box<dyn std::error::Error>> {
     // Durability is FileStore's job: it fsyncs each segment as it is sealed, once
     // per file rather than per block.
     outcome
+}
+
+/// Compare the host clock against the venue's, once, before recording starts.
+///
+/// Not fatal, because a wrong clock does not make the capture wrong: every
+/// `local_recv_ts` is shifted by the same amount, so ordering and dispatch -- the
+/// only things the engine acts on -- are unaffected. What it does ruin is every
+/// *latency* figure, and cross-venue comparison later.
+///
+/// So it is a loud warning and a recorded fact, not a refusal to start. Refusing
+/// would mean a stopped recorder over a problem that costs a metric, and the data
+/// is the thing that cannot be recreated.
+async fn check_host_clock(snapshots: &SnapshotClient, clock: &dyn Clock) {
+    let local_millis = clock.now().as_nanos() / 1_000_000;
+    match snapshots.clock_offset_millis(local_millis).await {
+        Ok(offset) if offset.abs() > MAX_CLOCK_OFFSET_MS => warn!(
+            offset_ms = offset,
+            limit_ms = MAX_CLOCK_OFFSET_MS,
+            "host clock disagrees with the venue: every venue-latency figure from \
+             this run is wrong by this much, and exchange_ts comparisons with it \
+             are meaningless. Sync the host clock before a long capture."
+        ),
+        Ok(offset) => info!(offset_ms = offset, "host clock agrees with the venue"),
+        // The snapshot fetch will report the same outage in a moment, and this
+        // check is not worth failing a capture over.
+        Err(e) => warn!(error = %e, "could not check the host clock against the venue"),
+    }
+}
+
+/// Log a metrics line every [`METRICS_INTERVAL`] until aborted.
+///
+/// The point of a *periodic* line rather than a total at the end: over seven days,
+/// a total cannot say when something changed, and the questions these metrics
+/// exist to answer -- is the venue still talking to us, is the writer keeping up,
+/// did latency degrade -- are all questions about a moment.
+async fn report_periodically(metrics: Arc<Metrics>, symbol: String) {
+    let mut reporter = MetricsReporter::new(metrics);
+    let mut ticker = tokio::time::interval(METRICS_INTERVAL);
+    // The first tick fires immediately and would report a zero-length interval.
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        let report = reporter.report(METRICS_INTERVAL);
+        let latency = report.latency;
+        info!(
+            symbol = %symbol,
+            msgs_per_sec = report.messages_per_sec,
+            bytes_per_sec = report.bytes_per_sec,
+            queue = report.queue_depth,
+            queue_peak = report.queue_high_water,
+            queue_capacity = report.queue_capacity,
+            dropped = report.dropped,
+            latency_p50_ms = latency.p50_micros / 1_000,
+            latency_p90_ms = latency.p90_micros / 1_000,
+            latency_p99_ms = latency.p99_micros / 1_000,
+            latency_max_ms = latency.max_micros / 1_000,
+            latency_samples = latency.count,
+            clock_skew = latency.clock_skew,
+            gap_disconnect = report.gaps[GapCause::Disconnect.index()],
+            gap_overflow = report.gaps[GapCause::LocalOverflow.index()],
+            gap_sequence = report.gaps[GapCause::SequenceGap.index()],
+            "metrics"
+        );
+
+        if latency.clock_skew > 0 {
+            // §2: a venue timestamp ahead of ours means the host clock is wrong,
+            // which makes every latency figure and every `local_recv_ts` suspect.
+            error!(
+                symbol = %symbol,
+                samples = latency.clock_skew,
+                "venue timestamps are ahead of ours: check the host clock"
+            );
+        }
+    }
+}
+
+/// The whole-run numbers, once the capture has stopped.
+fn report_lifetime(metrics: &Metrics) {
+    let sample = metrics.sample();
+    let latency = sample.lifetime_latency;
+    info!(
+        queue_peak = sample.queue_high_water,
+        queue_capacity = sample.queue_capacity,
+        latency_p50_ms = latency.p50_micros / 1_000,
+        latency_p90_ms = latency.p90_micros / 1_000,
+        latency_p99_ms = latency.p99_micros / 1_000,
+        latency_max_ms = latency.max_micros / 1_000,
+        latency_samples = latency.count,
+        clock_skew = latency.clock_skew,
+        "venue latency over the whole run"
+    );
+    for cause in GapCause::ALL {
+        let count = sample.gaps_by_cause[cause.index()];
+        if count > 0 {
+            info!(cause = cause.name(), count, "gaps by cause");
+        }
+    }
 }
 
 /// Log what the capture produced, per segment and in total.

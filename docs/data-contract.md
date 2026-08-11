@@ -247,6 +247,38 @@ The recorder is not done when it prints JSON. It is done when:
 The last one is not optional polish. If we cannot see queue depth we cannot
 tell the difference between a quiet market and a stalled consumer.
 
+### How the metrics are reported
+
+One structured log line per minute, plus a whole-run summary at shutdown:
+
+```text
+metrics symbol=BTCUSDT msgs_per_sec=37 bytes_per_sec=13070
+        queue=0 queue_peak=18 queue_capacity=4096 dropped=0
+        latency_p50_ms=41 latency_p90_ms=88 latency_p99_ms=140
+        latency_samples=2276 clock_skew=0
+        gap_disconnect=0 gap_overflow=0 gap_sequence=0
+```
+
+Rates are deltas between two readings, not totals, because a total that has
+stopped growing looks exactly like one that never grew. Latency percentiles come
+from a log-bucketed histogram — exact percentiles would need every sample, which
+over seven days is hundreds of millions of values — with the reported value being
+each bucket's **upper** bound, so a percentile never understates what was
+observed.
+
+The histogram is reported per interval and reset, so a degradation that begins on
+day five is visible rather than averaged away across the week; a second,
+never-reset histogram supplies the whole-run figure. Queue depth and its
+high-water mark are cumulative for the opposite reason: a spike between two
+readings must still show up in the next one.
+
+**A latency figure is only meaningful if the host clock is.** `local_recv_ts -
+exchange_ts` measures the clock difference just as much as the network, so the
+recorder checks itself against the venue's `/api/v3/time` at startup and warns
+above a one-second offset — the venue's own tolerance for a signed request. A
+negative latency is counted separately as `clock_skew` and never folded into the
+histogram, per §2.
+
 ### How the replay criteria are actually checked
 
 ```bash

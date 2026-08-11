@@ -101,12 +101,33 @@ struct Envelope<'a> {
 struct Payload<'a> {
     #[serde(rename = "e", borrow)]
     event: Option<&'a str>,
+    #[serde(rename = "E")]
+    event_time_millis: Option<i64>,
     #[serde(rename = "U")]
     first_update_id: Option<u64>,
     #[serde(rename = "u")]
     final_update_id: Option<u64>,
     #[serde(rename = "t")]
     trade_id: Option<u64>,
+}
+
+/// The venue's own timestamp on a stream message, in epoch milliseconds.
+///
+/// This is the `exchange_ts` half of the two-timestamp rule, and subtracting it
+/// from `local_recv_ts` gives the observed venue latency that
+/// `docs/data-contract.md` §7 asks the recorder to report percentiles for.
+///
+/// `None` rather than an error for anything unrecognized: latency is an
+/// observation, and a message we cannot read the timestamp out of should cost us
+/// a sample, never a recorded byte. That is the difference between this and
+/// [`classify`], which is loud because a chain check that silently skips messages
+/// would pass a capture with holes in it.
+#[must_use]
+pub fn event_time_millis(payload: &[u8]) -> Option<i64> {
+    serde_json::from_slice::<Envelope<'_>>(payload)
+        .ok()?
+        .data
+        .event_time_millis
 }
 
 /// Classify one recorded [`quant_storage::FrameKind::VenuePayload`].
@@ -245,6 +266,20 @@ mod tests {
             classify(b"not json at all"),
             Err(SequenceError::NotAStreamMessage(_))
         ));
+    }
+
+    #[test]
+    fn the_venue_timestamp_comes_out_of_a_stream_message() {
+        assert_eq!(event_time_millis(DEPTH), Some(1_769_000_000_000));
+        assert_eq!(event_time_millis(TRADE), Some(1_769_000_000_000));
+    }
+
+    #[test]
+    fn an_unreadable_payload_costs_a_latency_sample_and_nothing_else() {
+        // Deliberately quiet, unlike `classify`. A metric we cannot compute is a
+        // missing data point; a chain check that skips messages is a lie.
+        assert_eq!(event_time_millis(b"not json"), None);
+        assert_eq!(event_time_millis(br#"{"stream":"s","data":{}}"#), None);
     }
 
     #[test]

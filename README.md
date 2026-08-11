@@ -121,6 +121,16 @@ it arrived between — which is what tells a book builder which deltas precede t
 anchor and are stale. Nothing is discarded at capture time; that is M2's job,
 where a mistake costs a re-derive rather than a re-record.
 
+While recording, one metrics line per minute says whether it is healthy:
+messages and bytes per second, queue depth and its high-water mark against
+capacity, messages dropped in the interval, venue-latency percentiles, and gap
+counts by cause. Queue depth is the one that matters most — without it, a stalled
+consumer and a quiet market look identical from outside.
+
+Venue latency is `local_recv_ts - exchange_ts`, which measures the host clock as
+much as the network, so the recorder checks itself against the venue's clock at
+startup and warns above a one-second offset.
+
 ### Verifying
 
 ```bash
