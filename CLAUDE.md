@@ -425,6 +425,41 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   and cross-venue comparison break; refusing to start would cost data over a metric.
   **Before the 7-day run, sync the host clock.**
 
+- **The acceptance run harness** (`ops/*.ps1`, procedure in
+  `docs/acceptance-run.md`). Restarting is **outside** the recorder on purpose: a
+  process that has decided it is in a fatal state should die, and the format was
+  built for it — a new session id, its own files, and a `Gap{RecorderRestart}` in
+  the first frame, which is exactly the record the verifier reads as the
+  explanation. On a server `supervise.ps1` is `Restart=always` in a systemd unit.
+  Verification runs **during** the capture every 6h, which is what the exit code
+  was for. `preflight.ps1` refuses to start on a bad clock, a dirty capture root,
+  or thin disk, and `-Force` writes that override into `run.json` so a forced run
+  cannot be mistaken for a clean one later. `-Minutes` is a rehearsal mode,
+  because a run harness that has never been run is not a harness.
+
+- **PowerShell 5.1 traps that cost real time** (worth remembering before writing
+  more ops scripts): `$PSScriptRoot` is **empty while `param()` defaults are being
+  bound**, so a default computed from it silently becomes an empty string —
+  resolve paths in the body. Redirecting a native command's stderr (`2>&1`, even
+  `2>$null`) wraps every line in an `ErrorRecord`, which under
+  `ErrorActionPreference = 'Stop'` turns cargo's ordinary progress output into a
+  terminating error; `Start-Process -Wait` avoids that but **hung indefinitely**
+  after cargo had already exited, so the working answer is `cmd /c "... > log
+  2>&1"`, which keeps the native streams away from PowerShell entirely. `if` is a
+  statement and cannot be a hashtable value. `Start-Process -ArgumentList` joins an
+  array with spaces and quotes nothing, so every path argument needs its own
+  quotes.
+
+- **A metrics bug the rehearsal found**: a live line read
+  `latency_p99_ms=3145 latency_max_ms=3071`. Both were "correct" — percentiles
+  report a bucket's *upper* bound, which can exceed every value in it — and the
+  pair is nonsense to anyone reading it. Percentiles are now clamped to the
+  observed maximum, which keeps the never-understate guarantee (a percentile is
+  always ≤ the max) and loses nothing. Test:
+  `no_percentile_can_exceed_the_observed_maximum`. The general lesson is the same
+  one as the verifier's false positives: a number that looks broken *is* broken,
+  whatever its derivation says.
+
 Milestone table: see `README.md`.
 
 ## Conventions

@@ -147,11 +147,19 @@ impl Histogram {
         let clock_skew = take(&self.clock_skew);
         let _ = take(&self.count);
 
+        // Clamped to the observed maximum. A bucket's upper bound can exceed every
+        // value that landed in it, so an unclamped p99 can come out *above* the
+        // max -- true to the never-understate rule and instantly read as a broken
+        // metric by anyone looking at the line. The maximum is itself an upper
+        // bound on any percentile, so clamping keeps the guarantee and loses
+        // nothing.
+        let at = |pct| percentile(&counts, total, pct).min(max_micros);
+
         LatencySummary {
             count: total,
-            p50_micros: percentile(&counts, total, 50),
-            p90_micros: percentile(&counts, total, 90),
-            p99_micros: percentile(&counts, total, 99),
+            p50_micros: at(50),
+            p90_micros: at(90),
+            p99_micros: at(99),
             max_micros,
             clock_skew,
         }
@@ -565,6 +573,27 @@ mod tests {
         close(summary.p50_micros, 50_000);
         close(summary.p90_micros, 90_000);
         close(summary.p99_micros, 99_000);
+    }
+
+    #[test]
+    fn no_percentile_can_exceed_the_observed_maximum() {
+        // Found by reading a live metrics line that said p99=3145ms and max=3071ms.
+        // Both were "correct" -- the percentile was a bucket's upper bound -- and
+        // the pair was nonsense to anybody reading it.
+        let h = Histogram::new();
+        for micros in [1_u64, 900, 1_100, 3_071_000] {
+            h.record(micros);
+        }
+        let s = h.summarize(false);
+        assert!(s.p50_micros <= s.max_micros);
+        assert!(s.p90_micros <= s.max_micros);
+        assert!(
+            s.p99_micros <= s.max_micros,
+            "p99 {} exceeded max {}",
+            s.p99_micros,
+            s.max_micros
+        );
+        assert_eq!(s.max_micros, 3_071_000);
     }
 
     #[test]

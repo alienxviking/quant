@@ -65,7 +65,13 @@ crates/
                     criteria into a command with an exit code.
                     Top of the dependency graph.                   [M1d]
 docs/
-  data-contract.md  the on-disk format and its acceptance criteria
+  data-contract.md    the on-disk format and its acceptance criteria
+  acceptance-run.md   how the 7-day M1 run is conducted and judged
+ops/
+  preflight.ps1     refuse to waste a week: clock, disk, build, clean root
+  start-run.ps1     start the acceptance run; supervisors + verify loop
+  status.ps1        "how is it going" in one command
+  stop-run.ps1      stop it in a way that still seals the files
 ```
 
 ## Milestones
