@@ -100,9 +100,15 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   `MarketEvent` contract), CI, docker-compose for Postgres, data contract
   written *before* the recorder exists. 19 tests green in debug and release,
   clippy and fmt clean.
-- **M1 in progress**: the Binance recorder. Acceptance criteria are in
-  `docs/data-contract.md` §7 and are deliberately harsher than "it connects".
-  Sliced into five independently shippable commits:
+- **M1 code-complete, awaiting its acceptance run** (2026-08-11): the Binance
+  recorder. Every slice is written, tested and committed; 178 tests green in debug
+  and release, clippy and fmt clean. Five of §7's six criteria are settled by the
+  test suite and `quant-verify`. The sixth — **7 consecutive days unattended** —
+  is satisfied only by spending the time, and has not been spent yet. See
+  **"Picking up the acceptance run"** at the bottom of this file.
+
+  Acceptance criteria are in `docs/data-contract.md` §7 and are deliberately
+  harsher than "it connects". Sliced into independently shippable commits:
 
   | | Slice | Status |
   |---|---|---|
@@ -461,6 +467,93 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   whatever its derivation says.
 
 Milestone table: see `README.md`.
+
+## Picking up the acceptance run
+
+**Read this first if you are a session starting on a new machine.** Everything M1
+needs is written and committed; what remains is running it for seven days and
+judging the result against `docs/data-contract.md` §7. `docs/acceptance-run.md` is
+the procedure and the pass criteria; this section is only the context that is not
+in the repo.
+
+### Why it is moving to a different machine
+
+The run was set up on the user's Windows laptop and deliberately **not started**
+there. Two reasons, both operational rather than code:
+
+- `w32time` was **stopped** (StartType Manual) and the host clock sat ~2 s ahead
+  of Binance, which made `latency_p50_ms` read 2883. `ops/fix-clock.ps1` fixes it
+  but needs Administrator, which that session did not have. `ops/preflight.ps1`
+  blocks on it on purpose — a week of capture whose latency criterion is
+  unmeasurable is a week half spent.
+- It is the user's daily-driver laptop. Sleep, Windows Update reboots, and simply
+  needing to take it out all end a run.
+
+The plan agreed with the user: run it on a **friend's M1 MacBook Air** instead.
+Fanless, silent, no forced reboots, and macOS syncs time by default so the clock
+problem likely disappears on its own.
+
+### What does not exist yet
+
+- **`ops/` is Windows-only.** `preflight.ps1`, `supervise.ps1`, `verify-loop.ps1`,
+  `start-run.ps1`, `status.ps1`, `stop-run.ps1`. The *logic* ports; the scripts do
+  not. On macOS the supervisor is a `launchd` plist with `KeepAlive`, which is
+  simpler than the PowerShell version and, unlike it, survives a reboot and a
+  logout. Read `ops/supervise.ps1`'s header before rewriting it — the reasoning
+  about why restart lives outside the recorder is the part worth keeping.
+- **CI is `ubuntu-latest` only.** So "it builds on Apple Silicon" is a reasonable
+  expectation, not a fact the repo proves. Agreed next step: make
+  `.github/workflows/ci.yml` a matrix including `macos-latest` **before** shipping
+  a binary to a machine the user does not own.
+
+### What should just work on Apple Silicon, and the one thing that will not
+
+`aarch64-apple-darwin` is tier 1, and the dependency choices already dodge the
+usual macOS traps: `rustls` not OpenSSL, `ring` not `aws-lc-rs` (no cmake, no
+nasm), `tokio-postgres` pure Rust. The exception is **`zstd-sys`, which compiles
+C** — so Xcode Command Line Tools are required (`xcode-select --install`). Both
+that and `rustup` are cleanly removable afterwards, which matters on a borrowed
+machine.
+
+### The macOS-specific gotchas
+
+- **Sleep is the whole ballgame.** macOS sleeps far more aggressively than
+  Windows, and a closed lid sleeps regardless of power settings unless overridden:
+  `sudo pmset -a disablesleep 1` (undo with `0`), plus `caffeinate -dimsu` on the
+  recorder. Lid open and on mains is the low-risk version.
+- A sleep or a Wi-Fi drop **degrades rather than destroys**: the socket dies, the
+  recorder writes `Gap{Disconnect}`, reconnects, and fetches a fresh snapshot, and
+  the verifier reads all of that as *explained*. Nightly eight-hour holes still
+  make for a poor acceptance run and poor M2 input, so this is a reason not to
+  worry, not a reason to allow it.
+- Latency figures will reflect a **home connection** either way. That affects no
+  completeness criterion; only a VM near the venue would change it, and that
+  trade was considered and not taken.
+
+### Practicalities
+
+- Budget ~160 MB/day/symbol compressed at quiet-market rates; the preflight
+  budgets 1 GB/day/symbol for headroom. Two symbols for seven days is a few GB,
+  which has to come back off the borrowed machine at the end.
+- The metadata tier is optional by design. If Postgres is inconvenient on that
+  machine, leave `QUANT_DATABASE_URL` unset: the recorder logs a warning and
+  records anyway, and `verify` simply runs without `--reconcile`.
+- Use a **fresh capture root**. `preflight` blocks on a root that already holds
+  files, because a verdict covering someone else's older captures means nothing —
+  the two pre-M1.d1 sessions still sitting in this repo's `data/raw` are exactly
+  that failure and correctly report `unanchored-deltas`.
+
+### Do not re-litigate
+
+These were decided with reasons that are written down; changing them needs a new
+argument, not a fresh preference:
+
+- Restart belongs **outside** the recorder (`ops/supervise.ps1` header).
+- Verification runs **during** the capture, not after (`quant-verify`'s `lib.rs`).
+- Warnings do not fail a verification run (`finding.rs`).
+- Seven days is the criterion in `docs/data-contract.md` §7. Shortening it to suit
+  a machine's convenience is redefining "done"; if there is a real argument for a
+  shorter run, change the contract deliberately and record why.
 
 ## Conventions
 
