@@ -26,6 +26,59 @@ whole raw tier was built to make checkable.
 
 ## Running it
 
+The harness exists twice: PowerShell (`ops/*.ps1`) for the Windows host it was
+written on, and a line-for-line macOS/bash port (`ops/*.sh`) for the Apple Silicon
+machine the run actually moved to. The two are behaviourally the same; the reasons
+are in each script's header and the design decisions did not change in the port.
+
+### macOS (Apple Silicon)
+
+```bash
+# once, if preflight complains about the clock (the check itself needs no sudo):
+sudo ops/fix-clock.sh
+
+# optional: the metadata index. The capture does not need it.
+docker compose up -d
+export QUANT_DATABASE_URL='postgres://quant:quant_local_dev@localhost:5432/quant'
+
+ops/start-run.sh
+```
+
+Then, whenever you wonder:
+
+```bash
+ops/status.sh
+```
+
+And to end it early:
+
+```bash
+ops/stop-run.sh
+```
+
+Rehearse the whole chain first — a harness that has never been run is not a
+harness: `ops/start-run.sh --minutes 5` runs start → supervise → record → verify →
+status → stop in a few minutes against a throwaway root.
+
+macOS specifics, all handled by the scripts unless noted:
+
+- **Prerequisites**: Xcode Command Line Tools (`xcode-select --install`, for the
+  `zstd-sys` C build) and `rustup`. Both are cleanly removable afterwards.
+- **Sleep**: each recorder runs under `caffeinate -dimsu` for its lifetime, so the
+  system stays awake while it records — **but only with the lid open on mains.** A
+  closed lid still sleeps unless you also run `sudo pmset -a disablesleep 1` (undo
+  with `0`). Preflight reports the current sleep policy.
+- **Clean shutdown is SIGINT.** `stop-run.sh` sends the recorder `SIGINT`
+  (`tokio::signal::ctrl_c`), which seals the trailer; `SIGTERM`/`SIGKILL` would
+  leave the last segment looking like a crash. Do not `kill` the recorder by hand.
+- **The clock check is round-trip corrected.** From a home connection several
+  thousand km from the venue, one-way latency alone can be hundreds of ms, so the
+  naive `now - serverTime` the Windows script uses would block a run over a clock
+  that is fine. `preflight.sh` and `fix-clock.sh` use the NTP midpoint estimate
+  instead, and confirm sync read-only with `sntp` (no sudo).
+
+### Windows
+
 ```powershell
 # once, as Administrator, if preflight complains about the clock
 powershell -ExecutionPolicy Bypass -File ops\fix-clock.ps1
@@ -37,21 +90,12 @@ $env:QUANT_DATABASE_URL = 'postgres://quant:quant_local_dev@localhost:5432/quant
 powershell -ExecutionPolicy Bypass -File ops\start-run.ps1
 ```
 
-Then, whenever you wonder:
+Then `ops\status.ps1` to check, `ops\stop-run.ps1` to end it early.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File ops\status.ps1
-```
-
-And to end it early:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File ops\stop-run.ps1
-```
-
-`start-run.ps1` refuses to start on a preflight blocker. `-Force` overrides it and
-records that it did so in `run.json`, because a run started over a known problem
-should not be discovered to have been six months later.
+`start-run` (either host) refuses to start on a preflight blocker. `--force`
+(`-Force` on Windows) overrides it and records that it did so in `run.json`,
+because a run started over a known problem should not be discovered to have been
+six months later.
 
 ---
 
