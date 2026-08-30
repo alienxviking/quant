@@ -193,6 +193,52 @@ noticeably less than one whose can.
 
 ---
 
+## Getting the data off the machine
+
+The raw tier lives outside git (gitignored `/data/`), so it moves out-of-band. The
+capture is a few GB, and the machine it ran on is often not the one it will be used
+on — the 2026-08 run recorded on an Apple Silicon Mac and was carried back to a
+Windows laptop. The method (USB drive, or a cloud service like Google Drive) does
+not matter; getting the *same bytes* to the other side, provably, does.
+
+**1. Stop cleanly first, then package as one file.** Only package after the
+recorders have stopped and their trailers are sealed (a duration-limit exit or
+`stop-run` both do this). One tarball is easier to move and verify than a deep
+folder tree, and it preserves the `raw/exchange=…/symbol=…/date=…/session=…`
+layout the verifier depends on. Don't re-compress — the payload is already zstd.
+
+```bash
+# macOS/Linux, from the capture root's parent (e.g. quant/data)
+tar cf ~/quant-acceptance.tar acceptance          # raw/ + logs/ + run.json
+shasum -a 256 ~/quant-acceptance.tar | tee ~/quant-acceptance.tar.sha256
+```
+
+Carry the `.sha256` sidecar alongside the tarball — it is how the other side
+proves the transfer was lossless. A flaky-network upload that silently corrupts a
+byte is exactly the failure this whole project refuses to trust to luck.
+
+**2. Verify and extract on the other machine.** On Windows, PowerShell has both a
+hasher and `tar` built in (Windows 10+):
+
+```powershell
+# compare this against the value inside quant-acceptance.tar.sha256
+certutil -hashfile quant-acceptance.tar SHA256
+tar xf quant-acceptance.tar                        # restores the raw/ tree
+```
+
+**3. Re-verify the data itself — the gold standard.** A matching checksum proves
+the bytes survived; running the verifier proves they still *mean* what they did.
+Build `quant-verify` on the target machine and point it at the extracted root:
+
+```powershell
+cargo run --release -p quant-verify --bin verify -- .\acceptance
+```
+
+Exit `0` there is the strongest possible statement: the week of data is intact and
+every discontinuity is still explained, on a machine that never saw it recorded.
+
+---
+
 ## Known limits of a run on this host
 
 Worth stating plainly rather than discovering.

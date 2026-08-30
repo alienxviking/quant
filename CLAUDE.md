@@ -564,7 +564,9 @@ preference:
   `.github/workflows/ci.yml` is still worth adding so it stays proven.
 - **The `macos-acceptance-harness` branch is unmerged** at time of writing. The
   captured data lives outside git (gitignored `/data/`) and transfers off the
-  machine by USB — see `docs/acceptance-run.md`.
+  machine out-of-band — USB or cloud, tarball + `sha256`, verified and re-checked
+  with `quant-verify` on the far side. Procedure in `docs/acceptance-run.md`
+  ("Getting the data off the machine").
 
 ## Conventions
 
