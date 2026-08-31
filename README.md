@@ -81,10 +81,11 @@ ops/
 | M0 | Foundation + data contract | CI green; contract written before the recorder exists |
 | M1 | Binance market data recorder | Runs 7 days unattended; zero unexplained gaps |
 
-**Where this is:** M0 done. M1 is code-complete — every slice written, tested and
-committed — and waiting on its acceptance run, which is the one criterion only
-time can satisfy. See `docs/acceptance-run.md` for the procedure, and the
-"Picking up the acceptance run" section of `CLAUDE.md` for the state of it.
+**Where this is:** M0 and M1 done. M1's acceptance run — the one criterion only
+time can satisfy — was spent: seven days unattended on an Apple Silicon Mac,
+2026-08-21 → 2026-08-28, `quant-verify` exit 0 with every discontinuity explained.
+See `docs/acceptance-run.md` for the procedure, and the "The acceptance run, and
+how it went" section of `CLAUDE.md` for the result. **M2 is next.**
 
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day |
 | M3 | Engine seam + SimulatedVenue + MA crossover | Equity curve produced, and it is unimpressive |
