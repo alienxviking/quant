@@ -64,6 +64,8 @@ crates/
   quant-verify/     the offline verifier: turns the acceptance
                     criteria into a command with an exit code.
                     Top of the dependency graph.                   [M1d]
+  quant-book/       order book reconstruction and its invariants.
+                    Venue-agnostic; depends only on quant-core.    [M2b]
 docs/
   data-contract.md    the on-disk format and its acceptance criteria
   acceptance-run.md   how the 7-day M1 run is conducted and judged
@@ -84,8 +86,13 @@ ops/
 **Where this is:** M0 and M1 done. M1's acceptance run — the one criterion only
 time can satisfy — was spent: seven days unattended on an Apple Silicon Mac,
 2026-08-21 → 2026-08-28, `quant-verify` exit 0 with every discontinuity explained.
-See `docs/acceptance-run.md` for the procedure, and the "The acceptance run, and
-how it went" section of `CLAUDE.md` for the result. **M2 is next.**
+See `docs/acceptance-run.md` for the procedure, and "The acceptance run, and how it
+went" in `CLAUDE.md` for the result.
+
+**M2 is in progress.** The payload parser and the book are done and every one of
+the 16 acceptance segments replays with the invariants holding at every tick. What
+remains is joining a session's segments so the book carries across midnight, and
+writing the normalized Parquet tier.
 
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day |
 | M3 | Engine seam + SimulatedVenue + MA crossover | Equity curve produced, and it is unimpressive |
@@ -143,6 +150,31 @@ consumer and a quiet market look identical from outside.
 Venue latency is `local_recv_ts - exchange_ts`, which measures the host clock as
 much as the network, so the recorder checks itself against the venue's clock at
 startup and warns above a one-second offset.
+
+### Reconstructing a book
+
+```bash
+# parse every frame in a capture file; reports anything that will not parse
+cargo run --release -p quant-binance --example parse_all -- <path to part-*.bin.zst>
+
+# replay a capture file through a book and check the invariants at every tick
+cargo run --release -p quant-binance --example replay -- <path to part-*.bin.zst>
+```
+
+The normalized tier holds **events, not books**: `trades/`, `book_deltas/`,
+`book_snapshots/`, `gaps/`. A book is derived at replay time, never stored —
+storing one would mean a state per delta for something re-derivable in seconds.
+
+Reconstruction is where the three steps the recorder deliberately deferred live,
+because a mistake here costs a re-derive rather than a week of re-recording:
+buffer the deltas, discard the ones the snapshot supersedes, and check that the
+chain joins. The buffering is not optional — the snapshot arrives *later in the
+stream* than the deltas it supersedes, since the recorder fetches it concurrently
+with draining the socket.
+
+An invalidated book is **cleared, not flagged**. A flag can be ignored; an empty
+book cannot be misread as prices, which is what makes "refuse to trade across a
+gap" enforceable rather than advisory.
 
 ### Verifying
 

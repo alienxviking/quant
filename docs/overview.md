@@ -13,9 +13,10 @@ version is named. Read those when they disagree.
 | The milestone table | `README.md` |
 | How the 7-day run is conducted and judged | `docs/acceptance-run.md` |
 
-*State as of 2026-08-31: **M0 and M1 both complete.** M1's acceptance run was spent in
-full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. 12,147 lines
-of Rust across 6 crates, 179 tests passing in debug and release. **M2 is next.***
+*State as of 2026-08-31: **M0 and M1 complete, M2 in progress.** M1's acceptance run was
+spent in full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. M2's
+parser and book are done; every one of the 16 acceptance segments replays with the book
+invariants holding at every tick. 15,056 lines of Rust across 7 crates, 204 tests passing in debug and release.*
 
 ---
 
@@ -218,7 +219,7 @@ use whatever tool fits, with no schema registration.
 |---|---|---|---|
 | M0 | Foundation + data contract | CI green; contract written before the recorder | **done** |
 | M1 | Binance market data recorder | 7 days unattended, zero unexplained gaps | **done** |
-| M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | next |
+| M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | **in progress** |
 | M3 | Engine seam + SimulatedVenue + MA crossover | An equity curve exists, **and it is unimpressive** | |
 | M4 | Fee, slippage, latency modelling | Results degrade sensibly under realistic costs | |
 | M5 | Paper trading | 2 weeks live; P&L reconciles against an independent recompute | |
@@ -581,22 +582,90 @@ this one".
 
 ## 9. What is left
 
-### M2 — Normalizer + book reconstruction
+### M2 — Normalizer + book reconstruction *(in progress)*
 
 **Criterion:** book invariants hold at every tick of a replayed day —
-`best_bid < best_ask`, levels monotone, no negative quantities.
-
-Reads the raw tier and produces the normalized Parquet tier. This is where the three
-steps deferred out of M1.d live: buffer deltas, discard the stale ones
-(`u <= lastUpdateId`), and verify the chain joins. That off-by-one condition is the
-subtle part, and it belongs here because a mistake costs a re-derive rather than a
-re-record.
+`best_bid < best_ask`, no zero-quantity levels retained, nothing non-positive.
 
 Distinguish the two checks carefully: **update-id contiguity** (M1) answers "did we
 receive everything the venue sent" — a *completeness* property of the capture.
 **Book invariants** (M2) answer "does applying those messages in order produce a sane
 book" — a *correctness* property of the reconstruction. A capture can be complete and
 still reconstruct into nonsense if the normalizer is wrong.
+
+| | Slice | State |
+|---|---|---|
+| a | `quant-binance::parse` — payloads to events, in fixed-point | **done** |
+| b | `quant-book` — apply, invariants, gap invalidation, resync | **done** |
+| c | `quant-normalize` — join a session's segments, replay, report | next |
+| d | Parquet output — the normalized tier on disk | |
+
+**The scoping call.** The milestone reads "normalizer *and* book reconstruction", but
+those are two artifacts. The normalized tier holds **events, not books** — the
+contract's layout is `trades/`, `book_deltas/`, `book_snapshots/`, `gaps/`. Storing
+books would mean a state per delta, 11.6M of them with thousands of levels each, for
+something re-derivable in seconds. So the criterion is a property of the
+*reconstruction*, validated by replaying, not an output on disk.
+
+#### What the parser decided
+
+Written against payloads copied **verbatim out of the acceptance capture**, not from
+the venue's documentation — the dialect actually being spoken is the one worth being
+correct about.
+
+The **aggressor mapping inverts the venue's flag**. Binance sends `m`, "is the buyer
+the market maker", so `m: true` means a resting buyer was lifted and the *seller*
+crossed the spread. Backwards, this silently inverts order-flow imbalance — and a
+signal with the wrong sign looks *predictive* rather than broken, which is the worse
+failure.
+
+`exchange_ts` comes from `E`, the message emission time, not a trade's `T`. `E` keeps
+`local_recv_ts - exchange_ts` a transport measurement; `T` would fold Binance's own
+match-to-publish delay into what we call network latency.
+
+There are now **two parsers for one dialect** — a narrow one for the verifier walking
+70M frames, and this full one. That is a genuine drift risk, bounded by a test that
+pins them to classify the same bytes the same way.
+
+Validated on the corpus rather than on fixtures: every frame of all 16 segments, 58.9M
+trades, 11.6M deltas, **384 million price levels through fixed-point, zero failures**.
+
+#### The finding that made the slice worth it
+
+M1 deliberately deferred three steps to here: buffer the deltas, discard the ones the
+snapshot supersedes, and check the chain joins. I wrote in the book's own docs that
+the first was already handled — *"the capture file **is** the buffer"*.
+
+That is true about the file and **false about the algorithm**. The snapshot arrives
+*later in the stream* than the deltas it supersedes, because the recorder fetches it
+concurrently with draining the socket, so a few hundred milliseconds of messages land
+while the REST request is in flight. A replay that applied the snapshot and continued
+from the next frame produced:
+
+```
+applied   0 deltas          discarded 411,422 unanchored
+chain     12 breaks         on a file the verifier had passed clean
+```
+
+So the book buffers while it has no anchor and replays the buffer once it gets one —
+and the buffering lives **in the book, not the caller**, because a caller who has to
+remember will forget. The queue is bounded, because a snapshot may never arrive at all.
+
+Fixing it surfaced a second case by the same argument: **a snapshot the book has
+already passed is ignored**. The recorder takes an hourly anchor whether the book needs
+one or not, so by the time one is written the live stream is further ahead than the
+`lastUpdateId` the venue served; applying it would move the book backwards. Eleven of
+the twelve snapshots in a day are this case — which is also why periodic anchors are
+not wasted: their value is for the book that *has* been invalidated.
+
+After the fix, all 16 segments replay with **0 chain breaks, 0 invalidations, and the
+invariants holding at every tick**. Two independently written checks agreeing: the
+verifier says the chain is contiguous-or-explained, and the book produces zero broken
+outcomes.
+
+It also disproved a sentence in the verifier. `deltas_before_anchor` was described as
+*"recorded, but not reconstructible"* — they are in fact either superseded by the
+snapshot or replayed after it, and both halves are needed.
 
 ### M3 — Engine seam + SimulatedVenue + a deliberately bad strategy
 
@@ -775,8 +844,12 @@ cargo test --workspace --all-features
 cargo run -p quant-binance --bin record -- BTCUSDT data 60
 cargo run -p quant-verify  --bin verify -- data --reconcile
 
-# inspect a single file
+# inspect a single file (--sample N prints whole payloads)
 cargo run -p quant-storage --example dump -- <path to part-00000.bin.zst>
+
+# M2: parse every frame, and replay one through a book
+cargo run --release -p quant-binance --example parse_all -- <path to part-*.bin.zst>
+cargo run --release -p quant-binance --example replay    -- <path to part-*.bin.zst>
 ```
 
 Warnings are errors in CI. Commits explain **why** in the body — the rationale is the
@@ -786,12 +859,13 @@ point, because the code shows the what.
 
 | Crate | Lines | Knows about |
 |---|---|---|
-| `quant-core` | 1,582 | Money, time, instruments, the event contract. No I/O. |
-| `quant-storage` | 2,441 | The raw format. No venue, no network. |
-| `quant-recorder` | 3,370 | Ingress, overload policy, day rolling. Venue-agnostic, async-free. |
-| `quant-binance` | 1,736 | The only crate that knows a venue. |
-| `quant-meta` | 986 | Postgres. Sits above the recorder; optional. |
-| `quant-verify` | 2,032 | Top of the graph. The only crate allowed to know both a venue and the format. |
+| `quant-core` | 1,747 | Money, time, instruments, the event contract. No I/O. |
+| `quant-storage` | 2,702 | The raw format. No venue, no network. |
+| `quant-recorder` | 3,698 | Ingress, overload policy, day rolling. Venue-agnostic, async-free. |
+| `quant-binance` | 2,725 | The only crate that knows a venue. |
+| `quant-book` | 894 | Book reconstruction and its invariants. Depends only on `quant-core`. |
+| `quant-meta` | 1,075 | Postgres. Sits above the recorder; optional. |
+| `quant-verify` | 2,215 | Top of the graph. The only crate allowed to know both a venue and the format. |
 
 The dependency arrows only point one way. That is checked by the fact that adding a second
 venue should mean writing a new adapter and touching nothing else.

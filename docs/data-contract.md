@@ -337,3 +337,54 @@ A capture can be complete and still reconstruct into a nonsense book if the
 normalizer is wrong, and a book can look sane while built from a capture with
 a silent hole in it. Attributing each check to the milestone that can actually
 falsify it is what keeps "done" meaning something.
+
+---
+
+## 8. Acceptance criteria for M2
+
+The normalizer is done when:
+
+- [ ] Every frame in the acceptance capture parses, with no unrecognised event
+      types and no malformed numbers. *(met: 384M price levels through
+      fixed-point, zero failures.)*
+- [ ] A replayed day holds the book invariants at **every tick**:
+      `best_bid < best_ask`, no zero-quantity level retained, nothing
+      non-positive. *(met per segment; see below for the remaining gap.)*
+- [ ] A session's segments are joined, so the book carries across midnight
+      rather than restarting unanchored at each UTC day boundary.
+- [ ] The normalized Parquet tier is written, partitioned
+      `exchange / symbol / date`, and a replay from Parquet agrees with a replay
+      from raw.
+
+### The normalized tier holds events, not books
+
+`trades/`, `book_deltas/`, `book_snapshots/`, `gaps/` — per §5. A book is
+**derived at replay time and never stored**. Storing one would mean a state per
+delta, which for the acceptance capture is 11.6M states of thousands of levels
+each, for something re-derivable in seconds. So the book-invariant criterion is
+a property of the *reconstruction*, not an artifact to inspect.
+
+### The three steps the recorder deferred
+
+M1 captured the snapshot and did nothing else with it, because the fetch is the
+only irreversible step. The rest lands here, where a mistake costs a re-derive:
+
+1. **Buffer the deltas.** Not optional, and not free. The snapshot arrives
+   *later in the stream* than the deltas it supersedes — the recorder fetches it
+   concurrently with draining the socket, so messages land while the request is
+   in flight. A replay that applies the snapshot and continues from the next
+   frame skips every delta between the venue's `lastUpdateId` and the snapshot's
+   arrival.
+2. **Discard the superseded ones.** A delta whose whole range is at or below
+   `lastUpdateId` is accounted for by the snapshot.
+3. **Check the chain joins.** The first delta after a snapshot may *straddle*
+   it; every one after that must continue exactly.
+
+A snapshot the book has already moved past is **ignored**, not applied — the
+recorder takes an hourly anchor whether one is needed or not, and applying a
+stale one would move the book backwards.
+
+### An invalidated book is cleared, not flagged
+
+A flag can be ignored; an empty book cannot be misread as prices. That is what
+makes "refuse to trade across a gap" (§3) enforceable rather than advisory.
