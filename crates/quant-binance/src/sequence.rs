@@ -29,8 +29,8 @@
 use core::fmt;
 
 /// Binance's event-type discriminator, in the `e` field of a stream payload.
-const DEPTH_EVENT: &str = "depthUpdate";
-const TRADE_EVENT: &str = "trade";
+pub(crate) const DEPTH_EVENT: &str = "depthUpdate";
+pub(crate) const TRADE_EVENT: &str = "trade";
 
 /// What a recorded stream payload turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

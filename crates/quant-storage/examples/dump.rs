@@ -18,11 +18,23 @@ use quant_storage::{ControlRecord, FrameKind, RawReader};
 
 fn main() -> ExitCode {
     let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: dump <path to part-NNNNN.bin.zst>");
+        eprintln!("usage: dump <path to part-NNNNN.bin.zst> [--sample N]");
         return ExitCode::FAILURE;
     };
 
-    match dump(&path) {
+    // How many payloads of each frame kind to print in full.
+    //
+    // "What do the bytes actually look like" is the question a normalizer gets
+    // written against, and answering it from the venue's documentation rather
+    // than from a recorded file is how a parser ends up correct about a dialect
+    // nobody is speaking.
+    let sample = std::env::args()
+        .position(|a| a == "--sample")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+
+    match dump(&path, sample) {
         Ok(clean) => {
             if clean {
                 ExitCode::SUCCESS
@@ -37,7 +49,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn dump(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
+fn dump(path: &str, sample: usize) -> Result<bool, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     // Buffered because the reader issues one read per block header and one per
     // block body; unbuffered that is two syscalls per 256 KiB, which is fine, but
@@ -50,7 +62,7 @@ fn dump(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         quant_recorder_session_text(&reader.header().session_id)
     );
 
-    let scan = scan(&mut reader)?;
+    let scan = scan(&mut reader, sample)?;
 
     let stats = reader.stats();
     println!(
@@ -148,8 +160,12 @@ struct Scan {
     control: Vec<(u64, String)>,
 }
 
-fn scan<R: std::io::Read>(reader: &mut RawReader<R>) -> Result<Scan, Box<dyn std::error::Error>> {
+fn scan<R: std::io::Read>(
+    reader: &mut RawReader<R>,
+    sample: usize,
+) -> Result<Scan, Box<dyn std::error::Error>> {
     let mut scan = Scan::default();
+    let mut sampled = [0_usize; 3];
 
     while let Some(frame) = reader.next_frame() {
         let frame = frame?;
@@ -162,6 +178,26 @@ fn scan<R: std::io::Read>(reader: &mut RawReader<R>) -> Result<Scan, Box<dyn std
         }
         scan.first_seq.get_or_insert(frame.ingest_seq);
         scan.last_seq = Some(frame.ingest_seq);
+
+        // Printed before the counters so the first of each kind is the one shown.
+        let slot = match frame.kind {
+            FrameKind::VenuePayload => 0,
+            FrameKind::VenueSnapshot => 1,
+            FrameKind::Control => 2,
+        };
+        if sampled[slot] < sample {
+            sampled[slot] += 1;
+            let text = String::from_utf8_lossy(&frame.payload);
+            println!(
+                "sample    seq {} {:?} ({} bytes)
+          {}",
+                frame.ingest_seq,
+                frame.kind,
+                frame.payload.len(),
+                // Snapshots run to hundreds of kilobytes; the shape is in the head.
+                text.chars().take(400).collect::<String>()
+            );
+        }
 
         match frame.kind {
             FrameKind::VenuePayload => scan.venue += 1,
