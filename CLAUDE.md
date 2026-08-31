@@ -467,6 +467,116 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   one as the verifier's false positives: a number that looks broken *is* broken,
   whatever its derivation says.
 
+- **M2 in progress** (from 2026-08-31): the normalizer and book reconstruction.
+  204 tests green in debug and release, clippy and fmt clean. Criterion: **book
+  invariants hold at every tick of a replayed day**.
+
+  | | Slice | Status |
+  |---|---|---|
+  | a | `quant-binance::parse`: payloads → `MarketEvent`, full fixed-point | **done** |
+  | b | `quant-book`: apply, invariants, gap invalidation, resync | **done** |
+  | c | `quant-normalize`: join a session's segments, replay, report | next |
+  | d | Parquet output: the normalized tier on disk | |
+
+  **The scoping call, made first.** The milestone reads "normalizer *and* book
+  reconstruction", but those are two artifacts. The normalized tier holds
+  **events, not books** — the contract's layout is `trades/`, `book_deltas/`,
+  `book_snapshots/`, `gaps/`. Storing books would mean a state per delta (11.6M of
+  them, thousands of levels each) for something re-derivable in seconds. So the
+  criterion is a property of the *reconstruction*, validated by replaying, and not
+  an output. Same class of re-scope as M1.d.
+
+- **M2.a decisions** (`quant-binance/src/parse.rs`). Written against payloads
+  copied **verbatim out of `data/acceptance`**, not from the venue's documentation
+  — the dialect actually being spoken is the one worth being correct about. That is
+  why `dump` grew `--sample N`, which prints whole payloads per frame kind.
+
+  The **aggressor mapping inverts the venue's flag**. Binance sends `m`, "is the
+  buyer the market maker", so `m: true` means a resting buyer was lifted and the
+  *seller* crossed → `Side::Sell`. Backwards, this silently inverts order-flow
+  imbalance, and a signal with the wrong sign looks *predictive* rather than
+  broken. Pinned in both directions.
+
+  `exchange_ts` comes from **`E`, not a trade's `T`**, for both event types. `E` is
+  when the venue emitted the message, so `local_recv_ts - exchange_ts` stays a
+  transport measurement; `T` would fold Binance's own match-to-publish delay into
+  what we report as network latency. `T` remains in raw for anyone who needs it.
+  A REST snapshot has **no venue timestamp at all**, so `exchange_ts` is our
+  receive time — the same choice `ControlRecord::Gap` makes, for the same reason.
+
+  There are now **two parsers for one dialect**, which is a real drift risk and is
+  bounded rather than ignored. `sequence.rs` reads four fields for the verifier
+  walking 70M frames; allocating a `Vec<Level>` per delta to learn two integers
+  would be absurd. `both_parsers_agree_on_what_a_message_is` pins that they
+  classify the same bytes the same way, so a divergence fails a test instead of a
+  book quietly reconstructing from the wrong messages.
+
+  Proven on the **corpus**, not the fixtures: a `parse_all` example ran every frame
+  of all 16 segments — 58.9M trades, 11.6M deltas, 342 snapshots, **384M price
+  levels through fixed-point, zero failures, zero unrecognised event types**. A day
+  of BTCUSDT parses in 5 s.
+
+- **M2.b decisions** (`crates/quant-book/src/lib.rs`). Venue-agnostic, and it *can*
+  be: `BookDelta` carries the update id as a **range**, and Binance's rule is a
+  statement about that range, so a venue with a single monotonic sequence sets both
+  ends equal and it still holds. Generalising from one implementation is against
+  this project's usual instinct; it earns its place because **M0 put the range in
+  the event contract before any of this existed**.
+
+  An invalid book is **cleared, not flagged**. A flag can be ignored; an empty book
+  cannot be misread as prices. That is what makes "refuse to trade across a gap"
+  enforceable rather than advisory — the same reasoning that puts the risk layer
+  between strategy and venue rather than beside it.
+
+  `check()` is **O(1)** (the crossed-book test) and runs every tick, which is the
+  criterion. `audit()` is O(n) and runs at each snapshot and at the end; per-tick it
+  would be tens of billions of comparisons for properties that hold by construction.
+
+- **The replay proved my own module docs wrong** (the most useful thing in M2 so
+  far). I had written "buffer the deltas — already done, the capture file *is* the
+  buffer". True about the file, **false about the algorithm**: the snapshot arrives
+  *later in the stream* than the deltas it supersedes, because the recorder fetches
+  it concurrently with the drain, so a few hundred ms of messages land while the
+  REST request is in flight. A replay that applied the snapshot and continued from
+  the next frame gave **411,422 unanchored, 0 applied, 12 chain breaks** on a file
+  the verifier had passed clean.
+
+  So the book buffers while unanchored and replays on anchor — and **the buffering
+  lives in the book, not the caller**, because a caller who must remember will
+  forget. `MAX_PENDING_DELTAS` bounds it (a snapshot may never arrive;
+  `SnapshotFailed` is a recorded outcome) and drops the **oldest**, since
+  `lastUpdateId` lands near the recent end.
+
+  Fixing it surfaced a second case the same argument covers: **a snapshot the book
+  has already passed is ignored**, not applied. The recorder takes an hourly anchor
+  whether the book needs one or not, so by the time one is written the live stream
+  is further ahead than the `lastUpdateId` the venue served; applying it would move
+  the book backwards. **11 of the 12 snapshots in a day of BTCUSDT are this case** —
+  which is also why periodic anchors are not wasted: their value is for the book
+  that *has* been invalidated.
+
+  After the fix, all 16 segments replay with **0 chain breaks, 0 invalidations,
+  invariants holding at every tick** (3.97M live-book ticks on day one alone). Two
+  independently written checks agreeing: the verifier says the chain is
+  contiguous-or-explained, and the book produces zero `Broken` outcomes.
+
+- **A verifier sentence the book disproved**: `deltas_before_anchor` was described
+  as *"recorded, but not reconstructible"*. They are in fact either superseded by
+  the snapshot or replayed after it, and **both halves are needed**. Reworded in the
+  report line and in `session.rs`.
+
+- **Known artifact, not a defect**: replaying *single files* drops 7k–34k deltas on
+  days 2–8, because each file starts mid-stream with no anchor and waits up to an
+  hour for the next hourly snapshot. Day 1 drops none — its resync arrives 300 ms
+  in. Joining a session's segments is exactly what M2.c does, and the numbers
+  confirm the need rather than showing a fault.
+
+- **Book depth reaches 11k–34k levels** against the 5000-a-side snapshot window.
+  Expected: deltas keep inserting levels outside the window and nothing removes
+  them. The touch stays correct, which is what anything trading reads. Documented
+  in `quant-book`'s crate docs as an accepted limitation — the venue cannot tell us
+  more than 5000 levels.
+
 Milestone table: see `README.md`.
 
 ## The acceptance run, and how it went
@@ -607,10 +717,15 @@ turns out to be.
 
 ### Still open
 
-- Nothing blocking. M2 is next.
+- Nothing blocking on M1. M2 is under way; see the M2 entries above.
 
 ## Conventions
 
+- **Never push to `main`. Raise a pull request.** (Set 2026-08-31.) Branch, push
+  the branch, open a PR with `gh pr create`, and let the user merge it. The first
+  two merges into `main` went through PRs (#1, #2) and that is now the rule rather
+  than the accident. CI runs on `pull_request`, so a PR is also what gets the
+  `check` and `macos` jobs to vouch for a change before it lands.
 - Commits are authored **alienxviking <sroy191006@gmail.com>** with **no**
   `Co-Authored-By: Claude` trailer. Already set in this repo's local git
   config. Personal project under the user's own GitHub identity.
