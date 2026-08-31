@@ -26,6 +26,59 @@ whole raw tier was built to make checkable.
 
 ## Running it
 
+The harness exists twice: PowerShell (`ops/*.ps1`) for the Windows host it was
+written on, and a line-for-line macOS/bash port (`ops/*.sh`) for the Apple Silicon
+machine the run actually moved to. The two are behaviourally the same; the reasons
+are in each script's header and the design decisions did not change in the port.
+
+### macOS (Apple Silicon)
+
+```bash
+# once, if preflight complains about the clock (the check itself needs no sudo):
+sudo ops/fix-clock.sh
+
+# optional: the metadata index. The capture does not need it.
+docker compose up -d
+export QUANT_DATABASE_URL='postgres://quant:quant_local_dev@localhost:5432/quant'
+
+ops/start-run.sh
+```
+
+Then, whenever you wonder:
+
+```bash
+ops/status.sh
+```
+
+And to end it early:
+
+```bash
+ops/stop-run.sh
+```
+
+Rehearse the whole chain first — a harness that has never been run is not a
+harness: `ops/start-run.sh --minutes 5` runs start → supervise → record → verify →
+status → stop in a few minutes against a throwaway root.
+
+macOS specifics, all handled by the scripts unless noted:
+
+- **Prerequisites**: Xcode Command Line Tools (`xcode-select --install`, for the
+  `zstd-sys` C build) and `rustup`. Both are cleanly removable afterwards.
+- **Sleep**: each recorder runs under `caffeinate -dimsu` for its lifetime, so the
+  system stays awake while it records — **but only with the lid open on mains.** A
+  closed lid still sleeps unless you also run `sudo pmset -a disablesleep 1` (undo
+  with `0`). Preflight reports the current sleep policy.
+- **Clean shutdown is SIGINT.** `stop-run.sh` sends the recorder `SIGINT`
+  (`tokio::signal::ctrl_c`), which seals the trailer; `SIGTERM`/`SIGKILL` would
+  leave the last segment looking like a crash. Do not `kill` the recorder by hand.
+- **The clock check is round-trip corrected.** From a home connection several
+  thousand km from the venue, one-way latency alone can be hundreds of ms, so the
+  naive `now - serverTime` the Windows script uses would block a run over a clock
+  that is fine. `preflight.sh` and `fix-clock.sh` use the NTP midpoint estimate
+  instead, and confirm sync read-only with `sntp` (no sudo).
+
+### Windows
+
 ```powershell
 # once, as Administrator, if preflight complains about the clock
 powershell -ExecutionPolicy Bypass -File ops\fix-clock.ps1
@@ -37,21 +90,12 @@ $env:QUANT_DATABASE_URL = 'postgres://quant:quant_local_dev@localhost:5432/quant
 powershell -ExecutionPolicy Bypass -File ops\start-run.ps1
 ```
 
-Then, whenever you wonder:
+Then `ops\status.ps1` to check, `ops\stop-run.ps1` to end it early.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File ops\status.ps1
-```
-
-And to end it early:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File ops\stop-run.ps1
-```
-
-`start-run.ps1` refuses to start on a preflight blocker. `-Force` overrides it and
-records that it did so in `run.json`, because a run started over a known problem
-should not be discovered to have been six months later.
+`start-run` (either host) refuses to start on a preflight blocker. `--force`
+(`-Force` on Windows) overrides it and records that it did so in `run.json`,
+because a run started over a known problem should not be discovered to have been
+six months later.
 
 ---
 
@@ -146,6 +190,52 @@ Exit `0` is the run passing. Then walk §7 explicitly:
 Keep `run.json`, the verifier's final report, and the supervisor logs with the
 capture. A week of data whose provenance nobody can reconstruct is worth
 noticeably less than one whose can.
+
+---
+
+## Getting the data off the machine
+
+The raw tier lives outside git (gitignored `/data/`), so it moves out-of-band. The
+capture is a few GB, and the machine it ran on is often not the one it will be used
+on — the 2026-08 run recorded on an Apple Silicon Mac and was carried back to a
+Windows laptop. The method (USB drive, or a cloud service like Google Drive) does
+not matter; getting the *same bytes* to the other side, provably, does.
+
+**1. Stop cleanly first, then package as one file.** Only package after the
+recorders have stopped and their trailers are sealed (a duration-limit exit or
+`stop-run` both do this). One tarball is easier to move and verify than a deep
+folder tree, and it preserves the `raw/exchange=…/symbol=…/date=…/session=…`
+layout the verifier depends on. Don't re-compress — the payload is already zstd.
+
+```bash
+# macOS/Linux, from the capture root's parent (e.g. quant/data)
+tar cf ~/quant-acceptance.tar acceptance          # raw/ + logs/ + run.json
+shasum -a 256 ~/quant-acceptance.tar | tee ~/quant-acceptance.tar.sha256
+```
+
+Carry the `.sha256` sidecar alongside the tarball — it is how the other side
+proves the transfer was lossless. A flaky-network upload that silently corrupts a
+byte is exactly the failure this whole project refuses to trust to luck.
+
+**2. Verify and extract on the other machine.** On Windows, PowerShell has both a
+hasher and `tar` built in (Windows 10+):
+
+```powershell
+# compare this against the value inside quant-acceptance.tar.sha256
+certutil -hashfile quant-acceptance.tar SHA256
+tar xf quant-acceptance.tar                        # restores the raw/ tree
+```
+
+**3. Re-verify the data itself — the gold standard.** A matching checksum proves
+the bytes survived; running the verifier proves they still *mean* what they did.
+Build `quant-verify` on the target machine and point it at the extracted root:
+
+```powershell
+cargo run --release -p quant-verify --bin verify -- .\acceptance
+```
+
+Exit `0` there is the strongest possible statement: the week of data is intact and
+every discontinuity is still explained, on a machine that never saw it recorded.
 
 ---
 
