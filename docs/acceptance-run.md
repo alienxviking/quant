@@ -209,8 +209,24 @@ layout the verifier depends on. Don't re-compress — the payload is already zst
 
 ```bash
 # macOS/Linux, from the capture root's parent (e.g. quant/data)
-tar cf ~/quant-acceptance.tar acceptance          # raw/ + logs/ + run.json
+COPYFILE_DISABLE=1 tar cf ~/quant-acceptance.tar acceptance   # raw/ + logs/ + run.json
 shasum -a 256 ~/quant-acceptance.tar | tee ~/quant-acceptance.tar.sha256
+```
+
+`COPYFILE_DISABLE=1` is not decoration. macOS `tar` archives each file's extended
+attributes as a sibling **AppleDouble** stub — `._part-00000.bin.zst` beside the
+real thing — and the 2026-08 transfer arrived with 90 of them, 51 inside `raw/`.
+They are inert, but the verifier is right to notice: something unexpected in the
+immutable tier gets a line of output whatever it turns out to be. Suppressing them
+at the source is better than teaching the verifier to ignore a shape of file,
+because a verifier that has learned to ignore things is how one stops catching
+them.
+
+If a capture already has them, they are safe to remove — nothing in the raw tier
+depends on a resource fork:
+
+```bash
+find <capture root> -name '._*' -type f -delete
 ```
 
 Carry the `.sha256` sidecar alongside the tarball — it is how the other side

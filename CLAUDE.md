@@ -578,14 +578,36 @@ preference:
   Mac's last report (70.5M vs 68.98M) simply because that check ran 5.75 hours
   before the run ended.
 
+### The AppleDouble strays, and what they showed (2026-08-31)
+
+The transferred capture arrived with 90 macOS **AppleDouble** stubs
+(`._exchange=binance`, `._part-00000.bin.zst`, …), 51 of them inside `raw/`, which
+the verifier reported as `stray-file`. Root cause: macOS `tar` archives extended
+attributes as sibling `._` files unless `COPYFILE_DISABLE=1` is set — so the
+documented transfer procedure was followed and *still* produced them.
+`docs/acceptance-run.md` now sets it, and carries a `find … -name '._*' -delete`
+for captures that already have them.
+
+Deleted on 2026-08-31, with all 90 first confirmed AppleDouble by magic bytes
+(`00 05 16 07`) and every one of the 16 capture files sha256'd before and after to
+prove nothing else moved. Re-verified: exit 0, still 70,545,346 frames.
+
+**Two things this settled, both worth keeping.**
+
+The finding cap did its job unprompted. `stray-file` findings carry no session, so
+all 51 shared one `(code, session)` bucket and only 5 printed, followed by *"and 46
+more stray-file"* — which is precisely the burial the cap exists to prevent. The one
+genuinely meaningful warning, a resync snapshot that timed out on day 3, stayed
+visible throughout. After the cleanup it is the only warning left.
+
+And the fix belongs at the source, not in the verifier. Teaching it to ignore a
+shape of filename would have made the noise go away and made the check weaker;
+something unexpected in the immutable tier should get a line of output whatever it
+turns out to be.
+
 ### Still open
 
-- **51 `stray-file` warnings on the transferred capture**, all macOS AppleDouble
-  stubs (`._exchange=binance`, `._symbol=BTCUSDT`, …) created by copying off APFS:
-  90 files, 14.8 KB. Not capture defects, and nothing else is stray — every other
-  file under `raw/` is a `part-*.bin.zst`. They are left in place rather than
-  deleted, because the raw tier is immutable and this is exactly the stray-file
-  check earning its keep. Deleting them is safe whenever it becomes tiresome.
+- Nothing blocking. M2 is next.
 
 ## Conventions
 
