@@ -721,6 +721,20 @@ turns out to be.
 
 ## Conventions
 
+- **Commit often — at every point the tree is green.** (Set 2026-08-31.) Not once
+  per milestone slice. The log is the record of what happened and why, and a slice
+  squashed into one commit throws away the order things were learned in. For M2.a
+  that would have been three commits (the `dump --sample` flag, the parser, the
+  corpus validation) rather than one.
+
+  "Green" is the operative bound: it builds, `cargo test` passes, clippy is clean.
+  A commit that does not build is not a record, it is a hole in `git bisect` — and
+  the existing rule that commits stay **independently shippable** is what makes a
+  gap in the work safe. Small and green satisfies both; small and broken satisfies
+  neither.
+
+  With the PR rule below, this means **many small commits on a branch, one PR per
+  slice**. Fine-grained history for the record, reviewable units for the merge.
 - **Never push to `main`. Raise a pull request.** (Set 2026-08-31.) Branch, push
   the branch, open a PR with `gh pr create`, and let the user merge it. The first
   two merges into `main` went through PRs (#1, #2) and that is now the rule rather
