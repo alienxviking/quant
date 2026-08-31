@@ -1,0 +1,22 @@
+[package]
+name = "quant-book"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Order book reconstruction: apply snapshots and deltas, and hold the invariants.
+#
+# Venue-agnostic on purpose, and it can be, because `quant-core::BookDelta`
+# already carries the venue's update-id *range*. The resync rule is expressed over
+# that range rather than over Binance's field names, so a venue with a single
+# monotonic sequence number sets both ends equal and the same rule holds.
+#
+# Depends only on quant-core. Nothing about files, venues or networks reaches in
+# here, which is what makes the nastiest part -- the stale-delta rule -- an
+# ordinary unit test over hand-built events.
+[dependencies]
+quant-core = { workspace = true }
+
+[lints]
+workspace = true

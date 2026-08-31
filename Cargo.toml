@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/quant-binance",
+    "crates/quant-book",
     "crates/quant-core",
     "crates/quant-meta",
     "crates/quant-recorder",
@@ -22,6 +23,7 @@ repository = "https://github.com/alienxviking/quant"
 # only shows up in production.
 [workspace.dependencies]
 quant-binance = { path = "crates/quant-binance" }
+quant-book = { path = "crates/quant-book" }
 quant-core = { path = "crates/quant-core" }
 quant-meta = { path = "crates/quant-meta" }
 quant-recorder = { path = "crates/quant-recorder" }

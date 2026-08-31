@@ -763,6 +763,7 @@ name = "quant-binance"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "quant-book",
  "quant-core",
  "quant-meta",
  "quant-recorder",
@@ -776,6 +777,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "quant-book"
+version = "0.1.0"
+dependencies = [
+ "quant-core",
 ]
 
 [[package]]

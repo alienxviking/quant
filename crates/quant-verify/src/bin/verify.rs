@@ -97,8 +97,8 @@ fn print_report(report: &Report, root: &std::path::Path, reconciled: bool) {
         t.depth_deltas, t.trades
     );
     println!(
-        "anchoring {} deltas arrived before their episode's snapshot (recorded, but \
-         not reconstructible)",
+        "anchoring {} deltas arrived before their episode's snapshot (superseded \
+         by it, or replayed after it)",
         t.deltas_before_anchor
     );
     println!(

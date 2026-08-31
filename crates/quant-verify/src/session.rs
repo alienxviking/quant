@@ -71,9 +71,17 @@ struct Episode {
     start_seq: u64,
     deltas: u64,
     anchor: Anchor,
-    /// Deltas seen before this episode's first anchor. They are recorded faithfully
-    /// but are not reconstructible into a book, so they are worth counting even
-    /// when the episode is otherwise fine.
+    /// Deltas seen before this episode's first anchor.
+    ///
+    /// Not lost, and an earlier version of this comment said they were. M2's book
+    /// builder showed what actually happens to them: the snapshot arrives *later
+    /// in the stream* than the deltas it supersedes, so a replay buffers them and,
+    /// once anchored, discards the ones the snapshot accounts for and applies the
+    /// rest. Both halves are needed -- dropping them leaves a hole at the start of
+    /// every resync.
+    ///
+    /// Still worth counting: a number that climbs means snapshots are landing late,
+    /// and the buffer that holds these is bounded.
     deltas_before_anchor: u64,
 }
 

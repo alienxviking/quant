@@ -74,5 +74,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # recorders started in the same millisecond must not collide.
 uuid = { version = "1", features = ["v4"] }
 
+# For the `replay` example only: it feeds a recorded capture through a
+# reconstructed book to check the invariants hold. The library itself knows
+# nothing about books -- that stays venue-agnostic in quant-book.
+[dev-dependencies]
+quant-book = { workspace = true }
+
 [lints]
 workspace = true
