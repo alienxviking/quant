@@ -13,9 +13,9 @@ version is named. Read those when they disagree.
 | The milestone table | `README.md` |
 | How the 7-day run is conducted and judged | `docs/acceptance-run.md` |
 
-*State as of 2026-08-12: M0 complete, M1 code-complete awaiting its acceptance run.
-15 commits, 12,147 lines of Rust across 6 crates, 179 tests passing in debug and
-release.*
+*State as of 2026-08-31: **M0 and M1 both complete.** M1's acceptance run was spent in
+full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. 12,147 lines
+of Rust across 6 crates, 179 tests passing in debug and release. **M2 is next.***
 
 ---
 
@@ -217,7 +217,7 @@ use whatever tool fits, with no schema registration.
 | # | Milestone | Done when | Status |
 |---|---|---|---|
 | M0 | Foundation + data contract | CI green; contract written before the recorder | **done** |
-| M1 | Binance market data recorder | 7 days unattended, zero unexplained gaps | **code-complete, run pending** |
+| M1 | Binance market data recorder | 7 days unattended, zero unexplained gaps | **done** |
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | next |
 | M3 | Engine seam + SimulatedVenue + MA crossover | An equity curve exists, **and it is unimpressive** | |
 | M4 | Fee, slippage, latency modelling | Results degrade sensibly under realistic costs | |
@@ -269,7 +269,7 @@ read from the file header.
 
 ---
 
-## 7. M1 — The Binance recorder (code-complete, 2026-08-11)
+## 7. M1 — The Binance recorder (complete; code 2026-08-11, run passed 2026-08-28)
 
 Eight slices, each an independently shippable commit.
 
@@ -649,28 +649,59 @@ the simulation was honest. See §11.
 
 ### Proven
 
-- 179 tests passing in debug and release; clippy and fmt clean; CI green on Linux
-- The recorder records: live Binance capture at ~7× compression, `ingest_seq` contiguous,
-  trailers written, files verify clean
-- Reconnect, resync snapshots, and periodic snapshots all confirmed against the live venue
+- 179 tests passing in debug and release; clippy and fmt clean; CI green on Linux and
+  Apple Silicon
+- **Seven days unattended, and it passed.** See below.
 - Corruption is detected and distinguished from a torn tail (verified by flipping a byte)
 - The metadata index agrees with the files' own trailers, and disagreement is caught
 - The run harness works end to end: supervise, verify mid-capture, self-terminate, seal
 
+### The acceptance run
+
+Two symbols on a fanless M1 MacBook Air, 2026-08-21 → 2026-08-28.
+
+| | |
+|---|---|
+| Frames | 70,545,346 — 11.6M depth deltas, 58.9M trades, 342 snapshots |
+| Volume | ~2.9 GB compressed from ~23.5 GB of raw venue bytes |
+| Messages dropped | **0** — queue peaked at 728 of 4096, never close |
+| Sequence holes | **0** unexplained; `missing 0` |
+| Gap frames | 38, every one explained: 36 `Disconnect` + 2 `RecorderRestart` |
+| Restarts | **0** — one process per symbol, `exited cleanly after 604776s` |
+| Errors | 0. One warning: a resync snapshot that timed out on day 3 |
+| Verdict | `quant-verify` exit 0 |
+
+The single warning is worth dwelling on, because it is the design working. A resync
+snapshot timed out four times on flaky Wi-Fi. Rather than leaving a silence that could
+never be told apart from a build that never fetched snapshots, the recorder wrote a
+`SnapshotFailed` record saying so — and a warning does not fail a run.
+
+The whole capture was then moved off the Mac and **independently re-verified** on
+different hardware: exit 0 again, same frame count, zero errors. Two details from that
+second check were themselves evidence:
+
+- The `no-trailer` warnings the Mac's final in-run check had reported were **gone**. Those
+  files were still open at the time; the clean exit sealed them. That is exactly the
+  distinction the trailer exists to make, observed across a real transition.
+- The far-side frame count came out *higher* than the Mac's last report — 70.5M against
+  68.98M — because that check ran 5.75 hours before the run ended.
+
 ### Not proven
 
-1. **The 7-day run has not been spent.** This is the only remaining M1 criterion.
-2. **The Apple Silicon build is expected, not demonstrated.** CI covers Linux only;
-   adding `macos-latest` is the agreed next step.
-3. **Nothing at all is known about strategy edge.** No strategy exists. That question is
+1. **Nothing at all is known about strategy edge.** No strategy exists. That question is
    not asked until M3, and not answered honestly until M4.
+2. **The slippage model has no validation path at retail size.** Every order at $100 or
+   $500 fills at top of book on a liquid pair, because top-of-book depth is tens of
+   thousands of dollars. So the M4 model stays *modelled and unvalidated* until size
+   grows — which is fine, because at sizes where slippage is unmeasurable it is also
+   economically irrelevant. Worth writing down rather than discovering later.
 
 ### Honest proportion
 
 By milestone count this is two of nine. By risk it is further along than that: the
 irreversible part — the format that all future data is written in — is done, tested, and
-done in the order where mistakes are cheapest. What remains is mostly work where a mistake
-costs a re-run.
+proven over seven days of live capture, in the order where mistakes were cheapest. What
+remains is mostly work where a mistake costs a re-derive.
 
 ---
 

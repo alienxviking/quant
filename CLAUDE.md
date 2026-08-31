@@ -557,16 +557,35 @@ preference:
 - Seven days is the criterion in `docs/data-contract.md` §7. It was spent in full,
   not shortened for convenience.
 
+### Settled since
+
+- **The harness is merged.** `macos-acceptance-harness` landed as PR #1 and the
+  README followed as PR #2; `ops/` now carries a `.sh` beside every `.ps1`.
+- **CI covers Apple Silicon** as of 2026-08-31, as a second job rather than a
+  matrix leg. GitHub's `services:` containers are Linux-only, so a macOS leg could
+  not have the database whatever it were written as — and macOS runners bill at 10x
+  on a private repo, which makes running the whole gate twice a poor trade. So the
+  macOS job proves only what Linux cannot: that the workspace builds and tests pass
+  on `aarch64-apple-darwin`, guarding the C toolchain surface (`zstd-sys` compiles
+  C, `ring` assembles per-architecture). Format, lints and the release run stay on
+  Linux.
+- **The capture is off the Mac and independently re-verified** (2026-08-31): 16
+  segments, 3.0 GB, in `data/acceptance` on the Windows box. `quant-verify` exit 0,
+  70,545,346 frames, `missing 0`, 0 errors. Two details worth noting, because both
+  are the design working rather than luck. The `no-trailer` warnings the Mac's last
+  in-run check reported are **gone** — those files were still open at 06:49 and the
+  clean exit at 12:33 sealed them. And the far-side frame count is *higher* than the
+  Mac's last report (70.5M vs 68.98M) simply because that check ran 5.75 hours
+  before the run ended.
+
 ### Still open
 
-- **CI is `ubuntu-latest` only.** The Apple Silicon build is now a proven fact (this
-  run's binary), not just an expectation — but a `macos-latest` matrix in
-  `.github/workflows/ci.yml` is still worth adding so it stays proven.
-- **The `macos-acceptance-harness` branch is unmerged** at time of writing. The
-  captured data lives outside git (gitignored `/data/`) and transfers off the
-  machine out-of-band — USB or cloud, tarball + `sha256`, verified and re-checked
-  with `quant-verify` on the far side. Procedure in `docs/acceptance-run.md`
-  ("Getting the data off the machine").
+- **51 `stray-file` warnings on the transferred capture**, all macOS AppleDouble
+  stubs (`._exchange=binance`, `._symbol=BTCUSDT`, …) created by copying off APFS:
+  90 files, 14.8 KB. Not capture defects, and nothing else is stray — every other
+  file under `raw/` is a `part-*.bin.zst`. They are left in place rather than
+  deleted, because the raw tier is immutable and this is exactly the stray-file
+  check earning its keep. Deleting them is safe whenever it becomes tiresome.
 
 ## Conventions
 

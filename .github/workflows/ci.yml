@@ -13,13 +13,15 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # The full gate. Everything that is platform-independent is checked here
+  # exactly once, so the second job below can stay small.
   check:
     runs-on: ubuntu-latest
 
     # The metadata tests skip themselves when QUANT_DATABASE_URL is unset, which
     # keeps `cargo test` usable without Docker running locally. That is only
     # acceptable because CI always provides a database -- a test that skips
-    # everywhere is worse than no test.
+    # everywhere is worse than no test. This job is where that promise is kept.
     services:
       postgres:
         image: postgres:16-alpine
@@ -62,3 +64,33 @@ jobs:
         # release catches anything that depends on debug-only behaviour --
         # which is exactly the class of bug that only appears in production.
         run: cargo test --workspace --all-features --release
+
+  # Apple Silicon, because that is where the M1 acceptance run was actually
+  # spent -- so it is a platform this project depends on, not a hypothetical.
+  #
+  # A separate job rather than a matrix entry on `check`, for two reasons.
+  # GitHub's `services:` containers are Linux-only, so a macOS matrix leg could
+  # not have the database however it were written. And macOS runners bill at ten
+  # times the rate of Linux on a private repository, which makes "run everything
+  # twice" a poor trade for coverage that is almost entirely platform-independent.
+  #
+  # So this job proves only what Linux cannot: that the workspace builds and its
+  # tests pass on aarch64-apple-darwin. The parts that would be identical --
+  # formatting, lints, the release-profile run -- are left to `check`.
+  macos:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No QUANT_DATABASE_URL here on purpose: the quant-meta integration tests
+      # skip themselves, and `check` above is where they are guaranteed to run.
+      # What this job is really guarding is the C toolchain surface -- `zstd-sys`
+      # compiles C, and `ring` assembles per-architecture -- which is exactly the
+      # part that a Linux-only CI would let rot.
+      - name: Test
+        run: cargo test --workspace --all-features
