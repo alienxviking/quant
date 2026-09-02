@@ -1,0 +1,31 @@
+[package]
+name = "quant-normalize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The normalized tier: raw venue bytes back out as `MarketEvent`s, in order,
+# across a whole capture session.
+#
+# Like `quant-verify` this sits near the *top* of the graph, because turning
+# bytes into events needs both the container format and a venue adapter. Unlike
+# `quant-verify`, things are meant to depend on it: the Parquet writer at M2.d
+# and the `HistoricalSource`/`ReplaySource` of the engine at M3 are all consumers
+# of the same ordered event stream. That is why the replay is an iterator over
+# events and not a program that checks a book -- the book is one consumer among
+# several, and the one that happens to exist first.
+#
+# It must never depend on `quant-verify`, and `quant-verify` must never depend on
+# it. They answer different questions about the same files: "is this capture
+# complete" and "what did the market do". Wiring them together would make each
+# one's answer contingent on the other's correctness.
+[dependencies]
+quant-core = { workspace = true }
+quant-storage = { workspace = true }
+quant-recorder = { workspace = true }
+quant-binance = { workspace = true }
+quant-book = { workspace = true }
+
+[lints]
+workspace = true
