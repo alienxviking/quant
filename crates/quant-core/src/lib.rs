@@ -29,7 +29,7 @@
 //!                        ▼
 //!                     Engine ─────────►  Strategy
 //!                        │
-//!                        │  OrderRequest ← will be defined here (M3)
+//!                        │  OrderRequest ← defined here
 //!                        ▼
 //!                    RiskLayer  (mandatory chokepoint, M6)
 //!                        │
@@ -43,12 +43,17 @@
 //! property is the reason a backtest is worth anything.
 
 pub mod event;
+pub mod execution;
 pub mod fixed;
 pub mod instrument;
 pub mod time;
 
 pub use event::{
     BookDelta, BookSnapshot, EventMeta, Gap, GapCause, Level, MarketEvent, Side, Trade,
+};
+pub use execution::{
+    ClientOrderId, ExecutionEvent, Fill, OrderKind, OrderRequest, RejectReason, TimeInForce,
+    VenueOrderId,
 };
 pub use fixed::{Notional, ParseFixedError, Px, Qty, SCALE, SCALE_DECIMALS};
 pub use instrument::{
