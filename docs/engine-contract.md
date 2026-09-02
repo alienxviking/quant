@@ -291,6 +291,57 @@ Exact agreement is the target and is achievable, because both sides consume the
 same events with the same `local_recv_ts` and the same `ingest_seq` — see the
 tee below. Any divergence is a bug, not a tolerance.
 
+### Slices, and where this stands
+
+| | Slice | Status |
+|---|---|---|
+| a | `TeeSink`: one ingress, two consumers | **done** |
+| b | `LiveSource`: the venue socket as an `EventSource` | **done** |
+| c | The journal, and a reconciliation that can fail | **done** |
+| d | The `paper` binary: `record()` extracted so it can feed the tee | next |
+| e | Ops harness, rehearsal, and the fortnight | |
+
+**M5 is in progress**, and the criterion is the run. That is the same shape M1
+had: code complete 2026-08-11, acceptance run passed 2026-08-28, seventeen days
+apart and nothing rotted — because the harness was rehearsed and the reasoning
+was written down.
+
+### There is no `PaperVenue`
+
+`CLAUDE.md`'s diagram lists `SimulatedVenue`, `PaperVenue` and `LiveVenue` as
+three implementations. Building M5 established that the middle one does not need
+to exist.
+
+A paper venue fills orders against a reconstructed book at prices the book
+showed. That is exactly and entirely what `SimulatedVenue` does. What separates a
+backtest from paper trading is the **source** and the **durability**, not the
+matching — so the paper wiring is `LiveSource + SimulatedVenue`, and the
+three-venue row is really two: simulated (M3) and live (M8).
+
+Writing a second fill model to satisfy a diagram would have given the project two
+things that must agree forever and no way to notice when they stopped. That is
+the mistake M2.c, M4 and M5.b were each about avoiding, arriving from a fourth
+direction.
+
+### The reconciliation has to be able to fail
+
+The first version of `reconcile` checked that `cash - starting == realized -
+fees` and exited 0. That check is **vacuous**: the recompute derives all three
+from the same fill lines, so the identity holds by construction. It was
+decoration wearing the costume of evidence.
+
+A real check needs two *independent* computations of one quantity. So the engine
+writes `Checkpoint` entries stating what it believes, and the recompute has to
+arrive at the same numbers from the journal alone. Verified against hand-built
+journals: a wrong cash figure fails, a fill acted on but never written down fails
+and is named as such, and a journal with **no** checkpoint exits 2 rather than 0
+— because "nobody disagreed" and "two independent answers matched" are different
+statements, and only one of them is evidence.
+
+That is the same pattern as the venue and the portfolio each totalling fees, and
+`quant-verify` and `quant-normalize` each counting frames. Each time the value is
+not the second number but that a disagreement becomes visible.
+
 ### What paper trading cannot measure
 
 An earlier draft of this file claimed M5 was the instrument for queue position

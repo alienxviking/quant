@@ -74,8 +74,8 @@ crates/
                     no file format, no network.                   [M3b]
   quant-sim/        the simulated counterparty. Every backtest
                     modelling assumption lives here.              [M3c]
-  quant-backtest/   the wiring: a naive strategy, an equity
-                    curve, and the `backtest` binary.             [M3d]
+  quant-backtest/   the wiring: a naive strategy, an equity curve,
+                    and the `backtest` and `reconcile` binaries.  [M3d/M5c]
 docs/
   data-contract.md    the on-disk format and its acceptance criteria
   engine-contract.md  the seam a strategy sees, and why it is shaped
@@ -133,7 +133,7 @@ that latency changes something, and deliberately not which direction.
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day |
 | M3 | Engine seam + SimulatedVenue + MA crossover | Equity curve produced, and it is unimpressive |
 | M4 | Fee, slippage and latency modelling | Results degrade sensibly under realistic costs |
-| M5 | Paper trading | 2 weeks live; P&L reconciles against an independent recompute |
+| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window |
 | M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test |
 | M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute |
 | M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance |
