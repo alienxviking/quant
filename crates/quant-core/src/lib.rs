@@ -56,7 +56,7 @@ pub use execution::{
     ClientOrderId, ExecutionEvent, Fill, OrderKind, OrderRequest, RejectReason, TimeInForce,
     VenueOrderId,
 };
-pub use fixed::{Notional, ParseFixedError, Px, Qty, SCALE, SCALE_DECIMALS};
+pub use fixed::{Notional, ParseFixedError, Px, Qty, Rate, SCALE, SCALE_DECIMALS};
 pub use instrument::{
     Exchange, Instrument, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };

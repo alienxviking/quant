@@ -316,30 +316,21 @@ impl ExecutionVenue for SimulatedVenue {
     }
 }
 
-/// `px * qty`, in quote currency, exactly.
+/// `px * qty`, in quote currency.
 ///
-/// Both operands are scaled by `1e8`, so their product is scaled by `1e16` and
-/// has to come back down. Integer division truncates toward zero, which is the
-/// one rounding this platform does — and it is applied to a *notional*, never to
-/// a price or a size, so no quantity is ever silently altered.
+/// `quant-core`'s arithmetic, not our own: this module had its own 128-bit
+/// `mul_div` and so did `quant-engine`, which is two copies of a money
+/// calculation that must agree with each other forever. `Px::notional` predates
+/// both.
 fn notional(px: Px, qty: Qty) -> Notional {
-    Notional::from_raw(mul_div(px.raw(), qty.raw(), quant_core::SCALE))
+    px.notional(qty)
+        .expect("a notional beyond i64 means the inputs were wrong")
 }
 
 /// The size-weighted average price actually paid.
 fn average_price(cost: Notional, qty: Qty) -> Px {
-    Px::from_raw(mul_div(cost.raw(), quant_core::SCALE, qty.raw()))
-}
-
-/// `a * b / d` in 128-bit, so the intermediate cannot overflow.
-///
-/// A price near `1e5` and a size near `1e5`, both scaled by `1e8`, multiply to
-/// about `1e26` — four orders of magnitude past `i64`. Doing this in `i64` would
-/// wrap silently and produce a plausible-looking wrong number, which is the
-/// worst failure a money calculation has.
-fn mul_div(a: i64, b: i64, d: i64) -> i64 {
-    let wide = i128::from(a) * i128::from(b) / i128::from(d);
-    i64::try_from(wide).expect("a notional beyond i64 means the inputs were wrong")
+    cost.per_unit(qty)
+        .expect("a fill with a non-zero size has a price")
 }
 
 #[cfg(test)]
