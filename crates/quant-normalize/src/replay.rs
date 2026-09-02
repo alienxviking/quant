@@ -388,26 +388,29 @@ fn decode_binance(
     frame: &RawFrame,
     instrument: InstrumentId,
 ) -> Result<Option<MarketEvent>, String> {
-    match frame.kind {
-        FrameKind::VenuePayload => quant_binance::parse_stream_message(
+    // Which parser a frame kind belongs to is `quant-binance::decode`, not a
+    // copy here. It is six lines, and M5's live source needs the identical six:
+    // a snapshot decoded as a delta corrupts a book *silently*, which is why the
+    // frame kind was made explicit at M1.d1 in the first place.
+    let venue = match frame.kind {
+        FrameKind::VenuePayload => Some(quant_binance::VenueBytes::Stream),
+        FrameKind::VenueSnapshot => Some(quant_binance::VenueBytes::Snapshot),
+        FrameKind::Control => None,
+    };
+    match venue {
+        Some(what) => quant_binance::decode(
+            what,
             &frame.payload,
             instrument,
             frame.local_recv_ts,
             frame.ingest_seq,
         )
-        .map_err(|e| e.to_string()),
-        FrameKind::VenueSnapshot => quant_binance::parse_snapshot(
-            &frame.payload,
-            instrument,
-            frame.local_recv_ts,
-            frame.ingest_seq,
-        )
-        .map(|s| Some(MarketEvent::BookSnapshot(s)))
         .map_err(|e| e.to_string()),
         // Control frames carry the recorder's own account of what happened, and
         // a gap among them is what invalidates a book. A replay that filtered
         // them out would reconstruct straight through a period of blindness.
-        FrameKind::Control => frame.control().map_err(|e| e.to_string()).map(|c| {
+        // Venue-agnostic, so `quant-storage` owns it and both readers share it.
+        None => frame.control().map_err(|e| e.to_string()).map(|c| {
             c.and_then(|c| c.into_market_event(instrument, frame.local_recv_ts, frame.ingest_seq))
         }),
     }

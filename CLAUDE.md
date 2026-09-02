@@ -944,6 +944,85 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   its inverses (`Notional::per_unit`, `Notional::scaled_by`) live beside it so the
   set cannot drift. **Before writing arithmetic, grep `quant-core`.**
 
+- **M5 in progress** (from 2026-09-02): paper trading. 349 tests green in debug
+  and release, clippy and fmt clean. The criterion is **the run**, which is
+  deliberately deferred — the same shape M1 had, seventeen days between code
+  complete and the acceptance run passing.
+
+  | | Slice | Status |
+  |---|---|---|
+  | a | `TeeSink`: one ingress, two consumers | **done** |
+  | b | `quant-binance::LiveSource`: the socket as an `EventSource` | **done** |
+  | c | `quant-engine::journal` + the `reconcile` binary | **done** |
+  | d | The `paper` binary: `record()` extracted so it can feed the tee | next |
+  | e | Ops harness, rehearsal, and the fortnight | |
+
+- **M5's criterion was sharpened, and one of my claims was wrong.** "P&L
+  reconciles against an independent recompute" checks arithmetic against itself
+  and would pass on a system whose live and replay paths disagreed about what the
+  market did. It is now: **paper P&L must match a backtest over the data captured
+  during the same window**, exactly rather than within a tolerance. Achievable
+  because the tee gives both paths identical events with identical stamps.
+
+  And at the end of M4 I said M5 was the instrument for measuring queue position
+  and market impact. **Wrong**: a paper venue uses simulated fills, so our orders
+  are still not in the book and nobody is still reacting to them. Both remain
+  unmeasured after M5, and **only M8 can measure them.**
+
+- **There is no `PaperVenue`, and that is a finding.** The architecture diagram
+  lists three venues; the middle one does not need to exist. A paper venue fills
+  against a reconstructed book at prices the book showed, which is exactly what
+  `SimulatedVenue` does — what separates backtest from paper is the **source** and
+  the **durability**, not the matching. So paper is `LiveSource + SimulatedVenue`
+  and the row is really two venues, simulated and live. Writing a second fill
+  model to satisfy a diagram would have created two things that must agree forever
+  with no way to notice when they stopped.
+
+- **M5.a/b decisions.** `Ingress<S>` has been generic over its sink since M1.b, so
+  a `TeeSink` feeds the capture writer *and* the engine with **identical**
+  `local_recv_ts` and `ingest_seq` — no change to the recorder at all. Sameness is
+  not tidiness, it is what makes the agreement criterion checkable: two
+  subscriptions would stamp differently, a file tail would lag by a block.
+
+  The capture is **primary**: market data is irreplaceable, a paper fill is not.
+  A dead engine is **latched**, so a strategy that crashes on day three costs one
+  failed send rather than one per message for eleven days, and recording carries
+  on. The engine is never *told* it missed a record — it finds the hole in
+  `ingest_seq`, the same mechanism `quant-verify` and `quant-normalize` already
+  use. `GapCause::LocalOverflow` there means *this consumer* overflowed, and the
+  capture for the same instant shows no gap: that difference is information.
+
+  A payload that will not parse is also blindness (`SequenceGap`): nothing was
+  dropped, we simply cannot read what arrived, and a message whose effect on the
+  book is unknown is what a gap represents. Loud without killing a fortnight.
+
+  And the six lines mapping a frame kind to a parser now live once, in
+  `quant-binance::decode`, shared by the offline replay and the live source —
+  extracted **before** the second copy existed, which is the M2.d/M4 lesson
+  applied forwards for once.
+
+- **M5.c decisions.** The journal is a **file, not the metadata tier**: M1.c2 made
+  Postgres best-effort and optional, and a position that must survive a restart
+  cannot depend on something optional. Raw's relationship with its index, applied
+  to a second kind of irreplaceable data. JSON Lines against this project's grain,
+  because a journal is hundreds of lines a week rather than millions a day — so
+  density buys nothing and `jq` at 3am buys a lot; only the **last** line may be
+  torn, since nothing writes into the middle of an append-only file.
+  `(exchange, symbol)` and never an id, pinned by a test that replays one journal
+  through two registries with different id assignments. Fills are journalled
+  **before** the strategy is told, so a crash cannot erase a fill it acted on.
+
+- **The vacuous check** (worth remembering). My first `reconcile` asserted
+  `cash - starting == realized - fees` and exited 0. The recompute derives all
+  three from the same fill lines, so that identity holds *by construction* and can
+  never fail — decoration wearing the costume of evidence. A real check needs two
+  **independent** computations, so the engine now writes `Checkpoint` entries
+  claiming what it believes and the recompute must match them from the file alone.
+  Three hand-built journals confirm it goes red: wrong cash exits 1, a fill never
+  written down exits 1 and is named, and *no checkpoint* exits **2** — because
+  "nobody disagreed" is not "two answers matched". **General lesson: before
+  trusting a check, ask what input would make it fail.**
+
 Milestone table: see `README.md`.
 
 ## The acceptance run, and how it went
@@ -1084,7 +1163,11 @@ turns out to be.
 
 ### Still open
 
-- Nothing blocking on M1–M4. **Next is M5** — paper trading: two weeks live, with
+- **M5's fortnight is deferred at the user's request** (2026-09-02), and that is
+  fine: M1 did the same. M5.d/e (the `paper` binary and the ops harness) are the
+  remaining code. **M6 should land before the run**, so one fortnight exercises
+  the risk layer too rather than needing a second long run to test it.
+- Nothing blocking on M1–M4. **M5** — paper trading: two weeks live, with
   P&L reconciling against an independent recompute. It is also the only instrument
   that can measure the two things M4 could not model, because they are not
   recoverable from recorded data at any price: **queue position** (our order was

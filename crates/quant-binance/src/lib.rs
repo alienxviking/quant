@@ -56,6 +56,8 @@
 //! can be fixed by re-deriving rather than by re-recording a week.
 
 pub mod connection;
+pub mod decode;
+pub mod live;
 pub mod parse;
 pub mod rest;
 pub mod sequence;
@@ -85,6 +87,8 @@ pub fn install_crypto_provider() {
 }
 
 pub use connection::{ConnectionPolicy, EndReason};
+pub use decode::{decode, VenueBytes};
+pub use live::{LiveSource, LiveStats};
 pub use parse::{parse_snapshot, parse_stream_message, ParseError};
 pub use rest::{SnapshotClient, SnapshotError, DEPTH_LIMIT, SPOT_REST};
 pub use sequence::{classify, snapshot_last_update_id, SequenceError, StreamMessage};
