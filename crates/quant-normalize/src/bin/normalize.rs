@@ -1,10 +1,16 @@
 //! Replay every capture session under a data root and report the reconstruction.
 //!
 //! ```text
-//! normalize [DATA_ROOT] [--symbol SYM]
-//! normalize data/acceptance
+//! normalize [DATA_ROOT] [--symbol SYM] [--write]
+//! normalize data/acceptance                    # replay and report only
+//! normalize data/acceptance --write            # also write DATA_ROOT/normalized/
 //! normalize data/acceptance --symbol BTCUSDT
 //! ```
+//!
+//! `--write` is a flag and not the default, deliberately. Replaying is a
+//! read-only question about the capture and safe to ask at any time; writing
+//! replaces a tier other things may be reading. The tier is disposable, which
+//! makes re-deriving cheap — not accidental.
 //!
 //! Exit code 0 means every session reconstructed a book that held its invariants
 //! at every tick, which is `docs/data-contract.md` §8's second criterion.
@@ -24,19 +30,21 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use quant_core::instrument::{InstrumentDef, InstrumentKind, InstrumentRegistry};
-use quant_normalize::{replay_session, SessionSummary};
+use quant_normalize::{normalize_session, Dataset, Normalized};
 use quant_recorder::{catalog, format_session_id, SessionFiles};
 
 fn main() -> ExitCode {
     let mut root = None;
     let mut symbol: Option<String> = None;
+    let mut write = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                println!("usage: normalize [DATA_ROOT] [--symbol SYM]");
+                println!("usage: normalize [DATA_ROOT] [--symbol SYM] [--write]");
                 return ExitCode::SUCCESS;
             }
+            "--write" => write = true,
             "--symbol" => {
                 let Some(s) = args.next() else {
                     eprintln!("--symbol needs a value");
@@ -88,18 +96,19 @@ fn main() -> ExitCode {
             lot_size: "0.00000001".parse().expect("a valid literal"),
             min_notional: "0".parse().expect("a valid literal"),
         });
-        let summary = replay_session(files, instrument);
-        if !summary.is_clean() {
+        let out = write.then(|| root.clone());
+        let result = normalize_session(files, instrument, out.as_deref());
+        if !result.summary.is_clean() || result.write_error.is_some() {
             failures += 1;
         }
-        print_session(files, &summary);
+        print_session(files, &result);
     }
 
     println!();
     println!(
         "verdict   {}",
         if failures > 0 {
-            "RECONSTRUCTION FAILED: at least one session did not hold its invariants"
+            "FAILED: a session did not hold its invariants, or its write was abandoned"
         } else if sessions.is_empty() {
             "NOTHING REPLAYED: no capture sessions found under this root"
         } else {
@@ -114,7 +123,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn print_session(files: &SessionFiles, s: &SessionSummary) {
+fn print_session(files: &SessionFiles, result: &Normalized) {
+    let s = &result.summary;
     println!();
     println!(
         "session   {} {} {}",
@@ -167,6 +177,20 @@ fn print_session(files: &SessionFiles, s: &SessionSummary) {
             s.violations,
             s.first_violation.as_deref().unwrap_or("(none recorded)")
         );
+    }
+    if let Some(report) = &result.written {
+        println!(
+            "written   {} rows over {} day partitions ({} trades, {} deltas, {} snapshots, {} gaps)",
+            report.rows(),
+            report.days.len(),
+            report.rows_in(Dataset::Trades),
+            report.rows_in(Dataset::BookDeltas),
+            report.rows_in(Dataset::BookSnapshots),
+            report.rows_in(Dataset::Gaps),
+        );
+    }
+    if let Some(e) = &result.write_error {
+        println!("write     ABANDONED: {e}");
     }
 }
 

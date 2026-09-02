@@ -80,7 +80,8 @@ fn round_trip(name: &str, dataset: Dataset, events: &[MarketEvent]) -> Vec<Marke
     for event in events {
         writer.push(event).expect("push");
     }
-    writer.finish().expect("finish");
+    let (_sink, rows) = writer.finish().expect("finish");
+    assert_eq!(rows, events.len() as u64, "finish reports what it wrote");
     read_dataset(&scratch.path, dataset, instrument()).expect("read")
 }
 

@@ -74,7 +74,13 @@ impl<W: Write + Send> DatasetWriter<W> {
         Ok(())
     }
 
-    /// Number of events written so far, including any still buffered.
+    /// Events handed to the Parquet writer so far.
+    ///
+    /// Excludes whatever is still buffered, which is why [`Self::finish`]
+    /// returns the total rather than leaving a caller to read this afterwards —
+    /// the first version did exactly that and reported zero for every file
+    /// smaller than one batch. Same shape as `RawWriter::finish`, for the same
+    /// reason: a count is only trustworthy once the thing counting has closed.
     #[must_use]
     pub const fn rows(&self) -> u64 {
         self.rows_written
@@ -91,10 +97,11 @@ impl<W: Write + Send> DatasetWriter<W> {
         Ok(())
     }
 
-    /// Flush, close the file, and hand back the sink.
-    pub fn finish(mut self) -> Result<W, TierError> {
+    /// Flush, close the file, and hand back the sink with the final row count.
+    pub fn finish(mut self) -> Result<(W, u64), TierError> {
         self.flush()?;
-        Ok(self.writer.into_inner()?)
+        let rows = self.rows_written;
+        Ok((self.writer.into_inner()?, rows))
     }
 }
 

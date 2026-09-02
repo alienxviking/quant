@@ -16,6 +16,8 @@ use quant_core::time::{Ts, UtcDate};
 use quant_recorder::{catalog, CaptureTarget, SessionFiles};
 use quant_storage::{ControlRecord, FileHeader, RawWriter, WriterOptions};
 
+use quant_core::event::MarketEvent;
+
 use crate::{replay_session, BreakKind, ReplayItem, SessionReplay};
 
 const SESSION: [u8; 16] = [0x5e; 16];
@@ -48,6 +50,12 @@ impl Tree {
     }
 
     /// Write one segment. `frames` is `(ingest_seq, payload)` in order.
+    ///
+    /// Timestamps are milliseconds from the epoch and so deliberately disagree
+    /// with the 2026 dates in the paths. Real captures never diverge like that,
+    /// which is precisely why a fixture should: it means every partition test
+    /// here proves the day comes from the segment rather than from the record's
+    /// own clock. See `a_record_is_filed_where_the_raw_tier_filed_it`.
     fn segment(&self, day: u8, frames: &[Frame]) -> PathBuf {
         let path = Self::target(day).file(&self.root);
         std::fs::create_dir_all(path.parent().expect("a file has a parent")).expect("mkdir");
@@ -56,8 +64,13 @@ impl Tree {
         let mut writer =
             RawWriter::create(file, header, WriterOptions::default()).expect("create writer");
         for frame in frames {
+            if matches!(frame, Frame::Seal) {
+                writer.flush().expect("seal the pending block");
+                continue;
+            }
             let ts = Ts::from_millis(i64::try_from(frame.seq()).expect("small seq"));
             match frame {
+                Frame::Seal => unreachable!("handled above"),
                 Frame::Stream { seq, payload } => writer.write_venue_payload(ts, *seq, payload),
                 Frame::Snapshot { seq, payload } => writer.write_venue_snapshot(ts, *seq, payload),
                 Frame::Gap { seq } => writer.write_control(
@@ -94,15 +107,30 @@ impl Drop for Tree {
 }
 
 enum Frame {
-    Stream { seq: u64, payload: Vec<u8> },
-    Snapshot { seq: u64, payload: Vec<u8> },
-    Gap { seq: u64 },
+    Stream {
+        seq: u64,
+        payload: Vec<u8>,
+    },
+    Snapshot {
+        seq: u64,
+        payload: Vec<u8>,
+    },
+    Gap {
+        seq: u64,
+    },
+    /// Seal the pending block. Not a record — it exists so a test can put a
+    /// block boundary where it wants one, which is what makes a torn *tail*
+    /// distinguishable from a file destroyed entirely. A capture with one small
+    /// block loses everything when its tail is cut; a real one seals a block
+    /// every 256 KiB or every flush tick.
+    Seal,
 }
 
 impl Frame {
     const fn seq(&self) -> u64 {
         match self {
             Self::Stream { seq, .. } | Self::Snapshot { seq, .. } | Self::Gap { seq } => *seq,
+            Self::Seal => 0,
         }
     }
 }
@@ -320,6 +348,10 @@ fn a_torn_tail_is_a_break_and_the_frames_before_it_still_replay() {
         &[
             snapshot(1, 100),
             delta(2, 101, 101, "101.00000000"),
+            // Seal here, so the tear below takes the *second* block. Without a
+            // boundary the file is one block and cutting its tail destroys all
+            // of it, which is a different failure and not the one under test.
+            Frame::Seal,
             delta(3, 102, 102, "102.00000000"),
         ],
     );
@@ -329,6 +361,11 @@ fn a_torn_tail_is_a_break_and_the_frames_before_it_still_replay() {
 
     let summary = replay_session(&tree.only_session(), instrument());
     assert_eq!(summary.replay.breaks, 1);
+    assert_eq!(
+        summary.replay.events, 2,
+        "everything before the tear is intact and must still be replayed"
+    );
+    assert_eq!(summary.book.applied, 1, "and applied to the book");
     assert!(
         summary
             .first_break
@@ -366,4 +403,257 @@ fn the_catalog_finds_both_days_as_one_session() {
     assert_eq!(session.segments[1].target.date.day, 22);
     assert_eq!(session.symbol, SYMBOL);
     let _ = Path::new(".");
+}
+
+// --- The normalized tier, written from a real session ---
+
+#[test]
+fn a_session_is_written_into_one_partition_per_day() {
+    use crate::{normalize_session, Dataset, TierTarget};
+
+    let tree = Tree::new("write-partitions");
+    two_day_session(&tree);
+    let out = tree.root.join("out");
+
+    let result = normalize_session(&tree.only_session(), instrument(), Some(&out));
+    assert!(result.write_error.is_none(), "{:?}", result.write_error);
+    let report = result.written.expect("a write report");
+
+    // Two days in, two date partitions out -- and the deltas land in the day
+    // they were received on, not all in the day the session opened.
+    assert_eq!(report.days.len(), 2);
+    assert_eq!(report.rows_in(Dataset::BookDeltas), 4);
+    assert_eq!(report.rows_in(Dataset::BookSnapshots), 1);
+    assert_eq!(report.rows_in(Dataset::Trades), 0);
+
+    // Every day gets every dataset, empty ones included: an absent file and an
+    // empty file are different claims.
+    for day in &report.days {
+        for dataset in Dataset::ALL {
+            let target = TierTarget {
+                exchange: Exchange::Binance,
+                symbol: SYMBOL.to_owned(),
+                date: day.date,
+                dataset,
+            };
+            assert!(
+                target.file(&out).is_file(),
+                "missing {}",
+                target.file(&out).display()
+            );
+        }
+    }
+}
+
+#[test]
+fn what_was_written_reads_back_as_the_events_that_went_in() {
+    // M2's last criterion in miniature: raw in, Parquet out, same events.
+    use crate::tier::read_dataset;
+    use crate::{normalize_session, Dataset, ReplayItem, SessionReplay, TierTarget};
+
+    let tree = Tree::new("round-trip-session");
+    two_day_session(&tree);
+    let out = tree.root.join("out");
+    let session = tree.only_session();
+
+    let from_raw: Vec<MarketEvent> = SessionReplay::open(&session, instrument())
+        .filter_map(|item| match item {
+            ReplayItem::Event(e) => Some(e),
+            ReplayItem::Break(_) => None,
+        })
+        .collect();
+
+    let result = normalize_session(&session, instrument(), Some(&out));
+    assert!(result.write_error.is_none());
+
+    let mut from_parquet = Vec::new();
+    for day in &result.written.expect("written").days {
+        for dataset in Dataset::ALL {
+            let target = TierTarget {
+                exchange: Exchange::Binance,
+                symbol: SYMBOL.to_owned(),
+                date: day.date,
+                dataset,
+            };
+            from_parquet.extend(
+                read_dataset(&target.file(&out), dataset, instrument()).expect("read back"),
+            );
+        }
+    }
+    // Datasets are separate files, so the stream is reassembled by ingest_seq --
+    // which is exactly what makes it the ordering key.
+    from_parquet.sort_by_key(|e| e.meta().ingest_seq);
+    assert_eq!(from_parquet, from_raw);
+}
+
+#[test]
+fn a_break_abandons_the_partition_rather_than_writing_across_it() {
+    // Raw is the source of truth and this tier is disposable, so the answer to
+    // an unreadable archive is to stop and re-derive -- never to bake a hole
+    // into a file that will look continuous to everyone who reads it later.
+    use crate::normalize_session;
+    use crate::tier::TierTarget;
+
+    let tree = Tree::new("break-abandons");
+    tree.segment(
+        21,
+        &[
+            snapshot(1, 100),
+            delta(2, 101, 101, "101.00000000"),
+            // seq 3 is missing: a hole with no gap record.
+            delta(4, 102, 102, "102.00000000"),
+        ],
+    );
+    let out = tree.root.join("out");
+
+    let result = normalize_session(&tree.only_session(), instrument(), Some(&out));
+    assert!(
+        result
+            .write_error
+            .as_ref()
+            .is_some_and(|e| e.contains("sequence hole")),
+        "{:?}",
+        result.write_error
+    );
+    let target = TierTarget {
+        exchange: Exchange::Binance,
+        symbol: SYMBOL.to_owned(),
+        date: UtcDate {
+            year: 2026,
+            month: 8,
+            day: 21,
+        },
+        dataset: crate::Dataset::BookDeltas,
+    };
+    assert!(
+        !target.file(&out).exists(),
+        "an abandoned partition must leave nothing behind"
+    );
+    assert!(
+        !target.file(&out).with_extension("parquet.tmp").exists(),
+        "including its temporary file"
+    );
+
+    // The reconstruction is still reported: the two answer different questions.
+    assert_eq!(result.summary.replay.breaks, 1);
+}
+
+#[test]
+fn a_torn_tail_on_the_last_segment_still_publishes() {
+    // The ordinary signature of a killed recorder. Everything before the tear is
+    // intact and nothing follows it, so refusing to write would mean no session
+    // that ended by being killed could ever be normalized.
+    use crate::normalize_session;
+    use crate::tier::TierTarget;
+
+    let tree = Tree::new("torn-publishes");
+    let path = tree.segment(
+        21,
+        &[
+            snapshot(1, 100),
+            delta(2, 101, 101, "101.00000000"),
+            Frame::Seal,
+            delta(3, 102, 102, "102.00000000"),
+        ],
+    );
+    let bytes = std::fs::read(&path).expect("read");
+    std::fs::write(&path, &bytes[..bytes.len() - 40]).expect("truncate");
+    let out = tree.root.join("out");
+
+    let result = normalize_session(&tree.only_session(), instrument(), Some(&out));
+    assert!(result.write_error.is_none(), "{:?}", result.write_error);
+    assert_eq!(
+        result.summary.replay.breaks, 1,
+        "the tear is still reported"
+    );
+
+    let target = TierTarget {
+        exchange: Exchange::Binance,
+        symbol: SYMBOL.to_owned(),
+        date: UtcDate {
+            year: 2026,
+            month: 8,
+            day: 21,
+        },
+        dataset: crate::Dataset::BookSnapshots,
+    };
+    assert!(target.file(&out).is_file());
+}
+
+#[test]
+fn re_deriving_replaces_a_partition_rather_than_appending_to_it() {
+    // The tier is disposable, so running twice must leave what running once
+    // does. A writer that appended would double every row on the second run.
+    use crate::{normalize_session, Dataset};
+
+    let tree = Tree::new("re-derive");
+    two_day_session(&tree);
+    let out = tree.root.join("out");
+    let session = tree.only_session();
+
+    let first = normalize_session(&session, instrument(), Some(&out))
+        .written
+        .expect("first");
+    let second = normalize_session(&session, instrument(), Some(&out))
+        .written
+        .expect("second");
+    assert_eq!(first.rows(), second.rows());
+    assert_eq!(
+        second.rows_in(Dataset::BookDeltas),
+        4,
+        "a re-derive replaces, it does not accumulate"
+    );
+}
+
+#[test]
+fn a_record_is_filed_where_the_raw_tier_filed_it() {
+    // The rule this crate inherits rather than reimplements. quant-recorder rolls
+    // on the record's timestamp but never backwards, so a record stamped before
+    // the open segment's day -- after an NTP step -- is written to the open
+    // segment on purpose. Re-deriving the day here would put it somewhere the raw
+    // tier did not, and the two tiers would silently stop lining up.
+    //
+    // The fixture's timestamps are all 1970 while its segments are dated 2026, so
+    // every record in it is that case in the extreme.
+    use crate::{normalize_session, Dataset, TierTarget};
+
+    let tree = Tree::new("filed-where-raw-filed-it");
+    two_day_session(&tree);
+    let out = tree.root.join("out");
+
+    let result = normalize_session(&tree.only_session(), instrument(), Some(&out));
+    let report = result.written.expect("written");
+
+    let days: Vec<UtcDate> = report.days.iter().map(|d| d.date).collect();
+    assert_eq!(
+        days,
+        vec![
+            UtcDate {
+                year: 2026,
+                month: 8,
+                day: 21
+            },
+            UtcDate {
+                year: 2026,
+                month: 8,
+                day: 22
+            },
+        ],
+        "the partitions follow the segments, not the records' own timestamps"
+    );
+    assert!(
+        !TierTarget {
+            exchange: Exchange::Binance,
+            symbol: SYMBOL.to_owned(),
+            date: UtcDate {
+                year: 1970,
+                month: 1,
+                day: 1
+            },
+            dataset: Dataset::BookDeltas,
+        }
+        .file(&out)
+        .exists(),
+        "and never re-derive a day from local_recv_ts"
+    );
 }

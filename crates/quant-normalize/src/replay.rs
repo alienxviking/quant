@@ -51,6 +51,7 @@ use std::path::PathBuf;
 
 use quant_core::event::MarketEvent;
 use quant_core::instrument::{Exchange, InstrumentId};
+use quant_core::time::UtcDate;
 use quant_recorder::{CatalogEntry, SessionFiles};
 use quant_storage::{FrameKind, RawFrame, RawReader, Truncation};
 
@@ -152,6 +153,15 @@ pub struct SessionReplay {
     /// event, in that order, so there has to be somewhere to keep the second.
     pending: VecDeque<ReplayItem>,
     last_seq: Option<u64>,
+    /// The date partition the most recently delivered event was read from.
+    ///
+    /// Exposed because the normalized tier files events under the day the *raw*
+    /// tier filed them under, rather than re-deriving it from `local_recv_ts`.
+    /// Those agree except where the recorder's "never roll backwards" rule
+    /// applies — a record stamped before the open segment's day, after an NTP
+    /// step, is written to the open segment on purpose. Re-deriving would file
+    /// it elsewhere and the two tiers would stop lining up.
+    segment_date: Option<UtcDate>,
     stats: ReplayStats,
     done: bool,
 }
@@ -174,6 +184,7 @@ impl SessionReplay {
             current: None,
             pending: VecDeque::new(),
             last_seq: None,
+            segment_date: None,
             stats: ReplayStats::default(),
             done: false,
         };
@@ -204,6 +215,15 @@ impl SessionReplay {
     #[must_use]
     pub const fn last_seq(&self) -> Option<u64> {
         self.last_seq
+    }
+
+    /// Date partition of the segment the last delivered event came from.
+    ///
+    /// Valid immediately after [`Iterator::next`] returns a
+    /// [`ReplayItem::Event`]; see the field's docs for why a caller wants it.
+    #[must_use]
+    pub const fn segment_date(&self) -> Option<UtcDate> {
+        self.segment_date
     }
 
     /// Record a break and count it.
@@ -242,6 +262,7 @@ impl SessionReplay {
                     );
                 } else {
                     self.stats.segments_read += 1;
+                    self.segment_date = Some(entry.target.date);
                     self.current = Some(Open { path, reader });
                 }
             }

@@ -15,6 +15,7 @@
 //! The two interesting encoding decisions — money as `DECIMAL(18,8)` and the
 //! instrument being absent — are argued in [`schema`].
 
+pub mod partition;
 pub mod read;
 pub mod schema;
 pub mod write;
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 use quant_core::instrument::Exchange;
 use quant_core::time::UtcDate;
 
+pub use partition::{DayReport, PartitionWriter, WriteReport};
 pub use read::read_dataset;
 pub use schema::{Dataset, MAX_MONEY_RAW, MONEY_PRECISION, MONEY_SCALE};
 pub use write::{dataset_of, DatasetWriter, BATCH_ROWS};
