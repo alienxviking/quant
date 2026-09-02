@@ -71,6 +71,8 @@ crates/
                     tier written and read back. `normalize` bin.  [M2c/d]
 docs/
   data-contract.md    the on-disk format and its acceptance criteria
+  engine-contract.md  the seam a strategy sees, and why it is shaped
+                      that way. Written before the engine exists.
   acceptance-run.md   how the 7-day M1 run is conducted and judged
 ops/
   preflight.ps1     refuse to waste a week: clock, disk, build, clean root

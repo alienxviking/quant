@@ -1,0 +1,21 @@
+[package]
+name = "quant-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The seam: the loop that turns market events into strategy calls and strategy
+# calls into orders. `docs/engine-contract.md` is the argument; this is the code.
+#
+# Deliberately knows no venue, no file format and no network. It depends on the
+# vocabulary (`quant-core`) and on book reconstruction (`quant-book`) and on
+# nothing else, which is what lets the identical engine run a backtest, a paper
+# session and production. A dependency here on Parquet or on Binance would mean
+# the three worlds were not actually the same code.
+[dependencies]
+quant-core = { workspace = true }
+quant-book = { workspace = true }
+
+[lints]
+workspace = true

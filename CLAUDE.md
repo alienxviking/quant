@@ -1,8 +1,9 @@
 # CLAUDE.md
 
-Context for any Claude session working in this repo. Read `README.md` and
-`docs/data-contract.md` too — this file is the working agreement; those are
-the design.
+Context for any Claude session working in this repo. Read `README.md`,
+`docs/data-contract.md` and `docs/engine-contract.md` too — this file is the
+working agreement; those are the design. The data contract governs data at rest;
+the engine contract governs the seam a strategy sees.
 
 ## What this is
 
