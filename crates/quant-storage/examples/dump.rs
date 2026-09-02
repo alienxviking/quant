@@ -130,7 +130,7 @@ fn dump(path: &str, sample: usize) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(explained
         && reader
             .truncation()
-            .map_or(true, |t| !t.reason.is_corruption()))
+            .is_none_or(|t| !t.reason.is_corruption()))
 }
 
 /// What one pass over the frames saw.

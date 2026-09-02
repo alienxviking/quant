@@ -57,7 +57,7 @@ fn main() -> ExitCode {
     let sessions: Vec<SessionFiles> = found
         .sessions
         .into_iter()
-        .filter(|s| symbol.as_ref().map_or(true, |want| &s.symbol == want))
+        .filter(|s| symbol.as_ref().is_none_or(|want| &s.symbol == want))
         .collect();
 
     println!("root      {}", root.display());

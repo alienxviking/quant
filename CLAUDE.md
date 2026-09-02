@@ -819,4 +819,12 @@ turns out to be.
   switching dependencies, and keep the target dir inside the repo — one under
   `AppData\Local\Temp` was blocked far more aggressively. SAC cannot be
   re-enabled without a Windows reinstall, so this should not recur.
-- Rust 1.97, edition 2021, stable channel (pinned in `rust-toolchain.toml`).
+- Rust edition 2021 on the **stable channel**, pinned by `rust-toolchain.toml`
+  (the channel is pinned, not a version — whatever stable is when you build).
+- **`rust-version` is the floor our dependencies impose, not an aspiration.**
+  (Set 2026-09-02, 1.75 → 1.85.) Cargo's MSRV-aware resolver honours it when
+  choosing versions, so a stale one is not free: at 1.75 it silently held us to
+  `parquet` 54 from early 2025 while 59 was current — for a promise nothing tests,
+  since CI runs `stable`. Raise it when a dependency we want requires it. Bumping
+  it also un-blocks `clippy::incompatible_msrv`, which had been rejecting std APIs
+  stabilised years ago (`Option::is_none_or`, 1.82).
