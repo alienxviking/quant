@@ -467,16 +467,25 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   one as the verifier's false positives: a number that looks broken *is* broken,
   whatever its derivation says.
 
-- **M2 in progress** (from 2026-08-31): the normalizer and book reconstruction.
-  214 tests green in debug and release, clippy and fmt clean. Criterion: **book
-  invariants hold at every tick of a replayed day**.
+- **M2 complete** (2026-08-31 → 2026-09-02): the normalizer and book reconstruction.
+  237 tests green in debug and release, clippy and fmt clean. Criterion — **book
+  invariants hold at every tick of a replayed day** — met, along with all four
+  checkboxes in `docs/data-contract.md` §8.
 
   | | Slice | Status |
   |---|---|---|
   | a | `quant-binance::parse`: payloads → `MarketEvent`, full fixed-point | **done** |
   | b | `quant-book`: apply, invariants, gap invalidation, resync | **done** |
   | c | `quant-normalize`: join a session's segments, replay, report | **done** |
-  | d | Parquet output: the normalized tier on disk | next |
+  | d | Parquet output: the normalized tier on disk | **done** |
+
+  **The numbers on the acceptance capture**, both symbols, both weeks: 8 segments
+  joined per session, 70,545,346 frames read, **0** deltas dropped for want of an
+  anchor, 0 chain breaks, 0 archive breaks, invariants holding at all 70.5M ticks.
+  2.1 GB of Parquet written from 3.0 GB of raw in 2m27s, and **70,545,345 events
+  replayed from Parquet match the raw replay event for event** (4m03s). The one
+  frame difference is the day-3 `SnapshotFailed` control record, which is
+  correctly not a market event.
 
   **The scoping call, made first.** The milestone reads "normalizer *and* book
   reconstruction", but those are two artifacts. The normalized tier holds
@@ -625,6 +634,81 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   one nobody maintains is the one that quietly stops agreeing. `parse_all` stays: it
   holds no book logic, so there is nothing for it to drift against.
 
+- **M2.d decisions** (`crates/quant-normalize/src/tier/`, 2026-09-02). Four that
+  are hard to undo once a week of data is written in them.
+
+  **Money on disk is `DECIMAL(18,8)`, not `INT64`.** Identical bytes — Parquet backs
+  a decimal of precision ≤ 18 with an `INT64`, which a test asserts rather than
+  trusting — but the decimal carries **the scale in the schema**. Invariant 1 says
+  money never goes through `f64`, and until now that held only inside our own
+  process; a bare `INT64` makes every reader responsible for knowing the `1e8`
+  convention out of band, and the first that reads it as a double loses precision
+  silently on large notionals. `Decimal64` not `Decimal128`: same on disk, `i64` in
+  memory. The bound is **enforced, not assumed** — precision 18 holds values below
+  `10^10` where `i64` holds nine times that, so a value past it is a loud error on
+  write, per invariant 5. Both sides of the bound are tested. Timestamps are
+  `TIMESTAMP(NANOS, UTC)` on the same argument; this is the first time nanosecond
+  `Ts` leaves raw, which does not contradict `quant-meta`'s microseconds because
+  Postgres holds an *index* and this holds a re-derivation. The **instrument is not
+  a column** (M0: a registry index is never persisted) — identity comes from the
+  partition path.
+
+  **Levels are `LIST<STRUCT<px, qty>>`, one row per event.** Exploding to one row
+  per level compresses better and scans faster and destroys one-row-per-event;
+  since the criterion is that events round-trip exactly, the encoding that
+  preserves the event is the one that can be checked.
+
+  **A file names the session it came from**, in the Parquet footer, and the writer
+  **refuses a partition another session owns**. Found by writing the real capture:
+  the layout has no session dimension (correctly — the tier is about the market),
+  but a recorder restart makes a new session and two can cover one symbol-day, so
+  publishing the second over the first would lose a day and leave a file that looks
+  complete. Merging them — ordered by `local_recv_ts`, since `ingest_seq` is
+  session-scoped and cannot order across sessions — is the eventual answer and is
+  **not implemented**; refusing is what makes deferring it safe rather than lossy.
+  A file whose origin cannot be established is also left alone: *cannot tell is not
+  permission.* Partitions are **published by rename** (`.tmp` sibling, moved once
+  the footer lands), so a reader never finds a truncated file at a real path.
+
+  **A `Break` abandons the day in progress rather than writing across it.** The book
+  survives a discontinuity by clearing; a file cannot, because a partition written
+  across one looks continuous forever after and nothing in Parquet can say
+  otherwise. Raw is the source of truth and this tier is disposable, so the answer
+  is to stop and re-derive. One exception: a torn tail on the **last** segment, the
+  ordinary signature of a killed recorder — the same distinction `quant-verify`
+  draws between a missing trailer on the final segment and one anywhere else.
+
+- **The mistake M2.d's tests caught, and it is the interesting one**: my first
+  partition writer **re-derived** the day from `local_recv_ts` with a never-backwards
+  clamp — reimplementing M1.c1's rolling rule. Close enough to look right, and wrong
+  in exactly the case that rule exists for: a record stamped before the open
+  segment's day (an NTP step) is written to the open segment on purpose and counted
+  as `backdated_records`. A re-derivation files it somewhere raw did not, and the two
+  tiers stop lining up — taking with them the only cheap cross-check between them.
+  **The day is now inherited**: `SessionReplay` exposes the segment's date and the
+  writer is told where to file. General lesson: when another component has already
+  decided something, *ask it* rather than reimplementing the decision, however short
+  the reimplementation looks.
+
+- **Two smaller bugs the tests found in M2.d**: `DatasetWriter::rows()` was read
+  *before* `finish()` flushed the last batch, so every file under one batch
+  reported zero (fixed by returning the count from `finish`, the shape
+  `RawWriter::finish` already uses — *a count is only trustworthy once the thing
+  counting has closed*). And the reader indexed columns by **position**, got `gaps`
+  off by one, and reported a type error about a perfectly good file; it now looks
+  columns up **by name**, because positional access is a second silent copy of the
+  field order that only the reader knows.
+
+- **`normalize --check` is the criterion, and it is event by event.** Two
+  reconstructions can produce identical book statistics from different events — a
+  transposed pair of timestamps, a level moved from one delta to the next, an
+  aggressor flipped on a trade later cancelled out — so a summary comparison would
+  pass all of them. `TierReplay` is a **lazy iterator**, not a comparison routine,
+  because that is the shape M3's `HistoricalSource` needs; the check is its first
+  consumer, not its purpose. A day is a four-way merge on `ingest_seq` across the
+  four dataset files, which is what makes `ingest_seq` the ordering key rather than
+  an incidental column.
+
 - **Book depth reaches 11k–34k levels** against the 5000-a-side snapshot window.
   Expected: deltas keep inserting levels outside the window and nothing removes
   them. The touch stays correct, which is what anything trading reads. Documented
@@ -771,7 +855,12 @@ turns out to be.
 
 ### Still open
 
-- Nothing blocking on M1. M2 is under way; see the M2 entries above.
+- Nothing blocking on M1 or M2. **Next is M3** — the engine seam, `SimulatedVenue`,
+  and a deliberately unimpressive moving-average crossover.
+- **Two sessions covering one symbol-day are refused, not merged** (M2.d). Cannot
+  happen on the acceptance capture, where each symbol ran one session for the whole
+  week; it will the first time a recorder restarts mid-day. The merge is ordered by
+  `local_recv_ts`, since `ingest_seq` cannot order across sessions.
 - Minor: CI annotates `Node.js 20 is deprecated` for `actions/checkout@v4` on both
   jobs. Harmless; fixed by bumping to `@v5` whenever CI is next touched.
 
