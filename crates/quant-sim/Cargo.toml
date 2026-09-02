@@ -1,0 +1,21 @@
+[package]
+name = "quant-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The simulated counterparty: what a backtest fills against.
+#
+# Separate from `quant-engine` so the engine stays what it claims to be -- a loop
+# and four traits, with no opinion about how an order becomes a fill. This crate
+# is where every modelling assumption lives, which also makes it the obvious home
+# for M4's fees, slippage and latency: they belong beside the fill model they
+# make less optimistic, not scattered through the engine.
+[dependencies]
+quant-core = { workspace = true }
+quant-book = { workspace = true }
+quant-engine = { workspace = true }
+
+[lints]
+workspace = true

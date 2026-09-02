@@ -43,7 +43,8 @@ use quant_recorder::SessionFiles;
 
 pub use replay::{Break, BreakKind, ReplayItem, ReplayStats, SessionReplay};
 pub use tier::{
-    Dataset, DatasetWriter, PartitionWriter, TierError, TierReplay, TierTarget, WriteReport,
+    discover_days, Dataset, DatasetWriter, HistoricalSource, PartitionWriter, TierError,
+    TierReplay, TierTarget, WriteReport,
 };
 
 /// What a replayed session did, and whether it can be trusted.

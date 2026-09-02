@@ -1,0 +1,21 @@
+[package]
+name = "quant-backtest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Wiring: a historical source, a simulated venue, a strategy, and a report.
+#
+# The top of the graph, like `quant-verify` -- it is the only crate that knows
+# both where events come from and what fills them, because that pairing is what
+# a backtest *is*. Nothing may depend on it.
+[dependencies]
+quant-core = { workspace = true }
+quant-book = { workspace = true }
+quant-engine = { workspace = true }
+quant-normalize = { workspace = true }
+quant-sim = { workspace = true }
+
+[lints]
+workspace = true

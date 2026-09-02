@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/quant-backtest",
     "crates/quant-binance",
     "crates/quant-book",
     "crates/quant-core",
@@ -8,6 +9,7 @@ members = [
     "crates/quant-meta",
     "crates/quant-normalize",
     "crates/quant-recorder",
+    "crates/quant-sim",
     "crates/quant-storage",
     "crates/quant-verify",
 ]
@@ -30,6 +32,7 @@ repository = "https://github.com/alienxviking/quant"
 # crates that both parse exchange payloads is exactly the kind of bug that
 # only shows up in production.
 [workspace.dependencies]
+quant-backtest = { path = "crates/quant-backtest" }
 quant-binance = { path = "crates/quant-binance" }
 quant-book = { path = "crates/quant-book" }
 quant-core = { path = "crates/quant-core" }
@@ -37,6 +40,7 @@ quant-engine = { path = "crates/quant-engine" }
 quant-meta = { path = "crates/quant-meta" }
 quant-normalize = { path = "crates/quant-normalize" }
 quant-recorder = { path = "crates/quant-recorder" }
+quant-sim = { path = "crates/quant-sim" }
 quant-storage = { path = "crates/quant-storage" }
 quant-verify = { path = "crates/quant-verify" }
 serde = { version = "1", features = ["derive"] }

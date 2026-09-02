@@ -64,7 +64,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use quant_core::event::{BookDelta, BookSnapshot, Level, MarketEvent};
+use quant_core::event::{BookDelta, BookSnapshot, Level, MarketEvent, Side};
 use quant_core::fixed::{Px, Qty};
 
 /// How many deltas may wait for a snapshot.
@@ -432,6 +432,42 @@ impl Book {
     #[must_use]
     pub fn depth(&self) -> (usize, usize) {
         (self.bids.len(), self.asks.len())
+    }
+
+    /// Bids from the best downward.
+    ///
+    /// "From the best" in both directions, rather than exposing the maps' own
+    /// ascending order, because every consumer that walks a book walks *away
+    /// from the touch* — a simulator filling an order, a strategy measuring
+    /// depth. Handing out ascending bids would make each of them remember to
+    /// reverse, and the one that forgets fills at the worst price in the book
+    /// and calls it a touch.
+    #[must_use]
+    pub fn bids(&self) -> impl DoubleEndedIterator<Item = Level> + '_ {
+        self.bids
+            .iter()
+            .rev()
+            .map(|(px, qty)| Level::new(*px, *qty))
+    }
+
+    /// Asks from the best upward.
+    #[must_use]
+    pub fn asks(&self) -> impl DoubleEndedIterator<Item = Level> + '_ {
+        self.asks.iter().map(|(px, qty)| Level::new(*px, *qty))
+    }
+
+    /// Levels on one side, from the best outward.
+    ///
+    /// `Side::Buy` gives the **asks**: the side a buyer consumes. Named for what
+    /// the caller is doing rather than for which half of the book it is, because
+    /// "a buy order eats the ask side" is exactly the inversion that gets written
+    /// backwards at a call site.
+    #[must_use]
+    pub fn takeable(&self, side: Side) -> Box<dyn Iterator<Item = Level> + '_> {
+        match side {
+            Side::Buy => Box::new(self.asks()),
+            Side::Sell => Box::new(self.bids()),
+        }
     }
 
     #[must_use]
@@ -890,5 +926,46 @@ mod tests {
         ));
         assert_eq!(book.depth(), (4, 2));
         assert_eq!(book.stats().max_depth, 4);
+    }
+    #[test]
+    fn both_sides_iterate_from_the_touch_outward() {
+        // The property the accessors exist for. Handing out the maps' own
+        // ascending order would make every caller remember to reverse one side,
+        // and the one that forgets fills at the worst price in the book and
+        // calls it a touch.
+        let mut book = Book::new();
+        book.apply_snapshot(&BookSnapshot {
+            meta: meta(),
+            last_update_id: 10,
+            bids: vec![level("100.0", "1"), level("99.0", "2"), level("98.0", "3")],
+            asks: vec![
+                level("101.0", "1"),
+                level("102.0", "2"),
+                level("103.0", "3"),
+            ],
+        });
+
+        let bids: Vec<Px> = book.bids().map(|l| l.px).collect();
+        let asks: Vec<Px> = book.asks().map(|l| l.px).collect();
+        assert_eq!(bids[0], book.best_bid().expect("bid").px);
+        assert_eq!(asks[0], book.best_ask().expect("ask").px);
+        assert!(bids[0] > bids[2], "bids descend from the best");
+        assert!(asks[0] < asks[2], "asks ascend from the best");
+    }
+
+    #[test]
+    fn a_buyer_takes_the_ask_side() {
+        // Named for what the caller is doing, because "a buy eats the asks" is
+        // exactly the inversion that gets written backwards at a call site.
+        let mut book = Book::new();
+        book.apply_snapshot(&snapshot(10));
+        assert_eq!(
+            book.takeable(Side::Buy).next().expect("a level").px,
+            book.best_ask().expect("ask").px
+        );
+        assert_eq!(
+            book.takeable(Side::Sell).next().expect("a level").px,
+            book.best_bid().expect("bid").px
+        );
     }
 }

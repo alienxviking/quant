@@ -15,12 +15,14 @@
 use quant_book::Book;
 use quant_core::event::MarketEvent;
 use quant_core::execution::{ClientOrderId, ExecutionEvent, OrderRequest};
+use quant_core::fixed::{Notional, Px};
 use quant_core::instrument::InstrumentId;
 use quant_core::time::Ts;
 
+use crate::portfolio::{Portfolio, Position};
 use crate::risk::RiskLayer;
 use crate::venue::ExecutionVenue;
-use crate::{refuse, seam_check, EngineStats};
+use crate::{seam_check, Ledger};
 
 /// Everything a strategy can reach.
 ///
@@ -32,9 +34,8 @@ pub struct Context<'a> {
     now: Ts,
     venue: &'a mut dyn ExecutionVenue,
     risk: &'a mut dyn RiskLayer,
-    next_id: &'a mut u64,
-    deferred: &'a mut Vec<ExecutionEvent>,
-    stats: &'a mut EngineStats,
+    ledger: &'a mut Ledger,
+    portfolio: &'a Portfolio,
 }
 
 impl core::fmt::Debug for Context<'_> {
@@ -55,19 +56,43 @@ impl<'a> Context<'a> {
         now: Ts,
         venue: &'a mut dyn ExecutionVenue,
         risk: &'a mut dyn RiskLayer,
-        next_id: &'a mut u64,
-        deferred: &'a mut Vec<ExecutionEvent>,
-        stats: &'a mut EngineStats,
+        ledger: &'a mut Ledger,
+        portfolio: &'a Portfolio,
     ) -> Self {
         Self {
             books,
             now,
             venue,
             risk,
-            next_id,
-            deferred,
-            stats,
+            ledger,
+            portfolio,
         }
+    }
+
+    /// What we hold in an instrument, and what it cost.
+    ///
+    /// Maintained by the engine rather than by the strategy, for the reason the
+    /// book is: every strategy would otherwise derive it, and they would derive
+    /// it differently.
+    #[must_use]
+    pub fn position(&self, instrument: InstrumentId) -> Position {
+        self.portfolio.position(instrument)
+    }
+
+    /// Uncommitted cash.
+    #[must_use]
+    pub const fn cash(&self) -> Notional {
+        self.portfolio.cash()
+    }
+
+    /// Cash plus the position marked at `mark`.
+    ///
+    /// `None` when there is a position and no price to mark it at — after a gap,
+    /// there is no honest number, and a stale one would smooth over exactly the
+    /// periods worth looking at.
+    #[must_use]
+    pub fn equity(&self, instrument: InstrumentId, mark: Option<Px>) -> Option<Notional> {
+        self.portfolio.equity(instrument, mark)
     }
 
     /// The engine clock: the `local_recv_ts` of the event being handled.
@@ -98,21 +123,24 @@ impl<'a> Context<'a> {
     /// here. A caller that got refusals synchronously and fills asynchronously
     /// would have two code paths for one question.
     pub fn submit(&mut self, request: OrderRequest) -> ClientOrderId {
-        let client_order_id = ClientOrderId(*self.next_id);
-        *self.next_id += 1;
+        let client_order_id = self.ledger.mint();
 
         if let Some(reason) = seam_check(&request) {
-            refuse(self.deferred, self.stats, client_order_id, reason, self.now);
+            self.ledger.refuse(client_order_id, reason, self.now);
             return client_order_id;
         }
         if let Some(reason) = self.risk.check(&request, self.now) {
             // Refused here, so the venue never hears about it at all. That is
             // the chokepoint being a chokepoint.
-            refuse(self.deferred, self.stats, client_order_id, reason, self.now);
+            self.ledger.refuse(client_order_id, reason, self.now);
             return client_order_id;
         }
 
-        self.stats.submitted += 1;
+        self.ledger.stats.submitted += 1;
+        // Remembered so the fill can be booked: a fill names only the order.
+        self.ledger
+            .orders
+            .insert(client_order_id, (request.instrument, request.side));
         self.venue.submit(client_order_id, &request, self.now);
         client_order_id
     }
@@ -123,7 +151,7 @@ impl<'a> Context<'a> {
     /// it worked arrives as a `Cancelled` — or does not, because the order
     /// filled first.
     pub fn cancel(&mut self, client_order_id: ClientOrderId) {
-        self.stats.cancels += 1;
+        self.ledger.stats.cancels += 1;
         self.venue.cancel(client_order_id, self.now);
     }
 }

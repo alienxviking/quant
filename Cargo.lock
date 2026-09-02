@@ -1048,6 +1048,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "quant-backtest"
+version = "0.1.0"
+dependencies = [
+ "quant-book",
+ "quant-core",
+ "quant-engine",
+ "quant-normalize",
+ "quant-sim",
+]
+
+[[package]]
 name = "quant-binance"
 version = "0.1.0"
 dependencies = [
@@ -1126,6 +1137,15 @@ version = "0.1.0"
 dependencies = [
  "quant-core",
  "quant-storage",
+]
+
+[[package]]
+name = "quant-sim"
+version = "0.1.0"
+dependencies = [
+ "quant-book",
+ "quant-core",
+ "quant-engine",
 ]
 
 [[package]]

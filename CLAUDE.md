@@ -716,6 +716,133 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   in `quant-book`'s crate docs as an accepted limitation — the venue cannot tell us
   more than 5000 levels.
 
+- **M3 complete** (2026-09-02): the engine seam, the simulated venue, and a
+  deliberately naive strategy. 301 tests green in debug and release, clippy and fmt
+  clean. Criterion — **an equity curve is produced, and it is unimpressive** — met:
+  BTCUSDT $100 → **$97.53** over the acceptance week (−2.47%, 4.40 max drawdown,
+  209 round trips) with **no fees modelled at all**; ETHUSDT $100 → $99.18. All six
+  of `docs/engine-contract.md` §7's criteria are ticked.
+
+  | | Slice | Status |
+  |---|---|---|
+  | a | `quant-core::execution`: orders, fills, execution events | **done** |
+  | b | `quant-engine`: the loop, `Strategy`, `RiskLayer`, `ExecutionVenue` | **done** |
+  | c | `quant-sim`: the simulated venue and its fill model | **done** |
+  | d | `quant-backtest`: portfolio, equity curve, MA crossover, `backtest` bin | **done** |
+
+- **The engine contract was written before the engine** (`docs/engine-contract.md`),
+  for the reason M0 wrote the data contract before the recorder: the seam is the
+  expensive thing to change once anything depends on it.
+
+  **Submission is fire-and-forget**, and this is the decision everything else
+  follows from. `submit(order) -> Result<Fill>` is the obvious API and the most
+  damaging thing that could have gone in that document: a live venue cannot answer
+  without a round trip, so a synchronous return either blocks the engine or lies —
+  while a *simulated* venue answers instantly, handing a strategy the outcome of its
+  own order at the moment of placing it, **in backtest only**. Tuned on that, a
+  strategy is tuned on a machine that does not exist. So outcomes come back as
+  `ExecutionEvent`s into the same loop as market data, and the cost — a strategy must
+  track its own outstanding orders — is charged identically in all three worlds,
+  because production charges it anyway.
+
+  **Two identifiers.** `ClientOrderId` is ours and exists before the request leaves;
+  `VenueOrderId` is the venue's and may never exist, because a rejected request was
+  never an order for the venue to name. With only the venue's, a rejection could not
+  be correlated with the submission that caused it. `VenueOrderId` is a `String`
+  because it is the venue's namespace: normalising it into a number we invented would
+  destroy its one property, that pasting it into the venue's interface finds the order.
+
+- **M3.b decisions** (`crates/quant-engine/`). **The step order inside one event is
+  the part most able to lie**, so it is in the module docs and pinned by a test. For
+  an event at `T`: the clock advances, the book updates, **the venue matches resting
+  orders**, the strategy is told what happened to its orders, and *only then* does the
+  strategy see the event. Step 5 after step 3 is the whole point — an order submitted
+  on seeing a print is not eligible to match against that print. Reversing two lines
+  lets a strategy trade on information at the instant it is created, which is invisible
+  in the output and inflates every result.
+
+  **The test for it was verified against a deliberately inverted loop**, where it fails
+  with the fill landing at the timestamp of the event that prompted it. *A green test
+  that cannot go red is worth nothing* — worth doing again for any property this load-
+  bearing.
+
+  **The clock is the event stream**, in all three worlds. No system call on this path,
+  which makes a backtest deterministic and is still correct live. Invariant 4 arriving
+  where it was going.
+
+  **`Context` is the entire surface a strategy has**: a read-only book, the clock,
+  submit/cancel, and its own position. No venue, no source, no wall clock — so there is
+  no accessor that could reveal the wiring, and a test runs the *same strategy value*
+  against a filling venue and an accept-only one and compares state. The absence of a
+  venue reference is also what makes risk a chokepoint rather than a module the strategy
+  politely calls: a test with a refuse-everything layer asserts the venue was never
+  **told**, not merely that it declined.
+
+  **`EventSource` lives in `quant-core`**, so crates that provide events need not depend
+  on the engine, and returns `Option<Result<..>>`: the simpler signature has one failure
+  mode and it is the worst available — a source that hits an unreadable file returns
+  `None`, the engine sees a clean end of stream, and the backtest silently covers less
+  data than it claims to.
+
+- **M3.c decisions** (`crates/quant-sim/`). Separate crate so the engine stays a loop
+  and four traits with no opinion about how an order becomes a fill; it is also where
+  M4's cost models belong, beside the fill model they make less optimistic.
+
+  **A market order walks the book** and pays the size-weighted average. Filling a whole
+  order at the touch makes size free, and a strategy tuned on that learns to trade sizes
+  that do not exist. At our capital an order will almost never leave the first level —
+  a fact about our size, not a licence to skip the walk. (2 of 418 fills walked, in the
+  real run.)
+
+  **A resting limit fills only when the market trades *through* it** — strictly past the
+  limit. The usual shortcut fills as soon as the best ask touches the limit, which
+  silently assumes we were at the front of the queue at our own price; for a retail order
+  arriving last that is close to the least likely outcome. This understates fills, and
+  **understating is the safe direction**: a backtest that misses trades is disappointing,
+  one that invents them is dangerous.
+
+  **Fills happen only in `observe`, never in `submit`.** The engine's step order can only
+  hold if the venue does not fill early — this is the other half of that guarantee.
+
+  **`SimStats::caveats()` is a method, not a comment**, because the contract requires the
+  absence of fees, latency, queue position and market impact to be in the *output*. The
+  `backtest` binary prints it every run, not behind a flag.
+
+- **M3.d decisions.** The **portfolio lives in `quant-engine`**, not the simulator: a
+  live venue's fill report needs booking exactly as a simulated one does. Average cost
+  rather than FIFO (path-independent, cannot be gamed by lot choice). **Realized is money
+  that has moved; unrealized is an opinion about a price — and it goes away when the book
+  does.** `equity()` returns `None` when there is a position and no mark, because an
+  equity curve that interpolated through gaps would smooth over exactly the periods worth
+  looking at. Fees are inside cash *and* totalled separately, which is what makes
+  "profitable before costs and not after" visible rather than inferred — that sentence is
+  the whole of M4.
+
+  **`Recorded<S>` wraps any strategy** to sample equity: a decorator, not an engine
+  feature. The engine has no business knowing what a report is, and a trade log or a risk
+  observer would be another wrapper rather than another engine field.
+
+  **A missing sample is kept as a hole**, and written to CSV as an empty field — not a
+  zero (which looks like a wiped-out account) and not a carried value. Skipping would
+  leave a gap a plotting tool draws a straight line across.
+
+- **The property that composed itself** (worth remembering): 19 gaps in the run produced
+  **zero** orders refused for want of a market, and `MaCrossover` contains no mention of
+  gaps at all. A gap clears the book → there is no mid → no sample is taken → the
+  indicator does not advance → no crossing can fire. Three independent decisions (M2.b's
+  "cleared, not flagged"; sampling on a clock rather than per event; taking the mid from
+  the book) compose into "do not trade across a gap" with nobody enforcing it. **This is
+  the kind of property a later refactor removes by accident**, which is why it has a test
+  and a paragraph.
+
+- **Every number in the first run cross-checked**, which is what made the result
+  believable rather than merely disappointing: 10,080 samples is exactly 7 days of
+  minutes; 9,810 with a mid + 270 blind = 10,080; 418 crossings → 418 orders → 418 fills
+  as 209 entries + 209 exits (so it never got stuck holding); realized P&L equals the cash
+  change exactly and final equity equals cash because it ended flat. Two invocations are
+  byte-identical. *When a result is bad, check that it is bad for the reasons you can
+  account for.*
+
 Milestone table: see `README.md`.
 
 ## The acceptance run, and how it went
@@ -856,8 +983,9 @@ turns out to be.
 
 ### Still open
 
-- Nothing blocking on M1 or M2. **Next is M3** — the engine seam, `SimulatedVenue`,
-  and a deliberately unimpressive moving-average crossover.
+- Nothing blocking on M1, M2 or M3. **Next is M4** — fees, slippage and latency, whose
+  criterion is that results **degrade sensibly**. The M3 curve is expected to get worse;
+  if it improves, something in M4 is wrong.
 - **Two sessions covering one symbol-day are refused, not merged** (M2.d). Cannot
   happen on the acceptance capture, where each symbol ran one session for the whole
   week; it will the first time a recorder restarts mid-day. The merge is ordered by
