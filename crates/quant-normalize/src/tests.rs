@@ -734,3 +734,105 @@ fn a_written_partition_names_the_session_it_came_from() {
         Some(session.session_id)
     );
 }
+
+#[test]
+fn a_parquet_replay_agrees_with_the_raw_replay() {
+    // M2's last criterion, in miniature. Event by event and not by summary:
+    // two reconstructions can produce identical statistics from different
+    // events, and a summary comparison would pass every one of those.
+    use crate::{check_session, normalize_session};
+
+    let tree = Tree::new("agreement");
+    two_day_session(&tree);
+    let out = tree.root.join("out");
+    let session = tree.only_session();
+
+    let written = normalize_session(&session, instrument(), Some(&out));
+    assert!(written.write_error.is_none());
+
+    let agreement = check_session(&session, instrument(), &out);
+    assert!(agreement.agrees(), "{:?}", agreement.divergence);
+    assert_eq!(agreement.matched, 5, "every recorded event, both days");
+}
+
+#[test]
+fn a_missing_day_partition_is_a_disagreement_not_a_shorter_stream() {
+    // The failure this check exists to catch: a tier that is *plausible* -- it
+    // opens, it parses, its books reconstruct -- and is missing data. Comparing
+    // lengths after the fact would notice; comparing event by event notices
+    // where.
+    use crate::{check_session, normalize_session, Dataset, TierTarget};
+
+    let tree = Tree::new("missing-day");
+    two_day_session(&tree);
+    let out = tree.root.join("out");
+    let session = tree.only_session();
+    let _ = normalize_session(&session, instrument(), Some(&out));
+
+    let target = TierTarget {
+        exchange: Exchange::Binance,
+        symbol: SYMBOL.to_owned(),
+        date: UtcDate {
+            year: 2026,
+            month: 8,
+            day: 22,
+        },
+        dataset: Dataset::BookDeltas,
+    };
+    std::fs::remove_file(target.file(&out)).expect("remove a day's deltas");
+
+    let agreement = check_session(&session, instrument(), &out);
+    assert!(!agreement.agrees(), "a hole in the tier must not pass");
+    assert_eq!(
+        agreement.matched, 3,
+        "and the count says how far it got before the hole"
+    );
+}
+
+#[test]
+fn a_tampered_value_is_caught_rather_than_averaged_away() {
+    // A single wrong price in seventy million events is exactly what a summary
+    // comparison would miss, so it is worth proving the check sees one.
+    use crate::tier::{DatasetWriter, Provenance};
+    use crate::{check_session, normalize_session, Dataset, TierTarget};
+
+    let tree = Tree::new("tampered");
+    two_day_session(&tree);
+    let out = tree.root.join("out");
+    let session = tree.only_session();
+    let _ = normalize_session(&session, instrument(), Some(&out));
+
+    // Rewrite one day's deltas with a price that was never recorded.
+    let target = TierTarget {
+        exchange: Exchange::Binance,
+        symbol: SYMBOL.to_owned(),
+        date: UtcDate {
+            year: 2026,
+            month: 8,
+            day: 21,
+        },
+        dataset: Dataset::BookDeltas,
+    };
+    let path = target.file(&out);
+    let mut events =
+        crate::tier::read_dataset(&path, Dataset::BookDeltas, instrument()).expect("read");
+    if let MarketEvent::BookDelta(d) = &mut events[0] {
+        d.bids[0].px = "999.00000000".parse().expect("px");
+    }
+    let provenance = Provenance {
+        session_id: session.session_id,
+        exchange: Exchange::Binance,
+        symbol: SYMBOL.to_owned(),
+        date: target.date,
+    };
+    let file = std::fs::File::create(&path).expect("create");
+    let mut writer =
+        DatasetWriter::new(file, Dataset::BookDeltas, Some(&provenance)).expect("writer");
+    for event in &events {
+        writer.push(event).expect("push");
+    }
+    writer.finish().expect("finish");
+
+    let agreement = check_session(&session, instrument(), &out);
+    assert!(!agreement.agrees(), "one altered price must not pass");
+}

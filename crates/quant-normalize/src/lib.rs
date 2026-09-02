@@ -42,7 +42,9 @@ use quant_core::instrument::InstrumentId;
 use quant_recorder::SessionFiles;
 
 pub use replay::{Break, BreakKind, ReplayItem, ReplayStats, SessionReplay};
-pub use tier::{Dataset, DatasetWriter, PartitionWriter, TierError, TierTarget, WriteReport};
+pub use tier::{
+    Dataset, DatasetWriter, PartitionWriter, TierError, TierReplay, TierTarget, WriteReport,
+};
 
 /// What a replayed session did, and whether it can be trusted.
 #[derive(Debug, Clone, Default)]
@@ -237,3 +239,88 @@ fn note(summary: &mut SessionSummary, message: String) {
 
 #[cfg(test)]
 mod tests;
+
+/// The result of comparing a raw replay against a Parquet replay.
+///
+/// See [`check_session`] for what is compared and why.
+#[derive(Debug, Default, Clone)]
+pub struct Agreement {
+    /// Events seen on both sides, in agreement.
+    pub matched: u64,
+    /// The first place they diverged, if they did.
+    pub divergence: Option<String>,
+}
+
+impl Agreement {
+    #[must_use]
+    pub const fn agrees(&self) -> bool {
+        self.divergence.is_none()
+    }
+}
+
+/// M2's last criterion: does a replay from Parquet agree with a replay from raw?
+///
+/// # Why event by event, and not by summary
+///
+/// Two reconstructions can produce identical book statistics from different
+/// events — a transposed pair of timestamps, a level dropped from one delta and
+/// added to the next, an aggressor flipped on a trade that was later cancelled
+/// out. Comparing summaries would pass all of those. Comparing the events
+/// themselves is the only version of the question worth asking, and it is
+/// affordable because both sides stream.
+///
+/// # Why this makes "disposable" true rather than claimed
+///
+/// The storage-tier table has said since M0 that the normalized tier can be
+/// deleted and rebuilt from raw. That is a promise about a derivation nobody had
+/// checked. This is the check: if the two disagree anywhere in seventy million
+/// events, the tier is not a re-derivation of raw, it is a second source of
+/// truth wearing a disguise.
+#[must_use]
+pub fn check_session(files: &SessionFiles, instrument: InstrumentId, root: &Path) -> Agreement {
+    let mut agreement = Agreement::default();
+    let mut raw = SessionReplay::open(files, instrument).filter_map(|item| match item {
+        ReplayItem::Event(event) => Some(event),
+        ReplayItem::Break(_) => None,
+    });
+    // Only the days this session wrote. The tier has no session dimension, so
+    // reading "the whole symbol" could pull in a partition another run owns.
+    let mut days: Vec<_> = files.segments.iter().map(|s| s.target.date).collect();
+    days.dedup();
+    let mut tier = TierReplay::open(root, files.exchange, &files.symbol, instrument, days);
+
+    loop {
+        let from_raw = raw.next();
+        let from_tier = match tier.next().transpose() {
+            Ok(event) => event,
+            Err(e) => {
+                agreement.divergence = Some(format!("reading the tier: {e}"));
+                return agreement;
+            }
+        };
+        match (from_raw, from_tier) {
+            (None, None) => return agreement,
+            (Some(a), Some(b)) if a == b => agreement.matched += 1,
+            (a, b) => {
+                agreement.divergence = Some(describe(a.as_ref(), b.as_ref(), agreement.matched));
+                return agreement;
+            }
+        }
+    }
+}
+
+/// Say where the two streams parted company, without printing two book levels'
+/// worth of noise for a one-field difference.
+fn describe(raw: Option<&MarketEvent>, tier: Option<&MarketEvent>, after: u64) -> String {
+    let at = |e: Option<&MarketEvent>| {
+        e.map_or_else(
+            || "end of stream".to_owned(),
+            |e| format!("ingest_seq {}", e.meta().ingest_seq),
+        )
+    };
+    format!(
+        "after {after} events in agreement: raw has {}, the tier has {}",
+        at(raw),
+        at(tier)
+    )
+}

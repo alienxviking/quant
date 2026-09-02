@@ -11,22 +11,23 @@
 //! path — the caller resolves `(exchange, symbol)` through its own registry and
 //! passes the id in, exactly as `SessionReplay` does for the raw tier.
 
+use std::collections::VecDeque;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Decimal64Type, TimestampNanosecondType, UInt64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use quant_core::event::{
     BookDelta, BookSnapshot, EventMeta, Gap, GapCause, Level, MarketEvent, Side, Trade,
 };
-use quant_core::instrument::InstrumentId;
-use quant_core::time::Ts;
+use quant_core::instrument::{Exchange, InstrumentId};
+use quant_core::time::{Ts, UtcDate};
 use quant_core::{Px, Qty};
 
 use super::schema::Dataset;
-use super::TierError;
+use super::{TierError, TierTarget};
 
 /// Read one dataset file back into events, in the order they were written.
 pub fn read_dataset(
@@ -211,3 +212,170 @@ typed_column!(
     as_primitive_opt::<TimestampNanosecondType>
 );
 typed_column!(strings, arrow_array::StringArray, as_string_opt::<i32>);
+
+// --- Streaming a whole symbol back out of the tier ---
+
+/// One dataset file, decoded lazily into events.
+///
+/// A batch at a time rather than a file at a time: a day of book deltas is
+/// several hundred megabytes once every level is a `Vec<Level>`, and the point
+/// of this tier is to be replayable on an ordinary machine.
+#[derive(Debug)]
+pub struct DatasetStream {
+    dataset: Dataset,
+    instrument: InstrumentId,
+    reader: ParquetRecordBatchReader,
+    buffer: VecDeque<MarketEvent>,
+}
+
+impl DatasetStream {
+    /// Open one dataset file. A missing file yields nothing, which is how a day
+    /// that predates a dataset reads.
+    pub fn open(
+        path: &Path,
+        dataset: Dataset,
+        instrument: InstrumentId,
+    ) -> Result<Self, TierError> {
+        Ok(Self {
+            dataset,
+            instrument,
+            reader: ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.build()?,
+            buffer: VecDeque::new(),
+        })
+    }
+}
+
+impl Iterator for DatasetStream {
+    type Item = Result<MarketEvent, TierError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(event) = self.buffer.pop_front() {
+                return Some(Ok(event));
+            }
+            let batch = match self.reader.next()? {
+                Ok(batch) => batch,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let mut events = Vec::with_capacity(batch.num_rows());
+            if let Err(e) = decode_batch(&batch, self.dataset, self.instrument, &mut events) {
+                return Some(Err(e));
+            }
+            self.buffer.extend(events);
+        }
+    }
+}
+
+/// A symbol's normalized tier, back as one ordered event stream.
+///
+/// This is the shape M3's `HistoricalSource` needs, which is why it exists as a
+/// lazy iterator rather than as a comparison routine: the check that a Parquet
+/// replay agrees with a raw replay is its first consumer, not its purpose.
+///
+/// # How the order is recovered
+///
+/// The four datasets are four files, so a day's stream is a four-way merge on
+/// `ingest_seq` — which is exactly what makes `ingest_seq` the ordering key
+/// rather than an incidental column. Days are read in calendar order, and
+/// because `ingest_seq` is session-scoped and strictly increasing across a
+/// session's whole life, that reproduces the recorded order exactly.
+#[derive(Debug)]
+pub struct TierReplay {
+    root: PathBuf,
+    exchange: Exchange,
+    symbol: String,
+    instrument: InstrumentId,
+    days: std::vec::IntoIter<UtcDate>,
+    /// One head per dataset for the open day; `None` once that dataset is spent.
+    heads: Vec<Option<MarketEvent>>,
+    streams: Vec<DatasetStream>,
+    failed: bool,
+}
+
+impl TierReplay {
+    /// Replay `days` of one symbol, in the order given.
+    #[must_use]
+    pub fn open(
+        root: &Path,
+        exchange: Exchange,
+        symbol: &str,
+        instrument: InstrumentId,
+        days: Vec<UtcDate>,
+    ) -> Self {
+        Self {
+            root: root.to_owned(),
+            exchange,
+            symbol: symbol.to_owned(),
+            instrument,
+            days: days.into_iter(),
+            heads: Vec::new(),
+            streams: Vec::new(),
+            failed: false,
+        }
+    }
+
+    /// Open the next day's four files. `false` when there are no days left.
+    fn advance(&mut self) -> Result<bool, TierError> {
+        let Some(date) = self.days.next() else {
+            return Ok(false);
+        };
+        self.streams.clear();
+        self.heads.clear();
+        for dataset in Dataset::ALL {
+            let target = TierTarget {
+                exchange: self.exchange,
+                symbol: self.symbol.clone(),
+                date,
+                dataset,
+            };
+            let mut stream =
+                DatasetStream::open(&target.file(&self.root), dataset, self.instrument)?;
+            self.heads.push(stream.next().transpose()?);
+            self.streams.push(stream);
+        }
+        Ok(true)
+    }
+
+    /// Take the lowest-sequence head across the open day's datasets.
+    fn take_lowest(&mut self) -> Result<Option<MarketEvent>, TierError> {
+        let lowest = self
+            .heads
+            .iter()
+            .enumerate()
+            .filter_map(|(i, head)| head.as_ref().map(|e| (i, e.meta().ingest_seq)))
+            .min_by_key(|(_, seq)| *seq)
+            .map(|(i, _)| i);
+        let Some(i) = lowest else { return Ok(None) };
+        let event = self.heads[i].take();
+        self.heads[i] = self.streams[i].next().transpose()?;
+        Ok(event)
+    }
+}
+
+impl Iterator for TierReplay {
+    type Item = Result<MarketEvent, TierError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        loop {
+            match self.take_lowest() {
+                Ok(Some(event)) => return Some(Ok(event)),
+                Ok(None) => match self.advance() {
+                    // The day is spent; the loop opens the next one.
+                    Ok(true) => (),
+                    Ok(false) => return None,
+                    Err(e) => {
+                        self.failed = true;
+                        return Some(Err(e));
+                    }
+                },
+                Err(e) => {
+                    self.failed = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}

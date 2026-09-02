@@ -1,9 +1,10 @@
 //! Replay every capture session under a data root and report the reconstruction.
 //!
 //! ```text
-//! normalize [DATA_ROOT] [--symbol SYM] [--write]
+//! normalize [DATA_ROOT] [--symbol SYM] [--write] [--check]
 //! normalize data/acceptance                    # replay and report only
 //! normalize data/acceptance --write            # also write DATA_ROOT/normalized/
+//! normalize data/acceptance --check            # raw vs Parquet, event by event
 //! normalize data/acceptance --symbol BTCUSDT
 //! ```
 //!
@@ -30,21 +31,23 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use quant_core::instrument::{InstrumentDef, InstrumentKind, InstrumentRegistry};
-use quant_normalize::{normalize_session, Dataset, Normalized};
+use quant_normalize::{check_session, normalize_session, Dataset, Normalized};
 use quant_recorder::{catalog, format_session_id, SessionFiles};
 
 fn main() -> ExitCode {
     let mut root = None;
     let mut symbol: Option<String> = None;
     let mut write = false;
+    let mut check = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                println!("usage: normalize [DATA_ROOT] [--symbol SYM] [--write]");
+                println!("usage: normalize [DATA_ROOT] [--symbol SYM] [--write] [--check]");
                 return ExitCode::SUCCESS;
             }
             "--write" => write = true,
+            "--check" => check = true,
             "--symbol" => {
                 let Some(s) = args.next() else {
                     eprintln!("--symbol needs a value");
@@ -102,6 +105,22 @@ fn main() -> ExitCode {
             failures += 1;
         }
         print_session(files, &result);
+
+        if check {
+            let agreement = check_session(files, instrument, &root);
+            if agreement.agrees() {
+                println!(
+                    "check     {} events replayed from Parquet match the raw replay exactly",
+                    agreement.matched
+                );
+            } else {
+                failures += 1;
+                println!(
+                    "check     DISAGREES {}",
+                    agreement.divergence.as_deref().unwrap_or("(unreported)")
+                );
+            }
+        }
     }
 
     println!();
