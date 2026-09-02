@@ -442,3 +442,159 @@ fn a_notional_larger_than_i64_would_hold_is_computed_in_128_bits() {
         Some(("76650".to_owned(), "100000".to_owned()))
     );
 }
+
+// --- Costs (M4) ---
+
+#[test]
+fn a_free_venue_charges_nothing() {
+    // The no-op property, at the unit level: Costs::NONE must reproduce M3.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs::NONE);
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "1", OrderKind::Market),
+        &tick(),
+        &book(),
+    );
+    let (px, _) = fill_of(&events).expect("a fill");
+    assert_eq!(px, "101", "the price is the book's, unaltered");
+    assert_eq!(venue.stats().fees_charged.to_string(), "0");
+}
+
+#[test]
+fn a_taker_fee_is_charged_on_the_gross() {
+    // Ten basis points on 1 unit at 101 is 0.101.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        fees: crate::FeeSchedule::binance_spot(),
+        ..crate::Costs::NONE
+    });
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "1", OrderKind::Market),
+        &tick(),
+        &book(),
+    );
+    let ExecutionEvent::Filled { fill, .. } = events
+        .iter()
+        .find(|e| matches!(e, ExecutionEvent::Filled { .. }))
+        .expect("a fill")
+    else {
+        unreachable!()
+    };
+    assert_eq!(fill.fee.to_string(), "0.101");
+    assert!(!fill.is_maker, "a market order crossed the spread");
+    assert_eq!(venue.stats().fees_charged.to_string(), "0.101");
+}
+
+#[test]
+fn a_maker_rebate_is_a_negative_fee() {
+    // Some venues pay for passive flow. A schedule that could not express that
+    // would misprice every passive strategy.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        fees: crate::FeeSchedule {
+            maker: "-0.0001".parse().expect("rate"),
+            taker: "0.001".parse().expect("rate"),
+        },
+        ..crate::Costs::NONE
+    });
+    let mut book = Book::new();
+    book.apply_snapshot(&BookSnapshot {
+        meta: meta(),
+        last_update_id: 10,
+        bids: vec![level("98.0", "1")],
+        asks: vec![level("99.0", "1")],
+    });
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "1", limit("100.0")),
+        &print_at("99.0"),
+        &book,
+    );
+    let ExecutionEvent::Filled { fill, .. } = events
+        .iter()
+        .find(|e| matches!(e, ExecutionEvent::Filled { .. }))
+        .expect("a fill")
+    else {
+        unreachable!()
+    };
+    assert!(fill.is_maker, "a resting order that was traded through");
+    assert!(fill.fee.raw() < 0, "a rebate: {}", fill.fee);
+}
+
+#[test]
+fn a_maker_and_a_taker_are_charged_different_rates() {
+    // The distinction has to reach the fee, or `is_maker` is decoration.
+    let fees = crate::FeeSchedule {
+        maker: "0.0002".parse().expect("rate"),
+        taker: "0.001".parse().expect("rate"),
+    };
+    let gross: quant_core::Notional = "1000".parse().expect("amount");
+    assert_eq!(fees.fee(gross, true).to_string(), "0.2");
+    assert_eq!(fees.fee(gross, false).to_string(), "1");
+}
+
+#[test]
+fn a_higher_fee_rate_never_costs_less() {
+    // Monotonicity, which is the property a sign error breaks -- and a sign
+    // error on a fee is otherwise invisible, because it just looks like a
+    // surprisingly good strategy.
+    let gross: quant_core::Notional = "76650".parse().expect("amount");
+    let mut previous = quant_core::Notional::from_raw(i64::MIN);
+    for rate in ["0", "0.00001", "0.0001", "0.00075", "0.001", "0.01"] {
+        let fee = crate::FeeSchedule::flat(rate.parse().expect("rate")).fee(gross, false);
+        assert!(
+            fee >= previous,
+            "fee at {rate} was {fee}, below the previous {previous}"
+        );
+        previous = fee;
+    }
+}
+
+#[test]
+fn a_fee_is_truncated_toward_zero_rather_than_rounded_up() {
+    // Never round a fee up into money the venue did not charge.
+    let fees = crate::FeeSchedule::flat("0.001".parse().expect("rate"));
+    // 0.000000001 * 1e8 truncates to 0 rather than to one satoshi.
+    let tiny: quant_core::Notional = "0.000001".parse().expect("amount");
+    assert_eq!(fees.fee(tiny, false).raw(), 0);
+}
+
+#[test]
+fn the_stress_concession_is_always_against_us() {
+    // A buyer pays more, a seller receives less. A single signed field applied
+    // with `side.sign()` is one line for both, rather than a branch that can be
+    // written backwards.
+    let costs = crate::Costs {
+        adverse_per_fill: "0.5".parse().expect("px"),
+        ..crate::Costs::NONE
+    };
+
+    let mut buying = SimulatedVenue::with_costs(costs);
+    let bought = run(
+        &mut buying,
+        order(Side::Buy, "0.5", OrderKind::Market),
+        &tick(),
+        &book(),
+    );
+    assert_eq!(fill_of(&bought).expect("a fill").0, "101.5");
+
+    let mut selling = SimulatedVenue::with_costs(costs);
+    let sold = run(
+        &mut selling,
+        order(Side::Sell, "0.5", OrderKind::Market),
+        &tick(),
+        &book(),
+    );
+    assert_eq!(fill_of(&sold).expect("a fill").0, "98.5");
+}
+
+#[test]
+fn the_stress_concession_is_zero_by_default() {
+    // It is a knob and not a model, so it must not be on unless someone turned
+    // it on deliberately.
+    assert_eq!(
+        crate::Costs::default().adverse_per_fill,
+        quant_core::Px::ZERO
+    );
+    assert!(crate::Costs::default().is_free());
+    assert!(!crate::Costs::retail().is_free());
+}

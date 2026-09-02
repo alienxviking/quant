@@ -26,10 +26,12 @@
 //! backtest that misses trades is disappointing and a backtest that invents them
 //! is dangerous.
 //!
-//! **There are no fees, no latency and no queue position.** All three are M4.
-//! Their absence is not a rounding error — fees alone decide whether most
-//! high-turnover strategies are viable — so [`SimStats::caveats`] exists to put
-//! it in the output rather than leaving it in a comment nobody reads.
+//! **Fees and latency come from [`Costs`]**, and default to nothing. `Costs::NONE`
+//! reproduces M3 exactly, which is what makes the cost models checkable: if
+//! adding a zero-valued model changes a number, the model touched something it
+//! should not have. Queue position and market impact are still not modelled at
+//! all, and cannot be from recorded data — [`SimStats::caveats`] says so in the
+//! output rather than leaving it in a comment nobody reads.
 //!
 //! **An order is invisible to the market.** Our resting order does not appear in
 //! the reconstructed book and nobody reacts to it. True enough at sizes that are
@@ -45,6 +47,8 @@
 //! the other half of it: the engine can only guarantee the ordering if the venue
 //! does not fill early.
 
+pub mod costs;
+
 use quant_book::Book;
 use quant_core::event::{MarketEvent, Side};
 use quant_core::execution::{
@@ -53,6 +57,8 @@ use quant_core::execution::{
 use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::time::Ts;
 use quant_engine::ExecutionVenue;
+
+pub use costs::{Costs, FeeSchedule, Latency};
 
 /// An order the simulator is holding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +90,12 @@ pub struct SimStats {
     /// Orders refused because there was no book to price against — a gap, or
     /// before the first snapshot.
     pub no_market: u64,
+    /// Total fees charged, as a positive cost.
+    ///
+    /// Tracked here as well as in the portfolio so the two can be compared: the
+    /// venue says what it charged and the portfolio says what it paid, and a
+    /// disagreement means one of them is wrong.
+    pub fees_charged: Notional,
 }
 
 impl SimStats {
@@ -109,13 +121,29 @@ impl SimStats {
 pub struct SimulatedVenue {
     resting: Vec<Resting>,
     out: Vec<ExecutionEvent>,
+    costs: Costs,
     stats: SimStats,
 }
 
 impl SimulatedVenue {
+    /// Free and instant: M3's venue.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// With costs.
+    #[must_use]
+    pub fn with_costs(costs: Costs) -> Self {
+        Self {
+            costs,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub const fn costs(&self) -> Costs {
+        self.costs
     }
 
     #[must_use]
@@ -183,7 +211,17 @@ impl SimulatedVenue {
             self.stats.multi_level_fills += 1;
         }
 
-        let px = average_price(cost, taken);
+        // A market order took liquidity; a resting order that filled on a
+        // trade-through was the passive side.
+        let is_maker = order.request.limit().is_some();
+        // The stress concession, always against us: a buyer pays more, a seller
+        // receives less. Zero unless somebody deliberately turned it on.
+        let concession = self.costs.adverse_per_fill.raw() * order.request.side.sign();
+        let px = Px::from_raw(average_price(cost, taken).raw() + concession);
+        let gross = notional(px, taken);
+        let fee = self.costs.fees.fee(gross, is_maker);
+        self.stats.fees_charged = Notional::from_raw(self.stats.fees_charged.raw() + fee.raw());
+
         order.remaining = Qty::from_raw(order.remaining.raw() - taken.raw());
         self.stats.fills += 1;
         self.out.push(ExecutionEvent::Filled {
@@ -191,11 +229,8 @@ impl SimulatedVenue {
             fill: Fill {
                 px,
                 qty: taken,
-                // M4. Stated in `SimStats::caveats` rather than left implicit.
-                fee: Notional::from_raw(0),
-                // A market order took liquidity; a resting order that filled on
-                // a trade-through was the passive side.
-                is_maker: order.request.limit().is_some(),
+                fee,
+                is_maker,
             },
             remaining: order.remaining,
             ts: now,
