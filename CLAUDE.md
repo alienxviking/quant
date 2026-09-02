@@ -468,15 +468,15 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   whatever its derivation says.
 
 - **M2 in progress** (from 2026-08-31): the normalizer and book reconstruction.
-  204 tests green in debug and release, clippy and fmt clean. Criterion: **book
+  214 tests green in debug and release, clippy and fmt clean. Criterion: **book
   invariants hold at every tick of a replayed day**.
 
   | | Slice | Status |
   |---|---|---|
   | a | `quant-binance::parse`: payloads → `MarketEvent`, full fixed-point | **done** |
   | b | `quant-book`: apply, invariants, gap invalidation, resync | **done** |
-  | c | `quant-normalize`: join a session's segments, replay, report | next |
-  | d | Parquet output: the normalized tier on disk | |
+  | c | `quant-normalize`: join a session's segments, replay, report | **done** |
+  | d | Parquet output: the normalized tier on disk | next |
 
   **The scoping call, made first.** The milestone reads "normalizer *and* book
   reconstruction", but those are two artifacts. The normalized tier holds
@@ -565,11 +565,65 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   the snapshot or replayed after it, and **both halves are needed**. Reworded in the
   report line and in `session.rs`.
 
-- **Known artifact, not a defect**: replaying *single files* drops 7k–34k deltas on
+- **Known artifact, now removed**: replaying *single files* dropped 7k–34k deltas on
   days 2–8, because each file starts mid-stream with no anchor and waits up to an
-  hour for the next hourly snapshot. Day 1 drops none — its resync arrives 300 ms
-  in. Joining a session's segments is exactly what M2.c does, and the numbers
-  confirm the need rather than showing a fault.
+  hour for the next hourly snapshot. Day 1 dropped none — its resync arrives 300 ms
+  in. M2.c joined the segments and drove it to **0** on both symbols, which is the
+  slice's own acceptance evidence.
+
+- **M2.c decisions** (`crates/quant-normalize/`, 2026-09-02). The slice's whole
+  content is that **a UTC day boundary is a filing decision**: `ingest_seq` and the
+  venue's update-id chain both span a *session*, so crossing into the next day's
+  file must not reset anything. It works — both weeks, both symbols: **0 deltas
+  dropped for want of an anchor** (against 7k–34k per day when replayed one file at
+  a time), 0 chain breaks, 0 archive breaks, invariants holding at all 70.5M ticks.
+
+  **The replay is an iterator of events, not a program that checks a book.** The
+  book is the consumer that happens to exist first; M2.d's Parquet writer and M3's
+  `HistoricalSource`/`ReplaySource` want the identical stream. Written the other way
+  round, both would have to take it apart again to get at the events. `Book` driving
+  lives in `replay_session`, which is one consumer and not the point.
+
+  **The archive's own discontinuities are items in the stream, and they are `Break`s
+  rather than synthesized `Gap`s.** A segment that will not open, a torn tail, a hole
+  in `ingest_seq` — each means what follows does not continue what came before, and
+  skipping quietly to the next readable frame would produce a book that *looks*
+  continuous across data we never read. But `GapCause` is persisted in the immutable
+  tier and describes the venue or the recorder; "I could not read this file just now"
+  describes one replay on one machine, and a fifth cause for it would let a re-derive
+  on a failing disk produce different bytes than one on a healthy disk. Downstream
+  they mean the same thing — invalidate — and that obligation is discharged **inside**
+  `replay_session`, on the M2.b principle that a caller who must remember will forget.
+
+  **A hole breaks immediately, without waiting for a gap record to explain it.** The
+  recorder writes that record *after* the hole it describes (the hole is the evidence,
+  the record is the account), so waiting would mean handing out events across a known
+  discontinuity in the hope of being forgiven. Invalidating twice costs nothing.
+
+  **Session discovery moved down into `quant-recorder::catalog`** — the open question
+  from the M2 handoff, now closed. `quant-verify` had owned it since M1.d2 and nothing
+  may depend on `quant-verify`. Copying the fifteen lines was the easy call and the
+  wrong one: if the two ever disagreed about which files form a session or what order
+  they go in, the normalizer would replay a *different stream* than the one the
+  verifier passed clean, and nothing downstream could notice. What did **not** move is
+  the policy — `quant-recorder` has no idea what a finding is, so `catalog()` returns
+  what it found, what did not fit the layout and what it could not read, and each
+  caller decides. They genuinely differ: a stray file is a warning to the verifier and
+  an unreadable segment invalidates the normalizer's book.
+
+  **`quant-verify` and `quant-normalize` must never depend on each other**, in either
+  direction. The verifier asks *is this capture complete*; the normalizer asks *what
+  did the market do*. A capture with an honest recorded gap is complete and still goes
+  dark for a while, so a tool that conflated them would have to call one a failure.
+  That they now independently agree on **70,545,346 frames** while sharing no counting
+  code is what makes the number worth anything — and BTCUSDT's single `ignored` frame
+  is the day-3 `SnapshotFailed` record, the same one thing the verifier warns about.
+
+  **`quant-binance/examples/replay.rs` was deleted**, not kept as a convenience. It
+  did its job at M2.b (it is what found the buffering bug), but leaving it would mean
+  two implementations of "apply recorded events to a book, check every tick", and the
+  one nobody maintains is the one that quietly stops agreeing. `parse_all` stays: it
+  holds no book logic, so there is nothing for it to drift against.
 
 - **Book depth reaches 11k–34k levels** against the 5000-a-side snapshot window.
   Expected: deltas keep inserting levels outside the window and nothing removes
@@ -718,6 +772,8 @@ turns out to be.
 ### Still open
 
 - Nothing blocking on M1. M2 is under way; see the M2 entries above.
+- Minor: CI annotates `Node.js 20 is deprecated` for `actions/checkout@v4` on both
+  jobs. Harmless; fixed by bumping to `@v5` whenever CI is next touched.
 
 ## Conventions
 
