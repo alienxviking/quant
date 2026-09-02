@@ -257,3 +257,65 @@ a number.
 
 Both are why **M5 exists**: paper trading against the live venue is the only
 instrument that can measure them.
+
+---
+
+## 9. Acceptance criteria for M5 — paper trading
+
+The seam is proven in a second world when:
+
+- [ ] The **same strategy binary** runs against `LiveSource + PaperVenue` for
+      **two weeks**, unattended, with no code change from the backtest wiring.
+- [ ] **Paper P&L matches a backtest over the data captured during the same
+      window.** See below — this replaces "reconciles against an independent
+      recompute", which was a weaker question.
+- [ ] Every fill is journalled, and P&L recomputed from the journal alone agrees
+      with the engine's running portfolio.
+- [ ] The run survives restarts: position and cash are recovered from the
+      journal, not lost.
+
+### Why the criterion is live-versus-replay, not an arithmetic check
+
+"P&L reconciles against an independent recompute" checks arithmetic against
+itself. It would pass on a system whose *live path* and *replay path* disagreed
+about what the market did, which is the failure that would invalidate every
+result this platform ever produces.
+
+So the criterion is sharper: run the strategy live on a paper venue, capture the
+raw stream while doing it, then **backtest the identical strategy over that
+capture and require the two to agree**. If they diverge, one of the two paths is
+lying and we find out which. It is the live analogue of §8's raw-versus-Parquet
+agreement, and it is the strongest statement available without real money.
+
+Exact agreement is the target and is achievable, because both sides consume the
+same events with the same `local_recv_ts` and the same `ingest_seq` — see the
+tee below. Any divergence is a bug, not a tolerance.
+
+### What paper trading cannot measure
+
+An earlier draft of this file claimed M5 was the instrument for queue position
+and market impact. **That was wrong**, and the correction matters because it
+changes what M5 is worth.
+
+A paper venue uses *simulated* fills. Our orders are still not in the book, and
+nobody is still reacting to them. The two things M4 could not model remain
+unmodelled and unmeasured after M5, and **only M8 — real orders, real money —
+can measure them.** What M5 proves is that the engine runs continuously against
+a live socket, that the architectural claim holds (one binary, two wirings), and
+that live and replay agree.
+
+### One ingress, two consumers
+
+The paper run records raw **and** trades from the same stream, and they must be
+the same stream — not two subscriptions, not a tail of the file being written.
+`Ingress<S>` is generic over a sink precisely so a `TeeSink` can hand each record
+to both the capture writer and the engine, with the identical timestamp and
+sequence number. That identity is what makes the agreement criterion checkable
+rather than approximate.
+
+The capture is the **primary** sink and the engine the secondary. If the engine
+falls behind, its record is dropped and the capture is untouched: market data is
+irreplaceable and a paper fill is not. The engine then discovers the drop the
+same way the offline verifier discovers a recorder drop — a hole in `ingest_seq`
+— and responds the same way, by treating it as a gap and clearing the book. Same
+evidence, same remedy, in a second place.
