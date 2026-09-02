@@ -107,6 +107,7 @@
 //! [`recv_timeout`]: std::sync::mpsc::Receiver::recv_timeout
 
 pub mod backoff;
+pub mod catalog;
 pub mod ingress;
 pub mod layout;
 pub mod metrics;
@@ -116,6 +117,7 @@ pub mod sink;
 pub mod writer;
 
 pub use backoff::{Backoff, BackoffPolicy};
+pub use catalog::{catalog, Catalog, CatalogEntry, SessionFiles};
 pub use ingress::{Accepted, GapOutcome, Ingress, IngressStats, WriterGone, MAX_PENDING_GAPS};
 pub use layout::{format_session_id, parse_session_id, parse_utc_date, CaptureTarget};
 pub use metrics::{LatencySummary, Metrics, MetricsReport, MetricsReporter, MetricsSample};
