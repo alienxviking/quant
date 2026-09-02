@@ -69,6 +69,13 @@ crates/
   quant-normalize/  a capture session back out as ordered events:
                     segments joined, book driven, and the Parquet
                     tier written and read back. `normalize` bin.  [M2c/d]
+  quant-engine/     the seam: the loop, Strategy, RiskLayer,
+                    ExecutionVenue, and the portfolio. No venue,
+                    no file format, no network.                   [M3b]
+  quant-sim/        the simulated counterparty. Every backtest
+                    modelling assumption lives here.              [M3c]
+  quant-backtest/   the wiring: a naive strategy, an equity
+                    curve, and the `backtest` binary.             [M3d]
 docs/
   data-contract.md    the on-disk format and its acceptance criteria
   engine-contract.md  the seam a strategy sees, and why it is shaped
@@ -101,6 +108,14 @@ had dropped 7,000 to 34,000 deltas on each day after the first. The normalized
 Parquet tier is written (2.1 GB from 3.0 GB of raw), and **70,545,345 events
 replayed from Parquet match the raw replay event for event**, which is what turns
 "Normalized is disposable, rebuilt from raw" from a claim in a table into a fact.
+
+**M3 is complete**, and its criterion is unusual on purpose: an equity curve is
+produced, *and it is unimpressive*. A moving-average crossover over the acceptance
+week takes $100 to **$97.53** — a 2.47% loss with no fees modelled at all. That is
+the result to want. A crossover that looked profitable on its first run would mean
+the harness was lying, and every way it could lie (dispatching on the wrong
+timestamp, filling at prices the book never showed, trading through a gap) is
+invisible in the output. See `docs/engine-contract.md`.
 
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day |
 | M3 | Engine seam + SimulatedVenue + MA crossover | Equity curve produced, and it is unimpressive |
@@ -194,6 +209,10 @@ cargo run -p quant-verify --bin verify -- data --reconcile   # also check the in
 cargo run --release -p quant-normalize --bin normalize -- data
 cargo run --release -p quant-normalize --bin normalize -- data --write   # write the Parquet tier
 cargo run --release -p quant-normalize --bin normalize -- data --check   # raw vs Parquet, event by event
+
+# and run a strategy over it
+cargo run --release -p quant-backtest --bin backtest -- data --symbol BTCUSDT
+cargo run --release -p quant-backtest --bin backtest -- data --equity-csv equity.csv
 ```
 
 Exit 0 means every discontinuity in every session is explained by a record in the

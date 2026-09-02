@@ -127,20 +127,24 @@ does not justify.
 
 The engine seam is done when:
 
-- [ ] One strategy binary runs against `HistoricalSource + SimulatedVenue` and
-      produces an **equity curve**.
-- [ ] The equity curve is **unimpressive**. See below — this is a real
-      criterion, not a joke.
-- [ ] The `Strategy` trait has no method, and its context no accessor, that
-      reveals which source or venue it is attached to. Checked by a test that
-      runs the *same* strategy value against two different wirings.
-- [ ] A strategy cannot reach a venue except through the risk layer. Checked by
-      a test with a risk layer that rejects everything: no order reaches the
-      venue.
-- [ ] A strategy that reads prices across a `Gap` gets `None`, not a stale
+- [x] One strategy binary runs against `HistoricalSource + SimulatedVenue` and
+      produces an **equity curve**. *(`backtest`, over the acceptance week.)*
+- [x] The equity curve is **unimpressive**. *(BTCUSDT $100 → $97.53 over 8 days,
+      −2.47%, 4.40 max drawdown, 209 round trips — and that is **before any
+      costs exist**. ETHUSDT $100 → $99.18.)*
+- [x] The `Strategy` trait has no method, and its context no accessor, that
+      reveals which source or venue it is attached to. *(Checked by running the
+      same strategy value against a filling venue and an accept-only one, and
+      comparing the resulting state.)*
+- [x] A strategy cannot reach a venue except through the risk layer. *(Checked
+      with a refuse-everything layer: the venue is never **told**, not merely
+      declining.)*
+- [x] A strategy that reads prices across a `Gap` gets `None`, not a stale
       quote.
-- [ ] No wall-clock call anywhere in the engine or strategy path: the backtest
+- [x] No wall-clock call anywhere in the engine or strategy path: the backtest
       is deterministic, and running it twice produces byte-identical results.
+
+**M3 is complete.**
 
 ### Why "unimpressive" is a criterion
 
@@ -160,6 +164,27 @@ harness rather than to the idea.
 
 M4 adds fees, slippage and latency and the curve is expected to get **worse**.
 If it improves, something in M4 is wrong.
+
+### What the first run actually showed
+
+Every number cross-checked, which is what made the result believable rather than
+merely disappointing:
+
+| | |
+|---|---|
+| Samples | 10,080 — exactly 7 days of minutes |
+| Accounted for | 9,810 with a mid + 270 blind = 10,080 |
+| Signals to fills | 418 crossings → 418 orders → 418 fills |
+| Paired | 209 entries + 209 exits, so it never got stuck holding |
+| Realized P&L | equals the cash change exactly; final equity equals cash, because it ended flat |
+| Book walk | 2 fills consumed more than one level, at $76 a position |
+| Gaps | 19, and **zero** orders refused for want of a market |
+
+That last row is the one worth dwelling on. The strategy contains no mention of
+gaps at all. A gap clears the book, so there is no mid, so no sample is taken, so
+the indicator does not advance and no crossing can fire. "Do not trade across a
+gap" is structural here — three separate decisions (cleared not flagged, sample
+on a clock, mid from the book) compose into it without anyone enforcing it.
 
 ### What M3 explicitly does not do
 
