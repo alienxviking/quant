@@ -16,6 +16,7 @@
 //! instrument being absent — are argued in [`schema`].
 
 pub mod partition;
+pub mod provenance;
 pub mod read;
 pub mod schema;
 pub mod write;
@@ -26,6 +27,7 @@ use quant_core::instrument::Exchange;
 use quant_core::time::UtcDate;
 
 pub use partition::{DayReport, PartitionWriter, WriteReport};
+pub use provenance::Provenance;
 pub use read::read_dataset;
 pub use schema::{Dataset, MAX_MONEY_RAW, MONEY_PRECISION, MONEY_SCALE};
 pub use write::{dataset_of, DatasetWriter, BATCH_ROWS};
@@ -114,6 +116,14 @@ pub enum TierError {
         column: &'static str,
         value: String,
     },
+    /// The partition already holds a file written by a different capture
+    /// session. See [`provenance`] — overwriting it would lose a day of data
+    /// silently, and merging the two is not yet implemented.
+    PartitionOwnedByAnother {
+        path: String,
+        existing: String,
+        writing: String,
+    },
 }
 
 impl core::fmt::Display for TierError {
@@ -135,6 +145,14 @@ impl core::fmt::Display for TierError {
             Self::UnknownLabel { column, value } => {
                 write!(f, "unknown {column} label {value:?}")
             }
+            Self::PartitionOwnedByAnother {
+                path,
+                existing,
+                writing,
+            } => write!(
+                f,
+                "{path} was written by session {existing}, not {writing};                  merging two sessions into one day partition is not implemented"
+            ),
         }
     }
 }

@@ -36,6 +36,10 @@ impl Tree {
     }
 
     fn target(day: u8) -> CaptureTarget {
+        Self::target_for(SESSION, day)
+    }
+
+    fn target_for(session_id: [u8; 16], day: u8) -> CaptureTarget {
         CaptureTarget {
             exchange: Exchange::Binance,
             symbol: SYMBOL.to_owned(),
@@ -44,7 +48,7 @@ impl Tree {
                 month: 8,
                 day,
             },
-            session_id: SESSION,
+            session_id,
             part: 0,
         }
     }
@@ -57,10 +61,16 @@ impl Tree {
     /// here proves the day comes from the segment rather than from the record's
     /// own clock. See `a_record_is_filed_where_the_raw_tier_filed_it`.
     fn segment(&self, day: u8, frames: &[Frame]) -> PathBuf {
-        let path = Self::target(day).file(&self.root);
+        self.segment_for(SESSION, day, frames)
+    }
+
+    /// The same, for a session other than the default one — a recorder restart
+    /// produces exactly this: a second session covering days the first also saw.
+    fn segment_for(&self, session_id: [u8; 16], day: u8, frames: &[Frame]) -> PathBuf {
+        let path = Self::target_for(session_id, day).file(&self.root);
         std::fs::create_dir_all(path.parent().expect("a file has a parent")).expect("mkdir");
         let file = std::fs::File::create(&path).expect("create");
-        let header = FileHeader::new(Exchange::Binance, SYMBOL, SESSION);
+        let header = FileHeader::new(Exchange::Binance, SYMBOL, session_id);
         let mut writer =
             RawWriter::create(file, header, WriterOptions::default()).expect("create writer");
         for frame in frames {
@@ -655,5 +665,72 @@ fn a_record_is_filed_where_the_raw_tier_filed_it() {
         .file(&out)
         .exists(),
         "and never re-derive a day from local_recv_ts"
+    );
+}
+
+#[test]
+fn a_partition_another_session_wrote_is_refused_not_overwritten() {
+    // The normalized layout has no session dimension, so a recorder restart --
+    // which creates a new session -- can put two sessions on one symbol-day.
+    // Publishing over the first would lose a day of data and leave a file that
+    // looks complete, which is the worst failure available here.
+    use crate::normalize_session;
+
+    // A restart: a second session, its own files, covering a day the first saw.
+    const RESTARTED: [u8; 16] = [0xaa; 16];
+
+    let tree = Tree::new("two-sessions");
+    two_day_session(&tree);
+    tree.segment_for(
+        RESTARTED,
+        21,
+        &[snapshot(1, 200), delta(2, 201, 201, "201.00000000")],
+    );
+    let out = tree.root.join("out");
+
+    let sessions = tree.sessions();
+    assert_eq!(sessions.len(), 2, "the catalog sees both runs");
+    let (first, second) = sessions
+        .iter()
+        .partition::<Vec<_>, _>(|s| s.session_id == SESSION);
+
+    let _first = normalize_session(first[0], instrument(), Some(&out));
+    let result = normalize_session(second[0], instrument(), Some(&out));
+    assert!(
+        result
+            .write_error
+            .as_ref()
+            .is_some_and(|e| e.contains("not") && e.contains("written by session")),
+        "{:?}",
+        result.write_error
+    );
+}
+
+#[test]
+fn a_written_partition_names_the_session_it_came_from() {
+    // Provenance in the footer rather than a sidecar: a sidecar can be separated
+    // from what it describes, and every Parquet reader can already see this.
+    use crate::tier::Provenance;
+    use crate::{normalize_session, Dataset, TierTarget};
+
+    let tree = Tree::new("provenance");
+    two_day_session(&tree);
+    let out = tree.root.join("out");
+    let session = tree.only_session();
+    let _ = normalize_session(&session, instrument(), Some(&out));
+
+    let target = TierTarget {
+        exchange: Exchange::Binance,
+        symbol: SYMBOL.to_owned(),
+        date: UtcDate {
+            year: 2026,
+            month: 8,
+            day: 21,
+        },
+        dataset: Dataset::BookDeltas,
+    };
+    assert_eq!(
+        Provenance::session_of(&target.file(&out)).expect("readable"),
+        Some(session.session_id)
     );
 }

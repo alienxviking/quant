@@ -38,6 +38,7 @@ use quant_core::event::MarketEvent;
 use quant_core::instrument::Exchange;
 use quant_core::time::UtcDate;
 
+use super::provenance::Provenance;
 use super::schema::Dataset;
 use super::write::{dataset_of, DatasetWriter};
 use super::{TierError, TierTarget};
@@ -77,6 +78,9 @@ pub struct PartitionWriter {
     root: PathBuf,
     exchange: Exchange,
     symbol: String,
+    /// The capture session these events came from, stamped into every file and
+    /// checked against whatever is already there.
+    session_id: [u8; 16],
     open: Option<OpenDay>,
     report: WriteReport,
 }
@@ -93,11 +97,12 @@ struct OpenDay {
 impl PartitionWriter {
     /// Prepare to write a session's events under `root`.
     #[must_use]
-    pub fn new(root: &Path, exchange: Exchange, symbol: &str) -> Self {
+    pub fn new(root: &Path, exchange: Exchange, symbol: &str, session_id: [u8; 16]) -> Self {
         Self {
             root: root.to_owned(),
             exchange,
             symbol: symbol.to_owned(),
+            session_id,
             open: None,
             report: WriteReport::default(),
         }
@@ -132,10 +137,17 @@ impl PartitionWriter {
                 dataset,
             };
             let final_path = target.file(&self.root);
+            self.check_ownership(&final_path)?;
             std::fs::create_dir_all(target.directory(&self.root))?;
             let temp_path = final_path.with_extension("parquet.tmp");
             let file = BufWriter::new(File::create(&temp_path)?);
-            writers.push(DatasetWriter::new(file, dataset)?);
+            let provenance = Provenance {
+                session_id: self.session_id,
+                exchange: self.exchange,
+                symbol: self.symbol.clone(),
+                date,
+            };
+            writers.push(DatasetWriter::new(file, dataset, Some(&provenance))?);
             paths.push((temp_path, final_path));
         }
         self.open = Some(OpenDay {
@@ -144,6 +156,31 @@ impl PartitionWriter {
             paths,
         });
         Ok(())
+    }
+
+    /// Refuse to publish over a partition another capture session wrote.
+    ///
+    /// Re-deriving the *same* session must replace what is there — that is what
+    /// makes this tier disposable. A different session is the case provenance
+    /// exists for; see that module. An unreadable existing file is left alone
+    /// too: we cannot establish that it is ours, and "cannot tell" is not
+    /// permission.
+    fn check_ownership(&self, final_path: &Path) -> Result<(), TierError> {
+        if !final_path.exists() {
+            return Ok(());
+        }
+        let existing = Provenance::session_of(final_path).ok().flatten();
+        if existing == Some(self.session_id) {
+            return Ok(());
+        }
+        Err(TierError::PartitionOwnedByAnother {
+            path: final_path.display().to_string(),
+            existing: existing.map_or_else(
+                || "an unknown source".to_owned(),
+                |id| quant_recorder::format_session_id(&id),
+            ),
+            writing: quant_recorder::format_session_id(&self.session_id),
+        })
     }
 
     fn close_open(&mut self) -> Result<(), TierError> {

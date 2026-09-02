@@ -76,7 +76,7 @@ fn level(px: &str, qty: &str) -> Level {
 fn round_trip(name: &str, dataset: Dataset, events: &[MarketEvent]) -> Vec<MarketEvent> {
     let scratch = Scratch::new(name);
     let file = std::fs::File::create(&scratch.path).expect("create");
-    let mut writer = DatasetWriter::new(file, dataset).expect("writer");
+    let mut writer = DatasetWriter::new(file, dataset, None).expect("writer");
     for event in events {
         writer.push(event).expect("push");
     }
@@ -201,7 +201,7 @@ fn a_batch_boundary_is_invisible() {
 fn an_event_of_the_wrong_kind_is_refused_not_dropped() {
     let scratch = Scratch::new("wrong-kind");
     let file = std::fs::File::create(&scratch.path).expect("create");
-    let mut writer = DatasetWriter::new(file, Dataset::Trades).expect("writer");
+    let mut writer = DatasetWriter::new(file, Dataset::Trades, None).expect("writer");
     let err = writer
         .push(&MarketEvent::Gap(Gap {
             meta: meta(1),
@@ -218,7 +218,7 @@ fn a_price_beyond_the_decimal_precision_is_an_error_not_a_truncation() {
     // DECIMAL(18,8) does, so the gap is reachable in principle and must fail.
     let scratch = Scratch::new("out-of-range");
     let file = std::fs::File::create(&scratch.path).expect("create");
-    let mut writer = DatasetWriter::new(file, Dataset::Trades).expect("writer");
+    let mut writer = DatasetWriter::new(file, Dataset::Trades, None).expect("writer");
     let err = writer
         .push(&MarketEvent::Trade(Trade {
             meta: meta(1),
@@ -303,7 +303,7 @@ fn money_is_stored_as_an_int64_backed_decimal() {
 
     let scratch = Scratch::new("physical-type");
     let file = std::fs::File::create(&scratch.path).expect("create");
-    let mut writer = DatasetWriter::new(file, Dataset::Trades).expect("writer");
+    let mut writer = DatasetWriter::new(file, Dataset::Trades, None).expect("writer");
     writer
         .push(&MarketEvent::Trade(Trade {
             meta: meta(1),

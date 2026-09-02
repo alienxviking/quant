@@ -21,6 +21,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use quant_core::event::{Level, MarketEvent, Side};
 
+use super::provenance::Provenance;
 use super::schema::{level_fields, levels, Dataset, MAX_MONEY_RAW, MONEY_PRECISION, MONEY_SCALE};
 use super::TierError;
 
@@ -49,9 +50,17 @@ impl<W: Write + Send> DatasetWriter<W> {
     /// project already links it. Level 3 for the same reason `WriterOptions`
     /// chose it: the curve past there costs an order of magnitude of CPU for
     /// low double-digit percentages.
-    pub fn new(sink: W, dataset: Dataset) -> Result<Self, TierError> {
+    ///
+    /// `provenance` is stamped into the file's footer. See [`Provenance`] for
+    /// why a derived file has to name what it was derived from.
+    pub fn new(
+        sink: W,
+        dataset: Dataset,
+        provenance: Option<&Provenance>,
+    ) -> Result<Self, TierError> {
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+            .set_key_value_metadata(provenance.map(Provenance::key_values))
             .build();
         Ok(Self {
             dataset,

@@ -128,7 +128,8 @@ pub fn normalize_session(
 ) -> Normalized {
     let mut book = Book::new();
     let mut summary = SessionSummary::default();
-    let mut writer = out.map(|root| PartitionWriter::new(root, files.exchange, &files.symbol));
+    let mut writer =
+        out.map(|root| PartitionWriter::new(root, files.exchange, &files.symbol, files.session_id));
     let mut write_error = None;
     let mut written = None;
     // `while let` rather than `for`, because the iterator owns the counters this
