@@ -129,7 +129,14 @@ impl<'a> Context<'a> {
             self.ledger.refuse(client_order_id, reason, self.now);
             return client_order_id;
         }
-        if let Some(reason) = self.risk.check(&request, self.now) {
+        // The mark the risk layer prices against: this instrument's mid, or
+        // `None` when the book has no prices. A money limit must refuse rather
+        // than guess -- see `RiskLayer::check`.
+        let mark = self.book(request.instrument).and_then(|book| {
+            let (bid, ask) = (book.best_bid()?, book.best_ask()?);
+            Some(Px::from_raw((bid.px.raw() + ask.px.raw()) / 2))
+        });
+        if let Some(reason) = self.risk.check(&request, mark, self.now) {
             // Refused here, so the venue never hears about it at all. That is
             // the chokepoint being a chokepoint.
             self.ledger.refuse(client_order_id, reason, self.now);

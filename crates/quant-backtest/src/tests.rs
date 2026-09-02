@@ -470,3 +470,228 @@ fn a_latency_longer_than_the_data_means_nothing_ever_arrives() {
     );
     assert!(engine.stats().submitted > 0, "but orders were sent");
 }
+
+// --- M6: limits provably veto a misbehaving strategy ---
+//
+// The criterion says "provably, under test", so the misbehaving strategies are
+// part of the suite rather than something imagined. Each one below is a real
+// failure a fortnight of unattended running could produce, wired to the real
+// engine, the real simulator and the real risk layer.
+
+use quant_core::execution::{OrderKind, OrderRequest, TimeInForce};
+use quant_engine::{Limits, RiskEngine, TripCause};
+
+/// Buys as much as it can, every single event. The size failure.
+#[derive(Debug, Default)]
+struct Greedy {
+    instrument: Option<InstrumentId>,
+    refused: u64,
+    accepted: u64,
+}
+
+impl quant_engine::Strategy for Greedy {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &mut quant_engine::Context<'_>) {
+        self.instrument = Some(event.meta().instrument);
+        ctx.submit(OrderRequest {
+            instrument: event.meta().instrument,
+            side: quant_core::event::Side::Buy,
+            // Absurd on purpose: 1000 units at a mid near 100 is 100,000.
+            qty: "1000".parse().expect("qty"),
+            kind: OrderKind::Market,
+            time_in_force: TimeInForce::Gtc,
+        });
+    }
+
+    fn on_execution(
+        &mut self,
+        event: &quant_core::execution::ExecutionEvent,
+        _ctx: &mut quant_engine::Context<'_>,
+    ) {
+        match event {
+            quant_core::execution::ExecutionEvent::Rejected { .. } => self.refused += 1,
+            quant_core::execution::ExecutionEvent::Filled { .. } => self.accepted += 1,
+            _ => {}
+        }
+    }
+}
+
+/// Submits on every event forever. The loop failure.
+#[derive(Debug, Default)]
+struct Runaway {
+    submitted: u64,
+}
+
+impl quant_engine::Strategy for Runaway {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &mut quant_engine::Context<'_>) {
+        self.submitted += 1;
+        ctx.submit(OrderRequest {
+            instrument: event.meta().instrument,
+            side: quant_core::event::Side::Buy,
+            qty: "0.001".parse().expect("qty"),
+            kind: OrderKind::Market,
+            time_in_force: TimeInForce::Gtc,
+        });
+    }
+}
+
+fn run_risked<S: quant_engine::Strategy>(
+    steps: &[Step],
+    strategy: S,
+    limits: Limits,
+) -> quant_engine::Engine<Script, SimulatedVenue, RiskEngine, S> {
+    let mut engine = quant_engine::Engine::new(
+        Script::new(steps),
+        SimulatedVenue::new(),
+        RiskEngine::new(limits),
+        strategy,
+        CASH,
+    );
+    engine.run().expect("the script cannot fail");
+    engine
+}
+
+#[test]
+fn an_oversized_order_never_reaches_the_venue() {
+    // Not "the venue declines it" -- the venue is never told, which is what
+    // makes risk a chokepoint rather than a module the strategy calls.
+    let engine = run_risked(
+        &choppy(),
+        Greedy::default(),
+        Limits {
+            max_order_notional: Some("500".parse().expect("amount")),
+            ..Limits::default()
+        },
+    );
+    assert_eq!(
+        engine.venue().stats().submitted,
+        0,
+        "the venue heard nothing"
+    );
+    assert_eq!(engine.portfolio().fills(), 0);
+    assert!(engine.strategy().refused > 0, "and the strategy was told");
+    assert_eq!(engine.strategy().accepted, 0);
+    assert_eq!(engine.stats().submitted, 0);
+    assert!(engine.stats().refused > 0);
+}
+
+#[test]
+fn a_runaway_strategy_trips_the_switch_and_stops() {
+    // A loop does not stop because one order was declined, so the order-count
+    // limit latches. The number of orders that got out is bounded by the limit
+    // and not by the length of the run, which is the property that matters for
+    // an unattended fortnight.
+    let steps = choppy();
+    let engine = run_risked(
+        &steps,
+        Runaway::default(),
+        Limits {
+            max_orders_per_day: Some(3),
+            ..Limits::default()
+        },
+    );
+    assert!(
+        engine.strategy().submitted >= steps.len() as u64,
+        "the strategy kept trying"
+    );
+    assert_eq!(
+        engine.stats().submitted,
+        3,
+        "exactly the limit got through, however long the run"
+    );
+    assert_eq!(engine.risk().tripped(), Some(TripCause::OrderCount));
+}
+
+#[test]
+fn a_strategy_that_loses_its_budget_is_stopped_for_the_day() {
+    // The crossover with a loss limit tight enough to bite. It has to stop
+    // trading, and the switch has to stay thrown.
+    let instrument = instrument();
+    let strategy = Recorded::new(
+        MaCrossover::new(MaConfig {
+            instrument,
+            fast: 2,
+            slow: 3,
+            interval: SECOND,
+            qty: "0.001".parse().expect("qty"),
+        }),
+        instrument,
+        SECOND,
+    );
+    let mut engine = quant_engine::Engine::new(
+        Script::new(&choppy()),
+        SimulatedVenue::with_costs(quant_sim::Costs {
+            fees: quant_sim::FeeSchedule::flat("0.05".parse().expect("rate")),
+            ..quant_sim::Costs::NONE
+        }),
+        RiskEngine::new(Limits {
+            max_daily_loss: Some("0.005".parse().expect("amount")),
+            ..Limits::default()
+        }),
+        strategy,
+        CASH,
+    );
+    engine.run().expect("the script cannot fail");
+
+    assert_eq!(
+        engine.risk().tripped(),
+        Some(TripCause::DailyLoss),
+        "a 5% fee on every fill spends a half-cent budget quickly"
+    );
+    assert!(
+        engine.stats().refused > 0,
+        "and orders were refused afterwards"
+    );
+}
+
+#[test]
+fn a_refusal_reaches_the_strategy_as_an_execution_event() {
+    // A strategy has to be able to tell that it was stopped. A refusal that
+    // vanished would leave it believing it had an order working, and its next
+    // decision would be made on a position it does not have.
+    let engine = run_risked(
+        &choppy(),
+        Greedy::default(),
+        Limits {
+            max_order_notional: Some("1".parse().expect("amount")),
+            ..Limits::default()
+        },
+    );
+    assert!(engine.strategy().refused > 0);
+}
+
+#[test]
+fn the_same_strategy_is_untouched_when_the_limits_permit_it() {
+    // The other half of the criterion: limits that do not bind must not change
+    // behaviour. A risk layer that quietly altered a permitted run would make
+    // every backtest a different system from the one that trades.
+    let permissive = run_risked(&choppy(), Runaway::default(), Limits::default());
+    let mut unrisked = quant_engine::Engine::new(
+        Script::new(&choppy()),
+        SimulatedVenue::new(),
+        AllowAll,
+        Runaway::default(),
+        CASH,
+    );
+    unrisked.run().expect("the script cannot fail");
+
+    assert_eq!(permissive.portfolio().fills(), unrisked.portfolio().fills());
+    assert_eq!(permissive.portfolio().cash(), unrisked.portfolio().cash());
+    assert_eq!(permissive.stats().submitted, unrisked.stats().submitted);
+}
+
+#[test]
+fn no_money_limit_can_be_enforced_across_a_gap_so_it_refuses() {
+    // A gap clears the book, so there is no mark. A money limit has to refuse
+    // rather than guess -- tightest when the market is least understood.
+    let steps = vec![Step::Gap, Step::Gap, Step::Gap];
+    let engine = run_risked(
+        &steps,
+        Greedy::default(),
+        Limits {
+            max_order_notional: Some("1000000".parse().expect("amount")),
+            ..Limits::default()
+        },
+    );
+    assert_eq!(engine.venue().stats().submitted, 0);
+    assert!(engine.strategy().refused > 0, "refused for want of a price");
+}

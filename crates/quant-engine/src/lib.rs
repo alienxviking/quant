@@ -67,7 +67,7 @@ use quant_core::time::Ts;
 
 pub use journal::{InstrumentKey, Journal, JournalEntry};
 pub use portfolio::{Portfolio, Position};
-pub use risk::{AllowAll, RiskLayer};
+pub use risk::{AllowAll, Limits, RiskEngine, RiskLayer, TripCause};
 pub use strategy::{Context, Strategy};
 pub use venue::ExecutionVenue;
 
@@ -294,6 +294,17 @@ where
                     self.ledger.orders.get(&execution.client_order_id())
                 {
                     self.portfolio.apply_fill(instrument, side, fill);
+                    // Written down *before* the strategy hears about it, so a
+                    // crash cannot erase a fill the strategy has already acted
+                    // on.
+                    if let Some(observer) = self.observer.as_mut() {
+                        observer.on_fill(instrument, side, fill, execution.ts());
+                    }
+                    // Risk keeps its own tally, so it has to see fills too. It
+                    // deliberately does not read the portfolio: a limit computed
+                    // from the accounting can only be as correct as the
+                    // accounting, and would fail in the same direction.
+                    self.risk.on_fill(instrument, side, fill, execution.ts());
                 }
             }
             if execution.is_terminal() {
@@ -341,6 +352,12 @@ where
     #[must_use]
     pub const fn portfolio(&self) -> &Portfolio {
         &self.portfolio
+    }
+
+    /// The risk layer, after the run — for reading whether it tripped.
+    #[must_use]
+    pub const fn risk(&self) -> &R {
+        &self.risk
     }
 
     /// The reconstructed book for an instrument, after the run.
