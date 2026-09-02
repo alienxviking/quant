@@ -1129,6 +1129,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "quant-sim"
+version = "0.1.0"
+dependencies = [
+ "quant-book",
+ "quant-core",
+ "quant-engine",
+]
+
+[[package]]
 name = "quant-storage"
 version = "0.1.0"
 dependencies = [
