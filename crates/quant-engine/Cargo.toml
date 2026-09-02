@@ -16,6 +16,11 @@ license.workspace = true
 [dependencies]
 quant-core = { workspace = true }
 quant-book = { workspace = true }
+# The journal, and only the journal. A paper session's own record of its fills
+# has to survive a restart, and the metadata tier is deliberately optional -- so
+# this is a file, and JSON Lines is what a person can read at 3am.
+serde = { workspace = true }
+serde_json = "1"
 
 [lints]
 workspace = true

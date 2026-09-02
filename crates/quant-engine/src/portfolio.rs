@@ -106,6 +106,28 @@ impl Portfolio {
         self.fills
     }
 
+    /// Instruments currently held.
+    ///
+    /// Exists so a report can say "flat" without iterating a registry it may not
+    /// have. Counts non-flat holdings only, because a position that was closed
+    /// leaves a zeroed slot behind and reporting that as a holding would be a
+    /// lie about what we own.
+    #[must_use]
+    pub fn open_positions(&self) -> usize {
+        self.positions.iter().filter(|p| !p.is_flat()).count()
+    }
+
+    /// Every non-flat holding, with the instrument it is in.
+    #[must_use]
+    pub fn held(&self) -> Vec<(InstrumentId, Position)> {
+        self.positions
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.is_flat())
+            .map(|(i, p)| (InstrumentId::from_index(i), *p))
+            .collect()
+    }
+
     #[must_use]
     pub fn position(&self, instrument: InstrumentId) -> Position {
         self.positions

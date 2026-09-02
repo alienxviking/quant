@@ -160,6 +160,22 @@ impl InstrumentId {
     pub const fn index(self) -> usize {
         self.0 as usize
     }
+
+    /// Rebuild an id from a dense index.
+    ///
+    /// The inverse of [`Self::index`], for the one caller that legitimately has
+    /// an index and no id: a per-instrument array being reported back. Still not
+    /// a way to *invent* an id -- an index that no registry issued names nothing,
+    /// which is the same trap `index` already carries a warning about.
+    ///
+    /// # Panics
+    ///
+    /// If `index` does not fit in a `u32`, which would mean four billion
+    /// instruments.
+    #[must_use]
+    pub fn from_index(index: usize) -> Self {
+        Self(u32::try_from(index).expect("an instrument index fits in u32"))
+    }
 }
 
 impl fmt::Display for InstrumentId {

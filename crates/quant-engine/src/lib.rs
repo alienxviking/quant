@@ -49,6 +49,7 @@
 //! That is invariant 4 arriving at its destination: components take a clock, and
 //! here the clock is the data.
 
+pub mod journal;
 pub mod portfolio;
 pub mod risk;
 pub mod strategy;
@@ -58,12 +59,13 @@ use std::collections::HashMap;
 
 use quant_book::Book;
 use quant_core::event::{MarketEvent, Side};
-use quant_core::execution::{ClientOrderId, ExecutionEvent, OrderRequest, RejectReason};
+use quant_core::execution::{ClientOrderId, ExecutionEvent, Fill, OrderRequest, RejectReason};
 use quant_core::fixed::Notional;
 use quant_core::instrument::InstrumentId;
 use quant_core::source::{EventSource, SourceError};
 use quant_core::time::Ts;
 
+pub use journal::{InstrumentKey, Journal, JournalEntry};
 pub use portfolio::{Portfolio, Position};
 pub use risk::{AllowAll, RiskLayer};
 pub use strategy::{Context, Strategy};
@@ -125,8 +127,21 @@ impl Default for Ledger {
     }
 }
 
+/// Told about every fill, so something outside the engine can write it down.
+///
+/// A callback rather than the engine owning a journal, for the reason M1.c2
+/// gave when the recorder needed to reach Postgres: `quant-recorder` stayed
+/// DB-free via a plain on-seal callback so the arrows only pointed down. Same
+/// here — this crate knows no file format and no database, and a paper binary
+/// wires the journal in.
+///
+/// The instrument and side come from the engine because a [`Fill`] does not
+/// carry them: a fill belongs to an order, and the engine is what knows which.
+pub trait FillObserver {
+    fn on_fill(&mut self, instrument: InstrumentId, side: Side, fill: &Fill, at: Ts);
+}
+
 /// The loop.
-#[derive(Debug)]
 pub struct Engine<S, V, R, K> {
     source: S,
     venue: V,
@@ -140,6 +155,27 @@ pub struct Engine<S, V, R, K> {
     scratch: Vec<ExecutionEvent>,
     ledger: Ledger,
     portfolio: Portfolio,
+    /// Optional, because a backtest has nothing worth journalling: it can be
+    /// re-run from raw, and a two-week paper session cannot.
+    observer: Option<Box<dyn FillObserver>>,
+}
+
+impl<S: core::fmt::Debug, V: core::fmt::Debug, R: core::fmt::Debug, K: core::fmt::Debug>
+    core::fmt::Debug for Engine<S, V, R, K>
+{
+    /// Hand-written because the fill observer is a trait object that need not be
+    /// `Debug` -- it is a callback into a file, and printing it would say
+    /// nothing anyone wants.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Engine")
+            .field("source", &self.source)
+            .field("venue", &self.venue)
+            .field("risk", &self.risk)
+            .field("strategy", &self.strategy)
+            .field("now", &self.now)
+            .field("portfolio", &self.portfolio)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S, V, R, K> Engine<S, V, R, K>
@@ -165,7 +201,31 @@ where
             scratch: Vec::new(),
             ledger: Ledger::default(),
             portfolio: Portfolio::new(starting_cash),
+            observer: None,
         }
+    }
+
+    /// Have every fill reported to `observer` as it is booked.
+    ///
+    /// Called *after* the portfolio applies the fill and *before* the strategy
+    /// is told, so a journal entry exists before anything can act on the fill.
+    /// The other order would allow a strategy to submit on a fill that a crash
+    /// then erased from the record.
+    #[must_use]
+    pub fn observing_fills(mut self, observer: Box<dyn FillObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Start from a position already established, recovered from a journal.
+    ///
+    /// A restart on day nine of a two-week run has to come back up holding what
+    /// it held, or the strategy's first act is to trade against a position it
+    /// does not know it has.
+    #[must_use]
+    pub fn resuming(mut self, portfolio: Portfolio) -> Self {
+        self.portfolio = portfolio;
+        self
     }
 
     /// Run to the end of the source.
