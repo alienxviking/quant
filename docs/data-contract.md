@@ -344,14 +344,18 @@ falsify it is what keeps "done" meaning something.
 
 The normalizer is done when:
 
-- [ ] Every frame in the acceptance capture parses, with no unrecognised event
+- [x] Every frame in the acceptance capture parses, with no unrecognised event
       types and no malformed numbers. *(met: 384M price levels through
-      fixed-point, zero failures.)*
-- [ ] A replayed day holds the book invariants at **every tick**:
+      fixed-point, zero failures. Confirmed a second time by `quant-normalize`,
+      which read all 70,545,346 frames with no parse break.)*
+- [x] A replayed day holds the book invariants at **every tick**:
       `best_bid < best_ask`, no zero-quantity level retained, nothing
-      non-positive. *(met per segment; see below for the remaining gap.)*
-- [ ] A session's segments are joined, so the book carries across midnight
-      rather than restarting unanchored at each UTC day boundary.
+      non-positive. *(met: 70,539,557 live-book ticks across both weeks, zero
+      violations, zero chain breaks.)*
+- [x] A session's segments are joined, so the book carries across midnight
+      rather than restarting unanchored at each UTC day boundary. *(met:
+      `quant-normalize`, 8 segments joined per session, **0** deltas dropped for
+      want of an anchor where single-file replay dropped 7k-34k per day.)*
 - [ ] The normalized Parquet tier is written, partitioned
       `exchange / symbol / date`, and a replay from Parquet agrees with a replay
       from raw.
@@ -383,6 +387,26 @@ only irreversible step. The rest lands here, where a mistake costs a re-derive:
 A snapshot the book has already moved past is **ignored**, not applied — the
 recorder takes an hourly anchor whether one is needed or not, and applying a
 stale one would move the book backwards.
+
+### The archive's own discontinuities are not `Gap`s
+
+A segment that will not open, a torn tail, a hole in `ingest_seq` — each means
+the events after it do not continue the ones before it, and the book must be
+cleared exactly as a recorded `Gap` clears it. They are still **not** `Gap`s.
+
+`GapCause` is a statement about what happened at the venue or in the recorder,
+and it is persisted in the immutable tier under §1's rules. "I could not read
+this file just now" is a statement about a particular replay on a particular
+machine. Adding a fifth cause for it would put a replay-time condition into a
+capture-time contract, and a re-derive on a healthy disk would then produce
+different bytes from one on a failing disk. So `quant-normalize` reports them as
+`Break`s, which live only in the replay.
+
+A hole breaks the book **immediately**, without waiting to see whether a gap
+record explains it. The recorder writes that record *after* the hole it
+describes — the hole is the evidence, the record is the account — so waiting
+would mean handing out events across a known discontinuity in the hope of being
+forgiven. Invalidating twice costs nothing.
 
 ### An invalidated book is cleared, not flagged
 
