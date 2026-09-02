@@ -20,6 +20,10 @@ use quant_core::Notional;
 
 use crate::{AllowAll, Context, Engine, ExecutionVenue, RiskLayer, Strategy};
 
+/// Starting capital for the wiring tests. Any positive number; these tests are
+/// about the seam, and the accounting has its own.
+const CASH: Notional = Notional::from_raw(100 * quant_core::SCALE);
+
 fn instrument() -> InstrumentId {
     InstrumentRegistry::new().register(InstrumentDef {
         exchange: Exchange::Binance,
@@ -225,6 +229,7 @@ fn an_order_cannot_trade_against_the_event_that_prompted_it() {
         RecordingVenue::default(),
         AllowAll,
         Recorder::default(),
+        CASH,
     );
     engine.run().expect("no source failure");
 
@@ -254,6 +259,7 @@ fn the_venue_sees_an_event_before_the_strategy_does() {
         RecordingVenue::default(),
         AllowAll,
         Recorder::default(),
+        CASH,
     );
     engine.run().expect("run");
     assert_eq!(
@@ -285,6 +291,7 @@ fn a_refusing_risk_layer_means_no_order_reaches_the_venue() {
             submit_every_event: true,
             ..Recorder::default()
         },
+        CASH,
     );
     let stats = engine.run().expect("run");
 
@@ -330,6 +337,7 @@ fn a_malformed_request_is_refused_at_the_seam() {
         RecordingVenue::default(),
         AllowAll,
         SendsZero::default(),
+        CASH,
     );
     engine.run().expect("run");
     assert!(engine.venue().received.is_empty());
@@ -357,6 +365,7 @@ fn prices_go_away_across_a_gap_rather_than_going_stale() {
         RecordingVenue::default(),
         AllowAll,
         Recorder::default(),
+        CASH,
     );
     engine.run().expect("run");
 
@@ -407,6 +416,7 @@ fn the_same_strategy_value_runs_against_two_different_wirings() {
         RecordingVenue::default(),
         AllowAll,
         Counting::default(),
+        CASH,
     );
     filling.run().expect("run");
 
@@ -415,6 +425,7 @@ fn the_same_strategy_value_runs_against_two_different_wirings() {
         AcceptOnly::default(),
         AllowAll,
         Counting::default(),
+        CASH,
     );
     accepting.run().expect("run");
 
@@ -435,6 +446,7 @@ fn a_source_error_stops_the_run_and_is_not_an_ending() {
         RecordingVenue::default(),
         AllowAll,
         Recorder::default(),
+        CASH,
     );
     let err = engine
         .run()
@@ -463,6 +475,7 @@ fn the_clock_is_the_event_stream_and_nothing_else() {
             RecordingVenue::default(),
             AllowAll,
             Clocks::default(),
+            CASH,
         );
         engine.run().expect("run");
         engine.strategy().seen.clone()
@@ -496,6 +509,7 @@ fn a_cancel_reports_nothing_and_reaches_the_venue() {
         RecordingVenue::default(),
         AllowAll,
         Canceller,
+        CASH,
     );
     let stats = engine.run().expect("run");
     assert_eq!(stats.cancels, 1);
@@ -525,6 +539,7 @@ fn client_order_ids_are_unique_even_across_refusals() {
         RecordingVenue::default(),
         AllowAll,
         Two::default(),
+        CASH,
     );
     engine.run().expect("run");
     let ids = &engine.strategy().ids;

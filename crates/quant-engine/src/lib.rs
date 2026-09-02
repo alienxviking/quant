@@ -49,17 +49,22 @@
 //! That is invariant 4 arriving at its destination: components take a clock, and
 //! here the clock is the data.
 
+pub mod portfolio;
 pub mod risk;
 pub mod strategy;
 pub mod venue;
 
+use std::collections::HashMap;
+
 use quant_book::Book;
-use quant_core::event::MarketEvent;
+use quant_core::event::{MarketEvent, Side};
 use quant_core::execution::{ClientOrderId, ExecutionEvent, OrderRequest, RejectReason};
+use quant_core::fixed::Notional;
 use quant_core::instrument::InstrumentId;
 use quant_core::source::{EventSource, SourceError};
 use quant_core::time::Ts;
 
+pub use portfolio::{Portfolio, Position};
 pub use risk::{AllowAll, RiskLayer};
 pub use strategy::{Context, Strategy};
 pub use venue::ExecutionVenue;
@@ -81,6 +86,45 @@ pub struct EngineStats {
     pub last_ts: Option<Ts>,
 }
 
+/// The engine's mutable bookkeeping.
+///
+/// Grouped so a [`Context`] can borrow it as one thing. Four separate `&mut`
+/// parameters is the same borrow with more places to get the order wrong, and
+/// the compiler was starting to say so.
+#[derive(Debug)]
+pub(crate) struct Ledger {
+    /// Next client order id. Starts at 1, so a zero id is always a bug rather
+    /// than a legitimate first order.
+    next_id: u64,
+    /// Execution events raised during a strategy callback — a risk rejection, or
+    /// a seam rejection — waiting to be delivered.
+    ///
+    /// Deferred rather than delivered inline because a strategy must not be
+    /// re-entered while it is on the stack, and because even a rejection should
+    /// arrive the way every other outcome does: as an event, afterwards.
+    deferred: Vec<ExecutionEvent>,
+    /// Which instrument and side each live order belongs to.
+    ///
+    /// A `Fill` names only the order, so this is what lets a fill be booked at
+    /// all. The engine has to hold it in every world — a live venue's fill report
+    /// names the order too — which is why the portfolio lives here and not in the
+    /// simulator. Entries are removed on a terminal event, so this is bounded by
+    /// the strategy's working orders rather than by the length of the run.
+    orders: HashMap<ClientOrderId, (InstrumentId, Side)>,
+    stats: EngineStats,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            deferred: Vec::new(),
+            orders: HashMap::new(),
+            stats: EngineStats::default(),
+        }
+    }
+}
+
 /// The loop.
 #[derive(Debug)]
 pub struct Engine<S, V, R, K> {
@@ -93,16 +137,9 @@ pub struct Engine<S, V, R, K> {
     /// that touches one instrument pays for one book.
     books: Vec<Book>,
     now: Ts,
-    next_id: u64,
-    /// Execution events produced during a strategy callback — a risk rejection,
-    /// or a seam rejection — waiting to be delivered.
-    ///
-    /// Deferred rather than delivered inline because a strategy must not be
-    /// re-entered while it is on the stack, and because even a rejection should
-    /// arrive the way every other outcome does: as an event, afterwards.
-    deferred: Vec<ExecutionEvent>,
     scratch: Vec<ExecutionEvent>,
-    stats: EngineStats,
+    ledger: Ledger,
+    portfolio: Portfolio,
 }
 
 impl<S, V, R, K> Engine<S, V, R, K>
@@ -112,8 +149,12 @@ where
     R: RiskLayer,
     K: Strategy,
 {
-    /// Wire one up.
-    pub fn new(source: S, venue: V, risk: R, strategy: K) -> Self {
+    /// Wire one up with `starting_cash`.
+    ///
+    /// Capital is a constructor argument and not a default, because a run
+    /// without it is meaningless and a default of zero would silently produce an
+    /// equity curve of zero that looks like a flat strategy.
+    pub fn new(source: S, venue: V, risk: R, strategy: K, starting_cash: Notional) -> Self {
         Self {
             source,
             venue,
@@ -121,10 +162,9 @@ where
             strategy,
             books: Vec::new(),
             now: Ts::from_nanos(0),
-            next_id: 1,
-            deferred: Vec::new(),
             scratch: Vec::new(),
-            stats: EngineStats::default(),
+            ledger: Ledger::default(),
+            portfolio: Portfolio::new(starting_cash),
         }
     }
 
@@ -137,7 +177,7 @@ where
         while let Some(item) = self.source.next_event() {
             self.step(&item?);
         }
-        Ok(self.stats)
+        Ok(self.ledger.stats)
     }
 
     /// Everything that happens because of one event, in the order of the module
@@ -155,20 +195,19 @@ where
                     self.now,
                     &mut self.venue,
                     &mut self.risk,
-                    &mut self.next_id,
-                    &mut self.deferred,
-                    &mut self.stats,
+                    &mut self.ledger,
+                    &self.portfolio,
                 )
             };
         }
 
         // 1. The clock. Nothing else advances it.
         self.now = event.meta().local_recv_ts;
-        self.stats.events += 1;
-        self.stats.first_ts.get_or_insert(self.now);
-        self.stats.last_ts = Some(self.now);
+        self.ledger.stats.events += 1;
+        self.ledger.stats.first_ts.get_or_insert(self.now);
+        self.ledger.stats.last_ts = Some(self.now);
         if matches!(event, MarketEvent::Gap(_)) {
-            self.stats.gaps += 1;
+            self.ledger.stats.gaps += 1;
         }
 
         // 2. The book. A gap clears it, so there are no stale prices to read.
@@ -183,20 +222,30 @@ where
         self.scratch.clear();
         self.venue.poll(&mut self.scratch);
 
-        // 4. Tell the strategy what happened to its orders.
+        // 4. Book what happened, then tell the strategy. Booking first means a
+        //    strategy reading its own position during `on_execution` sees the
+        //    fill it is being told about, rather than the state before it.
         for i in 0..self.scratch.len() {
             let execution = self.scratch[i].clone();
-            self.stats.execution_events += 1;
-            if matches!(execution, ExecutionEvent::Filled { .. }) {
-                self.stats.fills += 1;
+            self.ledger.stats.execution_events += 1;
+            if let ExecutionEvent::Filled { fill, .. } = &execution {
+                self.ledger.stats.fills += 1;
+                if let Some(&(instrument, side)) =
+                    self.ledger.orders.get(&execution.client_order_id())
+                {
+                    self.portfolio.apply_fill(instrument, side, fill);
+                }
+            }
+            if execution.is_terminal() {
+                self.ledger.orders.remove(&execution.client_order_id());
             }
             let mut ctx = ctx!();
             self.strategy.on_execution(&execution, &mut ctx);
             // Rejections raised inside that callback, delivered before the next
             // one. Drained rather than iterated once, because a strategy may
             // submit from `on_execution` and be refused again.
-            while let Some(refusal) = self.deferred.pop() {
-                self.stats.execution_events += 1;
+            while let Some(refusal) = self.ledger.deferred.pop() {
+                self.ledger.stats.execution_events += 1;
                 let mut ctx = ctx!();
                 self.strategy.on_execution(&refusal, &mut ctx);
             }
@@ -206,8 +255,8 @@ where
         //    submits here is not eligible to trade against this event.
         let mut ctx = ctx!();
         self.strategy.on_market_event(event, &mut ctx);
-        while let Some(refusal) = self.deferred.pop() {
-            self.stats.execution_events += 1;
+        while let Some(refusal) = self.ledger.deferred.pop() {
+            self.ledger.stats.execution_events += 1;
             let mut ctx = ctx!();
             self.strategy.on_execution(&refusal, &mut ctx);
         }
@@ -225,7 +274,13 @@ where
 
     #[must_use]
     pub const fn stats(&self) -> EngineStats {
-        self.stats
+        self.ledger.stats
+    }
+
+    /// Cash, holdings and P&L after the run.
+    #[must_use]
+    pub const fn portfolio(&self) -> &Portfolio {
+        &self.portfolio
     }
 
     /// The reconstructed book for an instrument, after the run.
@@ -235,24 +290,27 @@ where
     }
 }
 
-/// Refuse a request at the seam, before any venue sees it.
-///
-/// Used for both risk rejections and malformed requests. Returns the id anyway,
-/// because the caller was promised one and an order that was refused still has
-/// to be something the strategy can reconcile against.
-pub(crate) fn refuse(
-    deferred: &mut Vec<ExecutionEvent>,
-    stats: &mut EngineStats,
-    client_order_id: ClientOrderId,
-    reason: RejectReason,
-    ts: Ts,
-) {
-    stats.refused += 1;
-    deferred.push(ExecutionEvent::Rejected {
-        client_order_id,
-        reason,
-        ts,
-    });
+impl Ledger {
+    /// Refuse a request at the seam, before any venue sees it.
+    ///
+    /// The order still gets its id, because the caller was promised one and a
+    /// refused order still has to be something the strategy can reconcile
+    /// against.
+    fn refuse(&mut self, client_order_id: ClientOrderId, reason: RejectReason, ts: Ts) {
+        self.stats.refused += 1;
+        self.deferred.push(ExecutionEvent::Rejected {
+            client_order_id,
+            reason,
+            ts,
+        });
+    }
+
+    /// Mint the next client order id.
+    fn mint(&mut self) -> ClientOrderId {
+        let id = ClientOrderId(self.next_id);
+        self.next_id += 1;
+        id
+    }
 }
 
 /// Whether a request is well-formed enough to send anywhere.
