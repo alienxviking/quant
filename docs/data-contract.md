@@ -356,9 +356,12 @@ The normalizer is done when:
       rather than restarting unanchored at each UTC day boundary. *(met:
       `quant-normalize`, 8 segments joined per session, **0** deltas dropped for
       want of an anchor where single-file replay dropped 7k-34k per day.)*
-- [ ] The normalized Parquet tier is written, partitioned
+- [x] The normalized Parquet tier is written, partitioned
       `exchange / symbol / date`, and a replay from Parquet agrees with a replay
-      from raw.
+      from raw. *(met: 2.1 GB of Parquet from 3.0 GB of raw, and **70,545,345
+      events match event for event** — `normalize --check`.)*
+
+**M2 is complete.**
 
 ### The normalized tier holds events, not books
 
@@ -407,6 +410,57 @@ record explains it. The recorder writes that record *after* the hole it
 describes — the hole is the evidence, the record is the account — so waiting
 would mean handing out events across a known discontinuity in the hope of being
 forgiven. Invalidating twice costs nothing.
+
+### Money on disk is `DECIMAL(18,8)`
+
+Not `INT64`. The bytes are identical — Parquet backs a decimal of precision ≤ 18
+with an `INT64` — but the decimal carries **the scale in the schema**. §1 says
+money is integral and never passes through `f64`, and that guarantee has so far
+only held inside our own process. A bare `INT64` column makes every reader
+responsible for knowing the `1e8` convention out of band; the first that does
+not is wrong by eight orders of magnitude, and the first that reads it as a
+double loses precision silently on large notionals. The column type is how the
+invariant survives the process boundary.
+
+Precision 18 at scale 8 holds values below `10^10`, where `i64` holds nine times
+that. A value past the bound is a **loud error on write**, per §5's "parse
+failures are loud" — never a truncation.
+
+Timestamps are `TIMESTAMP(NANOS, UTC)` on the same argument. This is the first
+place nanosecond `Ts` values leave the raw tier; the metadata tier's microseconds
+remain operational-only, which is not a contradiction, because Postgres holds an
+*index* and this holds a re-derivation.
+
+**The instrument is not a column.** `InstrumentId` is a registry index and is
+never persisted; identity lives in the partition path and is reattached from
+`(exchange, symbol)` on read.
+
+### A partition names the session it came from
+
+The normalized layout has no session in it, and should not: this tier is about
+what the market did, and which capture run saw it belongs to raw and to the
+metadata tier. But a recorder restart creates a new session, and two sessions can
+hold segments for the same symbol on the same day.
+
+So each file carries its source session in the Parquet footer, and the writer
+**refuses a partition another session owns** rather than publishing over it.
+Merging two sessions into one day — ordered by `local_recv_ts`, since
+`ingest_seq` is session-scoped and cannot order across them — is the eventual
+answer and is not yet implemented. Refusing is what makes deferring it safe
+rather than lossy.
+
+A day's partition is also **published by rename**: written to a `.tmp` sibling
+and moved into place once its footer lands, so a reader never finds a truncated
+file at a real path.
+
+### The partition day is inherited, not re-derived
+
+A record is filed under the day the **raw tier** filed it under, read off the
+segment it came from — not recomputed from `local_recv_ts`. The two agree except
+in the case §5's rolling rule carves out: a record stamped before the open
+segment's day, after an NTP step, is written to the open segment on purpose. A
+re-derivation would file it elsewhere, and the two tiers would stop lining up
+directory for directory — which is the only cheap cross-check between them.
 
 ### An invalidated book is cleared, not flagged
 
