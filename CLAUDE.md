@@ -843,6 +843,107 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   byte-identical. *When a result is bad, check that it is bad for the reasons you can
   account for.*
 
+- **M4 complete** (2026-09-02): fees, latency, and the answer. 320 tests green in
+  debug and release, clippy and fmt clean. Criterion — **results degrade sensibly
+  under realistic costs** — met, with all five of `docs/engine-contract.md` §8's
+  checkboxes ticked.
+
+  | | Slice | Status |
+  |---|---|---|
+  | a | `Rate` + `FeeSchedule`, fees on fills | **done** |
+  | b | Latency: outbound, inbound, cancels on the wire | **done** |
+  | c | CLI flags, the degradation sweep, the caveat split | **done** |
+
+  **The answer**, BTCUSDT over the acceptance week, 209 round trips:
+
+  | costs | equity | fees | drawdown | gross P&L |
+  |---|---|---|---|---|
+  | free (= M3) | 97.53 | 0 | 4.40 | −2.47 |
+  | 1 bps | 94.25 | 3.28 | 7.00 | −2.47 |
+  | 7.5 bps | 72.94 | 24.59 | 27.30 | −2.47 |
+  | **10 bps (Binance spot)** | **64.74** | **32.79** | **35.45** | −2.47 |
+  | latency 50 ms | 97.57 | 0 | 4.37 | −2.43 |
+  | `--realistic` | 64.79 | 32.79 | 35.41 | −2.43 |
+
+  The strategy loses **2.5% on price and 33% on commission**. 418 fills at ten basis
+  points on a $76 position is 43% of position value in a week, so gross returns
+  would have to beat that to break even. That settles this strategy class at this
+  turnover — which is what M4 was for, and it cost nothing to learn.
+
+- **M4 decisions.** **"Degrades sensibly" had to be made falsifiable** or it is a
+  vibe. Two properties: `Costs::NONE` reproduces M3 *to the last digit*, and fees
+  are **monotone** — for rates `a < b` the result under `b` is never better. The
+  second is the property a sign error on a fee breaks, and a sign error on a fee is
+  otherwise invisible because it just looks like a surprisingly good strategy.
+
+  **Costs are off by default**, so a bare `backtest` run is still M3's. Not
+  laziness: the no-op property is what makes the models checkable, and it is easier
+  to trust when it is what runs when you type nothing.
+
+  **Fees are visible separately from the price result.** `realized` is price only,
+  `fees` is its own total, `cash` carries both — so "profitable before costs and
+  not after" is read off the output rather than inferred. And the **venue and the
+  portfolio each tally the fees independently**, so a disagreement means one of them
+  is wrong; neither would say so alone. (Same shape as M2.d's two readers agreeing
+  on 70,545,346 frames.)
+
+  **Fees are charged in the quote currency**, which is a simplification and is named
+  as one in the caveat list: a spot venue takes its fee in the base, leaving the
+  position a fraction smaller rather than the cash a fraction lower. Second-order at
+  our size; modelling it properly needs two balances, which is M5's problem where a
+  real statement can settle it.
+
+  **`adverse_per_fill` is a stress knob, not a model** — zero by default, labelled
+  in three places, and the binary prints a warning when it is non-zero. An
+  uncalibrated number presented as a model is worse than no model, because the
+  output looks equally authoritative either way.
+
+- **Latency is a variance, not a cost** (the M4 finding worth remembering). At 50 ms
+  the result got slightly **better**. That is not a bug: fees subtract a known
+  amount, but latency moves the fill to a *later book*, and over a 60-second
+  sampling horizon the sign of that move is a coin flip — 50 ms is one
+  twelve-hundredth of a bar. So **"latency must never improve results" would have
+  been a wrong criterion**, and the test asserts that latency *changes something* —
+  a model that altered no fill would be a field, not a model — and deliberately
+  asserts no direction. It becomes a systematic cost only for a strategy fast enough
+  that the market's move during the round trip correlates with the reason it traded.
+
+  Outbound and inbound are separate numbers because their effects are not
+  symmetric: outbound changes **what price we get**, inbound changes **when we find
+  out**, and a strategy that reconciles its position behaves differently under the
+  two. **Cancels travel the wire too** — pretending cancellation is free is exactly
+  the assumption that makes a market-making backtest look safe — and can therefore
+  lose the race to a fill, which is why `cancel` was fire-and-forget from M3.
+  Reports still in flight when the data ends are **counted, not flushed**: flushing
+  would tell a strategy something it could not have known.
+
+- **The M4 bug worth remembering, twice over.** The first version of the CLI parsed
+  the flags, printed `fee taker 0.001`, and handed the venue `SimulatedVenue::new()`
+  — `cargo fmt` had collapsed the `Engine::new` call onto one line and my edit
+  silently missed it. So **the report announced ten basis points and the fills were
+  free**: a cost model configured but not wired, producing a *confidently wrong*
+  number, which is the exact failure this milestone exists to prevent.
+
+  The fix is not the wiring. The report now reads costs back off
+  `engine.venue().costs()`, so "configured" and "applied" cannot disagree again.
+  **General lesson: print what was used, not what was asked for — ask the thing
+  that did the work.**
+
+  And the caveat list was lying in the *other* direction: it claimed "no fees" and
+  "no latency" unconditionally, which became false the moment `Costs` existed. A
+  caveat that errs that way invites a reader to discount a cost that was actually
+  charged. Split into `caveats()` (cannot be modelled) and `switched_off(costs)`
+  (modelled, and you set it to zero), with a test asserting the permanent list makes
+  no claim a flag can change.
+
+- **I reimplemented `Px::notional` twice** before noticing it had existed in
+  `quant-core` since M0 — once in `quant-sim`, once in `quant-engine`'s portfolio,
+  each with its own 128-bit `mul_div`. Two copies of a money calculation that must
+  agree forever, beside a third that was there first. This is *the same lesson M2.d
+  recorded* and I broke it inside one milestone. Both now call `Px::notional`, and
+  its inverses (`Notional::per_unit`, `Notional::scaled_by`) live beside it so the
+  set cannot drift. **Before writing arithmetic, grep `quant-core`.**
+
 Milestone table: see `README.md`.
 
 ## The acceptance run, and how it went
@@ -983,9 +1084,17 @@ turns out to be.
 
 ### Still open
 
-- Nothing blocking on M1, M2 or M3. **Next is M4** — fees, slippage and latency, whose
-  criterion is that results **degrade sensibly**. The M3 curve is expected to get worse;
-  if it improves, something in M4 is wrong.
+- Nothing blocking on M1–M4. **Next is M5** — paper trading: two weeks live, with
+  P&L reconciling against an independent recompute. It is also the only instrument
+  that can measure the two things M4 could not model, because they are not
+  recoverable from recorded data at any price: **queue position** (our order was
+  never in the recorded book) and **market impact** (nobody in the recording reacted
+  to us).
+- **The strategy question is answered and the answer is no.** A crossover at 209
+  round trips a week cannot survive 10 bps a side. M5 and beyond are about the
+  platform being trustworthy, not about this strategy — and a lower-turnover or
+  maker-side idea is the shape that could work, which is a thing to try *after* the
+  platform can measure it honestly.
 - **Two sessions covering one symbol-day are refused, not merged** (M2.d). Cannot
   happen on the acceptance capture, where each symbol ran one session for the whole
   week; it will the first time a recorder restarts mid-day. The merge is ordered by
