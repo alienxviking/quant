@@ -28,7 +28,7 @@ use quant_core::time::UtcDate;
 
 pub use partition::{DayReport, PartitionWriter, WriteReport};
 pub use provenance::Provenance;
-pub use read::{read_dataset, DatasetStream, TierReplay};
+pub use read::{discover_days, read_dataset, DatasetStream, HistoricalSource, TierReplay};
 pub use schema::{Dataset, MAX_MONEY_RAW, MONEY_PRECISION, MONEY_SCALE};
 pub use write::{dataset_of, DatasetWriter, BATCH_ROWS};
 

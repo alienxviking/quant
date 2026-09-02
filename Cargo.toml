@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/quant-backtest",
     "crates/quant-binance",
     "crates/quant-book",
     "crates/quant-core",
@@ -31,6 +32,7 @@ repository = "https://github.com/alienxviking/quant"
 # crates that both parse exchange payloads is exactly the kind of bug that
 # only shows up in production.
 [workspace.dependencies]
+quant-backtest = { path = "crates/quant-backtest" }
 quant-binance = { path = "crates/quant-binance" }
 quant-book = { path = "crates/quant-book" }
 quant-core = { path = "crates/quant-core" }

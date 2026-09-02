@@ -23,6 +23,7 @@ use quant_core::event::{
     BookDelta, BookSnapshot, EventMeta, Gap, GapCause, Level, MarketEvent, Side, Trade,
 };
 use quant_core::instrument::{Exchange, InstrumentId};
+use quant_core::source::{EventSource, SourceError};
 use quant_core::time::{Ts, UtcDate};
 use quant_core::{Px, Qty};
 
@@ -378,4 +379,64 @@ impl Iterator for TierReplay {
             }
         }
     }
+}
+
+/// The normalized tier as an [`EventSource`], for the engine.
+///
+/// The "as fast as possible" leg of the three worlds: no pacing, no sockets,
+/// just the recorded events in recorded order. Pacing against the wall clock is
+/// a different source (`ReplaySource`, when M5 needs it) precisely so that a
+/// backtest cannot accidentally acquire timing behaviour it will not have.
+#[derive(Debug)]
+pub struct HistoricalSource {
+    inner: TierReplay,
+}
+
+impl HistoricalSource {
+    /// Replay `days` of one symbol out of `root`.
+    #[must_use]
+    pub fn new(
+        root: &Path,
+        exchange: Exchange,
+        symbol: &str,
+        instrument: InstrumentId,
+        days: Vec<UtcDate>,
+    ) -> Self {
+        Self {
+            inner: TierReplay::open(root, exchange, symbol, instrument, days),
+        }
+    }
+}
+
+impl EventSource for HistoricalSource {
+    fn next_event(&mut self) -> Option<Result<MarketEvent, SourceError>> {
+        self.inner
+            .next()
+            .map(|item| item.map_err(|e| SourceError(e.to_string())))
+    }
+}
+
+/// Every date partition present for one symbol, in calendar order.
+///
+/// Reads the directory rather than taking a range, so a run covers what is
+/// actually there. Asking for a range and silently getting less is how a
+/// backtest ends up reporting a period it did not test.
+#[must_use]
+pub fn discover_days(root: &Path, exchange: Exchange, symbol: &str) -> Vec<UtcDate> {
+    let dir = root
+        .join("normalized")
+        .join(format!("exchange={exchange}"))
+        .join(format!("symbol={symbol}"));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut days: Vec<UtcDate> = entries
+        .filter_map(|e| {
+            let name = e.ok()?.file_name();
+            let name = name.to_str()?;
+            quant_recorder::parse_utc_date(name.strip_prefix("date=")?)
+        })
+        .collect();
+    days.sort_by_key(|d| (d.year, d.month, d.day));
+    days
 }
