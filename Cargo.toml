@@ -14,7 +14,13 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# The floor our dependencies actually impose, not an aspiration. Cargo's
+# MSRV-aware resolver honours this number when choosing versions, so a stale one
+# is not free: at 1.75 it silently held us to `parquet` 54 (early 2025) while 59
+# was current, for a promise nothing tests -- CI runs `stable` and
+# rust-toolchain.toml pins the channel, not a version. Raise it when a dependency
+# we want requires it; never lower it below what we can build.
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/alienxviking/quant"
 
@@ -32,6 +38,15 @@ quant-recorder = { path = "crates/quant-recorder" }
 quant-storage = { path = "crates/quant-storage" }
 quant-verify = { path = "crates/quant-verify" }
 serde = { version = "1", features = ["derive"] }
+
+# The normalized tier. Default features pull brotli, flate2, lz4, snap, base64
+# and arrow-ipc; we compress with zstd exactly as the raw tier does, so none of
+# that earns its build time. `arrow` is not optional -- the low-level column API
+# would mean hand-rolling the nested LIST<STRUCT> encoding that book levels need.
+parquet = { version = "59", default-features = false, features = ["arrow", "zstd"] }
+arrow-array = "59"
+arrow-buffer = "59"
+arrow-schema = "59"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

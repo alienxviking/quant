@@ -13,10 +13,12 @@ version is named. Read those when they disagree.
 | The milestone table | `README.md` |
 | How the 7-day run is conducted and judged | `docs/acceptance-run.md` |
 
-*State as of 2026-09-02: **M0 and M1 complete, M2 in progress.** M1's acceptance run was
-spent in full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. M2's
-parser and book are done; every one of the 16 acceptance segments replays with the book
-invariants holding at every tick. 16,041 lines of Rust across 8 crates, 214 tests passing in debug and release.*
+*State as of 2026-09-02: **M0, M1 and M2 complete.** M1's acceptance run was
+spent in full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. Both
+weeks now replay as two joined 8-day sessions with book invariants holding at all 70.5M
+ticks, and the normalized Parquet tier reproduces the raw stream event for event. Next is
+M3, the engine seam. 18,641 lines of Rust across 8 crates, 237 tests passing in debug and
+release.*
 
 ---
 
@@ -219,7 +221,7 @@ use whatever tool fits, with no schema registration.
 |---|---|---|---|
 | M0 | Foundation + data contract | CI green; contract written before the recorder | **done** |
 | M1 | Binance market data recorder | 7 days unattended, zero unexplained gaps | **done** |
-| M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | **in progress** |
+| M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | **done** |
 | M3 | Engine seam + SimulatedVenue + MA crossover | An equity curve exists, **and it is unimpressive** | |
 | M4 | Fee, slippage, latency modelling | Results degrade sensibly under realistic costs | |
 | M5 | Paper trading | 2 weeks live; P&L reconciles against an independent recompute | |
@@ -582,7 +584,7 @@ this one".
 
 ## 9. What is left
 
-### M2 — Normalizer + book reconstruction *(in progress)*
+### M2 — Normalizer + book reconstruction *(complete)*
 
 **Criterion:** book invariants hold at every tick of a replayed day —
 `best_bid < best_ask`, no zero-quantity levels retained, nothing non-positive.
@@ -598,7 +600,7 @@ still reconstruct into nonsense if the normalizer is wrong.
 | a | `quant-binance::parse` — payloads to events, in fixed-point | **done** |
 | b | `quant-book` — apply, invariants, gap invalidation, resync | **done** |
 | c | `quant-normalize` — join a session's segments, replay, report | **done** |
-| d | Parquet output — the normalized tier on disk | next |
+| d | Parquet output — the normalized tier on disk | **done** |
 
 **The scoping call.** The milestone reads "normalizer *and* book reconstruction", but
 those are two artifacts. The normalized tier holds **events, not books** — the
@@ -708,6 +710,48 @@ verifier asks *is this capture complete*; the normalizer asks *what did the mark
 A capture with an honest recorded gap is complete and still goes dark for a while, so a
 tool that conflated the two would have to call one of them a failure.
 
+#### The Parquet tier, and what makes "disposable" true
+
+The storage-tier table has said since M0 that Normalized can be deleted and
+rebuilt from raw. That was a promise about a derivation nobody had checked.
+`normalize --check` checks it: 2.1 GB of Parquet from 3.0 GB of raw, and
+**70,545,345 events replayed from Parquet match the raw replay event for event**.
+
+Event by event, not by summary. Two reconstructions can produce identical book
+statistics from different events — a transposed pair of timestamps, a level moved
+from one delta to the next, an aggressor flipped on a trade later cancelled out.
+Comparing summaries passes every one of those.
+
+Four encoding decisions carry the weight.
+
+**Money is `DECIMAL(18,8)`, not `INT64`.** The bytes are identical — Parquet backs
+a decimal of precision ≤ 18 with an int64 — but the decimal carries the scale in
+the schema. Invariant 1 says money never goes through `f64`, and until now that
+held only inside our own process; a bare int64 makes every reader responsible for
+knowing the `1e8` convention out of band, and the first that reads it as a double
+loses precision silently. The column type is how the invariant crosses the process
+boundary. The bound it imposes is enforced rather than assumed: a value past
+`10^10` is a loud error on write.
+
+**A file names the session it came from.** The layout has no session dimension, and
+should not — this tier is about what the market did. But a recorder restart makes a
+new session, and two sessions can cover one symbol-day; publishing the second over
+the first would lose a day and leave a file that looks complete. Each file carries
+its source session in the Parquet footer and the writer refuses a partition another
+session owns. Merging two sessions into one day is the eventual answer; refusing is
+what makes deferring it safe rather than lossy.
+
+**The partition day is inherited from raw, not recomputed.** The first version
+re-derived it from `local_recv_ts` with a "never backwards" clamp — reimplementing
+the recorder's M1.c1 rule, and wrong in exactly the case that rule exists for.
+The tests caught it.
+
+**A break stops the write.** The book can survive a discontinuity by clearing; a
+file cannot, because a partition written across one looks continuous forever after.
+Raw is the source of truth and this tier is disposable, so the answer is to stop and
+re-derive. The exception is a torn tail on the last segment — the ordinary signature
+of a killed recorder.
+
 ### M3 — Engine seam + SimulatedVenue + a deliberately bad strategy
 
 **Criterion:** an equity curve is produced, **and it is unimpressive.**
@@ -769,6 +813,8 @@ the simulation was honest. See §11.
   book invariants holding at all 70.5M ticks, 0 chain breaks and 0 deltas dropped for
   want of an anchor — and `quant-normalize` and `quant-verify` independently agree on
   70,545,346 frames without sharing any counting code
+- **The normalized tier is a re-derivation and not a second source of truth.**
+  70,545,345 events replayed from Parquet match the raw replay event for event
 
 ### The acceptance run
 
@@ -911,7 +957,7 @@ point, because the code shows the what.
 | `quant-book` | 894 | Book reconstruction and its invariants. Depends only on `quant-core`. |
 | `quant-meta` | 1,075 | Postgres. Sits above the recorder; optional. |
 | `quant-verify` | 2,056 | Near the top. Asks whether the capture is complete. Nothing may depend on it. |
-| `quant-normalize` | 1,087 | Near the top. Asks what the market did. M2.d and M3 depend on it. |
+| `quant-normalize` | 3,687 | Near the top. Asks what the market did, and writes the normalized tier. |
 
 The dependency arrows only point one way. That is checked by the fact that adding a second
 venue should mean writing a new adapter and touching nothing else.
