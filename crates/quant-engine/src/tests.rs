@@ -168,7 +168,7 @@ impl ExecutionVenue for RecordingVenue {
         }
     }
 
-    fn poll(&mut self, out: &mut Vec<ExecutionEvent>) {
+    fn poll(&mut self, _now: Ts, out: &mut Vec<ExecutionEvent>) {
         out.append(&mut self.out);
     }
 }
@@ -404,7 +404,7 @@ fn the_same_strategy_value_runs_against_two_different_wirings() {
             });
         }
         fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
-        fn poll(&mut self, out: &mut Vec<ExecutionEvent>) {
+        fn poll(&mut self, _now: Ts, out: &mut Vec<ExecutionEvent>) {
             out.append(&mut self.out);
         }
     }
