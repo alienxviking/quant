@@ -114,6 +114,7 @@ pub mod metrics;
 pub mod record;
 pub mod segment;
 pub mod sink;
+pub mod tee;
 pub mod writer;
 
 pub use backoff::{Backoff, BackoffPolicy};
@@ -128,4 +129,5 @@ pub use segment::{
 pub use sink::{
     channel, CaptureReceiver, CaptureSender, RecordSink, SinkError, DEFAULT_CHANNEL_CAPACITY,
 };
+pub use tee::TeeSink;
 pub use writer::{run_writer, WriterOutcome, DEFAULT_FLUSH_INTERVAL};
