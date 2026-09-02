@@ -66,6 +66,8 @@ crates/
                     Top of the dependency graph.                   [M1d]
   quant-book/       order book reconstruction and its invariants.
                     Venue-agnostic; depends only on quant-core.    [M2b]
+  quant-normalize/  a capture session back out as ordered events:
+                    segments joined, book driven, `normalize` bin. [M2c]
 docs/
   data-contract.md    the on-disk format and its acceptance criteria
   acceptance-run.md   how the 7-day M1 run is conducted and judged
@@ -89,10 +91,12 @@ time can satisfy — was spent: seven days unattended on an Apple Silicon Mac,
 See `docs/acceptance-run.md` for the procedure, and "The acceptance run, and how it
 went" in `CLAUDE.md` for the result.
 
-**M2 is in progress.** The payload parser and the book are done and every one of
-the 16 acceptance segments replays with the invariants holding at every tick. What
-remains is joining a session's segments so the book carries across midnight, and
-writing the normalized Parquet tier.
+**M2 is in progress.** The payload parser, the book and the session join are done.
+Both weeks of the acceptance capture now replay as two joined 8-day sessions with
+book invariants holding at all 70.5M ticks, **zero** deltas dropped for want of an
+anchor, and zero chain breaks — where replaying one file at a time had dropped
+7,000 to 34,000 deltas on each day after the first. What remains is writing the
+normalized Parquet tier.
 
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day |
 | M3 | Engine seam + SimulatedVenue + MA crossover | Equity curve produced, and it is unimpressive |
@@ -181,6 +185,10 @@ gap" enforceable rather than advisory.
 ```bash
 cargo run -p quant-verify --bin verify -- data
 cargo run -p quant-verify --bin verify -- data --reconcile   # also check the index
+
+# and replay it: is the capture complete, and does it reconstruct?
+cargo run --release -p quant-normalize --bin normalize -- data
+cargo run --release -p quant-normalize --bin normalize -- data --symbol BTCUSDT
 ```
 
 Exit 0 means every discontinuity in every session is explained by a record in the

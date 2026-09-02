@@ -13,10 +13,10 @@ version is named. Read those when they disagree.
 | The milestone table | `README.md` |
 | How the 7-day run is conducted and judged | `docs/acceptance-run.md` |
 
-*State as of 2026-08-31: **M0 and M1 complete, M2 in progress.** M1's acceptance run was
+*State as of 2026-09-02: **M0 and M1 complete, M2 in progress.** M1's acceptance run was
 spent in full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. M2's
 parser and book are done; every one of the 16 acceptance segments replays with the book
-invariants holding at every tick. 15,056 lines of Rust across 7 crates, 204 tests passing in debug and release.*
+invariants holding at every tick. 16,041 lines of Rust across 8 crates, 214 tests passing in debug and release.*
 
 ---
 
@@ -597,8 +597,8 @@ still reconstruct into nonsense if the normalizer is wrong.
 |---|---|---|
 | a | `quant-binance::parse` — payloads to events, in fixed-point | **done** |
 | b | `quant-book` — apply, invariants, gap invalidation, resync | **done** |
-| c | `quant-normalize` — join a session's segments, replay, report | next |
-| d | Parquet output — the normalized tier on disk | |
+| c | `quant-normalize` — join a session's segments, replay, report | **done** |
+| d | Parquet output — the normalized tier on disk | next |
 
 **The scoping call.** The milestone reads "normalizer *and* book reconstruction", but
 those are two artifacts. The normalized tier holds **events, not books** — the
@@ -667,6 +667,47 @@ It also disproved a sentence in the verifier. `deltas_before_anchor` was describ
 *"recorded, but not reconstructible"* — they are in fact either superseded by the
 snapshot or replayed after it, and both halves are needed.
 
+#### Joining the days
+
+Replaying files one at a time left a known artifact: days 2 through 8 dropped between
+7,000 and 34,000 deltas apiece. Not a defect — each file starts mid-stream with no
+anchor and waits up to an hour for the next periodic snapshot. Day 1 dropped none,
+because its reconnect snapshot lands 300 ms in.
+
+A UTC day boundary is a **filing decision**. `ingest_seq` spans a session and so does
+the venue's update-id chain, so crossing from one day's file into the next must not
+reset anything. `quant-normalize` joins them, and the artifact disappears: both weeks,
+both symbols, **0 deltas dropped for want of an anchor**, 0 chain breaks, invariants
+holding at all 70.5M ticks.
+
+Three decisions inside it are worth keeping.
+
+**The replay is an iterator of events, not a program that checks a book.** The book is
+the consumer that happens to exist first; the Parquet writer at M2.d and the engine's
+historical and replay sources at M3 want the identical stream. Written the other way,
+both would have to take it apart again to get at the events.
+
+**The archive's own discontinuities are items in that stream.** A segment that will not
+open, a torn tail, a hole in `ingest_seq` — each means what follows does not continue
+what came before, and skipping quietly to the next readable frame would produce a book
+that *looks* continuous across data we never read. They are `Break`s and not
+synthesized `Gap`s, because `GapCause` is persisted in the immutable tier and describes
+the venue or the recorder, while "I could not read this file just now" describes one
+replay on one machine.
+
+**Session discovery moved down into `quant-recorder`.** The verifier had owned it since
+M1.d2, and nothing may depend on the verifier. Duplicating the fifteen lines would have
+been easy and wrong: if the two ever disagreed about which files form a session, the
+normalizer would replay a different stream than the one the verifier passed clean, and
+nothing downstream could notice. The two tools now share the walk and share nothing
+else — which is why it means something that they independently agree on 70,545,346
+frames.
+
+`quant-verify` and `quant-normalize` are kept apart in both directions on purpose. The
+verifier asks *is this capture complete*; the normalizer asks *what did the market do*.
+A capture with an honest recorded gap is complete and still goes dark for a while, so a
+tool that conflated the two would have to call one of them a failure.
+
 ### M3 — Engine seam + SimulatedVenue + a deliberately bad strategy
 
 **Criterion:** an equity curve is produced, **and it is unimpressive.**
@@ -718,12 +759,16 @@ the simulation was honest. See §11.
 
 ### Proven
 
-- 179 tests passing in debug and release; clippy and fmt clean; CI green on Linux and
+- 214 tests passing in debug and release; clippy and fmt clean; CI green on Linux and
   Apple Silicon
 - **Seven days unattended, and it passed.** See below.
 - Corruption is detected and distinguished from a torn tail (verified by flipping a byte)
 - The metadata index agrees with the files' own trailers, and disagreement is caught
 - The run harness works end to end: supervise, verify mid-capture, self-terminate, seal
+- **The week reconstructs.** Both 8-day sessions replay as one joined stream each, with
+  book invariants holding at all 70.5M ticks, 0 chain breaks and 0 deltas dropped for
+  want of an anchor — and `quant-normalize` and `quant-verify` independently agree on
+  70,545,346 frames without sharing any counting code
 
 ### The acceptance run
 
@@ -847,9 +892,9 @@ cargo run -p quant-verify  --bin verify -- data --reconcile
 # inspect a single file (--sample N prints whole payloads)
 cargo run -p quant-storage --example dump -- <path to part-00000.bin.zst>
 
-# M2: parse every frame, and replay one through a book
-cargo run --release -p quant-binance --example parse_all -- <path to part-*.bin.zst>
-cargo run --release -p quant-binance --example replay    -- <path to part-*.bin.zst>
+# M2: parse every frame in a file; replay whole sessions through a book
+cargo run --release -p quant-binance   --example parse_all -- <path to part-*.bin.zst>
+cargo run --release -p quant-normalize --bin normalize     -- data
 ```
 
 Warnings are errors in CI. Commits explain **why** in the body — the rationale is the
@@ -861,11 +906,12 @@ point, because the code shows the what.
 |---|---|---|
 | `quant-core` | 1,747 | Money, time, instruments, the event contract. No I/O. |
 | `quant-storage` | 2,702 | The raw format. No venue, no network. |
-| `quant-recorder` | 3,698 | Ingress, overload policy, day rolling. Venue-agnostic, async-free. |
-| `quant-binance` | 2,725 | The only crate that knows a venue. |
+| `quant-recorder` | 4,003 | Ingress, overload policy, day rolling. Venue-agnostic, async-free. |
+| `quant-binance` | 2,477 | The only crate that knows a venue. |
 | `quant-book` | 894 | Book reconstruction and its invariants. Depends only on `quant-core`. |
 | `quant-meta` | 1,075 | Postgres. Sits above the recorder; optional. |
-| `quant-verify` | 2,215 | Top of the graph. The only crate allowed to know both a venue and the format. |
+| `quant-verify` | 2,056 | Near the top. Asks whether the capture is complete. Nothing may depend on it. |
+| `quant-normalize` | 1,087 | Near the top. Asks what the market did. M2.d and M3 depend on it. |
 
 The dependency arrows only point one way. That is checked by the fact that adding a second
 venue should mean writing a new adapter and touching nothing else.
