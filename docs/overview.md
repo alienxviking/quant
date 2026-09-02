@@ -224,7 +224,7 @@ use whatever tool fits, with no schema registration.
 | M0 | Foundation + data contract | CI green; contract written before the recorder | **done** |
 | M1 | Binance market data recorder | 7 days unattended, zero unexplained gaps | **done** |
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | **done** |
-| M3 | Engine seam + SimulatedVenue + MA crossover | An equity curve exists, **and it is unimpressive** | |
+| M3 | Engine seam + SimulatedVenue + MA crossover | An equity curve exists, **and it is unimpressive** | **done** |
 | M4 | Fee, slippage, latency modelling | Results degrade sensibly under realistic costs | |
 | M5 | Paper trading | 2 weeks live; P&L reconciles against an independent recompute | |
 | M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | |
