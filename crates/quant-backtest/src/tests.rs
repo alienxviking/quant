@@ -297,3 +297,176 @@ fn a_curve_with_no_valuation_at_all_reports_nothing_rather_than_zero() {
     assert_eq!(c.last(), None);
     assert_eq!(c.range(), None);
 }
+
+// --- Costs (M4): the properties that make "degrades sensibly" falsifiable ---
+
+/// The same wiring, with costs.
+fn run_with(steps: &[Step], costs: quant_sim::Costs) -> Wired {
+    let instrument = instrument();
+    let strategy = Recorded::new(
+        MaCrossover::new(MaConfig {
+            instrument,
+            fast: 2,
+            slow: 3,
+            interval: SECOND,
+            qty: "0.001".parse().expect("qty"),
+        }),
+        instrument,
+        SECOND,
+    );
+    let mut engine = Engine::new(
+        Script::new(steps),
+        SimulatedVenue::with_costs(costs),
+        AllowAll,
+        strategy,
+        CASH,
+    );
+    engine.run().expect("the script cannot fail");
+    engine
+}
+
+/// A path that trades several times, so fees have something to bite.
+fn choppy() -> Vec<Step> {
+    let mut steps = Vec::new();
+    for _ in 0..4 {
+        for mid in [100, 100, 100, 101, 103, 106, 110, 108, 104, 99, 95, 90] {
+            steps.push(Step::Book(mid));
+        }
+    }
+    steps
+}
+
+#[test]
+fn zero_costs_reproduce_the_free_run_exactly() {
+    // The no-op property, end to end. If a zero-valued model changes a number,
+    // it touched something it had no business touching -- and every M4 result is
+    // quoted against this baseline, so it has to be the same baseline.
+    let free = run(&choppy());
+    let zeroed = run_with(&choppy(), quant_sim::Costs::NONE);
+    assert_eq!(free.portfolio(), zeroed.portfolio());
+    assert_eq!(
+        free.strategy().curve().points,
+        zeroed.strategy().curve().points
+    );
+}
+
+#[test]
+fn a_higher_fee_rate_never_leaves_more_equity() {
+    // Monotonicity: the property a sign error on a fee breaks, and a sign error
+    // on a fee is otherwise invisible because it looks like a good strategy.
+    let mut previous: Option<quant_core::Notional> = None;
+    for rate in ["0", "0.0001", "0.00075", "0.001", "0.01"] {
+        let engine = run_with(
+            &choppy(),
+            quant_sim::Costs {
+                fees: quant_sim::FeeSchedule::flat(rate.parse().expect("rate")),
+                ..quant_sim::Costs::NONE
+            },
+        );
+        let equity = engine
+            .strategy()
+            .curve()
+            .last()
+            .expect("the path ends with a live book");
+        if let Some(before) = previous {
+            assert!(
+                equity <= before,
+                "fees at {rate} left {equity}, more than the cheaper run's {before}"
+            );
+        }
+        previous = Some(equity);
+    }
+}
+
+#[test]
+fn fees_are_visible_separately_from_the_price_result() {
+    // "Profitable before costs and not after" has to be readable off the
+    // output, not inferred. Realized P&L is price only; fees are their own
+    // total; cash carries both.
+    let costed = run_with(
+        &choppy(),
+        quant_sim::Costs {
+            fees: quant_sim::FeeSchedule::binance_spot(),
+            ..quant_sim::Costs::NONE
+        },
+    );
+    let free = run(&choppy());
+
+    assert_eq!(
+        costed.portfolio().realized(),
+        free.portfolio().realized(),
+        "fees must not be folded into the price result"
+    );
+    assert!(costed.portfolio().fees().raw() > 0);
+    assert!(
+        costed.portfolio().cash() < free.portfolio().cash(),
+        "but they must come out of the money"
+    );
+}
+
+#[test]
+fn the_venue_and_the_portfolio_agree_on_what_was_charged() {
+    // Two independent tallies of the same number: the venue says what it
+    // charged and the portfolio says what it paid. A disagreement means one of
+    // them is wrong, and neither would say so on its own.
+    let engine = run_with(
+        &choppy(),
+        quant_sim::Costs {
+            fees: quant_sim::FeeSchedule::binance_spot(),
+            ..quant_sim::Costs::NONE
+        },
+    );
+    assert_eq!(
+        engine.venue().stats().fees_charged,
+        engine.portfolio().fees()
+    );
+}
+
+#[test]
+fn latency_is_allowed_to_help_or_hurt_because_it_is_variance_not_a_cost() {
+    // Deliberately *not* a monotonicity test, and the reason is worth keeping.
+    // Latency does not subtract a fee; it moves the fill to a later book, and
+    // over a horizon much longer than the latency the sign of that move is a
+    // coin flip. On the acceptance week 50ms of latency slightly *improved* the
+    // result, and a criterion saying it must not have would have been wrong.
+    //
+    // What must hold is that it changes something -- a latency model that
+    // altered no fill would be a field rather than a model -- and that the run
+    // stays well-defined.
+    let instant = run_with(&choppy(), quant_sim::Costs::NONE);
+    let slow = run_with(
+        &choppy(),
+        quant_sim::Costs {
+            latency: quant_sim::Latency::millis(400),
+            ..quant_sim::Costs::NONE
+        },
+    );
+    assert!(
+        slow.portfolio().fills() > 0,
+        "orders still reach the venue eventually"
+    );
+    assert_ne!(
+        instant.portfolio().realized(),
+        slow.portfolio().realized(),
+        "a latency model that changed no fill would be a field, not a model"
+    );
+}
+
+#[test]
+fn a_latency_longer_than_the_data_means_nothing_ever_arrives() {
+    // The degenerate end, checked so it fails loudly rather than looking like a
+    // strategy that chose not to trade.
+    let engine = run_with(
+        &choppy(),
+        quant_sim::Costs {
+            latency: quant_sim::Latency::millis(1_000_000),
+            ..quant_sim::Costs::NONE
+        },
+    );
+    assert_eq!(engine.portfolio().fills(), 0);
+    assert!(
+        engine.venue().stats().accepted == 0,
+        "not even acknowledged"
+    );
+    assert!(engine.stats().submitted > 0, "but orders were sent");
+}

@@ -136,20 +136,50 @@ pub struct SimStats {
 }
 
 impl SimStats {
-    /// What this run did **not** model, in words, for printing beside results.
+    /// What this simulator cannot model **at all**, whatever it is configured
+    /// with.
     ///
     /// A method rather than a doc comment because the engine contract requires
     /// the absence of costs to be stated in the output. A number quoted without
     /// this list is a number quoted dishonestly.
+    ///
+    /// Note what is no longer here. Until M4 this list also claimed "no fees"
+    /// and "no latency" unconditionally, which became *false* the moment
+    /// [`Costs`] existed — and a caveat list that errs in that direction is
+    /// worse than none, because it invites a reader to discount a cost that was
+    /// actually charged. Those two moved to [`Self::switched_off`], which asks
+    /// the configuration instead of assuming.
     #[must_use]
     pub const fn caveats() -> &'static [&'static str] {
         &[
-            "no fees: every fill is free, which flatters turnover most of all",
-            "no latency: an order is at the venue by the next event",
             "no queue position: a resting order is filled only on a trade-through, \
              which understates passive fills rather than overstating them",
-            "no market impact: our orders are invisible to everyone else",
+            "no market impact: our orders are invisible to everyone else, which is \
+             false at any size that matters and is not recoverable from recorded data",
+            "fees are charged in the quote currency; a spot venue takes them in the \
+             base, leaving the position smaller rather than the cash lower",
         ]
+    }
+
+    /// What a particular run chose to switch off.
+    ///
+    /// Separate from [`Self::caveats`] because a reader has to be able to tell
+    /// "cannot be modelled" from "modelled, and you set it to zero". The first
+    /// is a limit of the approach; the second is a decision, and only one of
+    /// them is fixable by passing a flag.
+    #[must_use]
+    pub fn switched_off(costs: Costs) -> Vec<&'static str> {
+        let mut off = Vec::new();
+        if costs.fees == FeeSchedule::FREE {
+            off.push("no fees: every fill is free, which flatters turnover most of all");
+        }
+        if costs.latency == Latency::NONE {
+            off.push(
+                "no latency: an order is at the venue by the next event, and the book \
+                 has not moved since the decision",
+            );
+        }
+        off
     }
 }
 

@@ -420,7 +420,16 @@ fn every_fill_is_free_and_the_caveats_say_so() {
         unreachable!()
     };
     assert_eq!(fill.fee.raw(), 0);
-    assert!(SimStats::caveats().iter().any(|c| c.contains("no fees")));
+    // "no fees" belongs to `switched_off`, not `caveats`: it is a decision this
+    // run made, not a limit of the simulator. Keeping them apart is what stops
+    // a costed run from claiming its fills were free.
+    assert!(SimStats::switched_off(crate::Costs::NONE)
+        .iter()
+        .any(|c| c.contains("no fees")));
+    assert!(
+        !SimStats::caveats().iter().any(|c| c.contains("no fees")),
+        "a permanent caveat list must not claim something a flag can change"
+    );
 }
 
 #[test]
