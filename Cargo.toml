@@ -39,6 +39,15 @@ quant-storage = { path = "crates/quant-storage" }
 quant-verify = { path = "crates/quant-verify" }
 serde = { version = "1", features = ["derive"] }
 
+# The normalized tier. Default features pull brotli, flate2, lz4, snap, base64
+# and arrow-ipc; we compress with zstd exactly as the raw tier does, so none of
+# that earns its build time. `arrow` is not optional -- the low-level column API
+# would mean hand-rolling the nested LIST<STRUCT> encoding that book levels need.
+parquet = { version = "59", default-features = false, features = ["arrow", "zstd"] }
+arrow-array = "59"
+arrow-buffer = "59"
+arrow-schema = "59"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

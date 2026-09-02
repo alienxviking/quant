@@ -32,6 +32,7 @@
 //! different hat.
 
 pub mod replay;
+pub mod tier;
 
 use quant_book::{Book, BookStats, Outcome};
 use quant_core::event::MarketEvent;
@@ -39,6 +40,7 @@ use quant_core::instrument::InstrumentId;
 use quant_recorder::SessionFiles;
 
 pub use replay::{Break, BreakKind, ReplayItem, ReplayStats, SessionReplay};
+pub use tier::{Dataset, DatasetWriter, TierError, TierTarget};
 
 /// What a replayed session did, and whether it can be trusted.
 #[derive(Debug, Clone, Default)]

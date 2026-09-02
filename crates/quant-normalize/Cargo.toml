@@ -27,5 +27,15 @@ quant-recorder = { workspace = true }
 quant-binance = { workspace = true }
 quant-book = { workspace = true }
 
+# Money on disk is DECIMAL(18,8), not INT64. Identical bytes -- parquet backs a
+# decimal of precision <= 18 with an int64 -- but the decimal carries the scale
+# in the schema, so DuckDB, Polars and pandas read exact decimals instead of
+# having to know our 1e8 convention out of band. Invariant 1 says money never
+# goes through f64; this is what extends that past our own process boundary.
+parquet = { workspace = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+
 [lints]
 workspace = true
