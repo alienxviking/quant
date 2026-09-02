@@ -188,7 +188,72 @@ on a clock, mid from the book) compose into it without anyone enforcing it.
 
 ### What M3 explicitly does not do
 
-- **No fees, slippage or latency.** M4. Their absence must be *stated in the
-  output*, not merely known, so nobody quotes an M3 curve as a result.
+- **No fees, slippage or latency.** M4 — now done; see §8.
 - **No risk limits.** M6. The chokepoint exists and passes everything.
 - **No live or paper venue.** M5 and M8. The seam is built so they slot in.
+
+---
+
+## 8. Acceptance criteria for M4
+
+Costs are done when:
+
+- [x] Cost models set to zero **reproduce the M3 numbers to the last digit**.
+      *(`Costs::NONE`: $97.5291254, realized −2.4708746, drawdown 4.3996746.)*
+- [x] Fees are **monotone**: for rates `a < b`, the result under `b` is never
+      better. *(Tested at the unit level and end to end.)*
+- [x] Fees are visible **separately from the price result**, so "profitable
+      before costs and not after" can be read off the output rather than
+      inferred.
+- [x] The venue and the portfolio **agree** on what was charged — two
+      independent tallies of one number.
+- [x] The output distinguishes **cannot be modelled** from **you set it to
+      zero**.
+
+**M4 is complete.**
+
+### The answer
+
+BTCUSDT, the acceptance week, 209 round trips:
+
+| costs | final equity | fees | drawdown | gross P&L |
+|---|---|---|---|---|
+| free (= M3) | 97.53 | 0 | 4.40 | −2.47 |
+| 1 bps | 94.25 | 3.28 | 7.00 | −2.47 |
+| 7.5 bps | 72.94 | 24.59 | 27.30 | −2.47 |
+| **10 bps (Binance spot)** | **64.74** | **32.79** | **35.45** | −2.47 |
+| latency 50 ms | 97.57 | 0 | 4.37 | −2.43 |
+| latency 500 ms | 97.54 | 0 | 4.41 | −2.46 |
+| `--realistic` | 64.79 | 32.79 | 35.41 | −2.43 |
+
+The strategy loses 2.5% on price and **33% on commission**. 418 fills at ten
+basis points on a $76 position is 43% of position value in a week, so gross
+returns would have to beat that to break even. That settles this strategy class
+at this turnover, which is what M4 was for.
+
+### Latency is a variance, not a cost
+
+At 50 ms the result got slightly **better**, and that is not a bug.
+
+Fees subtract a known amount. Latency does something else entirely: it moves the
+fill to a *later book*, and over a 60-second sampling horizon the sign of that
+move is a coin flip — 50 ms is one twelve-hundredth of a bar. So "latency must
+never improve results" would have been a **wrong** criterion, and the tests
+deliberately do not assert a direction. What they assert is that it changes
+something: a latency model that altered no fill would be a field, not a model.
+
+Latency becomes a systematic cost only for a strategy fast enough that the
+market's move during the round trip is correlated with the reason it traded.
+This strategy is nowhere near that, and the model says so rather than inventing
+a number.
+
+### What is still not modelled, and why not here
+
+- **Queue position.** Our order was never in the recorded book, so there is no
+  way to know what was ahead of it. The simulator's answer is to fill a resting
+  order only on a trade-through, which understates passive fills.
+- **Market impact.** Nobody in the recording reacted to us, because we were not
+  there. Not recoverable from recorded data at any price.
+
+Both are why **M5 exists**: paper trading against the live venue is the only
+instrument that can measure them.

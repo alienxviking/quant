@@ -112,7 +112,7 @@ fn run(
     venue.submit(ClientOrderId(1), &request, NOW);
     venue.observe(event, book, NOW);
     let mut out = Vec::new();
-    venue.poll(&mut out);
+    venue.poll(NOW, &mut out);
     out
 }
 
@@ -135,7 +135,7 @@ fn nothing_happens_at_submission() {
         NOW,
     );
     let mut out = Vec::new();
-    venue.poll(&mut out);
+    venue.poll(NOW, &mut out);
     assert!(out.is_empty(), "not even an acceptance: {out:?}");
     assert_eq!(venue.open_orders(), 1);
 }
@@ -335,12 +335,12 @@ fn a_cancel_after_a_fill_says_nothing_because_it_lost_the_race() {
     );
     venue.observe(&tick(), &book(), NOW);
     let mut out = Vec::new();
-    venue.poll(&mut out);
+    venue.poll(NOW, &mut out);
     assert!(fill_of(&out).is_some());
 
     venue.cancel(ClientOrderId(1), NOW);
     let mut after = Vec::new();
-    venue.poll(&mut after);
+    venue.poll(NOW, &mut after);
     assert!(after.is_empty(), "{after:?}");
     assert_eq!(venue.stats().cancelled, 0);
 }
@@ -350,12 +350,18 @@ fn a_cancel_before_a_fill_returns_the_unfilled_size() {
     let mut venue = SimulatedVenue::new();
     venue.submit(ClientOrderId(1), &order(Side::Buy, "1", limit("90.0")), NOW);
     venue.cancel(ClientOrderId(1), NOW);
+    // A cancel travels the same wire an order does, so it takes effect when the
+    // venue next looks at the market -- not the instant it is asked for.
+    venue.observe(&tick(), &book(), NOW);
     let mut out = Vec::new();
-    venue.poll(&mut out);
-    assert!(matches!(
-        out.first(),
-        Some(ExecutionEvent::Cancelled { remaining, .. }) if remaining.to_string() == "1"
-    ));
+    venue.poll(NOW, &mut out);
+    assert!(
+        out.iter().any(|e| matches!(
+            e,
+            ExecutionEvent::Cancelled { remaining, .. } if remaining.to_string() == "1"
+        )),
+        "{out:?}"
+    );
     assert_eq!(venue.open_orders(), 0);
 }
 
@@ -367,7 +373,7 @@ fn an_order_is_accepted_once_and_only_once() {
         venue.observe(&tick(), &book(), NOW);
     }
     let mut out = Vec::new();
-    venue.poll(&mut out);
+    venue.poll(NOW, &mut out);
     let accepts = out
         .iter()
         .filter(|e| matches!(e, ExecutionEvent::Accepted { .. }))
@@ -414,7 +420,16 @@ fn every_fill_is_free_and_the_caveats_say_so() {
         unreachable!()
     };
     assert_eq!(fill.fee.raw(), 0);
-    assert!(SimStats::caveats().iter().any(|c| c.contains("no fees")));
+    // "no fees" belongs to `switched_off`, not `caveats`: it is a decision this
+    // run made, not a limit of the simulator. Keeping them apart is what stops
+    // a costed run from claiming its fills were free.
+    assert!(SimStats::switched_off(crate::Costs::NONE)
+        .iter()
+        .any(|c| c.contains("no fees")));
+    assert!(
+        !SimStats::caveats().iter().any(|c| c.contains("no fees")),
+        "a permanent caveat list must not claim something a flag can change"
+    );
 }
 
 #[test]
@@ -441,4 +456,323 @@ fn a_notional_larger_than_i64_would_hold_is_computed_in_128_bits() {
         fill_of(&events),
         Some(("76650".to_owned(), "100000".to_owned()))
     );
+}
+
+// --- Costs (M4) ---
+
+#[test]
+fn a_free_venue_charges_nothing() {
+    // The no-op property, at the unit level: Costs::NONE must reproduce M3.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs::NONE);
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "1", OrderKind::Market),
+        &tick(),
+        &book(),
+    );
+    let (px, _) = fill_of(&events).expect("a fill");
+    assert_eq!(px, "101", "the price is the book's, unaltered");
+    assert_eq!(venue.stats().fees_charged.to_string(), "0");
+}
+
+#[test]
+fn a_taker_fee_is_charged_on_the_gross() {
+    // Ten basis points on 1 unit at 101 is 0.101.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        fees: crate::FeeSchedule::binance_spot(),
+        ..crate::Costs::NONE
+    });
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "1", OrderKind::Market),
+        &tick(),
+        &book(),
+    );
+    let ExecutionEvent::Filled { fill, .. } = events
+        .iter()
+        .find(|e| matches!(e, ExecutionEvent::Filled { .. }))
+        .expect("a fill")
+    else {
+        unreachable!()
+    };
+    assert_eq!(fill.fee.to_string(), "0.101");
+    assert!(!fill.is_maker, "a market order crossed the spread");
+    assert_eq!(venue.stats().fees_charged.to_string(), "0.101");
+}
+
+#[test]
+fn a_maker_rebate_is_a_negative_fee() {
+    // Some venues pay for passive flow. A schedule that could not express that
+    // would misprice every passive strategy.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        fees: crate::FeeSchedule {
+            maker: "-0.0001".parse().expect("rate"),
+            taker: "0.001".parse().expect("rate"),
+        },
+        ..crate::Costs::NONE
+    });
+    let mut book = Book::new();
+    book.apply_snapshot(&BookSnapshot {
+        meta: meta(),
+        last_update_id: 10,
+        bids: vec![level("98.0", "1")],
+        asks: vec![level("99.0", "1")],
+    });
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "1", limit("100.0")),
+        &print_at("99.0"),
+        &book,
+    );
+    let ExecutionEvent::Filled { fill, .. } = events
+        .iter()
+        .find(|e| matches!(e, ExecutionEvent::Filled { .. }))
+        .expect("a fill")
+    else {
+        unreachable!()
+    };
+    assert!(fill.is_maker, "a resting order that was traded through");
+    assert!(fill.fee.raw() < 0, "a rebate: {}", fill.fee);
+}
+
+#[test]
+fn a_maker_and_a_taker_are_charged_different_rates() {
+    // The distinction has to reach the fee, or `is_maker` is decoration.
+    let fees = crate::FeeSchedule {
+        maker: "0.0002".parse().expect("rate"),
+        taker: "0.001".parse().expect("rate"),
+    };
+    let gross: quant_core::Notional = "1000".parse().expect("amount");
+    assert_eq!(fees.fee(gross, true).to_string(), "0.2");
+    assert_eq!(fees.fee(gross, false).to_string(), "1");
+}
+
+#[test]
+fn a_higher_fee_rate_never_costs_less() {
+    // Monotonicity, which is the property a sign error breaks -- and a sign
+    // error on a fee is otherwise invisible, because it just looks like a
+    // surprisingly good strategy.
+    let gross: quant_core::Notional = "76650".parse().expect("amount");
+    let mut previous = quant_core::Notional::from_raw(i64::MIN);
+    for rate in ["0", "0.00001", "0.0001", "0.00075", "0.001", "0.01"] {
+        let fee = crate::FeeSchedule::flat(rate.parse().expect("rate")).fee(gross, false);
+        assert!(
+            fee >= previous,
+            "fee at {rate} was {fee}, below the previous {previous}"
+        );
+        previous = fee;
+    }
+}
+
+#[test]
+fn a_fee_is_truncated_toward_zero_rather_than_rounded_up() {
+    // Never round a fee up into money the venue did not charge.
+    let fees = crate::FeeSchedule::flat("0.001".parse().expect("rate"));
+    // 0.000000001 * 1e8 truncates to 0 rather than to one satoshi.
+    let tiny: quant_core::Notional = "0.000001".parse().expect("amount");
+    assert_eq!(fees.fee(tiny, false).raw(), 0);
+}
+
+#[test]
+fn the_stress_concession_is_always_against_us() {
+    // A buyer pays more, a seller receives less. A single signed field applied
+    // with `side.sign()` is one line for both, rather than a branch that can be
+    // written backwards.
+    let costs = crate::Costs {
+        adverse_per_fill: "0.5".parse().expect("px"),
+        ..crate::Costs::NONE
+    };
+
+    let mut buying = SimulatedVenue::with_costs(costs);
+    let bought = run(
+        &mut buying,
+        order(Side::Buy, "0.5", OrderKind::Market),
+        &tick(),
+        &book(),
+    );
+    assert_eq!(fill_of(&bought).expect("a fill").0, "101.5");
+
+    let mut selling = SimulatedVenue::with_costs(costs);
+    let sold = run(
+        &mut selling,
+        order(Side::Sell, "0.5", OrderKind::Market),
+        &tick(),
+        &book(),
+    );
+    assert_eq!(fill_of(&sold).expect("a fill").0, "98.5");
+}
+
+#[test]
+fn the_stress_concession_is_zero_by_default() {
+    // It is a knob and not a model, so it must not be on unless someone turned
+    // it on deliberately.
+    assert_eq!(
+        crate::Costs::default().adverse_per_fill,
+        quant_core::Px::ZERO
+    );
+    assert!(crate::Costs::default().is_free());
+    assert!(!crate::Costs::retail().is_free());
+}
+
+// --- Latency ---
+
+/// Advance the venue through a sequence of times, collecting deliveries.
+fn tick_through(venue: &mut SimulatedVenue, times: &[i64]) -> Vec<ExecutionEvent> {
+    let mut out = Vec::new();
+    for t in times {
+        let at = Ts::from_nanos(*t);
+        venue.observe(&tick(), &book(), at);
+        venue.poll(at, &mut out);
+    }
+    out
+}
+
+const MILLI: i64 = 1_000_000;
+
+#[test]
+fn an_order_in_flight_cannot_fill() {
+    // Outbound latency means the venue does not have the order yet, so it does
+    // not exist as far as the market is concerned -- not acknowledged, and
+    // certainly not filled.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        latency: crate::Latency {
+            outbound: 50 * MILLI,
+            inbound: 0,
+        },
+        ..crate::Costs::NONE
+    });
+    venue.submit(
+        ClientOrderId(1),
+        &order(Side::Buy, "0.5", OrderKind::Market),
+        Ts::from_nanos(0),
+    );
+
+    // 40 ms later: still travelling.
+    let early = tick_through(&mut venue, &[40 * MILLI]);
+    assert!(early.is_empty(), "nothing has happened yet: {early:?}");
+    assert_eq!(venue.stats().accepted, 0, "not even acknowledged");
+
+    // 60 ms: arrived.
+    let late = tick_through(&mut venue, &[60 * MILLI]);
+    assert!(fill_of(&late).is_some(), "{late:?}");
+    assert_eq!(venue.stats().accepted, 1);
+}
+
+#[test]
+fn a_report_in_flight_is_not_delivered_early() {
+    // Inbound latency changes when we find out, which is what a strategy's next
+    // decision depends on.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        latency: crate::Latency {
+            outbound: 0,
+            inbound: 50 * MILLI,
+        },
+        ..crate::Costs::NONE
+    });
+    venue.submit(
+        ClientOrderId(1),
+        &order(Side::Buy, "0.5", OrderKind::Market),
+        Ts::from_nanos(0),
+    );
+
+    // The fill happens at 10 ms but is not knowable until 60 ms.
+    let at_ten = tick_through(&mut venue, &[10 * MILLI]);
+    assert!(at_ten.is_empty(), "generated but not delivered: {at_ten:?}");
+    assert_eq!(venue.stats().fills, 1, "the venue did fill it");
+    assert!(venue.stats().undelivered > 0, "and is holding the report");
+
+    let later = tick_through(&mut venue, &[70 * MILLI]);
+    let ExecutionEvent::Filled { ts, .. } = later
+        .iter()
+        .find(|e| matches!(e, ExecutionEvent::Filled { .. }))
+        .expect("the fill arrives")
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        ts.as_nanos(),
+        10 * MILLI,
+        "the timestamp is when it happened, not when we heard -- \
+         stamping delivery time would make our latency look like the market's"
+    );
+}
+
+#[test]
+fn a_fill_that_never_arrives_is_counted_rather_than_flushed() {
+    // Flushing would tell a strategy something it could not have known. Leaving
+    // it and saying so keeps the discrepancy visible.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        latency: crate::Latency {
+            outbound: 0,
+            inbound: 10 * MILLI,
+        },
+        ..crate::Costs::NONE
+    });
+    venue.submit(
+        ClientOrderId(1),
+        &order(Side::Buy, "0.5", OrderKind::Market),
+        Ts::from_nanos(0),
+    );
+    let out = tick_through(&mut venue, &[MILLI]);
+    assert!(out.is_empty());
+    // Two: the acknowledgement and the fill. Both are things the venue knows
+    // and we do not, which is the whole point of an inbound number.
+    assert_eq!(venue.stats().undelivered, 2);
+}
+
+#[test]
+fn a_cancel_can_lose_the_race_to_a_fill_because_it_travels_too() {
+    // The reason `cancel` reports nothing. Pretending cancellation is free is
+    // exactly the assumption that makes a market-making backtest look safe.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        latency: crate::Latency {
+            outbound: 50 * MILLI,
+            inbound: 0,
+        },
+        ..crate::Costs::NONE
+    });
+    // A market order that arrives at 50 ms.
+    venue.submit(
+        ClientOrderId(1),
+        &order(Side::Buy, "0.5", OrderKind::Market),
+        Ts::from_nanos(0),
+    );
+    // Cancelled at 20 ms, so the cancel arrives at 70 ms -- after the fill.
+    venue.cancel(ClientOrderId(1), Ts::from_nanos(20 * MILLI));
+
+    let out = tick_through(&mut venue, &[60 * MILLI, 80 * MILLI]);
+    assert!(fill_of(&out).is_some(), "the order filled first: {out:?}");
+    assert_eq!(
+        venue.stats().cancelled,
+        0,
+        "and the cancel found nothing, saying nothing"
+    );
+}
+
+#[test]
+fn zero_latency_is_indistinguishable_from_no_latency_at_all() {
+    // Half of the no-op property: a model set to zero must not change the
+    // sequence of events, only the numbers it was given.
+    let free = {
+        let mut venue = SimulatedVenue::new();
+        run(
+            &mut venue,
+            order(Side::Buy, "0.5", OrderKind::Market),
+            &tick(),
+            &book(),
+        )
+    };
+    let zeroed = {
+        let mut venue = SimulatedVenue::with_costs(crate::Costs {
+            latency: crate::Latency::NONE,
+            ..crate::Costs::NONE
+        });
+        run(
+            &mut venue,
+            order(Side::Buy, "0.5", OrderKind::Market),
+            &tick(),
+            &book(),
+        )
+    };
+    assert_eq!(free, zeroed);
 }

@@ -14,13 +14,14 @@ version is named. Read those when they disagree.
 | How the 7-day run is conducted and judged | `docs/acceptance-run.md` |
 | The seam a strategy sees, and why | `docs/engine-contract.md` |
 
-*State as of 2026-09-02: **M0, M1, M2 and M3 complete.** M1's acceptance run was
+*State as of 2026-09-02: **M0 through M4 complete.** M1's acceptance run was
 spent in full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. Both
 weeks now replay as two joined 8-day sessions with book invariants holding at all 70.5M
 ticks, and the normalized Parquet tier reproduces the raw stream event for event. M3's
 engine seam is built and its first equity curve loses money before costs, which is the
-criterion. Next is M4, the cost models. 22,641 lines of Rust across 11 crates, 301 tests
-passing in debug and release.*
+criterion; M4's cost models then take it from $97.53 to $64.74 at real fees. Next is M5,
+paper trading. 23,630 lines of Rust across 11 crates, 320 tests passing in debug and
+release.*
 
 ---
 
@@ -225,7 +226,7 @@ use whatever tool fits, with no schema registration.
 | M1 | Binance market data recorder | 7 days unattended, zero unexplained gaps | **done** |
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | **done** |
 | M3 | Engine seam + SimulatedVenue + MA crossover | An equity curve exists, **and it is unimpressive** | **done** |
-| M4 | Fee, slippage, latency modelling | Results degrade sensibly under realistic costs | |
+| M4 | Fee, slippage, latency modelling | Results degrade sensibly under realistic costs | **done** |
 | M5 | Paper trading | 2 weeks live; P&L reconciles against an independent recompute | |
 | M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | |
 | M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | |
@@ -803,12 +804,44 @@ does not advance and no crossing can fire. Three independent decisions compose i
 property — which is the kind of thing a later refactor removes by accident, so it is
 written down.
 
-### M4 — Fee, slippage and latency modelling
+### M4 — Fee, slippage and latency modelling *(complete)*
 
-**Criterion:** results degrade sensibly under realistic costs.
+**Criterion:** results degrade sensibly under realistic costs. Met.
 
-Most naive strategies are profitable before costs and unprofitable after. The purpose is
-to make that visible early, before anyone becomes attached to a result.
+Most naive strategies are profitable before costs and unprofitable after. This one is
+unprofitable before costs and *obliterated* after:
+
+| costs | final equity | fees | drawdown | gross P&L |
+|---|---|---|---|---|
+| free (= M3) | 97.53 | 0 | 4.40 | −2.47 |
+| 1 bps | 94.25 | 3.28 | 7.00 | −2.47 |
+| 7.5 bps | 72.94 | 24.59 | 27.30 | −2.47 |
+| **10 bps (Binance spot)** | **64.74** | **32.79** | **35.45** | −2.47 |
+| latency 50 ms | 97.57 | 0 | 4.37 | −2.43 |
+| `--realistic` | 64.79 | 32.79 | 35.41 | −2.43 |
+
+2.5% lost on price, **33% on commission**. 418 fills at ten basis points on a $76
+position is 43% of position value in a week, so gross returns would have to beat that
+to break even. **That settles this strategy class at this turnover** — and it cost
+nothing to find out.
+
+**"Degrades sensibly" had to be made falsifiable**, or it is a vibe. Two properties:
+`Costs::NONE` reproduces the M3 numbers to the last digit, and fees are monotone — for
+rates `a < b` the result under `b` is never better. The second is the property a sign
+error on a fee breaks, and such an error is otherwise invisible because it looks like a
+surprisingly good strategy.
+
+**Latency turned out to be a variance, not a cost.** At 50 ms the result got slightly
+*better*. Fees subtract a known amount; latency moves the fill to a later book, and over
+a 60-second sampling horizon the sign of that move is a coin flip — 50 ms is one
+twelve-hundredth of a bar. So "latency must never improve results" would have been a
+**wrong** criterion, and the tests assert that latency changes something rather than
+which way. It becomes a systematic cost only for a strategy fast enough that the
+market's move during the round trip correlates with the reason it traded.
+
+**Queue position and market impact are still not modelled, and cannot be.** Our order
+was never in the recorded book, and nobody in the recording reacted to it. No amount of
+cleverness recovers that from a capture, which is exactly why M5 exists.
 
 ### M5 — Paper trading
 
@@ -862,6 +895,8 @@ the simulation was honest. See §11.
   venue is never told; prices go to `None` across a gap; two runs are byte-identical
 - **An equity curve exists, and it loses money before costs** — which is the M3 criterion,
   not a disappointment
+- **And it is destroyed by real fees**: $64.74 from $100 at 10 bps a side, with the fee
+  total shown separately from the price result so the two cannot be confused
 
 ### The acceptance run
 
@@ -895,14 +930,18 @@ second check were themselves evidence:
 
 ### Not proven
 
-1. **Nothing at all is known about strategy edge.** A crossover exists and loses money;
-   that is a fact about the harness being honest, not about the idea being tested. The
-   question is not answered honestly until M4 puts costs in.
-2. **The slippage model has no validation path at retail size.** Every order at $100 or
-   $500 fills at top of book on a liquid pair, because top-of-book depth is tens of
-   thousands of dollars. So the M4 model stays *modelled and unvalidated* until size
-   grows — which is fine, because at sizes where slippage is unmeasurable it is also
-   economically irrelevant. Worth writing down rather than discovering later.
+1. **No strategy has edge, and one has been ruled out.** The crossover loses 2.5% on
+   price and 33% on commission over the acceptance week. That is now a measured result
+   rather than an open question — for *this* strategy at *this* turnover. Nothing is
+   known about a lower-turnover or maker-side idea, because none has been tried.
+2. **The slippage model has no validation path at retail size**, and M4 confirmed it:
+   only 2 of 418 fills consumed more than one book level. Top-of-book depth is tens of
+   thousands of dollars and our position is $76, so the walk is real machinery that
+   almost never engages. Fine — at sizes where slippage is unmeasurable it is also
+   economically irrelevant — but it means the *slippage* half of M4 is modelled and
+   unvalidated, while the *fee* half is simply arithmetic on a published number.
+3. **Queue position and market impact are unmeasured, not merely unmodelled.** They are
+   not recoverable from recorded data at any price. M5 is the instrument.
 
 ### Honest proportion
 
@@ -990,8 +1029,9 @@ cargo run -p quant-storage --example dump -- <path to part-00000.bin.zst>
 cargo run --release -p quant-binance   --example parse_all -- <path to part-*.bin.zst>
 cargo run --release -p quant-normalize --bin normalize     -- data
 
-# M3: run a strategy over the normalized tier
+# M3/M4: run a strategy over the normalized tier, free then costed
 cargo run --release -p quant-backtest  --bin backtest      -- data --symbol BTCUSDT
+cargo run --release -p quant-backtest  --bin backtest      -- data --realistic
 ```
 
 Warnings are errors in CI. Commits explain **why** in the body — the rationale is the

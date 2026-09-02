@@ -52,9 +52,16 @@ pub trait ExecutionVenue {
         let _ = (event, book, now);
     }
 
-    /// Take everything that has happened since the last call.
+    /// Take everything the venue has told us **by** `now`.
+    ///
+    /// `now` is a parameter rather than something the venue remembers from the
+    /// last [`Self::observe`], because a report that is not yet due has to stay
+    /// undelivered and a venue inferring the time from call order would be one
+    /// refactor away from being wrong. A simulator with inbound latency holds
+    /// events until their delivery time; a live venue ignores it and hands over
+    /// whatever arrived.
     ///
     /// Appends rather than returning, so a busy venue does not allocate a vector
     /// per event on the hot path.
-    fn poll(&mut self, out: &mut Vec<ExecutionEvent>);
+    fn poll(&mut self, now: Ts, out: &mut Vec<ExecutionEvent>);
 }

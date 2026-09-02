@@ -117,6 +117,19 @@ the harness was lying, and every way it could lie (dispatching on the wrong
 timestamp, filling at prices the book never showed, trading through a gap) is
 invisible in the output. See `docs/engine-contract.md`.
 
+**M4 is complete**, and it answers the question the project was built to ask
+honestly. At Binance spot's published 10 bps a side, the same week takes $100 to
+**$64.74** — the strategy loses 2.5% on price and **33% on commission**. 418 fills
+on a $76 position is 43% of position value in fees in a week, so gross returns
+would have to beat that to break even. That is a real result: this strategy class,
+at this turnover, at retail fees, cannot work. Learning it from recorded data cost
+nothing.
+
+One finding worth repeating: **latency is a variance, not a cost.** At 50 ms the
+result got slightly *better*, because latency moves the fill to a later book and
+over a 60-second horizon the sign of that move is a coin flip. So the tests assert
+that latency changes something, and deliberately not which direction.
+
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day |
 | M3 | Engine seam + SimulatedVenue + MA crossover | Equity curve produced, and it is unimpressive |
 | M4 | Fee, slippage and latency modelling | Results degrade sensibly under realistic costs |

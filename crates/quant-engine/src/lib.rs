@@ -220,7 +220,7 @@ where
         // 3. The venue matches orders that were already resting.
         self.venue.observe(event, &self.books[index], self.now);
         self.scratch.clear();
-        self.venue.poll(&mut self.scratch);
+        self.venue.poll(self.now, &mut self.scratch);
 
         // 4. Book what happened, then tell the strategy. Booking first means a
         //    strategy reading its own position during `on_execution` sees the

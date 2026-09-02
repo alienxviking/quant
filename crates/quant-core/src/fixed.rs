@@ -338,6 +338,54 @@ fixed_type! {
     Notional
 }
 
+fixed_type! {
+    /// A dimensionless fraction: a fee rate, a discount, a percentage of
+    /// notional.
+    ///
+    /// Fixed-point like everything else, so `"0.001"` is ten basis points and
+    /// `"0.00075"` is seven and a half. Basis points as an integer would have
+    /// been tidier to read and could not express the fractional tiers venues
+    /// actually publish.
+    ///
+    /// Signed, because a maker rebate is a negative rate and a type that could
+    /// not hold one would quietly misprice every passive strategy.
+    Rate
+}
+
+impl Notional {
+    /// `notional / quantity`: the price implied by a value and a size.
+    ///
+    /// The inverse of [`Px::notional`], and it lives beside it so the pair
+    /// cannot drift. Used for the size-weighted average price of a fill that
+    /// consumed several book levels — the number a P&L must use, and one that
+    /// two call sites had previously each derived for themselves.
+    ///
+    /// `None` for a zero quantity: a price per nothing is not a price, and
+    /// returning zero would be a plausible wrong answer.
+    #[must_use]
+    pub fn per_unit(self, qty: Qty) -> Option<Px> {
+        if qty.raw() == 0 {
+            return None;
+        }
+        let scaled = i128::from(self.raw()).checked_mul(i128::from(SCALE))?;
+        i64::try_from(scaled / i128::from(qty.raw()))
+            .ok()
+            .map(Px::from_raw)
+    }
+
+    /// `notional * rate`: a fee, a discount, a fraction of a position.
+    ///
+    /// Truncates toward zero, like every other multiplication here, so a fee is
+    /// never rounded *up* into money the venue did not charge.
+    #[must_use]
+    pub fn scaled_by(self, rate: Rate) -> Option<Self> {
+        let product = i128::from(self.raw()).checked_mul(i128::from(rate.raw()))?;
+        i64::try_from(product / i128::from(SCALE))
+            .ok()
+            .map(Self::from_raw)
+    }
+}
+
 impl Px {
     /// `price * quantity`, in quote currency.
     ///

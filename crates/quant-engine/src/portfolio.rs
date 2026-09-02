@@ -30,7 +30,6 @@ use quant_core::event::Side;
 use quant_core::execution::Fill;
 use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::InstrumentId;
-use quant_core::SCALE;
 
 /// A holding in one instrument.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -168,8 +167,8 @@ impl Portfolio {
         if closing > 0 {
             // Realized on the part closed, at the position's average cost.
             // `before.signum()` makes a short's gain the mirror of a long's.
-            let moved =
-                mul_div(fill.px.raw() - position.avg_px.raw(), closing, SCALE) * before.signum();
+            let gain_per_unit = Px::from_raw(fill.px.raw() - position.avg_px.raw());
+            let moved = notional(gain_per_unit, Qty::from_raw(closing)).raw() * before.signum();
             self.realized = Notional::from_raw(self.realized.raw() + moved);
         }
 
@@ -204,9 +203,15 @@ impl Portfolio {
     }
 }
 
-/// `px * qty` in quote currency, exactly. Sign follows `qty`.
+/// `px * qty` in quote currency. Sign follows `qty`.
+///
+/// `quant-core`'s, not a local reimplementation: this module and `quant-sim`
+/// each had their own 128-bit version, which is two copies of a money
+/// calculation that have to agree with each other forever. `Px::notional`
+/// predates both of them.
 fn notional(px: Px, qty: Qty) -> Notional {
-    Notional::from_raw(mul_div(px.raw(), qty.raw(), SCALE))
+    px.notional(qty)
+        .expect("a notional beyond i64 means the inputs were wrong")
 }
 
 /// `(a * wa + b * wb) / (wa + wb)`, in 128-bit.
@@ -217,17 +222,6 @@ fn weighted_average(a: i64, wa: i64, b: i64, wb: i64) -> i64 {
     }
     let sum = i128::from(a) * i128::from(wa) + i128::from(b) * i128::from(wb);
     i64::try_from(sum / total).expect("an average of two prices is between them")
-}
-
-/// `a * b / d` in 128-bit, so the intermediate cannot overflow.
-///
-/// Same reasoning as `quant-sim`'s: two `1e8`-scaled values multiply to `1e16`
-/// times their product, which for realistic prices and sizes is orders of
-/// magnitude past `i64`. Wrapping there produces a plausible wrong number, which
-/// is the worst failure a money calculation has.
-fn mul_div(a: i64, b: i64, d: i64) -> i64 {
-    let wide = i128::from(a) * i128::from(b) / i128::from(d);
-    i64::try_from(wide).expect("a notional beyond i64 means the inputs were wrong")
 }
 
 #[cfg(test)]

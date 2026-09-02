@@ -3,8 +3,16 @@
 //! ```text
 //! backtest [DATA_ROOT] [--symbol SYM] [--cash N] [--fast N] [--slow N]
 //!          [--interval-secs N] [--qty N] [--equity-csv PATH]
-//! backtest data/acceptance --symbol BTCUSDT
+//!          [--realistic | --fee-rate R --latency-ms N --adverse P]
+//! backtest data/acceptance --symbol BTCUSDT              # free and instant
+//! backtest data/acceptance --realistic                   # what it would cost
+//! backtest data/acceptance --fee-rate 0.001              # fees only
 //! ```
+//!
+//! Costs are **off by default**, so the default run is M3's. That is not
+//! laziness: `Costs::NONE` reproducing the M3 numbers to the last digit is the
+//! property that makes the cost models checkable at all, and it is easier to
+//! trust when it is the thing that runs when you type nothing.
 //!
 //! Exit code 0 means the run completed. It says **nothing** about whether the
 //! strategy made money, and there is deliberately no threshold that would let it
@@ -17,10 +25,11 @@ use std::process::ExitCode;
 
 use quant_backtest::{EquityCurve, MaCrossover, Recorded};
 use quant_core::fixed::{Notional, Qty};
+use quant_core::fixed::{Px, Rate};
 use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
 use quant_engine::{AllowAll, Engine, EngineStats, Portfolio};
 use quant_normalize::{discover_days, HistoricalSource};
-use quant_sim::{SimStats, SimulatedVenue};
+use quant_sim::{Costs, FeeSchedule, Latency, SimStats, SimulatedVenue};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -35,6 +44,7 @@ struct Args {
     interval_secs: i64,
     qty: Qty,
     equity_csv: Option<PathBuf>,
+    costs: Costs,
 }
 
 impl Default for Args {
@@ -53,6 +63,8 @@ impl Default for Args {
             // position is most of the account.
             qty: "0.001".parse().expect("a valid quantity"),
             equity_csv: None,
+            // Free and instant unless asked otherwise. See the module docs.
+            costs: Costs::NONE,
         }
     }
 }
@@ -108,7 +120,13 @@ fn main() -> ExitCode {
         args.interval_secs * NANOS_PER_SEC,
     );
 
-    let mut engine = Engine::new(source, SimulatedVenue::new(), AllowAll, strategy, args.cash);
+    let mut engine = Engine::new(
+        source,
+        SimulatedVenue::with_costs(args.costs),
+        AllowAll,
+        strategy,
+        args.cash,
+    );
     let stats = match engine.run() {
         Ok(stats) => stats,
         Err(e) => {
@@ -148,6 +166,22 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
         "strategy  MA crossover, fast {} slow {} on {}s mids, {} per position",
         args.fast, args.slow, args.interval_secs, args.qty
     );
+    // Read back from the venue, not from the arguments. The first version of
+    // this line printed what was parsed while the venue had been handed
+    // `SimulatedVenue::new()` -- so the report announced ten basis points of fees
+    // and the fills were free. A cost model that is configured but not wired
+    // produces a confidently wrong number, which is the exact failure this
+    // milestone exists to prevent. Asking the thing that did the work makes the
+    // two impossible to disagree.
+    let costs = engine.venue().costs();
+    println!(
+        "costs     fee maker {} taker {}, latency {}ms out / {}ms in, adverse {}",
+        costs.fees.maker,
+        costs.fees.taker,
+        costs.latency.outbound / 1_000_000,
+        costs.latency.inbound / 1_000_000,
+        costs.adverse_per_fill,
+    );
     println!(
         "events    {} ({} gaps), {} execution events",
         stats.events, stats.gaps, stats.execution_events
@@ -162,7 +196,7 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
     );
     print_pnl(portfolio, curve, ma.entries, ma.exits);
     print_sim(engine.venue().stats());
-    print_caveats();
+    print_caveats(costs);
 }
 
 fn print_pnl(portfolio: &Portfolio, curve: &EquityCurve, entries: u64, exits: u64) {
@@ -200,6 +234,10 @@ fn print_sim(sim: SimStats) {
         "venue     {} fills, {} walked more than one level, {} exhausted the book, {} refused for no market",
         sim.fills, sim.multi_level_fills, sim.exhausted_book, sim.no_market
     );
+    println!(
+        "charged   {} in fees, {} reports still in flight when the data ran out",
+        sim.fees_charged, sim.undelivered
+    );
 }
 
 /// What the numbers above do not include.
@@ -208,10 +246,28 @@ fn print_sim(sim: SimStats) {
 /// absence of costs to be in the output: a result quoted without this list is
 /// quoted dishonestly, and the surest way for that to happen is for the list to
 /// be somewhere the reader has to go and look.
-fn print_caveats() {
-    println!("caveats   this is M3; the following are NOT modelled:");
+///
+/// Driven by the actual [`Costs`] rather than being a fixed paragraph, so that
+/// "not modelled" and "modelled as zero because you asked for zero" cannot be
+/// confused -- and so the list gets shorter as M4's models get used, rather than
+/// going stale.
+fn print_caveats(costs: Costs) {
+    println!("caveats   not modelled at all:");
     for caveat in SimStats::caveats() {
         println!("            - {caveat}");
+    }
+    let switched_off = SimStats::switched_off(costs);
+    if !switched_off.is_empty() {
+        println!("          switched off for this run:");
+        for caveat in switched_off {
+            println!("            - {caveat}");
+        }
+    }
+    if costs.adverse_per_fill != Px::ZERO {
+        println!(
+            "          NOTE: --adverse is a stress knob, not a calibrated model. \
+             Do not quote this as a slippage estimate."
+        );
     }
 }
 
@@ -248,7 +304,8 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-h" | "--help" => {
                 println!(
                     "usage: backtest [DATA_ROOT] [--symbol SYM] [--cash N] [--fast N] \
-                     [--slow N] [--interval-secs N] [--qty N] [--equity-csv PATH]"
+                     [--slow N] [--interval-secs N] [--qty N] [--equity-csv PATH] \
+                     [--realistic] [--fee-rate R] [--latency-ms N] [--adverse P]"
                 );
                 return Ok(None);
             }
@@ -263,6 +320,22 @@ fn parse_args() -> Result<Option<Args>, String> {
                     .map_err(|e| format!("--interval-secs: {e}"))?;
             }
             "--equity-csv" => args.equity_csv = Some(PathBuf::from(value()?)),
+            // A preset rather than three flags, because the three belong
+            // together: quoting a fee-only result as "realistic" would be
+            // exactly the kind of half-costed number M4 exists to prevent.
+            "--realistic" => args.costs = Costs::retail(),
+            "--fee-rate" => {
+                let rate: Rate = value()?.parse().map_err(|e| format!("--fee-rate: {e}"))?;
+                args.costs.fees = FeeSchedule::flat(rate);
+            }
+            "--latency-ms" => {
+                let ms: i64 = value()?.parse().map_err(|e| format!("--latency-ms: {e}"))?;
+                args.costs.latency = Latency::millis(ms);
+            }
+            "--adverse" => {
+                args.costs.adverse_per_fill =
+                    value()?.parse().map_err(|e| format!("--adverse: {e}"))?;
+            }
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other => args.root = PathBuf::from(other),
         }
@@ -272,6 +345,12 @@ fn parse_args() -> Result<Option<Args>, String> {
     }
     if args.interval_secs <= 0 {
         return Err("--interval-secs must be positive".to_owned());
+    }
+    if args.costs.latency.outbound < 0 || args.costs.latency.inbound < 0 {
+        return Err("latency cannot be negative; time does not work that way".to_owned());
+    }
+    if args.costs.adverse_per_fill.raw() < 0 {
+        return Err("--adverse is a concession against us; it cannot be negative".to_owned());
     }
     Ok(Some(args))
 }
