@@ -12,13 +12,15 @@ version is named. Read those when they disagree.
 | Per-slice design decisions and their reasoning | `CLAUDE.md`, and the module docs in each crate |
 | The milestone table | `README.md` |
 | How the 7-day run is conducted and judged | `docs/acceptance-run.md` |
+| The seam a strategy sees, and why | `docs/engine-contract.md` |
 
-*State as of 2026-09-02: **M0, M1 and M2 complete.** M1's acceptance run was
+*State as of 2026-09-02: **M0, M1, M2 and M3 complete.** M1's acceptance run was
 spent in full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. Both
 weeks now replay as two joined 8-day sessions with book invariants holding at all 70.5M
-ticks, and the normalized Parquet tier reproduces the raw stream event for event. Next is
-M3, the engine seam. 18,641 lines of Rust across 8 crates, 237 tests passing in debug and
-release.*
+ticks, and the normalized Parquet tier reproduces the raw stream event for event. M3's
+engine seam is built and its first equity curve loses money before costs, which is the
+criterion. Next is M4, the cost models. 22,641 lines of Rust across 11 crates, 301 tests
+passing in debug and release.*
 
 ---
 
@@ -752,14 +754,54 @@ Raw is the source of truth and this tier is disposable, so the answer is to stop
 re-derive. The exception is a torn tail on the last segment — the ordinary signature
 of a killed recorder.
 
-### M3 — Engine seam + SimulatedVenue + a deliberately bad strategy
+### M3 — Engine seam + SimulatedVenue + a deliberately bad strategy *(complete)*
 
-**Criterion:** an equity curve is produced, **and it is unimpressive.**
+**Criterion:** an equity curve is produced, **and it is unimpressive.** Met: $100 → $97.53.
 
 That criterion is not a joke. A moving-average crossover that looks profitable on first
 run means the harness is lying — lookahead bias, survivorship, or missing costs. The
 unimpressive equity curve is the *evidence* that the plumbing is honest. This is also
 where the `RiskLayer` chokepoint is designed in, empty.
+
+Eight days of BTCUSDT from the acceptance capture took $100 to **$97.53** — a 2.47% loss,
+4.40 max drawdown, 209 round trips, with **no fees modelled at all**. ETHUSDT: $100 →
+$99.18. Both lose money before costs exist, which is what was wanted.
+
+The full argument is in `docs/engine-contract.md`, written before the engine for the
+reason M0 wrote the data contract before the recorder. Four things from it are worth
+repeating here.
+
+**Submission is fire-and-forget.** The obvious API is `submit(order) -> Result<Fill>`, and
+it is the most damaging line that could have gone in that document. A live venue cannot
+answer without a round trip, so a synchronous return either blocks the engine or lies —
+while a *simulated* venue answers instantly, handing a strategy the outcome of its own
+order at the moment of placing it, in backtest only. So outcomes come back as events, into
+the same loop as market data. The cost is that a strategy must track its own outstanding
+orders; that cost exists in production whether or not the backtest charges for it.
+
+**The order of operations inside one event.** Clock advances, book updates, *venue matches
+resting orders*, strategy is told what happened to its orders, and only then does the
+strategy see the event. The strategy step after the venue step is the whole point: an
+order submitted on seeing a print cannot fill against that print. Reversing two lines lets
+a strategy trade on information at the instant it is created — invisible in the output, and
+it inflates everything. The test for it was checked against a deliberately inverted loop
+first, where it fails; a green test that cannot go red is worth nothing.
+
+**The simulator is pessimistic on purpose.** A market order walks the book and pays the
+size-weighted average, because filling a whole order at the touch makes size free and a
+strategy tuned on that learns to trade sizes that do not exist. A resting limit fills only
+when the market trades *through* it — the usual shortcut fills as soon as the ask touches
+the limit, which assumes we were at the front of the queue at our own price, and for a
+retail order arriving last that is close to the least likely outcome. Understating fills is
+the safe direction: a backtest that misses trades is disappointing, one that invents them
+is dangerous.
+
+**"Do not trade across a gap" holds without anyone enforcing it.** 19 gaps in the run
+produced zero orders refused for want of a market, and the strategy contains no mention of
+gaps. A gap clears the book, so there is no mid, so no sample is taken, so the indicator
+does not advance and no crossing can fire. Three independent decisions compose into the
+property — which is the kind of thing a later refactor removes by accident, so it is
+written down.
 
 ### M4 — Fee, slippage and latency modelling
 
@@ -815,6 +857,11 @@ the simulation was honest. See §11.
   70,545,346 frames without sharing any counting code
 - **The normalized tier is a re-derivation and not a second source of truth.**
   70,545,345 events replayed from Parquet match the raw replay event for event
+- **The engine seam holds its own properties.** The same strategy value runs against two
+  different venues with identical resulting state; a refuse-everything risk layer means the
+  venue is never told; prices go to `None` across a gap; two runs are byte-identical
+- **An equity curve exists, and it loses money before costs** — which is the M3 criterion,
+  not a disappointment
 
 ### The acceptance run
 
@@ -848,8 +895,9 @@ second check were themselves evidence:
 
 ### Not proven
 
-1. **Nothing at all is known about strategy edge.** No strategy exists. That question is
-   not asked until M3, and not answered honestly until M4.
+1. **Nothing at all is known about strategy edge.** A crossover exists and loses money;
+   that is a fact about the harness being honest, not about the idea being tested. The
+   question is not answered honestly until M4 puts costs in.
 2. **The slippage model has no validation path at retail size.** Every order at $100 or
    $500 fills at top of book on a liquid pair, because top-of-book depth is tens of
    thousands of dollars. So the M4 model stays *modelled and unvalidated* until size
@@ -941,6 +989,9 @@ cargo run -p quant-storage --example dump -- <path to part-00000.bin.zst>
 # M2: parse every frame in a file; replay whole sessions through a book
 cargo run --release -p quant-binance   --example parse_all -- <path to part-*.bin.zst>
 cargo run --release -p quant-normalize --bin normalize     -- data
+
+# M3: run a strategy over the normalized tier
+cargo run --release -p quant-backtest  --bin backtest      -- data --symbol BTCUSDT
 ```
 
 Warnings are errors in CI. Commits explain **why** in the body — the rationale is the
@@ -950,14 +1001,17 @@ point, because the code shows the what.
 
 | Crate | Lines | Knows about |
 |---|---|---|
-| `quant-core` | 1,747 | Money, time, instruments, the event contract. No I/O. |
+| `quant-core` | 2,256 | Money, time, instruments, the event contract. No I/O. |
 | `quant-storage` | 2,702 | The raw format. No venue, no network. |
 | `quant-recorder` | 4,003 | Ingress, overload policy, day rolling. Venue-agnostic, async-free. |
 | `quant-binance` | 2,477 | The only crate that knows a venue. |
-| `quant-book` | 894 | Book reconstruction and its invariants. Depends only on `quant-core`. |
+| `quant-book` | 971 | Book reconstruction and its invariants. Depends only on `quant-core`. |
 | `quant-meta` | 1,075 | Postgres. Sits above the recorder; optional. |
 | `quant-verify` | 2,056 | Near the top. Asks whether the capture is complete. Nothing may depend on it. |
-| `quant-normalize` | 3,687 | Near the top. Asks what the market did, and writes the normalized tier. |
+| `quant-normalize` | 3,749 | Near the top. Asks what the market did, and writes the normalized tier. |
+| `quant-engine` | 1,585 | The seam: the loop, the four traits, the portfolio. No venue, no format, no network. |
+| `quant-sim` | 790 | The simulated counterparty. Every backtest modelling assumption. |
+| `quant-backtest` | 977 | Top of the graph. The only crate that knows both where events come from and what fills them. |
 
 The dependency arrows only point one way. That is checked by the fact that adding a second
 venue should mean writing a new adapter and touching nothing else.
