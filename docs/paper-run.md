@@ -70,6 +70,23 @@ ops/fix-clock.sh          # read-only confirmation, no sudo
 Fourteen days of one symbol is about 3 GB compressed; two symbols about 6 GB.
 Preflight refuses to start on a thin disk.
 
+### Building on Apple Silicon
+
+Proven at M1. `zstd-sys` compiles C, so Xcode Command Line Tools are required:
+
+```bash
+xcode-select --install
+cargo build --release
+```
+
+Everything else builds clean on `aarch64-apple-darwin`, and CI has covered it as
+a second job since 2026-08-31 — guarding exactly this C-toolchain surface, since
+`zstd-sys` compiles C and `ring` assembles per architecture.
+
+macOS ships **bash 3.2**: no `mapfile`, no associative arrays. The `ops/*.sh`
+scripts are written to that, and the `.ps1` half is **recorder-only** — a paper
+mode there would be a harness nobody has run.
+
 ---
 
 ## Starting it

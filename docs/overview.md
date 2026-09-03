@@ -14,15 +14,16 @@ version is named. Read those when they disagree.
 | How the 7-day run is conducted and judged | `docs/acceptance-run.md` |
 | The seam a strategy sees, and why | `docs/engine-contract.md` |
 
-*State as of 2026-09-02: **M0 through M4 and M6 complete; M5 in progress.** M1's acceptance run was
+*State as of 2026-09-03: **M0 through M4 and M6 complete; M5's code complete and rehearsed.** M1's acceptance run was
 spent in full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. Both
 weeks now replay as two joined 8-day sessions with book invariants holding at all 70.5M
 ticks, and the normalized Parquet tier reproduces the raw stream event for event. M3's
 engine seam is built and its first equity curve loses money before costs, which is the
 criterion; M4's cost models then take it from $97.53 to $64.74 at real fees. M6's risk
-layer is built ahead of M5's fortnight so one long run exercises it too. What remains for
-M5 is the `paper` binary, the ops harness, and two weeks of wall clock. 26,201 lines of
-Rust across 11 crates, 373 tests passing in debug and release.*
+layer is built ahead of M5's fortnight so one long run exercises it too, and M5's paper
+binary and ops harness are built and rehearsed against the live venue. **The only thing
+left in M5 is two weeks of wall clock.** 26,905 lines of Rust across 11 crates, 373 tests
+passing in debug and release.*
 
 ---
 
@@ -74,7 +75,7 @@ EventSource ──┼── ReplaySource       (raw capture, wall-clock paced)
                         │              not a module the strategy calls politely)
                         ▼
                  ┌── SimulatedVenue   (fills, fees, slippage, latency model)
-ExecutionVenue ──┼── PaperVenue       (live prices, simulated fills)
+ExecutionVenue ──┼── (no PaperVenue: paper uses SimulatedVenue -- see M5)
                  └── LiveVenue        (real orders)
 ```
 
@@ -228,7 +229,7 @@ use whatever tool fits, with no schema registration.
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | **done** |
 | M3 | Engine seam + SimulatedVenue + MA crossover | An equity curve exists, **and it is unimpressive** | **done** |
 | M4 | Fee, slippage, latency modelling | Results degrade sensibly under realistic costs | **done** |
-| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | in progress |
+| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | code done; run pending |
 | M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | **done** |
 | M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | |
 | M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance | |
@@ -851,6 +852,52 @@ cleverness recovers that from a capture, which is exactly why M5 exists.
 Live prices, simulated fills. The reconciliation matters more than the P&L: two
 independent calculations agreeing is evidence; one calculation is an assertion.
 
+### M5 — Paper trading *(code complete; the run is the criterion)*
+
+**Criterion:** two weeks live, and **paper P&L matches a backtest over the data
+captured during the same window** — exactly, not within a tolerance.
+
+That criterion was sharpened during M5. "P&L reconciles against an independent
+recompute" checks arithmetic against itself and would pass on a system whose live
+and replay paths disagreed about what the market did, which is the one failure that
+would invalidate everything downstream.
+
+**One ingress, two consumers.** `Ingress<S>` has been generic over its sink since
+M1.b, so a `TeeSink` feeds the capture writer *and* the engine with identical
+`local_recv_ts` and identical `ingest_seq` — with no change to the recorder at all.
+That sameness is not tidiness; it is what makes the criterion checkable exactly.
+The capture is primary, because market data is irreplaceable and a paper fill is
+not, and a dead engine is latched so a strategy that crashes on day three costs one
+failed send rather than one per message for eleven days.
+
+**There is no `PaperVenue`, and that is a finding.** The architecture diagram lists
+three venues; building the thing that would have needed the middle one established
+that it does not exist. A paper venue fills against a reconstructed book at prices
+the book showed — exactly `SimulatedVenue`. What separates backtest from paper is
+the **source** and the **durability**, not the matching.
+
+**The journal is a file, not the metadata tier.** M1.c2 made Postgres best-effort
+and optional, and a position that must survive a restart cannot depend on something
+optional. Raw's relationship with its index, applied to a second kind of
+irreplaceable data.
+
+**And a check that could not fail.** The first `reconcile` asserted
+`cash − starting == realized − fees` and exited 0 — an identity the recompute
+satisfies *by construction*, so it could never fail. Decoration wearing the costume
+of evidence. The engine now writes `Checkpoint` entries claiming what it believes,
+and the recompute must reach the same numbers from the file alone. The general
+lesson is in `CLAUDE.md`: **before trusting a check, ask what input would make it
+fail.**
+
+The rehearsal found three more defects that a fortnight would have found
+expensively — starting capital silently reset to zero, no final checkpoint written,
+and "nothing to check" reported as a disagreement. M1's rule holds: a harness that
+has never been run is not a harness.
+
+**What this run cannot measure:** queue position and market impact. A paper venue
+uses simulated fills, so our orders are still not in the book and nobody is still
+reacting to them. Only M8 can measure those.
+
 ### M6 — Risk engine + kill switch *(complete)*
 
 **Criterion:** limits provably veto a misbehaving strategy, under test. Met, with
@@ -919,6 +966,9 @@ the simulation was honest. See §11.
   not a disappointment
 - **And it is destroyed by real fees**: $64.74 from $100 at 10 bps a side, with the fee
   total shown separately from the price result so the two cannot be confused
+- **The engine runs against a live venue**, with the capture and the engine fed from one
+  ingress: a rehearsal gave 4552 frames captured and 4552 events reaching the engine, a
+  clean verification, and a journal that reconciles against the engine's own checkpoint
 
 ### The acceptance run
 
@@ -1054,6 +1104,10 @@ cargo run --release -p quant-normalize --bin normalize     -- data
 # M3/M4: run a strategy over the normalized tier, free then costed
 cargo run --release -p quant-backtest  --bin backtest      -- data --symbol BTCUSDT
 cargo run --release -p quant-backtest  --bin backtest      -- data --realistic
+
+# M5: paper trade live, then check the journal accounts for itself
+cargo run --release -p quant-backtest  --bin paper     -- --symbol BTCUSDT data --minutes 10
+cargo run --release -p quant-backtest  --bin reconcile -- data/paper-BTCUSDT.jsonl
 ```
 
 Warnings are errors in CI. Commits explain **why** in the body — the rationale is the
@@ -1066,14 +1120,14 @@ point, because the code shows the what.
 | `quant-core` | 2,326 | Money, time, instruments, the event contract. No I/O. |
 | `quant-storage` | 2,702 | The raw format. No venue, no network. |
 | `quant-recorder` | 4,204 | Ingress, overload policy, day rolling. Venue-agnostic, async-free. |
-| `quant-binance` | 2,875 | The only crate that knows a venue. |
+| `quant-binance` | 2,971 | The only crate that knows a venue. |
 | `quant-book` | 971 | Book reconstruction and its invariants. Depends only on `quant-core`. |
 | `quant-meta` | 1,075 | Postgres. Sits above the recorder; optional. |
 | `quant-verify` | 2,056 | Near the top. Asks whether the capture is complete. Nothing may depend on it. |
 | `quant-normalize` | 3,752 | Near the top. Asks what the market did, and writes the normalized tier. |
-| `quant-engine` | 3,113 | The seam: the loop, the four traits, the portfolio. No venue, no format, no network. |
+| `quant-engine` | 3,136 | The seam: the loop, the four traits, the portfolio. No venue, no format, no network. |
 | `quant-sim` | 1,478 | The simulated counterparty. Every backtest modelling assumption. |
-| `quant-backtest` | 1,649 | Top of the graph. The only crate that knows both where events come from and what fills them. |
+| `quant-backtest` | 2,234 | Top of the graph. The only crate that knows both where events come from and what fills them. |
 
 The dependency arrows only point one way. That is checked by the fact that adding a second
 venue should mean writing a new adapter and touching nothing else.

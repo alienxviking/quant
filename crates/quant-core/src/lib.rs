@@ -34,9 +34,8 @@
 //!                    RiskLayer  (mandatory chokepoint, M6)
 //!                        │
 //!                        ▼
-//!                 ┌── SimulatedVenue
-//!  ExecutionVenue ┼── PaperVenue
-//!                 └── LiveVenue
+//!                 ┌── SimulatedVenue  (paper uses this one too; see M5)
+//!  ExecutionVenue ┴── LiveVenue       (M8)
 //! ```
 //!
 //! A strategy must not be able to tell which sources it is wired to. That

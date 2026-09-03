@@ -20,16 +20,22 @@ EventSource ──┼── ReplaySource       (raw capture, wall-clock paced)
                     RiskLayer         (mandatory chokepoint — not optional,
                         │              not called politely by the strategy)
                         ▼
-                 ┌── SimulatedVenue   (fills, fees, slippage, latency model)
-ExecutionVenue ──┼── PaperVenue       (live prices, simulated fills)
-                 └── LiveVenue        (real orders)
+                 ┌── SimulatedVenue   (fills, fees, latency; also paper's venue)
+ExecutionVenue ──┴── LiveVenue        (real orders)                        [M8]
 ```
 
 | Mode | Source | Venue |
 |---|---|---|
 | Backtest | Historical | Simulated |
-| Paper | Live | Paper |
+| Paper | **Live** | **Simulated** |
 | Live | Live | Live |
+
+There is deliberately **no `PaperVenue`**, and finding that out was one of M5's
+results. A paper venue fills against a reconstructed book at prices the book
+showed — which is exactly `SimulatedVenue`. What separates a backtest from paper
+trading is the **source** and the **durability**, not the matching, so writing a
+second fill model would have created two things that must agree forever with no
+way to notice when they stopped.
 
 **A strategy must not be able to tell which pair it is wired to.** If it can,
 that is a bug. Divergence between these three paths is how backtests end up
@@ -70,6 +76,15 @@ crates/
                     segments joined, book driven, and the Parquet
                     tier written and read back. `normalize` bin.  [M2c/d]
   quant-engine/     the seam: the loop, Strategy, RiskLayer,
+                    ExecutionVenue, the portfolio and the journal.
+                    Knows no venue, no format, no network.     [M3b/M5c]
+  quant-sim/        the simulated counterparty and its cost
+                    models. Every backtest number comes from
+                    the assumptions stated here.               [M3c/M4]
+  quant-backtest/   the wiring: a naive strategy, an equity curve,
+                    and the `backtest`, `paper` and `reconcile`
+                    binaries.                              [M3d/M5c/d]
+  quant-engine/     the seam: the loop, Strategy, RiskLayer,
                     ExecutionVenue, and the portfolio. No venue,
                     no file format, no network.                   [M3b]
   quant-sim/        the simulated counterparty. Every backtest
@@ -91,16 +106,28 @@ ops/
 
 ## Milestones
 
-| # | Milestone | Done when |
-|---|---|---|
-| M0 | Foundation + data contract | CI green; contract written before the recorder exists |
-| M1 | Binance market data recorder | Runs 7 days unattended; zero unexplained gaps |
+| # | Milestone | Done when | |
+|---|---|---|---|
+| M0 | Foundation + data contract | CI green; contract written before the recorder exists | done |
+| M1 | Binance market data recorder | Runs 7 days unattended; zero unexplained gaps | done |
+| M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | done |
+| M3 | Engine seam + SimulatedVenue + MA crossover | Equity curve produced, and it is unimpressive | done |
+| M4 | Fee, slippage and latency modelling | Results degrade sensibly under realistic costs | done |
+| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | code done, run pending |
+| M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | done |
+| M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | |
+| M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance | |
 
-**Where this is:** M0 and M1 done. M1's acceptance run — the one criterion only
-time can satisfy — was spent: seven days unattended on an Apple Silicon Mac,
-2026-08-21 → 2026-08-28, `quant-verify` exit 0 with every discontinuity explained.
-See `docs/acceptance-run.md` for the procedure, and "The acceptance run, and how it
-went" in `CLAUDE.md` for the result.
+Milestones have **acceptance criteria, not feature lists**. "Done" means the
+criterion passes — which is why M5 sits at *code done, run pending*: everything is
+built and rehearsed against the live venue, and its criterion is two weeks of wall
+clock. `docs/paper-run.md` is the procedure.
+
+**M1's acceptance run** — the one criterion only time can satisfy — was spent in
+full: seven days unattended on an Apple Silicon Mac, 2026-08-21 → 2026-08-28,
+`quant-verify` exit 0 with every discontinuity explained by a record in the
+capture. See `docs/acceptance-run.md` for the procedure, and "The acceptance run,
+and how it went" in `CLAUDE.md` for the result.
 
 **M2 is complete.** Both weeks of the acceptance capture replay as two joined 8-day
 sessions with book invariants holding at all 70.5M ticks, **zero** deltas dropped
@@ -126,6 +153,18 @@ would have to beat that to break even. That is a real result: this strategy clas
 at this turnover, at retail fees, cannot work. Learning it from recorded data cost
 nothing.
 
+**M5's code is complete and rehearsed**; its fortnight is the one criterion still
+outstanding. `paper` runs `LiveSource + SimulatedVenue` with the capture and the
+engine fed from **one ingress** — the same records with the same timestamps, which
+is what makes "paper P&L must match a backtest over the same window" checkable
+exactly rather than approximately. A three-minute rehearsal against Binance gave
+4552 frames captured and 4552 events reaching the engine, with `verify` clean and
+the journal reconciling. `docs/paper-run.md` is the procedure.
+
+The rehearsal also produced M4's finding in miniature, from live data: one round
+trip bought at 77,634.64 and sold at 77,637.67 — **three tenths of a cent of price
+against fifteen and a half cents of fees.**
+
 **M6 is complete**, built before M5's fortnight on purpose so one long run
 exercises the limits too. Two deliberately misbehaving strategies live in the test
 suite; an oversized order **never reaches the venue**, and a runaway gets exactly
@@ -137,14 +176,6 @@ One M4 finding worth repeating: **latency is a variance, not a cost.** At 50 ms 
 result got slightly *better*, because latency moves the fill to a later book and
 over a 60-second horizon the sign of that move is a coin flip. So the tests assert
 that latency changes something, and deliberately not which direction.
-
-| M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day |
-| M3 | Engine seam + SimulatedVenue + MA crossover | Equity curve produced, and it is unimpressive |
-| M4 | Fee, slippage and latency modelling | Results degrade sensibly under realistic costs |
-| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window |
-| M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test |
-| M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute |
-| M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance |
 
 ## Development
 

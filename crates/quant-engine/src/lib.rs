@@ -12,7 +12,8 @@
 //! ```
 //!
 //! Backtest is `HistoricalSource + SimulatedVenue`. Paper is
-//! `LiveSource + PaperVenue`. Live is `LiveSource + LiveVenue`. The strategy is
+//! `LiveSource + SimulatedVenue` (there is no separate paper venue -- M5 found the
+//! middle one need not exist). Live is `LiveSource + LiveVenue`. The strategy is
 //! the same value in all three, and cannot ask which one it is in.
 //!
 //! # The order of operations inside one event, and why it is that order

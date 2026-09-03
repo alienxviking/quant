@@ -50,12 +50,16 @@ EventSource ──┼── ReplaySource       (raw capture, wall-clock paced)
                     RiskLayer         (mandatory chokepoint)
                         │
                         ▼
-                 ┌── SimulatedVenue
-ExecutionVenue ──┼── PaperVenue
-                 └── LiveVenue
+                 ┌── SimulatedVenue   (paper uses this one too)
+ExecutionVenue ──┴── LiveVenue        (M8)
 ```
 
-Backtest = Historical + Simulated · Paper = Live + Paper · Live = Live + Live.
+Backtest = Historical + Simulated · Paper = **Live + Simulated** · Live = Live + Live.
+
+M5 established there is no `PaperVenue`: a paper venue fills against a
+reconstructed book at prices the book showed, which is exactly `SimulatedVenue`.
+What separates backtest from paper is the **source** and the **durability**, not
+the matching.
 
 **A strategy must not be able to tell which pair it is wired to.** If it can,
 that is a bug. Three divergent code paths is how a backtest ends up
@@ -95,6 +99,11 @@ Market data does **not** go in Postgres. ClickHouse later just points at the
 same Parquet. Full reasoning in `docs/data-contract.md`.
 
 ## State
+
+**M0–M4 and M6 are complete. M5's code is complete and rehearsed; its fortnight
+is the one remaining criterion.** 373 tests green in debug and release, clippy
+and fmt clean, 26,905 lines across 11 crates. To start the run, see *Picking up
+the paper run on the Mac* near the bottom of this file.
 
 - **M0 complete** (2026-07-26): workspace, `crates/quant-core` (fixed-point
   money, `Ts`/`Clock`, instrument registry with venue filters, the
@@ -944,10 +953,11 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   its inverses (`Notional::per_unit`, `Notional::scaled_by`) live beside it so the
   set cannot drift. **Before writing arithmetic, grep `quant-core`.**
 
-- **M5 in progress** (from 2026-09-02): paper trading. 349 tests green in debug
-  and release, clippy and fmt clean. The criterion is **the run**, which is
-  deliberately deferred — the same shape M1 had, seventeen days between code
-  complete and the acceptance run passing.
+- **M5 code complete** (2026-09-02 → 2026-09-03): paper trading. 373 tests green
+  in debug and release, clippy and fmt clean. Every slice is built and **rehearsed
+  against the live venue**; the criterion is **the run**, deliberately deferred —
+  the same shape M1 had, seventeen days between code complete and the acceptance
+  run passing.
 
   | | Slice | Status |
   |---|---|---|
@@ -1259,18 +1269,102 @@ shape of filename would have made the noise go away and made the check weaker;
 something unexpected in the immutable tier should get a line of output whatever it
 turns out to be.
 
+---
+
+## Picking up the paper run on the Mac
+
+**Everything M5 needs is built and rehearsed. The only thing left is wall clock.**
+This section is what a session on the MacBook needs and nothing else; the full
+procedure is `docs/paper-run.md`.
+
+### Where things stand
+
+M0–M4 and M6 are complete. M5's code is complete and rehearsed against the live
+venue; **the fortnight is the remaining criterion**. 373 tests green in debug and
+release, clippy and fmt clean, 26,905 lines across 11 crates.
+
+### The three rules, and the third is the one that bites
+
+1. **Pin the run to a tag** (`git tag m5-run-start && git push origin m5-run-start`),
+   check the Mac out at it, and **never `git pull` there** until the run ends. The
+   running process would not change; the ability to say which code produced the
+   result would.
+2. **Freeze the raw container version and the journal schema** for the fortnight.
+   Everything else on the development machine is free — the Mac runs a binary that
+   is already loaded. But the artifacts must stay *readable*, and a container bump
+   mid-run (as M1.d1 did, 1 → 2) would leave two weeks of data newer tools refuse.
+3. **Run the final comparison from that tag.** M5's criterion compares paper P&L
+   against a backtest over the same window. If `quant-engine`, `quant-sim` or the
+   strategy change while the run is in flight, that comparison is between **two
+   different systems** and would fail for reasons unrelated to live-versus-replay,
+   which is the only thing being asked.
+
+### Building on `aarch64-apple-darwin`
+
+Proven at M1. `zstd-sys` compiles C, so Xcode Command Line Tools are required
+(`xcode-select --install`); everything else builds clean. macOS ships **bash 3.2**
+— no `mapfile`, no associative arrays. CI has covered Apple Silicon since
+2026-08-31 as a second job, guarding exactly this C-toolchain surface.
+
+### Starting it
+
+```bash
+git checkout m5-run-start && cargo build --release
+
+# Rehearse first. Not optional -- M1's lesson is that a harness which has never
+# been run is not a harness, and the aggressive indicator settings are the point:
+# the fortnight's 10/30 on one-minute mids needs half an hour before it can cross,
+# so a short rehearsal on those settings would leave the journal, the fills and
+# the reconciliation untested.
+ops/start-run.sh --paper --minutes 10 --symbols "BTCUSDT" --root ~/rehearsal \
+    --paper-args "--qty 0.001 --fast 2 --slow 4 --interval-secs 5"
+
+ops/start-run.sh --paper --days 14 --symbols "BTCUSDT ETHUSDT" --root ~/paper \
+    --paper-args "--qty 0.001 --cash 100"
+```
+
+Two symbols means two paper processes, each capturing *and* trading its own
+instrument from one ingress — which is what the agreement criterion needs, and
+gives the fortnight two independent samples.
+
+### macOS specifics that cost real time at M1
+
+- **Clean stop is `SIGINT`, not `SIGTERM`.** The recorder's shutdown is
+  `tokio::signal::ctrl_c`, which is SIGINT on Unix; SIGTERM is not caught and
+  leaves the last segment trailerless — indistinguishable from a crash.
+  `stop-run.sh` already sends SIGINT.
+- **The clock check is round-trip corrected.** Measuring `now - serverTime`
+  naively folds one-way latency into the offset and would block a run over a clock
+  that is fine (seen live: −1445 ms naive vs +450 ms corrected).
+- **`caffeinate -dimsu -w $$`** is held for each supervisor's lifetime, so the Mac
+  stays awake across every reconnect. A reboot still ends the run, deliberately.
+- **`COPYFILE_DISABLE=1 tar ...`** when bringing data back, or macOS writes
+  AppleDouble `._*` stubs that the verifier reports as strays. `docs/acceptance-run.md`
+  carries the cleanup for captures that already have them.
+- **Supervision is a plain bash loop, not `launchd`/`KeepAlive`.** A run should be
+  watched and should stop when told to, not silently resurrect itself.
+
+### While it runs
+
+**M7 (observability) is the safe thing to build**, because it does not touch
+either frozen format. Do **not** build M8 on top of an unvalidated live path — it
+depends on M5's live-versus-replay agreement having actually passed.
+
+---
+
 ### Still open
 
-- **M5's fortnight is deferred at the user's request** (2026-09-02), and that is
-  fine: M1 did the same. M5.d/e (the `paper` binary and the ops harness) are the
-  remaining code. **M6 should land before the run**, so one fortnight exercises
-  the risk layer too rather than needing a second long run to test it.
-- Nothing blocking on M1–M4. **M5** — paper trading: two weeks live, with
-  P&L reconciling against an independent recompute. It is also the only instrument
-  that can measure the two things M4 could not model, because they are not
-  recoverable from recorded data at any price: **queue position** (our order was
-  never in the recorded book) and **market impact** (nobody in the recording reacted
-  to us).
+- **M5's fortnight is the one remaining criterion** (deferred at the user's
+  request, 2026-09-02, which is fine — M1 did the same, seventeen days between
+  code complete and the run passing). All of M5.a–e is built and rehearsed. See
+  *Picking up the paper run on the Mac* above and `docs/paper-run.md`.
+- **A hard kill between a risk trip and shutdown loses the trip**, because the
+  kill switch is journalled at shutdown. Harmless in paper, where nothing is at
+  stake; **must be fixed before M8**, by recovering the day's tally from the
+  journal rather than only the switch.
+- **Queue position and market impact remain unmeasured** after M5 and cannot be
+  measured by it: a paper venue uses simulated fills, so our orders are still not
+  in the book and nobody is still reacting to them. **Only M8 can measure them.**
 - **The strategy question is answered and the answer is no.** A crossover at 209
   round trips a week cannot survive 10 bps a side. M5 and beyond are about the
   platform being trustworthy, not about this strategy — and a lower-turnover or
