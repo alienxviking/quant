@@ -1269,6 +1269,16 @@ turns out to be.
 - Commits are authored **alienxviking <sroy191006@gmail.com>** with **no**
   `Co-Authored-By: Claude` trailer. Already set in this repo's local git
   config. Personal project under the user's own GitHub identity.
+- **Conventional commit subjects.** (Set 2026-09-03.) `type(scope): subject`,
+  lowercase, no trailing full stop. Types: `feat`, `fix`, `refactor`, `test`,
+  `docs`, `build`, `perf`, `chore`. Scope is the **milestone slice** for milestone
+  work (`m5d`, `m6`) and the **crate or area** otherwise (`engine`, `sim`,
+  `binance`) — the milestone tie is what makes this repo's log readable against
+  `CLAUDE.md`, and the type is what makes the graph scannable by kind.
+
+  Existing history is **not** rewritten. Relabelling merged commits on `main`
+  would mean force-pushing shared history, which is a worse habit than an
+  inconsistent log; the convention applies going forward.
 - Commit messages explain *why*, in the body. The rationale is the point.
 - Warnings are errors in CI (`RUSTFLAGS: -D warnings`). Run before committing:
 
