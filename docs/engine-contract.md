@@ -370,3 +370,88 @@ irreplaceable and a paper fill is not. The engine then discovers the drop the
 same way the offline verifier discovers a recorder drop — a hole in `ingest_seq`
 — and responds the same way, by treating it as a gap and clearing the book. Same
 evidence, same remedy, in a second place.
+
+---
+
+## 10. Acceptance criteria for M6 — the risk engine
+
+The chokepoint is filled in when:
+
+- [x] Limits **provably veto a misbehaving strategy, under test.** Two are in
+      the suite: one that buys 1000 units on every event, one that submits
+      forever.
+- [x] A vetoed order **never reaches the venue** — not declined by it, never
+      told to it.
+- [x] The refusal reaches the strategy as an execution event, so it can tell it
+      was stopped.
+- [x] A tripped kill switch **survives a restart**.
+- [x] Limits that do not bind **change nothing**: a permitted run is identical
+      to one with no risk layer at all.
+
+**M6 is complete.**
+
+### Why risk keeps its own tally
+
+`RiskEngine` tracks position and realized P&L itself rather than reading
+`Portfolio`. Deliberate duplication — the one kind this project accepts.
+
+A limit computed from the accounting can only be as correct as the accounting. If
+the portfolio has a bug, the limits go wrong in the same direction and stop
+protecting anything *precisely when something is already wrong*. An independent
+tally means a portfolio bug cannot silently disable a limit.
+
+Fourth time this pattern has paid: the venue and the portfolio each total fees,
+`quant-verify` and `quant-normalize` each count frames, the journal and the engine
+each claim a P&L. Each time the value is not the second number but that a
+disagreement becomes visible.
+
+The tally is deliberately *simpler* than the portfolio's. A risk limit needs to be
+obviously right rather than exactly right, and forty lines readable in one sitting
+is worth more here than agreement to the satoshi.
+
+### The decisions inside it
+
+**A money limit refuses when there is no price.** You cannot size what you cannot
+price, and "assume the last price" makes a limit widest exactly when the market is
+least understood. But an order with *no* money limit configured passes through a
+gap — a limit nobody set should not have an effect.
+
+**The position limit checks the position the order would create**, not the one we
+have. The latter lets every order through right up to the one that mattered.
+Exposure is absolute, so a short counts: a limit that only looked at longs would
+permit an unlimited short, which is the more dangerous direction.
+
+**Reducing an oversized position is always allowed.** A risk layer that trapped a
+position it considered too large would be the most dangerous thing in the system.
+
+**Fees count against the daily loss budget.** A limit ignoring them would be
+reached late by exactly the amount a high-turnover strategy pays — which §8 showed
+is most of the damage.
+
+**Loss and order-count limits *trip* rather than refuse**, because a strategy in a
+loop does not stop being declined once. A refused order does not consume the daily
+count, or the count would measure our refusals rather than the strategy's
+activity.
+
+**A tripped switch survives a restart, and a new day does not clear it.** A kill
+switch that forgets is not a kill switch: the supervisor exists to restart a dead
+process, so a switch held only in memory would be re-armed by the machinery meant
+to keep things running. Whether to resume tomorrow is a decision, not a timeout.
+The day never rolls backwards either, so an NTP step cannot hand a stopped
+strategy a fresh budget.
+
+**A tripped switch refuses everything, including a flattening order.** A real
+trade-off, written down: closing out becomes a manual act, which is the right
+friction for something that has already gone wrong.
+
+### Why M6 lands before M5's run
+
+M6's own criterion is a test-suite one, so it does not need the fortnight. But the
+paper run is the first time this system runs unattended with a strategy submitting
+orders, and a run that exercises the risk layer for two weeks is worth strictly
+more than one that does not. Running first and adding risk after would want a
+*second* long run to see the limits behave live.
+
+Same reasoning that made M1's acceptance run worth more because M1.e's metrics
+existed before it started.
+

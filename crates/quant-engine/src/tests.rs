@@ -277,7 +277,12 @@ fn a_refusing_risk_layer_means_no_order_reaches_the_venue() {
     #[derive(Debug)]
     struct RefuseAll;
     impl RiskLayer for RefuseAll {
-        fn check(&mut self, _r: &OrderRequest, _now: Ts) -> Option<RejectReason> {
+        fn check(
+            &mut self,
+            _r: &OrderRequest,
+            _mark: Option<quant_core::Px>,
+            _now: Ts,
+        ) -> Option<RejectReason> {
             Some(RejectReason::RiskLimit)
         }
     }

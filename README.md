@@ -125,7 +125,14 @@ would have to beat that to break even. That is a real result: this strategy clas
 at this turnover, at retail fees, cannot work. Learning it from recorded data cost
 nothing.
 
-One finding worth repeating: **latency is a variance, not a cost.** At 50 ms the
+**M6 is complete**, built before M5's fortnight on purpose so one long run
+exercises the limits too. Two deliberately misbehaving strategies live in the test
+suite; an oversized order **never reaches the venue**, and a runaway gets exactly
+its limit of orders out however long the run. The risk engine keeps its own tally
+rather than reading the portfolio, because a limit computed from the accounting
+can only be as correct as the accounting — and would fail in the same direction.
+
+One M4 finding worth repeating: **latency is a variance, not a cost.** At 50 ms the
 result got slightly *better*, because latency moves the fill to a later book and
 over a 60-second horizon the sign of that move is a coin flip. So the tests assert
 that latency changes something, and deliberately not which direction.

@@ -184,6 +184,12 @@ macro_rules! fixed_type {
         impl $name {
             /// The zero value.
             pub const ZERO: Self = Self(0);
+            /// The largest representable value.
+            ///
+            /// A sentinel for "more than any limit", used where an overflowing
+            /// multiplication has to compare as too big rather than wrap. Not a
+            /// value any real price or size takes.
+            pub const MAX_VALUE: Self = Self(i64::MAX);
             /// Smallest representable positive increment (`1e-8`).
             pub const MIN_TICK: Self = Self(1);
 

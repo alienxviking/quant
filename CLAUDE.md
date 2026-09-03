@@ -1023,6 +1023,66 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   "nobody disagreed" is not "two answers matched". **General lesson: before
   trusting a check, ask what input would make it fail.**
 
+- **M6 complete** (2026-09-02): the risk engine and kill switch. 373 tests green
+  in debug and release, clippy and fmt clean. Criterion — **limits provably veto a
+  misbehaving strategy, under test** — met, with all five of
+  `docs/engine-contract.md` §10's checkboxes ticked. Built **before** M5's run on
+  purpose, so one fortnight exercises the limits too rather than needing a second.
+
+- **M6 decisions.** **Risk keeps its own tally** rather than reading `Portfolio`.
+  Deliberate duplication, and the point: a limit computed from the accounting can
+  only be as correct as the accounting, so a portfolio bug would take the limits
+  with it *precisely when something is already wrong*. Fourth time this pattern has
+  paid. The tally is deliberately **simpler** than the portfolio's — a limit needs
+  to be obviously right rather than exactly right.
+
+  **A money limit refuses when there is no price.** You cannot size what you cannot
+  price, and "assume the last price" makes the limit widest when the market is least
+  understood. But an order with *no* money limit set passes through a gap: a limit
+  nobody configured should not have an effect.
+
+  **The position limit checks the position the order would create**, not the one we
+  hold — the latter lets everything through up to the one that mattered. Exposure is
+  absolute so a short counts, and **reducing an oversized position is always
+  allowed**: a risk layer that trapped a position it thought too large would be the
+  most dangerous thing here.
+
+  **Fees count against the daily loss budget**, or the limit is reached late by
+  exactly the amount M4 showed is most of the damage. Loss and order-count limits
+  **trip** rather than refuse, because a loop does not stop being declined once; a
+  refused order does **not** consume the daily count, or the count measures our
+  refusals rather than the strategy's activity.
+
+  **A tripped switch survives a restart** (`RiskEngine::recover`) because a kill
+  switch that forgets is not a kill switch — the supervisor would re-arm it. **A new
+  day resets the counters and not the switch**: resuming is a decision, not a
+  timeout. The day never rolls backwards, so an NTP step cannot hand a stopped
+  strategy a fresh budget.
+
+  **A tripped switch refuses everything, including a flattening order.** A real
+  trade-off, written down rather than discovered: closing out becomes manual, which
+  is the right friction for something that has already gone wrong.
+
+- **Two misbehaving strategies live in the test suite**, because the criterion says
+  *provably, under test*: one buys 1000 units every event, one submits forever. The
+  oversized order **never reaches the venue** — not declined by it, never told to
+  it — and the runaway gets exactly its limit of orders out however long the run.
+  And **limits that do not bind change nothing**, which is the other half: a risk
+  layer that quietly altered a permitted run would make every backtest a different
+  system from the one that trades.
+
+  **All of it verified capable of failing.** With the limits neutered, three of
+  these tests go red. That check is now a habit rather than an afterthought, and it
+  came directly from M5.c's vacuous-identity lesson.
+
+- **A bug M6 uncovered in M5.c**: the `FillObserver` was never actually called.
+  `cargo fmt` had reformatted the block my edit targeted and the replacement
+  silently missed, so fills would never have been journalled — the durability M5.c
+  claimed did not exist. This is the *second* time a formatting-shifted edit has
+  silently not applied (M4's cost flags were the first). **Lesson: after a scripted
+  edit, grep for the thing that should now be there rather than trusting that the
+  patch matched.**
+
 Milestone table: see `README.md`.
 
 ## The acceptance run, and how it went

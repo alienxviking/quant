@@ -14,14 +14,15 @@ version is named. Read those when they disagree.
 | How the 7-day run is conducted and judged | `docs/acceptance-run.md` |
 | The seam a strategy sees, and why | `docs/engine-contract.md` |
 
-*State as of 2026-09-02: **M0 through M4 complete.** M1's acceptance run was
+*State as of 2026-09-02: **M0 through M4 and M6 complete; M5 in progress.** M1's acceptance run was
 spent in full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. Both
 weeks now replay as two joined 8-day sessions with book invariants holding at all 70.5M
 ticks, and the normalized Parquet tier reproduces the raw stream event for event. M3's
 engine seam is built and its first equity curve loses money before costs, which is the
-criterion; M4's cost models then take it from $97.53 to $64.74 at real fees. Next is M5,
-paper trading. 23,630 lines of Rust across 11 crates, 320 tests passing in debug and
-release.*
+criterion; M4's cost models then take it from $97.53 to $64.74 at real fees. M6's risk
+layer is built ahead of M5's fortnight so one long run exercises it too. What remains for
+M5 is the `paper` binary, the ops harness, and two weeks of wall clock. 26,201 lines of
+Rust across 11 crates, 373 tests passing in debug and release.*
 
 ---
 
@@ -227,8 +228,8 @@ use whatever tool fits, with no schema registration.
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | **done** |
 | M3 | Engine seam + SimulatedVenue + MA crossover | An equity curve exists, **and it is unimpressive** | **done** |
 | M4 | Fee, slippage, latency modelling | Results degrade sensibly under realistic costs | **done** |
-| M5 | Paper trading | 2 weeks live; P&L reconciles against an independent recompute | |
-| M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | |
+| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | in progress |
+| M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | **done** |
 | M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | |
 | M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance | |
 
@@ -850,9 +851,30 @@ cleverness recovers that from a capture, which is exactly why M5 exists.
 Live prices, simulated fills. The reconciliation matters more than the P&L: two
 independent calculations agreeing is evidence; one calculation is an assertion.
 
-### M6 — Risk engine + kill switch
+### M6 — Risk engine + kill switch *(complete)*
 
-**Criterion:** limits provably veto a misbehaving strategy, under test.
+**Criterion:** limits provably veto a misbehaving strategy, under test. Met, with
+two deliberately misbehaving strategies in the suite.
+
+Built **before** M5's fortnight on purpose. M6's criterion is a test-suite one, so
+it does not need a long run — but the paper run is the first time this system runs
+unattended with a strategy submitting orders, and a run that exercises the limits
+for two weeks is worth strictly more than one that does not. Running first and
+adding risk after would want a *second* long run.
+
+**Risk keeps its own tally** rather than reading the portfolio. A limit computed
+from the accounting can only be as correct as the accounting, so a portfolio bug
+would take the limits with it precisely when something is already wrong. That is
+the fourth time this project has bought a second independent tally of one
+quantity, and each time the value is not the second number but that a disagreement
+becomes visible.
+
+Two decisions worth repeating. **A money limit refuses when there is no price** —
+you cannot size what you cannot price, and "assume the last price" makes a limit
+widest exactly when the market is least understood. And **a tripped kill switch
+survives a restart**, because the supervisor exists to restart a dead process and
+a switch held only in memory would be re-armed by the machinery meant to keep the
+system running.
 
 The chokepoint designed at M3 gets filled in: max order notional, max position, max daily
 loss, kill switch. "Provably, under test" means a deliberately misbehaving strategy is
@@ -1041,17 +1063,17 @@ point, because the code shows the what.
 
 | Crate | Lines | Knows about |
 |---|---|---|
-| `quant-core` | 2,256 | Money, time, instruments, the event contract. No I/O. |
+| `quant-core` | 2,326 | Money, time, instruments, the event contract. No I/O. |
 | `quant-storage` | 2,702 | The raw format. No venue, no network. |
-| `quant-recorder` | 4,003 | Ingress, overload policy, day rolling. Venue-agnostic, async-free. |
-| `quant-binance` | 2,477 | The only crate that knows a venue. |
+| `quant-recorder` | 4,204 | Ingress, overload policy, day rolling. Venue-agnostic, async-free. |
+| `quant-binance` | 2,875 | The only crate that knows a venue. |
 | `quant-book` | 971 | Book reconstruction and its invariants. Depends only on `quant-core`. |
 | `quant-meta` | 1,075 | Postgres. Sits above the recorder; optional. |
 | `quant-verify` | 2,056 | Near the top. Asks whether the capture is complete. Nothing may depend on it. |
-| `quant-normalize` | 3,749 | Near the top. Asks what the market did, and writes the normalized tier. |
-| `quant-engine` | 1,585 | The seam: the loop, the four traits, the portfolio. No venue, no format, no network. |
-| `quant-sim` | 790 | The simulated counterparty. Every backtest modelling assumption. |
-| `quant-backtest` | 977 | Top of the graph. The only crate that knows both where events come from and what fills them. |
+| `quant-normalize` | 3,752 | Near the top. Asks what the market did, and writes the normalized tier. |
+| `quant-engine` | 3,113 | The seam: the loop, the four traits, the portfolio. No venue, no format, no network. |
+| `quant-sim` | 1,478 | The simulated counterparty. Every backtest modelling assumption. |
+| `quant-backtest` | 1,649 | Top of the graph. The only crate that knows both where events come from and what fills them. |
 
 The dependency arrows only point one way. That is checked by the fact that adding a second
 venue should mean writing a new adapter and touching nothing else.
