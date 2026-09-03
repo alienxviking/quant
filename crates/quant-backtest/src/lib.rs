@@ -20,7 +20,7 @@ pub mod equity;
 pub mod ma;
 
 pub use equity::{EquityCurve, EquityPoint, Recorded};
-pub use ma::MaCrossover;
+pub use ma::{MaConfig, MaCrossover};
 
 #[cfg(test)]
 mod tests;

@@ -954,8 +954,46 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
   | a | `TeeSink`: one ingress, two consumers | **done** |
   | b | `quant-binance::LiveSource`: the socket as an `EventSource` | **done** |
   | c | `quant-engine::journal` + the `reconcile` binary | **done** |
-  | d | The `paper` binary: `record()` extracted so it can feed the tee | next |
-  | e | Ops harness, rehearsal, and the fortnight | |
+  | d | The `paper` binary: `record()` extracted so it can feed the tee | **done** |
+  | e | Ops harness and rehearsal | **done** |
+  | — | The fortnight itself | **the remaining criterion** |
+
+- **M5.d/e decisions.** `record()`'s 160-line body moved to
+  `quant-binance::capture`, parameterised by a closure that wraps the capture
+  channel's sender: a recorder passes it through, a paper run returns a `TeeSink`.
+  That closure is the *entire* difference, which keeps the seven-day-proven path
+  and the paper path the same code. Everything else moved rather than being
+  rewritten — that code has an acceptance run behind it and the M1 notes are full
+  of things it learned the hard way.
+
+  **Costs default to retail in `paper`**, the opposite of `backtest`. A paper
+  session exists to resemble live trading, and run free it produces a number that
+  looks like a paper result and is not.
+
+  The harness is **parameterised, not duplicated**: `supervise.sh` takes a mode,
+  `start-run.sh` takes `--paper`. Nine hundred lines copied for one changed argv
+  would be two harnesses that must agree forever. The `.ps1` half is deliberately
+  *not* updated — those exist for a Windows run that is not happening, and an
+  untested paper mode there would be exactly the harness-never-run M1 warns about.
+
+- **The rehearsal earned its keep** (three defects a fortnight would have found
+  expensively). `.resuming()` replaces the portfolio outright, so calling it with
+  a fresh journal's empty recompute reset starting capital to zero — the first
+  rehearsal reported `cash 0 from 0` on a session configured with a hundred. No
+  final checkpoint or `Stopped` was written, so `reconcile` would have exited 2 on
+  a perfectly good session. And `NothingToCheck` was being reported as a
+  disagreement, which it is not.
+
+  End to end it now gives: 4552 frames captured, **4552 events reaching the
+  engine** (the tee delivering everything, no drops either side), fills journalled,
+  `verify` clean, `reconcile` AGREES. A harness round trip bought at 77,634.64 and
+  sold at 77,637.67 — **+0.3 cents of price against 15.5 cents of fees**, which is
+  M4's finding arriving from live data.
+
+- **A known hole to close before M8**: a hard kill between a risk trip and
+  shutdown loses the trip, because the switch is journalled at shutdown. Harmless
+  in paper; before real money the day's tally must be recovered from the journal
+  rather than only the switch.
 
 - **M5's criterion was sharpened, and one of my claims was wrong.** "P&L
   reconciles against an independent recompute" checks arithmetic against itself
@@ -1269,6 +1307,16 @@ turns out to be.
 - Commits are authored **alienxviking <sroy191006@gmail.com>** with **no**
   `Co-Authored-By: Claude` trailer. Already set in this repo's local git
   config. Personal project under the user's own GitHub identity.
+- **Conventional commit subjects.** (Set 2026-09-03.) `type(scope): subject`,
+  lowercase, no trailing full stop. Types: `feat`, `fix`, `refactor`, `test`,
+  `docs`, `build`, `perf`, `chore`. Scope is the **milestone slice** for milestone
+  work (`m5d`, `m6`) and the **crate or area** otherwise (`engine`, `sim`,
+  `binance`) — the milestone tie is what makes this repo's log readable against
+  `CLAUDE.md`, and the type is what makes the graph scannable by kind.
+
+  Existing history is **not** rewritten. Relabelling merged commits on `main`
+  would mean force-pushing shared history, which is a worse habit than an
+  inconsistent log; the convention applies going forward.
 - Commit messages explain *why*, in the body. The rationale is the point.
 - Warnings are errors in CI (`RUSTFLAGS: -D warnings`). Run before committing:
 

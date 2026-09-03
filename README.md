@@ -81,6 +81,7 @@ docs/
   engine-contract.md  the seam a strategy sees, and why it is shaped
                       that way. Written before the engine exists.
   acceptance-run.md   how the 7-day M1 run is conducted and judged
+  paper-run.md        how the 2-week M5 paper run is conducted and judged
 ops/
   preflight.ps1     refuse to waste a week: clock, disk, build, clean root
   start-run.ps1     start the acceptance run; supervisors + verify loop

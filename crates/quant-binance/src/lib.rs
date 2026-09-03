@@ -55,6 +55,7 @@
 //! we are writing down, and they belong to the normalizer at M2 where a mistake
 //! can be fixed by re-deriving rather than by re-recording a week.
 
+pub mod capture;
 pub mod connection;
 pub mod decode;
 pub mod live;
@@ -86,6 +87,7 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+pub use capture::{run as run_capture, CaptureConfig};
 pub use connection::{ConnectionPolicy, EndReason};
 pub use decode::{decode, VenueBytes};
 pub use live::{LiveSource, LiveStats};

@@ -16,6 +16,16 @@ quant-book = { workspace = true }
 quant-engine = { workspace = true }
 quant-normalize = { workspace = true }
 quant-sim = { workspace = true }
+# The `paper` binary needs the venue adapter (its capture loop and live source)
+# and a tokio runtime to drive it. `backtest` needs neither, but a second crate
+# for one binary would separate two things that share the strategy and the
+# equity recorder -- which is the whole of what makes paper and backtest
+# comparable.
+quant-binance = { workspace = true }
+quant-recorder = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]
 workspace = true

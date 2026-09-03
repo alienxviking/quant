@@ -24,17 +24,31 @@
 # resurrect itself across a reboot (see docs/acceptance-run.md). The reboot limit
 # is deliberate, not an oversight of this port.
 #
-# Usage: supervise.sh SYMBOL ROOT END_EPOCH LOGDIR
+# Usage: supervise.sh SYMBOL ROOT END_EPOCH LOGDIR [MODE] [EXTRA...]
+#
+#   MODE   record (default) or paper. A paper session captures raw *and* trades
+#          it from the same ingress, so it replaces the recorder rather than
+#          running beside one -- two processes would mean two subscriptions and
+#          two sets of timestamps, and docs/engine-contract.md 9 needs them
+#          identical. Everything else about supervising is the same, which is
+#          why this is a parameter and not a second script.
+#   EXTRA  passed through to the paper binary (--qty, --cash, --max-* and so on).
 set -uo pipefail
 
 symbol="${1:?symbol required}"
 root="${2:?root required}"
 end_epoch="${3:?end epoch (unix seconds) required}"
 log_dir="${4:?logdir required}"
+mode="${5:-record}"
+if [ $# -gt 5 ]; then shift 5; extra=("$@"); else extra=(); fi
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
-exe="$repo/target/release/record"
+case "$mode" in
+    record) exe="$repo/target/release/record";;
+    paper)  exe="$repo/target/release/paper";;
+    *) echo "unknown mode: $mode (want record or paper)" >&2; exit 2;;
+esac
 
 # The recorder logs through `tracing`, which emits ANSI colour even when its output
 # is a file rather than a terminal. Over a week that is escape codes in every log
@@ -75,7 +89,7 @@ note() {
     echo "$line" >>"$journal"
 }
 
-note "supervising $symbol until $(date -u -r "$end_epoch" +%Y-%m-%dT%H:%M:%SZ) into $root"
+note "supervising $symbol in $mode mode until $(date -u -r "$end_epoch" +%Y-%m-%dT%H:%M:%SZ) into $root"
 
 while [ "$(date +%s)" -lt "$end_epoch" ]; do
     remaining=$(( end_epoch - $(date +%s) ))
@@ -92,7 +106,15 @@ while [ "$(date +%s)" -lt "$end_epoch" ]; do
     # erase the log that explains why the previous attempt ended. It handles its
     # own SIGINT (clean shutdown, sealing the trailer); we deliver that only from
     # stop-run.sh.
-    "$exe" "$symbol" "$root" "$remaining" >"$out" 2>&1
+    if [ "$mode" = paper ]; then
+        # The paper binary takes whole minutes, so the remaining seconds are
+        # rounded *up*: rounding down would leave the last partial minute
+        # unsupervised, and a restart loop with nothing left to do spins.
+        minutes=$(( (remaining + 59) / 60 ))
+        "$exe" --symbol "$symbol" "$root" --minutes "$minutes" "${extra[@]}" >"$out" 2>&1
+    else
+        "$exe" "$symbol" "$root" "$remaining" >"$out" 2>&1
+    fi
     code=$?
     ran_for=$(( $(date +%s) - started_at ))
 

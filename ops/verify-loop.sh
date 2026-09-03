@@ -31,6 +31,8 @@ first_check_seconds="${5:-300}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 exe="$repo/target/release/verify"
+# Present only for a paper run; a bare recorder run finds no journals to feed it.
+reconcile="$repo/target/release/reconcile"
 log="$log_dir/verify.log"
 
 if [ ! -x "$exe" ]; then
@@ -79,6 +81,26 @@ while [ "$(date +%s)" -lt "$end_epoch" ]; do
             grep -E '^  (ERROR|warn|\.\.\.)' "$out" 2>/dev/null | while IFS= read -r l; do note "     $l"; done
             ;;
     esac
+
+    # Any paper journals under this root get reconciled too, on the same
+    # cadence and for the same reason: a live path and a replay path that have
+    # started disagreeing should cost hours, not a fortnight. Absent journals
+    # mean this is a bare recorder run, and the loop simply finds none.
+    for journal in "$root"/paper-*.jsonl; do
+        [ -e "$journal" ] || continue
+        rout="$log_dir/reconcile-$(basename "$journal" .jsonl)-$stamp.txt"
+        "$reconcile" "$journal" >"$rout" 2>&1
+        rcode=$?
+        rverdict="$(grep '^verdict' "$rout" 2>/dev/null | tr '
+' ' ')"
+        case "$rcode" in
+            0) note "OK   $(basename "$journal"): $rverdict";;
+            # Exit 2 is "no checkpoint yet", which is normal before the first
+            # fill and is not a disagreement. Worth a line, not an alarm.
+            2) note "WAIT $(basename "$journal"): nothing to check yet";;
+            *) note "FAIL $(basename "$journal"): $rverdict";;
+        esac
+    done
 
     remaining=$(( end_epoch - $(date +%s) ))
     [ "$remaining" -le 60 ] && break
