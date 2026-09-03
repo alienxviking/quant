@@ -95,6 +95,16 @@ pub enum JournalEntry {
         fees: Notional,
         fills: u64,
     },
+    /// The kill switch was thrown.
+    ///
+    /// Journalled because a switch held only in memory is re-armed by the
+    /// supervisor that restarts the process — the machinery meant to keep the
+    /// system running would silently resume trading minutes after a limit said
+    /// stop. `RiskEngine::recover` reads this back.
+    Tripped {
+        at: Ts,
+        cause: crate::risk::TripCause,
+    },
     /// A session ended cleanly.
     ///
     /// Its absence is how a crash is told from a clean stop — the same
@@ -109,6 +119,7 @@ impl JournalEntry {
             Self::Started { at, .. }
             | Self::Filled { at, .. }
             | Self::Checkpoint { at, .. }
+            | Self::Tripped { at, .. }
             | Self::Stopped { at } => *at,
         }
     }

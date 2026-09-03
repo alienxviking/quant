@@ -137,8 +137,20 @@ impl Default for Ledger {
 ///
 /// The instrument and side come from the engine because a [`Fill`] does not
 /// carry them: a fill belongs to an order, and the engine is what knows which.
+///
+/// `portfolio` is the state *after* the fill, so an observer that writes a
+/// checkpoint records what the engine actually believes rather than a total it
+/// accumulated itself. A third independent tally would not be a check against
+/// the engine — it would be a check against itself.
 pub trait FillObserver {
-    fn on_fill(&mut self, instrument: InstrumentId, side: Side, fill: &Fill, at: Ts);
+    fn on_fill(
+        &mut self,
+        instrument: InstrumentId,
+        side: Side,
+        fill: &Fill,
+        at: Ts,
+        portfolio: &Portfolio,
+    );
 }
 
 /// The loop.
@@ -157,7 +169,7 @@ pub struct Engine<S, V, R, K> {
     portfolio: Portfolio,
     /// Optional, because a backtest has nothing worth journalling: it can be
     /// re-run from raw, and a two-week paper session cannot.
-    observer: Option<Box<dyn FillObserver>>,
+    observer: Option<Box<dyn FillObserver + Send>>,
 }
 
 impl<S: core::fmt::Debug, V: core::fmt::Debug, R: core::fmt::Debug, K: core::fmt::Debug>
@@ -212,7 +224,7 @@ where
     /// The other order would allow a strategy to submit on a fill that a crash
     /// then erased from the record.
     #[must_use]
-    pub fn observing_fills(mut self, observer: Box<dyn FillObserver>) -> Self {
+    pub fn observing_fills(mut self, observer: Box<dyn FillObserver + Send>) -> Self {
         self.observer = Some(observer);
         self
     }
@@ -298,7 +310,7 @@ where
                     // crash cannot erase a fill the strategy has already acted
                     // on.
                     if let Some(observer) = self.observer.as_mut() {
-                        observer.on_fill(instrument, side, fill, execution.ts());
+                        observer.on_fill(instrument, side, fill, execution.ts(), &self.portfolio);
                     }
                     // Risk keeps its own tally, so it has to see fills too. It
                     // deliberately does not read the portfolio: a limit computed

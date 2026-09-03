@@ -1051,11 +1051,16 @@ dependencies = [
 name = "quant-backtest"
 version = "0.1.0"
 dependencies = [
+ "quant-binance",
  "quant-book",
  "quant-core",
  "quant-engine",
  "quant-normalize",
+ "quant-recorder",
  "quant-sim",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
