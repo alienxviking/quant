@@ -298,8 +298,12 @@ tee below. Any divergence is a bug, not a tolerance.
 | a | `TeeSink`: one ingress, two consumers | **done** |
 | b | `LiveSource`: the venue socket as an `EventSource` | **done** |
 | c | The journal, and a reconciliation that can fail | **done** |
-| d | The `paper` binary: `record()` extracted so it can feed the tee | next |
-| e | Ops harness, rehearsal, and the fortnight | |
+| d | The `paper` binary: `record()` extracted so it can feed the tee | **done** |
+| e | Ops harness and rehearsal | **done** |
+| — | The fortnight itself | **the remaining criterion** |
+
+The procedure is `docs/paper-run.md`. Everything except wall clock is built and
+rehearsed against the live venue.
 
 **M5 is in progress**, and the criterion is the run. That is the same shape M1
 had: code complete 2026-08-11, acceptance run passed 2026-08-28, seventeen days
