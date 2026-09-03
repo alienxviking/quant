@@ -11,9 +11,9 @@
 //!
 //! # There is no `PaperVenue`, and that is the finding
 //!
-//! `CLAUDE.md`'s diagram lists `SimulatedVenue`, `PaperVenue` and `LiveVenue` as
-//! three implementations, and this binary was expected to need the second. It
-//! does not exist. A paper venue fills orders against a reconstructed book at
+//! `CLAUDE.md`'s diagram *listed* `SimulatedVenue`, `PaperVenue` and `LiveVenue`
+//! as three implementations, and this binary was expected to need the second. It
+//! does not exist, and the diagram has since been corrected. A paper venue fills orders against a reconstructed book at
 //! prices the book showed — which is exactly and entirely what [`SimulatedVenue`]
 //! does. What separates a backtest from paper trading is the **source** and the
 //! **durability**, not the matching.

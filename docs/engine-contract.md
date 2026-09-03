@@ -18,7 +18,8 @@ ends up describing a system that was never run.
 > **A strategy must not be able to tell which sources it is wired to.**
 
 Backtest is `HistoricalSource + SimulatedVenue`. Paper is
-`LiveSource + PaperVenue`. Live is `LiveSource + LiveVenue`. One strategy
+`LiveSource + SimulatedVenue` — see §9, there is no separate paper venue. Live is
+`LiveSource + LiveVenue`. One strategy
 binary, three worlds, no code changes between them.
 
 If a strategy *can* tell, the backtest is measuring a system that will never
@@ -264,7 +265,7 @@ instrument that can measure them.
 
 The seam is proven in a second world when:
 
-- [ ] The **same strategy binary** runs against `LiveSource + PaperVenue` for
+- [ ] The **same strategy binary** runs against `LiveSource + SimulatedVenue` for
       **two weeks**, unattended, with no code change from the backtest wiring.
 - [ ] **Paper P&L matches a backtest over the data captured during the same
       window.** See below — this replaces "reconciles against an independent
@@ -312,9 +313,9 @@ was written down.
 
 ### There is no `PaperVenue`
 
-`CLAUDE.md`'s diagram lists `SimulatedVenue`, `PaperVenue` and `LiveVenue` as
+`CLAUDE.md`'s diagram *listed* `SimulatedVenue`, `PaperVenue` and `LiveVenue` as
 three implementations. Building M5 established that the middle one does not need
-to exist.
+to exist, and the diagram has since been corrected — this section is why.
 
 A paper venue fills orders against a reconstructed book at prices the book
 showed. That is exactly and entirely what `SimulatedVenue` does. What separates a
