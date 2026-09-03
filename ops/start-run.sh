@@ -18,6 +18,14 @@
 # Usage:
 #   start-run.sh [--symbols "BTCUSDT ETHUSDT"] [--root DIR] [--days N]
 #                [--verify-interval-hours H] [--minutes M] [--force]
+#                [--paper] [--paper-args "..."]
+#
+#   --paper       Run M5's paper session instead of a bare recorder. The paper
+#                 binary records raw *and* trades it from the same ingress, so it
+#                 replaces the recorder rather than running beside one. One
+#                 process per symbol still, each with its own journal -- which
+#                 also gives the fortnight two independent samples instead of one.
+#   --paper-args  Extra flags for the paper binary, e.g. "--qty 0.001 --cash 100".
 #
 #   --minutes M   Rehearsal. A run harness that has never been run is not a
 #                 harness, and the worst moment to discover a typo in it is four
@@ -35,6 +43,8 @@ days=7
 verify_interval_hours=6
 minutes=0
 force=0
+mode=record
+paper_args=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --symbols) symbols="$2"; shift 2;;
@@ -42,6 +52,8 @@ while [ $# -gt 0 ]; do
         --days)    days="$2"; shift 2;;
         --verify-interval-hours) verify_interval_hours="$2"; shift 2;;
         --minutes) minutes="$2"; shift 2;;
+        --paper)   mode=paper; shift;;
+        --paper-args) paper_args="$2"; shift 2;;
         --force)   force=1; shift;;
         *) echo "unknown argument: $1" >&2; exit 2;;
     esac
@@ -110,6 +122,7 @@ Q_SUBJECT="$subject" \
 Q_DIRTY="$dirty" \
 Q_DATABASE="$database" \
 Q_PREFLIGHT="$preflight_state" \
+Q_MODE="$mode" \
 Q_HOST="$(scutil --get ComputerName 2>/dev/null || hostname)" \
 Q_PLATFORM="$(uname -sm)" \
 python3 - "$root/run.json" <<'PY'
@@ -117,6 +130,7 @@ import json, os, sys
 m = {
     "started_at": os.environ["Q_STARTED"],
     "ends_at": os.environ["Q_ENDS"],
+    "mode": os.environ["Q_MODE"],
     "symbols": os.environ["Q_SYMBOLS"].split(),
     "root": os.environ["Q_ROOT"],
     "duration_seconds": int(os.environ["Q_DURATION"]),
@@ -159,8 +173,10 @@ launch() { # label  script  args...
     pids+=("$pid")
 }
 
+# shellcheck disable=SC2206
+paper_arg_arr=($paper_args)
 for symbol in "${symbol_arr[@]}"; do
-    launch "recorder $symbol" supervise.sh "$symbol" "$root" "$end_epoch" "$log_dir"
+    launch "$mode $symbol" supervise.sh "$symbol" "$root" "$end_epoch" "$log_dir"         "$mode" "${paper_arg_arr[@]}"
 done
 launch "verifier" verify-loop.sh "$root" "$end_epoch" "$log_dir" "$verify_every" "$first_check_seconds"
 
