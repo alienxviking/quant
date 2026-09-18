@@ -305,24 +305,58 @@ pub enum Agreement {
     },
 }
 
-/// Compare a recomputed portfolio against the journal's last checkpoint.
+/// Compare the journal's last checkpoint against a recompute of the entries it
+/// describes.
 ///
 /// The check in `docs/engine-contract.md` §9. The two numbers are computed by
 /// different code from different inputs -- one accumulated in memory as fills
 /// arrived, one replayed from a file afterwards -- which is what makes their
 /// agreement mean something.
+///
+/// # A checkpoint is a claim about a *prefix*
+///
+/// This used to take an already-recomputed portfolio, and every caller replayed
+/// the whole journal to produce it. That is correct only for a journal nothing
+/// is writing to any more. `ops/verify-loop.sh` runs `reconcile` *during* a run,
+/// against a file the engine is still appending to, so the fills after the last
+/// checkpoint are ordinarily there -- and comparing a claim made at fill 5
+/// against a replay of 8 fills reported `DISAGREES on fills: the engine counted
+/// 5, the journal holds 8` on a session that was perfectly healthy.
+///
+/// Observed, not theorised: a five-minute rehearsal went `OK`, `FAIL`, `FAIL` on
+/// consecutive passes as the journal grew. Over a fortnight that is a red
+/// verdict every six hours from the first checkpoint onward -- the failure M1's
+/// verifier already taught this project once, where a check that cries wolf on
+/// good data is worse than no check because it trains everyone to ignore the
+/// exit code.
+///
+/// So the replay happens *here*, over the entries up to and including the last
+/// checkpoint, rather than being the caller's job to get right. `the_last_checkpoint_is_the_one_that_counts`
+/// already made this argument for earlier checkpoints -- "an earlier one
+/// describes an earlier state and comparing against it would fail on every
+/// healthy run" -- and it is the same argument, applied to the other end.
+///
+/// A fresh registry is used for the recompute because only the aggregate money
+/// and fill count are compared, and `a_journal_replays_the_same_through_any_registry`
+/// pins that those do not depend on id assignment.
 #[must_use]
-pub fn agrees(entries: &[JournalEntry], recomputed: &Portfolio) -> Agreement {
+pub fn agrees(entries: &[JournalEntry]) -> Agreement {
+    let last_checkpoint = entries
+        .iter()
+        .rposition(|e| matches!(e, JournalEntry::Checkpoint { .. }));
+    let Some(end) = last_checkpoint else {
+        return Agreement::NothingToCheck;
+    };
+    let described = &entries[..=end];
+    let recomputed = &replay(described, &mut InstrumentRegistry::new());
+
     let Some(JournalEntry::Checkpoint {
         cash,
         realized,
         fees,
         fills,
         ..
-    }) = entries
-        .iter()
-        .rev()
-        .find(|e| matches!(e, JournalEntry::Checkpoint { .. }))
+    }) = entries.get(end)
     else {
         return Agreement::NothingToCheck;
     };
@@ -614,16 +648,14 @@ mod tests {
         let portfolio = replay(&entries, &mut registry);
         entries.push(JournalEntry::checkpoint(Ts::from_nanos(4), &portfolio));
 
-        assert_eq!(agrees(&entries, &portfolio), Agreement::Agrees);
+        assert_eq!(agrees(&entries), Agreement::Agrees);
     }
 
     #[test]
     fn a_journal_with_no_checkpoint_reports_nothing_to_check() {
         // Deliberately not agreement. "Nobody disagreed" and "two answers
         // matched" are different statements and only one of them is evidence.
-        let mut registry = InstrumentRegistry::new();
-        let portfolio = replay(&session(), &mut registry);
-        assert_eq!(agrees(&session(), &portfolio), Agreement::NothingToCheck);
+        assert_eq!(agrees(&session()), Agreement::NothingToCheck);
     }
 
     #[test]
@@ -639,7 +671,7 @@ mod tests {
             fills: portfolio.fills(),
         });
         assert_eq!(
-            agrees(&entries, &portfolio),
+            agrees(&entries),
             Agreement::Differs {
                 field: "cash",
                 claimed: amount("999"),
@@ -664,12 +696,44 @@ mod tests {
             fills: portfolio.fills() + 1,
         });
         assert_eq!(
-            agrees(&entries, &portfolio),
+            agrees(&entries),
             Agreement::FillCountDiffers {
                 claimed: portfolio.fills() + 1,
                 recomputed: portfolio.fills(),
             }
         );
+    }
+
+    #[test]
+    fn fills_after_the_last_checkpoint_are_not_a_disagreement() {
+        // The false alarm that would have turned a fortnight red every six
+        // hours. `ops/verify-loop.sh` runs `reconcile` *during* a run, against a
+        // journal the engine is still appending to, so fills after the last
+        // checkpoint are the ordinary state of a healthy live file -- not
+        // evidence that one was acted on and never written down.
+        //
+        // Seen for real before it was fixed: a five-minute rehearsal reported
+        // OK, then "DISAGREES on fills: the engine counted 5, the journal holds
+        // 8", then "counted 10, holds 11", on consecutive passes as the file
+        // grew. The claim was right, the recompute was right, and the comparison
+        // was between a claim about fill 5 and a replay of eight.
+        let mut entries = session();
+        let mut registry = InstrumentRegistry::new();
+        let at_checkpoint = replay(&entries, &mut registry);
+        entries.push(JournalEntry::checkpoint(Ts::from_nanos(4), &at_checkpoint));
+
+        // The run carries on. These are good fills, correctly written down.
+        let more = session();
+        entries.extend(
+            more.into_iter()
+                .filter(|e| matches!(e, JournalEntry::Filled { .. })),
+        );
+        assert!(
+            replay(&entries, &mut registry).fills() > at_checkpoint.fills(),
+            "the journal really has grown past the checkpoint"
+        );
+
+        assert_eq!(agrees(&entries), Agreement::Agrees);
     }
 
     #[test]
@@ -687,7 +751,7 @@ mod tests {
             fills: 99,
         });
         entries.push(JournalEntry::checkpoint(Ts::from_nanos(5), &mid));
-        assert_eq!(agrees(&entries, &mid), Agreement::Agrees);
+        assert_eq!(agrees(&entries), Agreement::Agrees);
     }
 
     #[test]

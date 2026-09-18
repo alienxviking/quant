@@ -78,7 +78,26 @@ use tracing_subscriber::EnvFilter;
 /// so they are cheap and frequent rather than one at the end: a run that is
 /// killed hard still leaves a recent claim for the recompute to be compared
 /// against.
-const CHECKPOINT_EVERY: u64 = 25;
+///
+/// **Calibrated against the cadence that consumes it, not chosen for feel.**
+/// `ops/verify-loop.sh` runs `reconcile` every six hours during a run, and a
+/// checkpoint written less often than that means most passes re-check a claim
+/// they already checked — or, before the first one, exit 2 with "nothing to
+/// check". This was 25, and both 10-minute rehearsals produced 22 fills, so
+/// neither wrote a single checkpoint before shutdown and the in-run
+/// reconciliation reported `nothing to check yet` for the entire run. At the
+/// fortnight's observed rate — M4's acceptance week was 418 fills over 7 days,
+/// about 60 a day — 25 is roughly one checkpoint every ten hours, still coarser
+/// than the thing reading it. Five is about two hours, so every reconcile pass
+/// has something new.
+///
+/// The remaining hole is honest and unfixed: this triggers on *fills*, so a
+/// strategy that trades less than five times between passes still leaves nothing
+/// new to check, and a hard kill before the fifth fill loses the lot. A
+/// time-based checkpoint would close it and needs a periodic hook the engine
+/// does not have — `FillObserver` fires only on fills and `Engine::run` blocks —
+/// which is a change to the seam and not a thing to slip in before a fortnight.
+const CHECKPOINT_EVERY: u64 = 5;
 
 /// Writes fills down before the strategy is told about them.
 struct JournalWriter {
@@ -386,13 +405,7 @@ fn print_banner(
         println!("RISK      TRIPPED by {cause}. Nothing will be sent. Clear it deliberately.");
         warn!(%cause, "starting with the kill switch already thrown");
     }
-    println!(
-        "limits    order {:?}, position {:?}, daily loss {:?}, orders/day {:?}",
-        args.limits.max_order_notional,
-        args.limits.max_position_notional,
-        args.limits.max_daily_loss,
-        args.limits.max_orders_per_day
-    );
+    println!("{}", quant_backtest::limits_line(args.limits));
     if args.free {
         println!("costs     NONE -- a rehearsal, not a paper result. Do not quote it.");
         warn!("running with no fees or latency; this is not a paper trading result");
@@ -436,9 +449,7 @@ where
     // Two independent computations of one quantity: the engine accumulated its
     // numbers in memory, this replays them from the file.
     let recovered = journal::read(journal_path)?;
-    let mut registry = InstrumentRegistry::new();
-    let recomputed = journal::replay(&recovered.entries, &mut registry);
-    match journal::agrees(&recovered.entries, &recomputed) {
+    match journal::agrees(&recovered.entries) {
         Agreement::Agrees => println!("journal   AGREES with the engine"),
         // Not a disagreement, and not reported as one: nothing was checked. It
         // means no checkpoint reached the disk, which is itself worth knowing.
