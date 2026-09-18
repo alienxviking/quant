@@ -179,6 +179,64 @@ which side is lying is then the whole job.
 - **Same fills, different P&L** — the accounting differs between the two paths,
   which should be impossible since both use the same `Portfolio`.
 
+### The judging pipeline has been rehearsed end to end (2026-09-18)
+
+On a 10-minute paper session at `~/paper-rehearsal` (fast 2, slow 4, 5 s mids),
+all four steps ran and **step 4 reproduced the paper session exactly**:
+
+| | paper | backtest |
+|---|---|---|
+| events | 21690, 1 gap, 44 execution events | 21690, 1 gap, 44 execution events |
+| orders | 23 sent, 0 refused | 23 submitted, 0 refused |
+| fills | 22 | 22 |
+| cash | 98.35961601 from 100 | 98.35961601 from 100 |
+| realized | 0.07729 | 0.07729 |
+| fees | 1.71767399 | 1.71767399 |
+
+So the plumbing works: one decoder (`quant-binance::decode`) serves the live
+source and the offline replay, `normalize --check` closes the last link by
+proving Parquet replay matches raw replay event for event (21690 of them), and
+nothing on the path reads a wall clock.
+
+**Carry the strategy flags into step 4.** The command above omits
+`--fast/--slow/--interval-secs` because the fortnight's paper defaults (10/30/60)
+happen to equal the backtest's. They are *not* equal for a rehearsal at other
+settings, and running the bare command against this rehearsal samples at 60 s over
+a 600 s window: slow=30 never warms up, 0 crossings, 0 fills, cash 100.00000000.
+That reads as a catastrophic platform failure and is a missing flag. Diff the two
+`strategy` banner lines character for character before believing any divergence.
+
+**Pass `--realistic` and nothing else cost-related.** It assigns the cost model
+wholesale, so `--fee-rate 0.001 --realistic` silently discards the fee rate. Then
+read the `costs` line back — it is printed from `engine.venue().costs()`, not from
+the parsed flags, which is the M4 fix. If a `switched off for this run` section
+appears, a cost was zeroed.
+
+**`venue` fills may exceed `fills`, and that is not a disagreement.** This
+rehearsal ended with `venue 23 fills, charged 1.79581017` against the portfolio's
+22 and 1.71767399 — one fill's worth. Order #23 matched, but with 50 ms each way
+its report was still in flight when the data ran out, and a report in flight is
+counted rather than flushed, because flushing would tell a strategy something it
+could not have known. The `reports still in flight` count on the same line is what
+accounts for the difference.
+
+**What the rehearsal does not cover.** One session, one segment, one day
+partition, and the only gap is the mandatory `RecorderRestart` first frame. Untested
+here: joining segments across UTC midnight (M2.c's whole reason for existing), a
+real `Disconnect` gap with its resync, `LocalOverflow`, `SnapshotFailed`, the hourly
+periodic and stale-snapshot paths, and above all **a recorder restart producing two
+sessions on one symbol-day, which `normalize --write` refuses rather than merges**
+(M2.d, still open). That last one is the likeliest thing to stop the fortnight being
+judgeable at all.
+
+**A hole worth closing first.** `paper` wires a real `RiskEngine`; `backtest` wires
+`AllowAll` and exposes no `--max-*` flags. On this rehearsal that is inert — 23
+orders against a 200/day cap, worst loss 1.64 against a 20 cap, 0 refused — but one
+refusal or one kill-switch trip during the fortnight and the exact comparison
+becomes impossible with today's `backtest`. Either give it the limit flags before
+starting, or accept that the criterion is only checkable on a run where nothing
+bound, and say so in the result.
+
 ---
 
 ## What this run cannot tell us
