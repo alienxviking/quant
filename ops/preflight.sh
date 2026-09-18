@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# preflight.sh -- check that this Mac can be trusted with a seven-day capture.
+# preflight.sh -- check that this Mac can be trusted with a long unattended run.
 #
-# macOS port of ops/preflight.ps1. Every check here exists because failing it
-# wastes days rather than minutes. A recorder that starts and runs is not the
-# same as one whose output will be worth anything at the end of the week, and the
-# difference is almost always knowable up front: a clock that is wrong, a disk
-# that will fill on day five, a build that is not the one being tested.
+# macOS port of ops/preflight.ps1. Written for M1's seven-day capture and used
+# unchanged by M5's paper fortnight, which captures raw *and* trades it from one
+# ingress -- so every check here applies to both worlds, and a check written as
+# if only a recorder existed is a bug rather than a scope decision. That is not
+# hypothetical: the build step below shipped a hand-written list of two binaries
+# and stayed silent about the two a paper run launches.
+#
+# Every check exists because failing it wastes days rather than minutes. A
+# process that starts and runs is not the same as one whose output will be worth
+# anything at the end, and the difference is almost always knowable up front: a
+# clock that is wrong, a disk that will fill on day five, a build that is not the
+# one being tested.
 #
 # Blockers exit non-zero. Advisories print and continue. The distinction is
 # whether the run would produce data that cannot be trusted (blocker) or data
@@ -33,6 +40,16 @@ done
 # Budgeted well above the ~160 MB/day/symbol observed on a quiet market, because
 # the point of a headroom check is to survive a busy one. A week of frantic
 # trading is the run we most want to have recorded.
+#
+# A paper run is budgeted by the same number, and that is measured rather than
+# assumed -- the question is obvious enough that the next person will ask it, and
+# an unrecorded answer gets re-derived. M5's ten-minute rehearsal wrote 1.22 MB
+# of raw -- 176 MB/day/symbol, which is the ~160 above and the same order either
+# way -- against 4.5 KB of journal and 8 KB of logs. The journal grows by one
+# line per fill plus one checkpoint per 25 of them, so a fortnight at M3's
+# observed turnover is ~160 KB: four ten-thousandths of a single day's raw. Paper
+# trades the stream it is already recording, so it writes no materially
+# different volume and there is nothing here to parameterise by mode.
 mb_per_symbol_per_day=1024
 max_clock_offset_ms=1000
 
@@ -62,13 +79,57 @@ echo "root   $root"
 echo ""
 
 # --- the build under test -------------------------------------------------
-# Release, not debug: a seven-day run should be the binary we would deploy.
-# Debug builds carry overflow checks and no optimisation, and a run that proves a
-# debug build works has proved nothing about a release one.
+# Release, not debug: a run measured in days should be the binary we would
+# deploy. Debug builds carry overflow checks and no optimisation, and a run that
+# proves a debug build works has proved nothing about a release one.
+#
+# `--workspace --bins`, not a hand-written list of what this run needs. The list
+# was `record` and `verify`, which was true while only the recorder ran
+# unattended and became false the moment `--paper` existed: supervise.sh reaches
+# for target/release/paper, verify-loop.sh for target/release/reconcile. This
+# step could report "build ok" on a tree where the paper run cannot start, and it
+# failed quietly in every direction -- supervise.sh's own -x check fires into a
+# nohup'd log while start-run.sh prints "running", and verify-loop.sh does not
+# check at all, so an absent `reconcile` exits 127 and logs FAIL against a
+# healthy journal every cycle for a fortnight.
+#
+# Two shapes were rejected. Enumerating the four binaries a paper run needs fixes
+# today's list and leaves tomorrow's to drift the same way. Selecting them from a
+# --paper flag puts the build behind a caller remembering which world it is in --
+# and start-run.sh does not pass the mode today, which is precisely how this was
+# missed; a check that can quietly not happen is the worst outcome available. The
+# workspace already knows what it can run, and asking it cannot go stale.
+#
+# This step does not only test, it *produces*: anything it skips is whatever was
+# left in target/. A present-but-stale `paper` is worse than an absent one,
+# because start-run.sh writes the commit preflight just checked into run.json, so
+# the manifest would name code that did not produce the result. The rehearsal
+# only got four current binaries because docs/paper-run.md tells you to run a
+# bare `cargo build --release` first -- a documented manual step is exactly the
+# thing preflight exists to stop depending on.
+#
+# Cost is near nothing over naming the four by hand: quant-backtest depends on
+# quant-normalize, so `paper` drags in parquet/arrow either way, and `normalize`
+# and `backtest` are then free. The strictness -- an unrelated broken binary
+# blocks the run -- is right rather than collateral: a tag whose workspace does
+# not build is not one to pin a fortnight to, and CI already compiles every bin.
 export PATH="$HOME/.cargo/bin:$PATH"
 build_log="$(mktemp -t quant-preflight-build.XXXXXX.log)"
-if ( cd "$repo" && cargo build --release -p quant-binance --bin record -p quant-verify --bin verify ) >"$build_log" 2>&1; then
-    report 'build' ok 'release binaries built'
+if ( cd "$repo" && cargo build --release --workspace --bins ) >"$build_log" 2>&1; then
+    # Ask the filesystem what is there rather than trusting that the build
+    # command covered it -- M4's lesson, where the report announced ten basis
+    # points that had never been wired to the venue. Print what was used, not
+    # what was asked for. This is also what catches a renamed or moved binary,
+    # which a green `cargo build` would say nothing about.
+    missing=""
+    for wanted in record verify paper reconcile; do
+        [ -x "$repo/target/release/$wanted" ] || missing="$missing $wanted"
+    done
+    if [ -n "$missing" ]; then
+        report 'build' blocker "cargo build succeeded but the harness launches these and they are not there:$missing"
+    else
+        report 'build' ok 'release binaries present: record, verify, paper, reconcile'
+    fi
 else
     report 'build' blocker "cargo build --release failed, see $build_log"
 fi
@@ -182,6 +243,43 @@ if [ -d "$root/raw" ]; then
     fi
 else
     report 'capture root' ok 'will be created'
+fi
+
+# --- a clean root, part two: the journal ----------------------------------
+# The check above walks $root/raw, which is everything a recorder leaves in the
+# root and not everything a paper run does. The journal lands at
+# $root/paper-SYMBOL.jsonl -- beside raw/, not inside it -- and nothing else
+# looks there: quant-recorder::catalog walks only root/raw, so a stale journal is
+# invisible to quant-verify. This is the one place it can be caught.
+#
+# And leaving one is not a stray file, it is a silently different run. The paper
+# binary *resumes* a journal it finds: starting capital comes from the old file's
+# first `Started` line, so --cash is ignored; position, realized, fees and the
+# fill count are inherited; and a `Tripped` in it re-arms the kill switch, so the
+# fortnight would refuse every order from its first second while looking healthy.
+# M5's criterion compares paper P&L against a backtest over the data captured in
+# the *same window*, and a resumed journal carries fills from outside it -- so the
+# comparison would fail for a reason unrelated to live-versus-replay, which is
+# the only thing being asked.
+#
+# Blocked in both modes rather than only under --paper, for two reasons. It is
+# not mode-specific: verify-loop.sh globs $root/paper-*.jsonl whatever the run
+# is, so a stale journal under a recorder run gets reconciled every cycle and
+# logs a P&L against a session that did not produce it. And a check that only
+# happens when a caller remembers to pass a flag is a check that can quietly not
+# happen -- start-run.sh passes no mode today.
+#
+# Resuming on purpose stays available and stays on the record: --force writes
+# preflight=forced into run.json, so a deliberately resumed run cannot later be
+# mistaken for a fresh one. A restart *within* a run is untouched, because
+# preflight runs once from start-run.sh and supervise.sh re-execs the binary
+# directly. This only sees the default path; a --journal in --paper-args puts the
+# file somewhere preflight cannot know about, which is the caller's to own.
+journals="$(find "$root" -maxdepth 1 -name 'paper-*.jsonl' 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$journals" -gt 0 ]; then
+    report 'paper journal' blocker "$journals journal(s) already in the root -- a paper run resumes them, so starting cash, position and any tripped kill switch would come from that session and not this one"
+else
+    report 'paper journal' ok 'no journal to resume'
 fi
 
 # --- metadata tier (optional by design) -----------------------------------

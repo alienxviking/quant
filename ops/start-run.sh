@@ -86,7 +86,14 @@ if [ "$minutes" -gt 0 ]; then
     rehearsal=1
     end_epoch=$(( started_epoch + minutes * 60 ))
     first_check_seconds=45
-    verify_every=1
+    # Seconds, not hours. This said `1` and meant one *hour*, which is longer than
+    # any rehearsal -- so a ten-minute run got exactly one pass, 45 s in, before a
+    # fill could exist. The journal branch of verify-loop.sh therefore only ever
+    # reported "nothing to check yet", and reconcile had to be run by hand
+    # afterwards to learn whether it works at all. A rehearsal that leaves the
+    # thing it is rehearsing untested is the harness-nobody-ran failure M1 warns
+    # about, wearing a green tick.
+    verify_every=60s
 else
     rehearsal=0
     end_epoch=$(( started_epoch + days * 86400 ))
