@@ -695,3 +695,109 @@ fn no_money_limit_can_be_enforced_across_a_gap_so_it_refuses() {
     assert_eq!(engine.venue().stats().submitted, 0);
     assert!(engine.strategy().refused > 0, "refused for want of a price");
 }
+
+// --- The backtest binary's risk wiring (M5's criterion) ---
+//
+// `backtest` used to wire `AllowAll` while `paper` wired a real `RiskEngine`.
+// M5's criterion compares the two over the same window and demands they match
+// exactly, so a difference in the layer every order passes through is a
+// difference between the two systems being compared. These pin both halves of
+// the swap: that it changes nothing when no limit is set, and that a limit set
+// here binds the same way it does in paper.
+
+/// The backtest binary's wiring exactly: the real crossover behind a `RiskEngine`.
+fn run_crossover_risked(
+    steps: &[Step],
+    limits: Limits,
+) -> quant_engine::Engine<Script, SimulatedVenue, RiskEngine, Recorded<MaCrossover>> {
+    let instrument = instrument();
+    let strategy = Recorded::new(
+        MaCrossover::new(MaConfig {
+            instrument,
+            fast: 2,
+            slow: 3,
+            interval: SECOND,
+            qty: "0.001".parse().expect("qty"),
+        }),
+        instrument,
+        SECOND,
+    );
+    let mut engine = quant_engine::Engine::new(
+        Script::new(steps),
+        SimulatedVenue::new(),
+        RiskEngine::new(limits),
+        strategy,
+        CASH,
+    );
+    engine.run().expect("the script cannot fail");
+    engine
+}
+
+#[test]
+fn unset_limits_reproduce_the_unrisked_backtest_exactly() {
+    // The no-op property, and the reason the swap is safe to make at all. It is
+    // the same shape as `zero_costs_reproduce_the_free_run_exactly`: the default
+    // run has to be byte-identical to the one before the feature existed, or
+    // every earlier result silently describes a different system.
+    //
+    // `the_same_strategy_is_untouched_when_the_limits_permit_it` proves this for
+    // `Runaway`. This proves it for the strategy the binary actually ships, which
+    // is the one whose numbers M5 compares.
+    let risked = run_crossover_risked(&choppy(), Limits::default());
+    let unrisked = run_with(&choppy(), quant_sim::Costs::NONE);
+
+    assert_eq!(risked.portfolio().cash(), unrisked.portfolio().cash());
+    assert_eq!(risked.portfolio().fills(), unrisked.portfolio().fills());
+    assert_eq!(
+        risked.portfolio().realized(),
+        unrisked.portfolio().realized()
+    );
+    assert_eq!(risked.stats().submitted, unrisked.stats().submitted);
+    assert_eq!(risked.stats().refused, 0);
+    assert_eq!(
+        risked.strategy().curve().last(),
+        unrisked.strategy().curve().last()
+    );
+}
+
+#[test]
+fn a_binding_order_limit_stops_the_crossover_before_the_venue() {
+    // And the other half: a limit set on a backtest has to actually bind, or the
+    // flags would be decoration and a paper run's refusals could never be
+    // reproduced here. Not "the venue declined it" -- the venue is never told.
+    // 0.05, because `choppy()` runs between 90 and 110 and the crossover trades
+    // 0.001 -- so an order is 0.09 to 0.11 of notional and this binds on every
+    // one of them. The first draft of this test used 1, copied from the `Greedy`
+    // test above where the order is 1000 units, and it did not bind at all: the
+    // venue saw 14 submissions and the test failed. A limit's test value is a
+    // fact about the price path it runs on, not a number to copy.
+    let engine = run_crossover_risked(
+        &choppy(),
+        Limits {
+            max_order_notional: Some("0.05".parse().expect("amount")),
+            ..Limits::default()
+        },
+    );
+
+    assert_eq!(engine.venue().stats().submitted, 0, "never reached a venue");
+    assert_eq!(engine.stats().submitted, 0);
+    assert!(engine.stats().refused > 0, "the limit has to bind");
+    assert_eq!(engine.portfolio().fills(), 0);
+    assert_eq!(engine.portfolio().cash(), CASH, "nothing was ever spent");
+
+    // The control, and it is what makes the assertions above mean anything. With
+    // the layer neutered to refuse everything, every assertion so far still holds
+    // -- so on its own this test cannot tell "the limit bound" from "nothing gets
+    // through at all". Verified by doing exactly that: it stayed green. A loosened
+    // limit on the *same* path has to trade, which is the difference.
+    let loose = run_crossover_risked(
+        &choppy(),
+        Limits {
+            max_order_notional: Some("1".parse().expect("amount")),
+            ..Limits::default()
+        },
+    );
+    assert!(loose.stats().submitted > 0, "0.11 is under a limit of 1");
+    assert_eq!(loose.stats().refused, 0);
+    assert!(loose.portfolio().fills() > 0);
+}

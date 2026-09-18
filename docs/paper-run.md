@@ -161,7 +161,8 @@ cargo run --release -p quant-normalize --bin normalize -- ~/paper --write --chec
 
 # 4. the criterion: backtest the same strategy over the same window
 cargo run --release -p quant-backtest --bin backtest -- ~/paper --symbol BTCUSDT \
-    --realistic --qty 0.001 --cash 100
+    --realistic --qty 0.001 --cash 100 \
+    --max-order 200 --max-position 200 --max-daily-loss 20 --max-orders 200
 ```
 
 Step 4's result must match the paper session's. **Exactly** — both consumed the
@@ -229,13 +230,26 @@ sessions on one symbol-day, which `normalize --write` refuses rather than merges
 (M2.d, still open). That last one is the likeliest thing to stop the fortnight being
 judgeable at all.
 
-**A hole worth closing first.** `paper` wires a real `RiskEngine`; `backtest` wires
-`AllowAll` and exposes no `--max-*` flags. On this rehearsal that is inert — 23
-orders against a 200/day cap, worst loss 1.64 against a 20 cap, 0 refused — but one
-refusal or one kill-switch trip during the fortnight and the exact comparison
-becomes impossible with today's `backtest`. Either give it the limit flags before
-starting, or accept that the criterion is only checkable on a run where nothing
-bound, and say so in the result.
+**That hole is now closed.** `backtest` used to wire `AllowAll` while `paper` wired
+a real `RiskEngine`, so one refusal or one kill-switch trip during the fortnight
+would have made the exact comparison impossible — the backtest would send an order
+paper had refused, and every number after it would differ for a reason that is not
+a bug. `backtest` now always wires a `RiskEngine` and takes `--max-order`,
+`--max-position`, `--max-daily-loss` and `--max-orders`, spelled exactly as
+`paper`'s so a paper run's arguments replay here verbatim.
+
+Limits are **off by default**, on the same argument that keeps costs off: a bare
+run has to stay byte-identical to the one before the feature existed.
+`Limits::default()` permits everything, and `unset_limits_reproduce_the_unrisked_backtest_exactly`
+pins that the real crossover behind a permissive `RiskEngine` produces the same
+cash, fills, realized P&L and curve as the unrisked wiring.
+
+So **pass the paper run's limits into step 4**. They are printed in the paper
+session's own log (`limits    order 200, position 200, daily loss 20,
+orders/day 200`) and `backtest` prints the line back from
+`engine.risk().limits()` — the layer that did the refusing, not the flags it was
+handed, which is M4's lesson applied to the second thing that can be configured
+and not wired.
 
 ---
 

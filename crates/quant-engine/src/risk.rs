@@ -188,6 +188,19 @@ pub struct RiskEngine {
 }
 
 impl RiskEngine {
+    /// What this engine is actually enforcing.
+    ///
+    /// For a report to print the limits it *ran under* rather than the ones it
+    /// parsed. M4 learned that distinction expensively: the backtest binary once
+    /// announced ten basis points of fees while the venue had been handed a free
+    /// one, because an edit missed a line `cargo fmt` had moved. A configured-but-
+    /// unwired limit would fail the same way and look identical in the output, so
+    /// the reader asks the thing that did the work.
+    #[must_use]
+    pub const fn limits(&self) -> Limits {
+        self.limits
+    }
+
     #[must_use]
     pub fn new(limits: Limits) -> Self {
         Self {
