@@ -17,13 +17,64 @@
 #   1  something is not
 #   2  --reconcile could not run (a database problem, not a capture problem)
 #
-# Usage: verify-loop.sh ROOT END_EPOCH LOGDIR [INTERVAL_HOURS] [FIRST_CHECK_SECONDS]
+# Usage: verify-loop.sh ROOT END_EPOCH LOGDIR [INTERVAL] [FIRST_CHECK_SECONDS]
+#
+#   INTERVAL  How often to check: a whole number with an optional unit -- `6` or
+#             `6h` hours, `90m` minutes, `60s` seconds. A bare number still means
+#             hours, so the production call site stays the readable `6` and the
+#             .ps1 half's `-IntervalHours 6` keeps meaning exactly what it means
+#             today.
+#
+#             The suffix exists because an hour is the wrong floor for the one
+#             case that needs a tighter one. A ten-minute rehearsal on an hourly
+#             cadence gets exactly *one* pass, 45 s in -- before a fill can
+#             exist -- so the journal branch below only ever reports "nothing to
+#             check yet", and a harness proving less than it claims is worse than
+#             one that claims less. Hours were not made fractional instead: bash
+#             has no float arithmetic, and a cadence of `0.0166` would be
+#             unreadable at both call sites.
+#
+#             Seconds and minutes are a rehearsal instrument, not a production
+#             one. Every pass re-reads the whole capture, so the cost of a check
+#             grows with the run; on a fortnight, six hours is still the answer.
 set -uo pipefail
 
 root="${1:?root required}"
 end_epoch="${2:?end epoch (unix seconds) required}"
 log_dir="${3:?logdir required}"
-interval_hours="${4:-6}"
+# Parsed to seconds once, here, so the sleep arithmetic below has one unit and no
+# conversion left to get wrong. A malformed value is fatal rather than defaulted:
+# a typo in a cadence would otherwise quietly become "never checked again", which
+# is the single failure this loop exists to prevent. Invariant 5 -- parse failures
+# are loud -- applied to the harness.
+interval_seconds_from() {
+    local spec="$1" number unit
+    number="${spec%[hms]}"
+    unit="${spec#"$number"}"
+    case "$number" in
+        ''|*[!0-9]*) return 1;;
+    esac
+    [ "$number" -gt 0 ] || return 1
+    case "$unit" in
+        s) echo "$number";;
+        m) echo $(( number * 60 ));;
+        h|'') echo $(( number * 3600 ));;
+        *) return 1;;
+    esac
+}
+interval_spec="${4:-6h}"
+interval_seconds="$(interval_seconds_from "$interval_spec")" || {
+    echo "bad interval '$interval_spec' -- want 6, 6h, 90m or 60s" >&2
+    exit 2
+}
+# A bare number is hours; say so in the log rather than printing a cadence in
+# units nobody chose. The log line is the only place the cadence is ever stated,
+# and it is what made this defect visible at all -- a rehearsal log that read
+# "every 1h" was telling the truth about a run that lasted ten minutes.
+case "$interval_spec" in
+    *[hms]) ;;
+    *) interval_spec="${interval_spec}h";;
+esac
 # How long to wait before the first check. A misconfiguration shows up in the
 # first few minutes, and that is the failure most worth catching early.
 first_check_seconds="${5:-300}"
@@ -53,10 +104,21 @@ note() {
 # same reason warnings do not fail a verification run.
 use_reconcile=0
 [ -n "${QUANT_DATABASE_URL:-}" ] && use_reconcile=1
-note "verifying $root every ${interval_hours}h until $(date -u -r "$end_epoch" +%Y-%m-%dT%H:%M:%SZ), reconcile=$use_reconcile"
+note "verifying $root every $interval_spec until $(date -u -r "$end_epoch" +%Y-%m-%dT%H:%M:%SZ), reconcile=$use_reconcile"
 
 # A first pass shortly after the start, because the failure worth catching early
 # is a misconfiguration, and that shows up in the first few minutes.
+#
+# Never wait past the end of the run, though. A first check longer than the whole
+# window would have the loop wake after the deadline and check nothing at all --
+# leaving a log that says only that verification started and finished, which
+# reads exactly like a clean run. Halving what is left keeps one pass, and keeps
+# it late enough that there is something on disk to look at.
+window=$(( end_epoch - $(date +%s) ))
+if [ "$window" -gt 1 ] && [ "$first_check_seconds" -ge "$window" ]; then
+    first_check_seconds=$(( window / 2 ))
+    note "first check pulled in to ${first_check_seconds}s: the run is shorter than the configured wait"
+fi
 sleep "$first_check_seconds"
 
 while [ "$(date +%s)" -lt "$end_epoch" ]; do
@@ -103,8 +165,18 @@ while [ "$(date +%s)" -lt "$end_epoch" ]; do
     done
 
     remaining=$(( end_epoch - $(date +%s) ))
-    [ "$remaining" -le 60 ] && break
-    step=$(( interval_hours * 3600 ))
+    # Stop when the next pass would land on top of the deadline; the post-run
+    # check covers the tail. The floor is the interval itself when that is
+    # shorter than a minute, because a fixed 60 s would silently eat the last
+    # pass of a rehearsal -- the pass most likely to have a fill behind it, and
+    # therefore the one the rehearsal is being run for.
+    tail_seconds=60
+    [ "$interval_seconds" -lt "$tail_seconds" ] && tail_seconds=$interval_seconds
+    [ "$remaining" -le "$tail_seconds" ] && break
+    # Clamped to what is left, which is what makes the loop end with the run
+    # rather than one interval after it. `step` is at least 1 s either way, so
+    # every iteration moves towards `end_epoch` and the loop cannot spin.
+    step=$interval_seconds
     [ "$step" -gt "$remaining" ] && step=$remaining
     sleep "$step"
 done
