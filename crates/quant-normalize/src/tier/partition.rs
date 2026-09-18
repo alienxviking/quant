@@ -38,10 +38,10 @@ use quant_core::event::MarketEvent;
 use quant_core::instrument::Exchange;
 use quant_core::time::UtcDate;
 
-use super::provenance::Provenance;
+use super::provenance::{self, Provenance};
 use super::schema::Dataset;
 use super::write::{dataset_of, DatasetWriter};
-use super::{TierError, TierTarget};
+use super::{published_parts, TierError, TierTarget};
 
 /// Rows written, per day and in total.
 #[derive(Debug, Default, Clone)]
@@ -68,6 +68,12 @@ impl WriteReport {
 #[derive(Debug, Clone)]
 pub struct DayReport {
     pub date: UtcDate,
+    /// Which part of the day this session contributed.
+    ///
+    /// Non-zero means the day is shared: another session already published a
+    /// slice of it. Reported rather than merely recorded, because a reader that
+    /// opens only `part-00000` would under-read such a day and say nothing.
+    pub part: u32,
     /// Rows per dataset, indexed by [`Dataset::index`].
     pub rows: [u64; Dataset::ALL.len()],
 }
@@ -89,9 +95,16 @@ pub struct PartitionWriter {
 #[derive(Debug)]
 struct OpenDay {
     date: UtcDate,
+    /// Which part of the day this session is contributing.
+    part: u32,
     writers: Vec<DatasetWriter<BufWriter<File>>>,
     /// Where each writer is writing, and where it will be renamed to.
     paths: Vec<(PathBuf, PathBuf)>,
+    /// The venue's update-id span over this part's book events, which is what
+    /// orders it against the parts already published. `None` until a book event
+    /// is seen, and a part that never sees one cannot be ordered — see
+    /// [`TierError::PartOrderUnknowable`].
+    book_seq: Option<(u64, u64)>,
 }
 
 impl PartitionWriter {
@@ -120,6 +133,12 @@ impl PartitionWriter {
             self.roll(date)?;
         }
         let open = self.open.as_mut().expect("just opened");
+        if let Some(seq) = book_seq_of(event) {
+            open.book_seq = Some(match open.book_seq {
+                None => (seq, seq),
+                Some((first, last)) => (first.min(seq), last.max(seq)),
+            });
+        }
         open.writers[dataset_of(event).index()].push(event)
     }
 
@@ -127,6 +146,7 @@ impl PartitionWriter {
     fn roll(&mut self, date: UtcDate) -> Result<(), TierError> {
         self.close_open()?;
 
+        let part = self.place(date)?;
         let mut writers = Vec::with_capacity(Dataset::ALL.len());
         let mut paths = Vec::with_capacity(Dataset::ALL.len());
         for dataset in Dataset::ALL {
@@ -135,9 +155,9 @@ impl PartitionWriter {
                 symbol: self.symbol.clone(),
                 date,
                 dataset,
+                part,
             };
             let final_path = target.file(&self.root);
-            self.check_ownership(&final_path)?;
             std::fs::create_dir_all(target.directory(&self.root))?;
             let temp_path = final_path.with_extension("parquet.tmp");
             let file = BufWriter::new(File::create(&temp_path)?);
@@ -152,45 +172,172 @@ impl PartitionWriter {
         }
         self.open = Some(OpenDay {
             date,
+            part,
             writers,
             paths,
+            book_seq: None,
         });
         Ok(())
     }
 
-    /// Refuse to publish over a partition another capture session wrote.
+    /// Decide which part of `date` this session is, and refuse rather than guess.
     ///
-    /// Re-deriving the *same* session must replace what is there — that is what
-    /// makes this tier disposable. A different session is the case provenance
-    /// exists for; see that module. An unreadable existing file is left alone
-    /// too: we cannot establish that it is ours, and "cannot tell" is not
-    /// permission.
-    fn check_ownership(&self, final_path: &Path) -> Result<(), TierError> {
-        if !final_path.exists() {
+    /// Three questions, in order, because each makes the next one answerable.
+    ///
+    /// **Do the four datasets agree on what is published?** Ownership used to be
+    /// checked per dataset path, which quietly guarded a case that is easy to
+    /// miss: a half-finished cleanup that removes `trades/` but leaves `gaps/`.
+    /// Enumerating one dataset and trusting the rest would let a new session take
+    /// an index another session still holds in the three nobody looked at.
+    ///
+    /// **Are the indices contiguous from zero?** A hole means a part was removed,
+    /// or that a rename died between unlinking the old file and putting the new
+    /// one there — a window this very function's `close_open` has. Deriving the
+    /// next index by *counting* would then hand back an index that is already
+    /// occupied and overwrite it. Max-plus-one plus a contiguity requirement
+    /// cannot.
+    ///
+    /// **Is one of them ours?** Re-deriving a session must replace its own part
+    /// in place, or every re-derive would append another copy. That is what keeps
+    /// the tier disposable.
+    fn place(&self, date: UtcDate) -> Result<u32, TierError> {
+        let mut per_dataset = Vec::with_capacity(Dataset::ALL.len());
+        for dataset in Dataset::ALL {
+            let target = TierTarget {
+                exchange: self.exchange,
+                symbol: self.symbol.clone(),
+                date,
+                dataset,
+                part: 0,
+            };
+            per_dataset.push(published_parts(&target.directory(&self.root)));
+        }
+
+        let indices = per_dataset[0].clone();
+        for (dataset, found) in Dataset::ALL.iter().zip(&per_dataset) {
+            if *found != indices {
+                return Err(TierError::DayPartsInconsistent {
+                    date: date.to_string(),
+                    detail: format!(
+                        "{} holds {found:?} but {} holds {indices:?}",
+                        dataset.dir(),
+                        Dataset::ALL[0].dir()
+                    ),
+                });
+            }
+        }
+
+        let n = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+        if indices.iter().copied().ne(0..n) {
+            return Err(TierError::DayPartsNotContiguous {
+                date: date.to_string(),
+                found: format!("{indices:?}"),
+            });
+        }
+
+        for &index in &indices {
+            let target = TierTarget {
+                exchange: self.exchange,
+                symbol: self.symbol.clone(),
+                date,
+                dataset: Dataset::ALL[0],
+                part: index,
+            };
+            let path = target.file(&self.root);
+            match Provenance::session_of(&path)? {
+                Some(id) if id == self.session_id => return Ok(index),
+                Some(_) => {}
+                None => {
+                    return Err(TierError::PartOriginUnknown {
+                        path: path.display().to_string(),
+                    })
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    /// Refuse to publish a part that does not follow the ones already there.
+    ///
+    /// Only reached when this session is appending — a first part has nothing to
+    /// follow, which is why the single-session case never runs this at all.
+    ///
+    /// The comparison is on the venue's update ids and deliberately not on
+    /// `local_recv_ts`; [`provenance`] carries the argument. Note which direction
+    /// this fails in: it refuses rather than reordering, because a part that does
+    /// not follow means the sessions were concurrent, and there is no ordering of
+    /// two simultaneous recordings of the same messages that is the truth.
+    fn check_follows(
+        &self,
+        date: UtcDate,
+        part: u32,
+        span: Option<(u64, u64)>,
+    ) -> Result<(), TierError> {
+        if part == 0 {
             return Ok(());
         }
-        let existing = Provenance::session_of(final_path).ok().flatten();
-        if existing == Some(self.session_id) {
-            return Ok(());
+        let Some((first, _)) = span else {
+            return Err(TierError::PartOrderUnknowable {
+                date: date.to_string(),
+                detail: "the incoming part saw no book event, so it has no venue sequence"
+                    .to_owned(),
+            });
+        };
+        for index in 0..part {
+            let target = TierTarget {
+                exchange: self.exchange,
+                symbol: self.symbol.clone(),
+                date,
+                dataset: Dataset::ALL[0],
+                part: index,
+            };
+            let path = target.file(&self.root);
+            let Some((_, last)) = Provenance::book_span_of(&path)? else {
+                return Err(TierError::PartOrderUnknowable {
+                    date: date.to_string(),
+                    detail: format!(
+                        "{} records no venue sequence, so it predates part ordering",
+                        path.display()
+                    ),
+                });
+            };
+            if first <= last {
+                return Err(TierError::PartsOutOfOrder {
+                    date: date.to_string(),
+                    existing_last: last,
+                    writing_first: first,
+                });
+            }
         }
-        Err(TierError::PartitionOwnedByAnother {
-            path: final_path.display().to_string(),
-            existing: existing.map_or_else(
-                || "an unknown source".to_owned(),
-                |id| quant_recorder::format_session_id(&id),
-            ),
-            writing: quant_recorder::format_session_id(&self.session_id),
-        })
+        Ok(())
     }
 
     fn close_open(&mut self) -> Result<(), TierError> {
         let Some(open) = self.open.take() else {
             return Ok(());
         };
+        // Before anything is published. A refusal here leaves four `.tmp` files
+        // and no change to what a reader can see, which is the same failure shape
+        // as abandoning a day -- and it is why the check is here rather than at
+        // `roll`, where only the first row of the part is known and its span is
+        // not.
+        self.check_follows(open.date, open.part, open.book_seq)?;
+
         let mut rows = [0_u64; Dataset::ALL.len()];
-        for (i, (writer, (temp, final_path))) in
+        for (i, (mut writer, (temp, final_path))) in
             open.writers.into_iter().zip(open.paths).enumerate()
         {
+            // Facts about the rows, so they are appended now rather than handed
+            // to the constructor. Written into every dataset of the part, the
+            // empty ones included: the span belongs to the *part*, and a day with
+            // no gaps at all is ordinary -- keying the span to each file's own
+            // rows would leave that day's `gaps` file unable to say where it
+            // belongs, and refuse the next session on a perfectly normal day.
+            writer.append_key_value(provenance::PART_KEY, open.part.to_string());
+            if let Some((first, last)) = open.book_seq {
+                writer.append_key_value(provenance::BOOK_SEQ_FIRST_KEY, first.to_string());
+                writer.append_key_value(provenance::BOOK_SEQ_LAST_KEY, last.to_string());
+            }
             // `finish` writes the footer; only after that is the file a Parquet
             // file at all, which is why the rename comes second -- and why the
             // row count comes from `finish` rather than from before it.
@@ -212,6 +359,7 @@ impl PartitionWriter {
         }
         self.report.days.push(DayReport {
             date: open.date,
+            part: open.part,
             rows,
         });
         Ok(())
@@ -253,5 +401,20 @@ impl Dataset {
             Self::BookSnapshots => 2,
             Self::Gaps => 3,
         }
+    }
+}
+
+/// The venue's own update id for an event, where it has one.
+///
+/// Deltas and snapshots only. A trade id is a different namespace, and a span
+/// that mixed the two would compare numbers that do not mean the same thing.
+/// `BookDelta` carries the range in the M0 event contract, so reading it here
+/// adds no venue knowledge to this crate -- the same argument that let
+/// `quant-book` be venue-agnostic.
+const fn book_seq_of(event: &MarketEvent) -> Option<u64> {
+    match event {
+        MarketEvent::BookDelta(d) => Some(d.final_update_id),
+        MarketEvent::BookSnapshot(s) => Some(s.last_update_id),
+        MarketEvent::Trade(_) | MarketEvent::Gap(_) => None,
     }
 }

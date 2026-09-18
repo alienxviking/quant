@@ -207,6 +207,25 @@ fn print_session(files: &SessionFiles, result: &Normalized) {
             report.rows_in(Dataset::BookSnapshots),
             report.rows_in(Dataset::Gaps),
         );
+        // Loud, and not behind a flag. A merged day is invisible in every other
+        // line of this report, and a reader that opens only `part-00000` -- which
+        // is every build before M2.e, including one checked out at the run's own
+        // tag -- would read the first session's slice, find the streams
+        // exhausted, and move to the next day. Silently under-reading the file the
+        // criterion is computed from is the failure this project refuses, so the
+        // artifact says so itself rather than relying on anyone remembering.
+        let shared: Vec<String> = report
+            .days
+            .iter()
+            .filter(|d| d.part > 0)
+            .map(|d| format!("{} (part {})", d.date, d.part))
+            .collect();
+        if !shared.is_empty() {
+            println!(
+                "merged    {} -- a recorder restart shares these days with another session; read every part, not part-00000 alone",
+                shared.join(", ")
+            );
+        }
     }
     if let Some(e) = &result.write_error {
         println!("write     ABANDONED: {e}");

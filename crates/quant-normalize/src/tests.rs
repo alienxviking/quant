@@ -30,7 +30,15 @@ struct Tree {
 
 impl Tree {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("quant-normalize-{name}"));
+        // The test's own name is part of the path, so two fixtures that pick the
+        // same label cannot collide. They did: a new test reused "re-derive" and
+        // the two shared one directory, each wiping the other's tree on the way
+        // in -- which failed about half the time and never alone, because the
+        // harness runs tests in parallel. A fixture root that is unique by
+        // construction is cheaper than remembering every name already taken.
+        let thread = std::thread::current();
+        let unique = thread.name().unwrap_or("unnamed").replace("::", "-");
+        let root = std::env::temp_dir().join(format!("quant-normalize-{name}-{unique}"));
         let _ = std::fs::remove_dir_all(&root);
         Self { root }
     }
@@ -146,6 +154,15 @@ impl Frame {
 }
 
 /// A `depthUpdate` covering `[first, last]` that moves the best bid.
+/// The UTC date the fixtures file day `d` under.
+fn day(d: u8) -> UtcDate {
+    UtcDate {
+        year: 2026,
+        month: 8,
+        day: d,
+    }
+}
+
 fn delta(seq: u64, first: u64, last: u64, bid: &str) -> Frame {
     Frame::Stream {
         seq,
@@ -445,6 +462,7 @@ fn a_session_is_written_into_one_partition_per_day() {
                 symbol: SYMBOL.to_owned(),
                 date: day.date,
                 dataset,
+                part: 0,
             };
             assert!(
                 target.file(&out).is_file(),
@@ -484,6 +502,7 @@ fn what_was_written_reads_back_as_the_events_that_went_in() {
                 symbol: SYMBOL.to_owned(),
                 date: day.date,
                 dataset,
+                part: 0,
             };
             from_parquet.extend(
                 read_dataset(&target.file(&out), dataset, instrument()).expect("read back"),
@@ -534,6 +553,7 @@ fn a_break_abandons_the_partition_rather_than_writing_across_it() {
             day: 21,
         },
         dataset: crate::Dataset::BookDeltas,
+        part: 0,
     };
     assert!(
         !target.file(&out).exists(),
@@ -586,6 +606,7 @@ fn a_torn_tail_on_the_last_segment_still_publishes() {
             day: 21,
         },
         dataset: crate::Dataset::BookSnapshots,
+        part: 0,
     };
     assert!(target.file(&out).is_file());
 }
@@ -661,6 +682,7 @@ fn a_record_is_filed_where_the_raw_tier_filed_it() {
                 day: 1
             },
             dataset: Dataset::BookDeltas,
+            part: 0,
         }
         .file(&out)
         .exists(),
@@ -669,18 +691,22 @@ fn a_record_is_filed_where_the_raw_tier_filed_it() {
 }
 
 #[test]
-fn a_partition_another_session_wrote_is_refused_not_overwritten() {
+fn two_sessions_on_one_day_are_merged_into_parts() {
     // The normalized layout has no session dimension, so a recorder restart --
     // which creates a new session -- can put two sessions on one symbol-day.
-    // Publishing over the first would lose a day of data and leave a file that
-    // looks complete, which is the worst failure available here.
+    // M2.d refused that, which was safe rather than lossy but left the day
+    // unnormalizable; a fortnight that restarts once would have been unjudgeable.
+    //
+    // A restart is sequential, so the day is a concatenation and each session
+    // gets its own part. Nothing inside a row changes.
     use crate::normalize_session;
 
-    // A restart: a second session, its own files, covering a day the first saw.
     const RESTARTED: [u8; 16] = [0xaa; 16];
 
     let tree = Tree::new("two-sessions");
     two_day_session(&tree);
+    // Later update ids than the first session's 100..102, which is what says
+    // this session came after it.
     tree.segment_for(
         RESTARTED,
         21,
@@ -694,13 +720,256 @@ fn a_partition_another_session_wrote_is_refused_not_overwritten() {
         .iter()
         .partition::<Vec<_>, _>(|s| s.session_id == SESSION);
 
-    let _first = normalize_session(first[0], instrument(), Some(&out));
+    let a = normalize_session(first[0], instrument(), Some(&out));
+    assert!(a.write_error.is_none(), "{:?}", a.write_error);
+    let b = normalize_session(second[0], instrument(), Some(&out));
+    assert!(b.write_error.is_none(), "{:?}", b.write_error);
+
+    // The first session took part 0 of both its days; the second took part 1 of
+    // the day they share.
+    let written = b.written.as_ref().expect("written");
+    let shared = written
+        .days
+        .iter()
+        .find(|d| d.date == day(21))
+        .expect("the shared day was written");
+    assert_eq!(shared.part, 1, "the restart appended rather than replacing");
+    assert!(
+        a.written
+            .as_ref()
+            .expect("written")
+            .days
+            .iter()
+            .all(|d| d.part == 0),
+        "the first session is always part 0"
+    );
+
+    // And each session still reads back as itself, which is what `--check` does.
+    for files in &sessions {
+        let agreement = crate::check_session(files, instrument(), &out);
+        assert!(agreement.agrees(), "{:?}", agreement.divergence);
+    }
+}
+
+#[test]
+fn a_re_derive_replaces_its_own_part_rather_than_appending() {
+    // What keeps the tier disposable. Without this, every re-derive would add
+    // another copy of the same session and the day would grow without bound.
+    use crate::normalize_session;
+
+    const RESTARTED: [u8; 16] = [0xaa; 16];
+
+    let tree = Tree::new("re-derive-part");
+    two_day_session(&tree);
+    tree.segment_for(
+        RESTARTED,
+        21,
+        &[snapshot(1, 200), delta(2, 201, 201, "201.00000000")],
+    );
+    let out = tree.root.join("out");
+    let sessions = tree.sessions();
+    let (first, second) = sessions
+        .iter()
+        .partition::<Vec<_>, _>(|s| s.session_id == SESSION);
+
+    let _ = normalize_session(first[0], instrument(), Some(&out));
+    let _ = normalize_session(second[0], instrument(), Some(&out));
+    // Again, both, in the same order.
+    let again_a = normalize_session(first[0], instrument(), Some(&out));
+    let again_b = normalize_session(second[0], instrument(), Some(&out));
+    assert!(again_a.write_error.is_none(), "{:?}", again_a.write_error);
+    assert!(again_b.write_error.is_none(), "{:?}", again_b.write_error);
+
+    let shared_dir = crate::tier::TierTarget {
+        exchange: Exchange::Binance,
+        symbol: SYMBOL.to_owned(),
+        date: day(21),
+        dataset: crate::tier::Dataset::BookDeltas,
+        part: 0,
+    }
+    .directory(&out);
+    let parts = std::fs::read_dir(&shared_dir)
+        .expect("the shared day exists")
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".parquet"))
+        })
+        .count();
+    assert_eq!(parts, 2, "still two parts, not four");
+}
+
+#[test]
+fn concurrent_sessions_are_refused_rather_than_concatenated() {
+    // The case a concatenation cannot represent. Two recorders subscribed at
+    // once produce overlapping venue sequences, and there is no ordering of two
+    // simultaneous recordings of the same messages that is the truth -- so this
+    // refuses instead of picking one.
+    use crate::normalize_session;
+
+    const CONCURRENT: [u8; 16] = [0xbb; 16];
+
+    let tree = Tree::new("concurrent");
+    two_day_session(&tree);
+    // Update ids inside the first session's 100..102, not after it.
+    tree.segment_for(
+        CONCURRENT,
+        21,
+        &[snapshot(1, 100), delta(2, 101, 101, "101.00000000")],
+    );
+    let out = tree.root.join("out");
+    let sessions = tree.sessions();
+    let (first, second) = sessions
+        .iter()
+        .partition::<Vec<_>, _>(|s| s.session_id == SESSION);
+
+    let _ = normalize_session(first[0], instrument(), Some(&out));
     let result = normalize_session(second[0], instrument(), Some(&out));
     assert!(
         result
             .write_error
             .as_ref()
-            .is_some_and(|e| e.contains("not") && e.contains("written by session")),
+            .is_some_and(|e| e.contains("not sequential")),
+        "{:?}",
+        result.write_error
+    );
+}
+
+#[test]
+fn a_shared_day_with_no_gaps_still_merges() {
+    // The case that would have made the feature useless in practice. `gaps` is
+    // ordinarily empty -- the whole acceptance week had 38 gap frames -- and an
+    // empty dataset still gets a file, so a span keyed to each file's own rows
+    // would leave that file unable to say where it belongs and refuse the
+    // restart on a completely normal day. The span belongs to the part.
+    use crate::normalize_session;
+
+    const RESTARTED: [u8; 16] = [0xaa; 16];
+
+    let tree = Tree::new("no-gaps");
+    two_day_session(&tree);
+    tree.segment_for(
+        RESTARTED,
+        21,
+        &[snapshot(1, 200), delta(2, 201, 201, "201.00000000")],
+    );
+    let out = tree.root.join("out");
+    let sessions = tree.sessions();
+    let (first, second) = sessions
+        .iter()
+        .partition::<Vec<_>, _>(|s| s.session_id == SESSION);
+
+    let a = normalize_session(first[0], instrument(), Some(&out));
+    // Neither session produced a gap event.
+    assert_eq!(
+        a.written
+            .as_ref()
+            .expect("written")
+            .days
+            .iter()
+            .map(|d| d.rows[crate::tier::Dataset::Gaps.index()])
+            .sum::<u64>(),
+        0,
+        "the fixture has no gaps, which is the point"
+    );
+    let b = normalize_session(second[0], instrument(), Some(&out));
+    assert!(b.write_error.is_none(), "{:?}", b.write_error);
+}
+
+#[test]
+fn a_tmp_file_is_not_mistaken_for_a_published_part() {
+    // A `.tmp` sibling exists beside published parts while a day is written and
+    // survives a SIGKILL. Before parts the reader opened one exact path, so a
+    // stray name was unreachable; enumerating a directory is what makes it
+    // reachable, and counting one would put the next session at an index with a
+    // hole under it.
+    use crate::normalize_session;
+
+    const RESTARTED: [u8; 16] = [0xaa; 16];
+
+    let tree = Tree::new("tmp-stray");
+    two_day_session(&tree);
+    tree.segment_for(
+        RESTARTED,
+        21,
+        &[snapshot(1, 200), delta(2, 201, 201, "201.00000000")],
+    );
+    let out = tree.root.join("out");
+    let sessions = tree.sessions();
+    let (first, second) = sessions
+        .iter()
+        .partition::<Vec<_>, _>(|s| s.session_id == SESSION);
+    let _ = normalize_session(first[0], instrument(), Some(&out));
+
+    for dataset in crate::tier::Dataset::ALL {
+        let dir = crate::tier::TierTarget {
+            exchange: Exchange::Binance,
+            symbol: SYMBOL.to_owned(),
+            date: day(21),
+            dataset,
+            part: 0,
+        }
+        .directory(&out);
+        std::fs::write(dir.join("part-00001.parquet.tmp"), b"not a parquet file")
+            .expect("leave a stray");
+    }
+
+    let b = normalize_session(second[0], instrument(), Some(&out));
+    assert!(
+        b.write_error.is_none(),
+        "the stray must be ignored, not counted: {:?}",
+        b.write_error
+    );
+    let written = b.written.as_ref().expect("written");
+    let shared = written
+        .days
+        .iter()
+        .find(|d| d.date == day(21))
+        .expect("written");
+    assert_eq!(shared.part, 1, "still part 1, not 2");
+}
+
+#[test]
+fn a_half_deleted_day_is_refused_not_re_placed() {
+    // Ownership used to be checked per dataset path, which quietly guarded this:
+    // remove `trades/` and leave the rest, and a per-day enumeration that
+    // trusted one dataset would hand the incoming session index 0 -- silently
+    // overwriting the other three datasets of a session that is still there.
+    use crate::normalize_session;
+
+    const RESTARTED: [u8; 16] = [0xaa; 16];
+
+    let tree = Tree::new("half-deleted");
+    two_day_session(&tree);
+    tree.segment_for(
+        RESTARTED,
+        21,
+        &[snapshot(1, 200), delta(2, 201, 201, "201.00000000")],
+    );
+    let out = tree.root.join("out");
+    let sessions = tree.sessions();
+    let (first, second) = sessions
+        .iter()
+        .partition::<Vec<_>, _>(|s| s.session_id == SESSION);
+    let _ = normalize_session(first[0], instrument(), Some(&out));
+
+    let trades = crate::tier::TierTarget {
+        exchange: Exchange::Binance,
+        symbol: SYMBOL.to_owned(),
+        date: day(21),
+        dataset: crate::tier::Dataset::Trades,
+        part: 0,
+    }
+    .directory(&out);
+    std::fs::remove_dir_all(&trades).expect("remove one dataset");
+
+    let result = normalize_session(second[0], instrument(), Some(&out));
+    assert!(
+        result
+            .write_error
+            .as_ref()
+            .is_some_and(|e| e.contains("disagree about which parts exist")),
         "{:?}",
         result.write_error
     );
@@ -728,6 +997,7 @@ fn a_written_partition_names_the_session_it_came_from() {
             day: 21,
         },
         dataset: Dataset::BookDeltas,
+        part: 0,
     };
     assert_eq!(
         Provenance::session_of(&target.file(&out)).expect("readable"),
@@ -778,6 +1048,7 @@ fn a_missing_day_partition_is_a_disagreement_not_a_shorter_stream() {
             day: 22,
         },
         dataset: Dataset::BookDeltas,
+        part: 0,
     };
     std::fs::remove_file(target.file(&out)).expect("remove a day's deltas");
 
@@ -812,6 +1083,7 @@ fn a_tampered_value_is_caught_rather_than_averaged_away() {
             day: 21,
         },
         dataset: Dataset::BookDeltas,
+        part: 0,
     };
     let path = target.file(&out);
     let mut events =

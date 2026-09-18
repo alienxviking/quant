@@ -442,12 +442,32 @@ what the market did, and which capture run saw it belongs to raw and to the
 metadata tier. But a recorder restart creates a new session, and two sessions can
 hold segments for the same symbol on the same day.
 
-So each file carries its source session in the Parquet footer, and the writer
-**refuses a partition another session owns** rather than publishing over it.
-Merging two sessions into one day — ordered by `local_recv_ts`, since
-`ingest_seq` is session-scoped and cannot order across them — is the eventual
-answer and is not yet implemented. Refusing is what makes deferring it safe
-rather than lossy.
+So each file carries its source session in the Parquet footer. M2.d used that to
+**refuse** a partition another session owned, which was safe rather than lossy
+but left the day unnormalizable. Since M2.e the day is a sequence of **parts** —
+`part-00000.parquet`, `part-00001.parquet`, … — one per contributing session, and
+every file still names exactly one session, so nothing has to describe two
+sources at once.
+
+A restart is **sequential**: `ops/supervise.sh` runs the recorder in the
+foreground of its restart loop and reads its exit code before respawning. So a
+shared day is a **concatenation**, not an interleave, and a file boundary is the
+exact and free encoding of one. The ordering key is `(part, ingest_seq)`: within
+a part `ingest_seq` is one session's and strictly increasing, and across parts
+the index is enforced to be capture order. Nothing inside a row changes, which is
+forced rather than chosen — `normalize --check` compares whole events, and
+`EventMeta` includes `ingest_seq`, so renumbering would fail at the first event.
+
+**This paragraph used to say "ordered by `local_recv_ts`", and that was wrong.**
+`local_recv_ts` is `SystemTime`: it steps, and it is not monotone even within one
+session — §6's never-roll-backwards rule and the `backdated_records` counter
+exist because of it. Ordering two sessions by a quantity that can run backwards
+either refuses a healthy day after an NTP step or, worse, silently reverses them.
+Parts are ordered by the **venue's own update-id span**, recorded per part in the
+footer, which is strictly increasing per symbol across disconnects and is immune
+to anything our host's clock does. Two sessions whose spans overlap were
+concurrent rather than sequential, and that is refused: there is no ordering of
+two simultaneous recordings of the same messages that is the truth.
 
 A day's partition is also **published by rename**: written to a `.tmp` sibling
 and moved into place once its footer lands, so a reader never finds a truncated

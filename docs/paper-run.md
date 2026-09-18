@@ -169,6 +169,17 @@ cargo run --release -p quant-backtest --bin backtest -- ~/paper --symbol BTCUSDT
     --max-order 200 --max-position 200 --max-daily-loss 20 --max-orders 200
 ```
 
+**One exception to running at the tag, and it is narrow.** If either recorder
+restarted mid-day, that symbol-day holds more than one part (M2.e) and a build
+from the tag reads `part-00000` alone — it would find the first session's slice,
+see the streams exhausted, and move to the next day, silently under-reading the
+very artifact the criterion is computed from. `normalize --write` prints a
+`merged` line whenever this applies, so the run says so itself. In that case run
+**steps 3 and 4 from a build that contains the parts reader**. That does not
+breach the freeze: the freeze exists so the *system under comparison* does not
+change, and rule 3 names `quant-engine`, `quant-sim` and the strategy. A reader
+that reads all of the data rather than some of it is not the system under test.
+
 Step 4's result must match the paper session's. **Exactly** — both consumed the
 same events with the same `local_recv_ts` and the same `ingest_seq`, because the
 tee gave them the identical records. Any divergence is a bug, and finding out
