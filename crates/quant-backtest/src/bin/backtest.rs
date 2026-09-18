@@ -4,6 +4,7 @@
 //! backtest [DATA_ROOT] [--symbol SYM] [--cash N] [--fast N] [--slow N]
 //!          [--interval-secs N] [--qty N] [--equity-csv PATH]
 //!          [--realistic | --fee-rate R --latency-ms N --adverse P]
+//!          [--max-order N] [--max-position N] [--max-daily-loss N] [--max-orders N]
 //! backtest data/acceptance --symbol BTCUSDT              # free and instant
 //! backtest data/acceptance --realistic                   # what it would cost
 //! backtest data/acceptance --fee-rate 0.001              # fees only
@@ -13,6 +14,18 @@
 //! laziness: `Costs::NONE` reproducing the M3 numbers to the last digit is the
 //! property that makes the cost models checkable at all, and it is easier to
 //! trust when it is the thing that runs when you type nothing.
+//!
+//! **Limits are off by default too, for a second reason on top of that one.**
+//! M5's criterion compares a paper session against a backtest over the same
+//! window and demands they match exactly, so the two binaries have to be the same
+//! system. Until now this one wired `AllowAll` while `paper` wired a real
+//! `RiskEngine`: on a run where nothing bound, that difference was invisible, and
+//! on the first run where something *did* bind it would have made the comparison
+//! impossible rather than merely wrong — the backtest would send an order paper
+//! had refused, and every number after it would differ for a reason that is not a
+//! bug. So the layer is now always a `RiskEngine`, and `Limits::default()`
+//! permits everything. The flags are spelled exactly as `paper`'s, so a paper
+//! run's arguments can be replayed here verbatim.
 //!
 //! Exit code 0 means the run completed. It says **nothing** about whether the
 //! strategy made money, and there is deliberately no threshold that would let it
@@ -27,7 +40,7 @@ use quant_backtest::{EquityCurve, MaCrossover, Recorded};
 use quant_core::fixed::{Notional, Qty};
 use quant_core::fixed::{Px, Rate};
 use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
-use quant_engine::{AllowAll, Engine, EngineStats, Portfolio};
+use quant_engine::{Engine, EngineStats, Limits, Portfolio, RiskEngine};
 use quant_normalize::{discover_days, HistoricalSource};
 use quant_sim::{Costs, FeeSchedule, Latency, SimStats, SimulatedVenue};
 
@@ -45,6 +58,7 @@ struct Args {
     qty: Qty,
     equity_csv: Option<PathBuf>,
     costs: Costs,
+    limits: Limits,
 }
 
 impl Default for Args {
@@ -65,6 +79,12 @@ impl Default for Args {
             equity_csv: None,
             // Free and instant unless asked otherwise. See the module docs.
             costs: Costs::NONE,
+            // Permits everything, so a bare run is byte-identical to the one
+            // before limits existed. `paper` defaults the other way and says why:
+            // a fortnight unattended is the wrong place for no limits, whereas a
+            // backtest whose limits changed under it would stop being a
+            // measurement of the strategy.
+            limits: Limits::default(),
         }
     }
 }
@@ -123,7 +143,7 @@ fn main() -> ExitCode {
     let mut engine = Engine::new(
         source,
         SimulatedVenue::with_costs(args.costs),
-        AllowAll,
+        RiskEngine::new(args.limits),
         strategy,
         args.cash,
     );
@@ -148,7 +168,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-type Wiring = Engine<HistoricalSource, SimulatedVenue, AllowAll, Recorded<MaCrossover>>;
+type Wiring = Engine<HistoricalSource, SimulatedVenue, RiskEngine, Recorded<MaCrossover>>;
 
 fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, engine: &Wiring) {
     let curve = engine.strategy().curve();
@@ -182,6 +202,9 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
         costs.latency.inbound / 1_000_000,
         costs.adverse_per_fill,
     );
+    // Same argument as the costs line above, applied to the other thing that can
+    // be configured and not wired: ask the layer that did the refusing.
+    print_limits(engine.risk().limits());
     println!(
         "events    {} ({} gaps), {} execution events",
         stats.events, stats.gaps, stats.execution_events
@@ -197,6 +220,31 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
     print_pnl(portfolio, curve, ma.entries, ma.exits);
     print_sim(engine.venue().stats());
     print_caveats(costs);
+}
+
+/// What the risk layer was enforcing.
+///
+/// Printed on every run, including the default one where nothing is set. Silence
+/// would be the wrong encoding: a reader comparing this against a paper session
+/// needs to know whether the backtest had the same limits or none at all, and an
+/// absent line reads as "not applicable" rather than "nothing was refusing".
+fn print_limits(limits: Limits) {
+    if limits == Limits::default() {
+        println!("limits    none set -- nothing can be refused");
+        return;
+    }
+    let show = |limit: Option<Notional>| {
+        limit.map_or_else(|| "none".to_owned(), |value| value.to_string())
+    };
+    println!(
+        "limits    order {}, position {}, daily loss {}, orders/day {}",
+        show(limits.max_order_notional),
+        show(limits.max_position_notional),
+        show(limits.max_daily_loss),
+        limits
+            .max_orders_per_day
+            .map_or_else(|| "none".to_owned(), |n| n.to_string()),
+    );
 }
 
 fn print_pnl(portfolio: &Portfolio, curve: &EquityCurve, entries: u64, exits: u64) {
@@ -305,7 +353,9 @@ fn parse_args() -> Result<Option<Args>, String> {
                 println!(
                     "usage: backtest [DATA_ROOT] [--symbol SYM] [--cash N] [--fast N] \
                      [--slow N] [--interval-secs N] [--qty N] [--equity-csv PATH] \
-                     [--realistic] [--fee-rate R] [--latency-ms N] [--adverse P]"
+                     [--realistic] [--fee-rate R] [--latency-ms N] [--adverse P]\n\
+                     \x20               [--max-order N] [--max-position N] \
+                     [--max-daily-loss N] [--max-orders N]"
                 );
                 return Ok(None);
             }
@@ -335,6 +385,32 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--adverse" => {
                 args.costs.adverse_per_fill =
                     value()?.parse().map_err(|e| format!("--adverse: {e}"))?;
+            }
+            // Spelled exactly as `paper`'s, deliberately. The whole point is that
+            // a paper session's arguments can be replayed into a backtest, and a
+            // flag that meant the same thing under a different name would be one
+            // more thing to get right at the moment the comparison is being made.
+            "--max-order" => {
+                args.limits.max_order_notional =
+                    Some(value()?.parse().map_err(|e| format!("--max-order: {e}"))?);
+            }
+            "--max-position" => {
+                args.limits.max_position_notional = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--max-position: {e}"))?,
+                );
+            }
+            "--max-daily-loss" => {
+                args.limits.max_daily_loss = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--max-daily-loss: {e}"))?,
+                );
+            }
+            "--max-orders" => {
+                args.limits.max_orders_per_day =
+                    Some(value()?.parse().map_err(|e| format!("--max-orders: {e}"))?);
             }
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other => args.root = PathBuf::from(other),
