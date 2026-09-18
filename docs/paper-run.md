@@ -123,7 +123,11 @@ cat ~/paper/paper-BTCUSDT.jsonl | jq -c 'select(.type=="filled")'
 ```
 
 The verify loop runs every six hours and now reconciles the journals on the same
-cadence. `WAIT ... nothing to check yet` before the first fill is normal.
+cadence. `WAIT ... nothing to check yet` before the first *checkpoint* is normal
+— `paper` writes one every five fills and one at shutdown, so a quiet start has
+nothing to compare against yet. After that every pass should read `AGREES`, and
+it is judged against the entries the checkpoint describes rather than the whole
+file, so fills arriving after it are not a disagreement.
 
 **A `msgs_per_sec=0` in the last metrics line is not a stall** — M1 learned this
 the hard way. The honest liveness signal is the capture file growing, which

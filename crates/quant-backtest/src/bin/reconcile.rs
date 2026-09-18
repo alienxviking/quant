@@ -44,7 +44,7 @@ fn main() -> ExitCode {
 
     describe_journal(&path, &recovered);
     describe_portfolio(&portfolio, &registry, &recovered);
-    verdict(&recovered.entries, &portfolio)
+    verdict(&recovered.entries)
 }
 
 /// `None` when the arguments were wrong or help was printed.
@@ -152,9 +152,9 @@ fn describe_portfolio(portfolio: &Portfolio, registry: &InstrumentRegistry, reco
 /// The engine accumulated its numbers in memory as fills arrived; this replayed
 /// them from the file afterwards. Their agreement is evidence. The identity
 /// printed above is not.
-fn verdict(entries: &[JournalEntry], portfolio: &Portfolio) -> ExitCode {
+fn verdict(entries: &[JournalEntry]) -> ExitCode {
     println!();
-    match journal::agrees(entries, portfolio) {
+    match journal::agrees(entries) {
         Agreement::Agrees => {
             println!("verdict   AGREES: the engine's checkpoint matches this recompute");
             ExitCode::SUCCESS

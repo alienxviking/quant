@@ -204,7 +204,7 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
     );
     // Same argument as the costs line above, applied to the other thing that can
     // be configured and not wired: ask the layer that did the refusing.
-    print_limits(engine.risk().limits());
+    println!("{}", quant_backtest::limits_line(engine.risk().limits()));
     println!(
         "events    {} ({} gaps), {} execution events",
         stats.events, stats.gaps, stats.execution_events
@@ -220,31 +220,6 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
     print_pnl(portfolio, curve, ma.entries, ma.exits);
     print_sim(engine.venue().stats());
     print_caveats(costs);
-}
-
-/// What the risk layer was enforcing.
-///
-/// Printed on every run, including the default one where nothing is set. Silence
-/// would be the wrong encoding: a reader comparing this against a paper session
-/// needs to know whether the backtest had the same limits or none at all, and an
-/// absent line reads as "not applicable" rather than "nothing was refusing".
-fn print_limits(limits: Limits) {
-    if limits == Limits::default() {
-        println!("limits    none set -- nothing can be refused");
-        return;
-    }
-    let show = |limit: Option<Notional>| {
-        limit.map_or_else(|| "none".to_owned(), |value| value.to_string())
-    };
-    println!(
-        "limits    order {}, position {}, daily loss {}, orders/day {}",
-        show(limits.max_order_notional),
-        show(limits.max_position_notional),
-        show(limits.max_daily_loss),
-        limits
-            .max_orders_per_day
-            .map_or_else(|| "none".to_owned(), |n| n.to_string()),
-    );
 }
 
 fn print_pnl(portfolio: &Portfolio, curve: &EquityCurve, entries: u64, exits: u64) {

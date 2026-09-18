@@ -22,5 +22,34 @@ pub mod ma;
 pub use equity::{EquityCurve, EquityPoint, Recorded};
 pub use ma::{MaConfig, MaCrossover};
 
+/// The risk limits, as one report line.
+///
+/// Shared by `paper` and `backtest` because the two lines exist to be *diffed*
+/// against each other -- M5's criterion compares a paper session with a backtest
+/// over the same window, and the first thing to check on a divergence is that
+/// both ran under the same limits. They were not comparable by eye: `paper`
+/// printed the `Option<Notional>` with `{:?}`, giving
+/// `order Some(Notional(200))`, while `backtest` printed `order 200`. Two
+/// formattings of one fact is the shape this project keeps paying for, so there
+/// is now one.
+#[must_use]
+pub fn limits_line(limits: quant_engine::Limits) -> String {
+    if limits == quant_engine::Limits::default() {
+        return "limits    none set -- nothing can be refused".to_owned();
+    }
+    let show = |limit: Option<quant_core::fixed::Notional>| {
+        limit.map_or_else(|| "none".to_owned(), |value| value.to_string())
+    };
+    format!(
+        "limits    order {}, position {}, daily loss {}, orders/day {}",
+        show(limits.max_order_notional),
+        show(limits.max_position_notional),
+        show(limits.max_daily_loss),
+        limits
+            .max_orders_per_day
+            .map_or_else(|| "none".to_owned(), |n| n.to_string()),
+    )
+}
+
 #[cfg(test)]
 mod tests;
