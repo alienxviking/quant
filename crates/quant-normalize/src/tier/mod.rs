@@ -6,11 +6,35 @@
 //! last criterion is that a replay *from Parquet* agrees with a replay *from
 //! raw*, which is only checkable because [`read`] exists alongside [`write`].
 //!
-//! The layout is `exchange=…/symbol=…/date=…/<dataset>/part-00000.parquet`, with
+//! The layout is `exchange=…/symbol=…/date=…/<dataset>/part-NNNNN.parquet`, with
 //! one file per [`Dataset`] — `trades`, `book_deltas`, `book_snapshots`, `gaps`.
 //! Hive-style `key=value` directories because every tool that will ever read this
 //! (`DuckDB`, Polars, pandas, Spark, `ClickHouse`) discovers them by convention,
 //! which is the same reason `quant-recorder::layout` uses them for the raw tier.
+//!
+//! # Why a day has *parts*
+//!
+//! There is no session in that path, and there should not be — the tier is about
+//! what the market did, and which of our capture runs saw it is a capture-side
+//! concern. But a recorder restart makes a new session, and two sessions can
+//! cover one symbol-day. M2.d refused that case rather than losing it, and left
+//! the merge as work owing.
+//!
+//! A restart is **sequential** — `ops/supervise.sh` runs the recorder in the
+//! foreground of its restart loop and reads its exit code before respawning, so
+//! the dead process is dead before the next one starts. A merged day is therefore
+//! a **concatenation**, not an interleave, and a file boundary is the exact and
+//! free encoding of a concatenation: one part per contributing session, in
+//! capture order. Nothing inside a row changes, which is forced rather than
+//! chosen — `normalize --check` compares whole `MarketEvent` values with `==`,
+//! and `EventMeta` includes `ingest_seq`, so renumbering rows would fail at the
+//! first event with no tolerance available.
+//!
+//! The ordering key is `(part, ingest_seq)`, lexicographic. Within a part
+//! `ingest_seq` is unique and strictly increasing; across parts the index is
+//! distinct by construction *and* is enforced to be capture order, so a reader
+//! that concatenates parts in index order gets the stream a single uninterrupted
+//! consumer would have seen.
 //!
 //! The two interesting encoding decisions — money as `DECIMAL(18,8)` and the
 //! instrument being absent — are argued in [`schema`].
@@ -45,6 +69,11 @@ pub struct TierTarget {
     pub symbol: String,
     pub date: UtcDate,
     pub dataset: Dataset,
+    /// Which contributing session's slice of the day this is, from zero.
+    ///
+    /// Not a session id: the index says *order*, which is the only thing a
+    /// reader needs, and the id is in the footer for anyone who wants identity.
+    pub part: u32,
 }
 
 impl TierTarget {
@@ -58,10 +87,14 @@ impl TierTarget {
             .join(self.dataset.dir())
     }
 
-    /// Full path of the dataset file.
+    /// Full path of this part's file.
+    ///
+    /// Zero-padded so lexical order is numeric order, which is what lets a
+    /// reader sort names as text and get capture order. The raw tier pins the
+    /// same property for the same reason.
     #[must_use]
     pub fn file(&self, root: &Path) -> PathBuf {
-        self.directory(root).join("part-00000.parquet")
+        self.directory(root).join(part_file_name(self.part))
     }
 
     /// Read a path back into the identity that produced it.
@@ -74,16 +107,40 @@ impl TierTarget {
         let symbol = parts.next()??;
         let exchange = parts.next()??;
 
-        if !file.ends_with(".parquet") {
-            return None;
-        }
         Some(Self {
             exchange: Exchange::from_name(exchange.strip_prefix("exchange=")?)?,
             symbol: symbol.strip_prefix("symbol=")?.to_owned(),
             date: quant_recorder::parse_utc_date(date.strip_prefix("date=")?)?,
             dataset: Dataset::from_dir(dataset)?,
+            part: part_index(file)?,
         })
     }
+}
+
+/// The name [`TierTarget::file`] gives part `n`.
+#[must_use]
+pub fn part_file_name(part: u32) -> String {
+    format!("part-{part:05}.parquet")
+}
+
+/// Read a part index back out of a file name, or `None` if this is not one of
+/// ours.
+///
+/// Deliberately the exact inverse of [`part_file_name`] and not a pattern that
+/// merely looks close: it must reject `part-00000.parquet.tmp`, which is a real
+/// file that exists beside published parts while a partition is being written
+/// and outlives a `SIGKILL`. Before parts existed the reader opened one exact
+/// path and the question never arose; enumerating a directory is what makes a
+/// stray name reachable, so the enumeration is the thing that has to be strict.
+/// That is not a heuristic — recognising the names we ourselves emit is the same
+/// discipline `TierTarget::parse` already follows.
+#[must_use]
+pub fn part_index(file_name: &str) -> Option<u32> {
+    let digits = file_name.strip_prefix("part-")?.strip_suffix(".parquet")?;
+    if digits.len() != 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Anything that can go wrong writing or reading the normalized tier.
@@ -116,13 +173,58 @@ pub enum TierError {
         column: &'static str,
         value: String,
     },
-    /// The partition already holds a file written by a different capture
-    /// session. See [`provenance`] — overwriting it would lose a day of data
-    /// silently, and merging the two is not yet implemented.
-    PartitionOwnedByAnother {
+    /// The four dataset directories disagree about which parts this day holds.
+    ///
+    /// Before parts, ownership was checked per dataset path, and that was
+    /// load-bearing rather than incidental: a half-finished cleanup that removed
+    /// `trades/` but left `gaps/` would otherwise let a new session take an index
+    /// another session still occupies in the datasets nobody looked at.
+    DayPartsInconsistent {
+        date: String,
+        detail: String,
+    },
+    /// This day's parts are not numbered contiguously from zero.
+    ///
+    /// A hole means a published part was removed — or that a rename died between
+    /// unlinking the old file and putting the new one in place. Either way the
+    /// next index cannot be derived by counting, and guessing would overwrite a
+    /// session that is still there. "Cannot tell" is not permission.
+    DayPartsNotContiguous {
+        date: String,
+        found: String,
+    },
+    /// A published part whose capture session cannot be read.
+    PartOriginUnknown {
         path: String,
-        existing: String,
-        writing: String,
+    },
+    /// A part's position in the day cannot be established, so it is not written.
+    ///
+    /// Ordering parts needs the venue's own update-id span at both ends. A part
+    /// written before spans were recorded does not have one. The tier is
+    /// disposable, so the remedy is cheap and is named in the message: delete
+    /// the day and re-derive every session that covers it.
+    PartOrderUnknowable {
+        date: String,
+        detail: String,
+    },
+    /// A day was asked for and holds no parts.
+    ///
+    /// An error rather than an empty stream: before parts, a missing day failed
+    /// at `File::open`, and turning that into a shorter stream would let a check
+    /// that compares two replays agree about data neither of them read.
+    NoPartsForDay {
+        date: String,
+    },
+    /// The incoming part does not follow the parts already published.
+    ///
+    /// Sessions are sequential, so a later session's book sequence must start
+    /// after the earlier one's ends. When it does not, the two were not
+    /// sequential — concurrent recorders on one symbol — and concatenating them
+    /// would hand out an order the market never had.
+    PartsOutOfOrder {
+        date: String,
+        existing_last: u64,
+        writing_first: u64,
     },
 }
 
@@ -145,13 +247,31 @@ impl core::fmt::Display for TierError {
             Self::UnknownLabel { column, value } => {
                 write!(f, "unknown {column} label {value:?}")
             }
-            Self::PartitionOwnedByAnother {
-                path,
-                existing,
-                writing,
+            Self::DayPartsInconsistent { date, detail } => write!(
+                f,
+                "the dataset directories for {date} disagree about which parts exist: {detail}"
+            ),
+            Self::DayPartsNotContiguous { date, found } => write!(
+                f,
+                "{date} holds parts {found}, which is not contiguous from 0 -- a part was removed, so the next index cannot be derived"
+            ),
+            Self::PartOriginUnknown { path } => {
+                write!(f, "cannot establish which session wrote {path}")
+            }
+            Self::PartOrderUnknowable { date, detail } => write!(
+                f,
+                "cannot order the parts of {date}: {detail}; delete this day and re-derive every session covering it"
+            ),
+            Self::NoPartsForDay { date } => {
+                write!(f, "{date} holds no parts under the normalized tier")
+            }
+            Self::PartsOutOfOrder {
+                date,
+                existing_last,
+                writing_first,
             } => write!(
                 f,
-                "{path} was written by session {existing}, not {writing};                  merging two sessions into one day partition is not implemented"
+                "on {date} the published parts run to venue update id {existing_last} but the incoming part starts at {writing_first}, so these sessions were not sequential"
             ),
         }
     }
@@ -179,3 +299,23 @@ impl From<arrow_schema::ArrowError> for TierError {
 
 #[cfg(test)]
 mod tests;
+
+/// The published part indices in one dataset directory, ascending.
+///
+/// Only names [`part_file_name`] could have produced. A directory listing is
+/// what makes a stray name reachable at all -- `part-00000.parquet.tmp` is a
+/// real file that sits beside published parts while a day is being written, and
+/// survives a `SIGKILL` -- so the enumeration is where strictness belongs. A
+/// missing directory is an empty list rather than an error: the day simply has
+/// no parts yet.
+fn published_parts(directory: &Path) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut found: Vec<u32> = entries
+        .flatten()
+        .filter_map(|e| part_index(e.file_name().to_str()?))
+        .collect();
+    found.sort_unstable();
+    found
+}

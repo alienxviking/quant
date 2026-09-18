@@ -265,6 +265,7 @@ fn a_written_path_parses_back_to_the_target_that_wrote_it() {
                 day: 21,
             },
             dataset,
+            part: 0,
         };
         let path = target.file(std::path::Path::new("data"));
         assert_eq!(TierTarget::parse(&path).as_ref(), Some(&target));
@@ -284,6 +285,7 @@ fn the_path_matches_the_published_layout() {
             day: 21,
         },
         dataset: Dataset::BookDeltas,
+        part: 0,
     };
     let path = target.file(std::path::Path::new("data"));
     assert_eq!(

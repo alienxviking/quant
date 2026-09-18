@@ -106,6 +106,19 @@ impl<W: Write + Send> DatasetWriter<W> {
         Ok(())
     }
 
+    /// Add a footer entry whose value is only known once the rows are written.
+    ///
+    /// The part's span is the case: it is a fact about the rows, so it cannot be
+    /// handed to the constructor with the rest of the provenance. Appending is
+    /// safe up until `finish`, which is what writes the footer.
+    pub fn append_key_value(&mut self, key: &str, value: String) {
+        self.writer
+            .append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                key.to_owned(),
+                value,
+            ));
+    }
+
     /// Flush, close the file, and hand back the sink with the final row count.
     pub fn finish(mut self) -> Result<(W, u64), TierError> {
         self.flush()?;

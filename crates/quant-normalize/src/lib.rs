@@ -284,11 +284,21 @@ pub fn check_session(files: &SessionFiles, instrument: InstrumentId, root: &Path
         ReplayItem::Event(event) => Some(event),
         ReplayItem::Break(_) => None,
     });
-    // Only the days this session wrote. The tier has no session dimension, so
-    // reading "the whole symbol" could pull in a partition another run owns.
+    // Only the days this session wrote, and within them only its own parts. The
+    // tier has no session dimension, and since M2.e a day two sessions covered
+    // holds one part each -- so reading the whole day would interleave the other
+    // session's events into this comparison and report a healthy merge as a
+    // divergence.
     let mut days: Vec<_> = files.segments.iter().map(|s| s.target.date).collect();
     days.dedup();
-    let mut tier = TierReplay::open(root, files.exchange, &files.symbol, instrument, days);
+    let mut tier = TierReplay::open_session(
+        root,
+        files.exchange,
+        &files.symbol,
+        instrument,
+        days,
+        files.session_id,
+    );
 
     loop {
         let from_raw = raw.next();

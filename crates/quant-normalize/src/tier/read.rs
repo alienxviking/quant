@@ -28,7 +28,7 @@ use quant_core::time::{Ts, UtcDate};
 use quant_core::{Px, Qty};
 
 use super::schema::Dataset;
-use super::{TierError, TierTarget};
+use super::{published_parts, TierError, TierTarget};
 
 /// Read one dataset file back into events, in the order they were written.
 pub fn read_dataset(
@@ -275,11 +275,25 @@ impl Iterator for DatasetStream {
 ///
 /// # How the order is recovered
 ///
-/// The four datasets are four files, so a day's stream is a four-way merge on
+/// The four datasets are four files, so a part's stream is a four-way merge on
 /// `ingest_seq` — which is exactly what makes `ingest_seq` the ordering key
-/// rather than an incidental column. Days are read in calendar order, and
-/// because `ingest_seq` is session-scoped and strictly increasing across a
-/// session's whole life, that reproduces the recorded order exactly.
+/// rather than an incidental column. Within a part, `ingest_seq` is one
+/// session's and strictly increasing, so the merge reproduces the recorded order
+/// exactly.
+///
+/// A day can hold more than one part when a recorder restarted inside it. Parts
+/// are **concatenated in index order and never merged with each other**: the
+/// writer establishes that index order is capture order, and `ingest_seq`
+/// restarts at 1 for a new session, so merging across a part boundary on it
+/// would interleave the second session's opening events into the middle of the
+/// first. The full ordering key is `(day, part, ingest_seq)`, and only the last
+/// of those is compared inside the four-way merge.
+///
+/// A day that resolves to no parts at all is an error, not an empty stream. The
+/// reader used to open one exact path, so a missing day failed at `File::open`;
+/// listing a directory would quietly turn that into a shorter stream, and a
+/// check that compares two streams would then agree about data neither of them
+/// read.
 #[derive(Debug)]
 pub struct TierReplay {
     root: PathBuf,
@@ -287,7 +301,13 @@ pub struct TierReplay {
     symbol: String,
     instrument: InstrumentId,
     days: std::vec::IntoIter<UtcDate>,
-    /// One head per dataset for the open day; `None` once that dataset is spent.
+    /// When set, read only the parts this session wrote.
+    only_session: Option<[u8; 16]>,
+    /// The day whose parts are being walked.
+    open_date: Option<UtcDate>,
+    /// Parts still to read for the day now open, ascending.
+    parts: std::vec::IntoIter<u32>,
+    /// One head per dataset for the open part; `None` once that dataset is spent.
     heads: Vec<Option<MarketEvent>>,
     streams: Vec<DatasetStream>,
     failed: bool,
@@ -309,17 +329,95 @@ impl TierReplay {
             symbol: symbol.to_owned(),
             instrument,
             days: days.into_iter(),
+            only_session: None,
+            open_date: None,
+            parts: Vec::new().into_iter(),
             heads: Vec::new(),
             streams: Vec::new(),
             failed: false,
         }
     }
 
-    /// Open the next day's four files. `false` when there are no days left.
+    /// Replay only the parts one capture session contributed.
+    ///
+    /// `normalize --check` compares a *session's* raw replay against the tier, so
+    /// on a day two sessions share it must read back only its own slice —
+    /// otherwise the other session's first event arrives where this session's
+    /// next one should be, and a healthy merge reads as a divergence. Selecting
+    /// by the footer's session id rather than by remembering which index was
+    /// written keeps the two sides independent, which is the whole point of the
+    /// check.
+    #[must_use]
+    pub fn open_session(
+        root: &Path,
+        exchange: Exchange,
+        symbol: &str,
+        instrument: InstrumentId,
+        days: Vec<UtcDate>,
+        session_id: [u8; 16],
+    ) -> Self {
+        let mut replay = Self::open(root, exchange, symbol, instrument, days);
+        replay.only_session = Some(session_id);
+        replay
+    }
+
+    /// Open the next part's four files. `false` when there is nothing left.
+    ///
+    /// Walks parts within the open day first, then moves to the next day, so the
+    /// stream is day order outside and part order inside.
     fn advance(&mut self) -> Result<bool, TierError> {
-        let Some(date) = self.days.next() else {
-            return Ok(false);
-        };
+        loop {
+            if let Some(part) = self.parts.next() {
+                self.open_part(self.open_date.expect("a day is open"), part)?;
+                return Ok(true);
+            }
+            let Some(date) = self.days.next() else {
+                return Ok(false);
+            };
+            let parts = published_parts(
+                &TierTarget {
+                    exchange: self.exchange,
+                    symbol: self.symbol.clone(),
+                    date,
+                    dataset: Dataset::ALL[0],
+                    part: 0,
+                }
+                .directory(&self.root),
+            );
+            let parts = match self.only_session {
+                None => parts,
+                Some(id) => parts
+                    .into_iter()
+                    .filter(|&part| {
+                        let target = TierTarget {
+                            exchange: self.exchange,
+                            symbol: self.symbol.clone(),
+                            date,
+                            dataset: Dataset::ALL[0],
+                            part,
+                        };
+                        super::Provenance::session_of(&target.file(&self.root))
+                            .ok()
+                            .flatten()
+                            == Some(id)
+                    })
+                    .collect(),
+            };
+            if parts.is_empty() {
+                // Loud, because the alternative is a stream that is quietly
+                // shorter than the days it was asked for. `open_part` would fail
+                // on the missing file anyway; this says which day and why.
+                return Err(TierError::NoPartsForDay {
+                    date: date.to_string(),
+                });
+            }
+            self.open_date = Some(date);
+            self.parts = parts.into_iter();
+        }
+    }
+
+    /// Open one part's four dataset files and prime a head from each.
+    fn open_part(&mut self, date: UtcDate, part: u32) -> Result<(), TierError> {
         self.streams.clear();
         self.heads.clear();
         for dataset in Dataset::ALL {
@@ -328,13 +426,14 @@ impl TierReplay {
                 symbol: self.symbol.clone(),
                 date,
                 dataset,
+                part,
             };
             let mut stream =
                 DatasetStream::open(&target.file(&self.root), dataset, self.instrument)?;
             self.heads.push(stream.next().transpose()?);
             self.streams.push(stream);
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Take the lowest-sequence head across the open day's datasets.
