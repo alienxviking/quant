@@ -84,25 +84,35 @@ crates/
   quant-backtest/   the wiring: a naive strategy, an equity curve,
                     and the `backtest`, `paper` and `reconcile`
                     binaries.                              [M3d/M5c/d]
-  quant-engine/     the seam: the loop, Strategy, RiskLayer,
-                    ExecutionVenue, and the portfolio. No venue,
-                    no file format, no network.                   [M3b]
-  quant-sim/        the simulated counterparty. Every backtest
-                    modelling assumption lives here.              [M3c]
-  quant-backtest/   the wiring: a naive strategy, an equity curve,
-                    and the `backtest` and `reconcile` binaries.  [M3d/M5c]
+  quant-explain/    the time cursor: what the system was doing at an
+                    instant, read from raw and the journal. Writes
+                    nothing -- no index, no cache, no sidecar.      [M7]
 docs/
+  overview.md         the whole project as a narrative, start to finish;
+                      authoritative on nothing, and says so
   data-contract.md    the on-disk format and its acceptance criteria
   engine-contract.md  the seam a strategy sees, and why it is shaped
                       that way. Written before the engine exists.
+  observability.md    why M7 is a reader and not an exporter, and its
+                      criteria. Written before the reader exists.
   acceptance-run.md   how the 7-day M1 run is conducted and judged
   paper-run.md        how the 2-week M5 paper run is conducted and judged
 ops/
-  preflight.ps1     refuse to waste a week: clock, disk, build, clean root
-  start-run.ps1     start the acceptance run; supervisors + verify loop
-  status.ps1        "how is it going" in one command
-  stop-run.ps1      stop it in a way that still seals the files
+  preflight.sh      refuse to waste a week: clock, disk, build, clean root
+  start-run.sh      start a run: supervisors + verify loop. `--paper` runs
+                    M5's fortnight instead of a bare recorder
+  supervise.sh      keep one symbol running to its deadline, restarting it
+  verify-loop.sh    verify during the capture rather than after it
+  status.sh         "how is it going" in one command
+  stop-run.sh       stop it in a way that still seals the files
+  fix-clock.sh      sync the host clock, which venue latency also measures
 ```
+
+Every `ops/` script has a PowerShell half beside the bash one. The bash half is
+the one that has been run — M1's seven days and M5's fortnight were both
+conducted from it — and it is the only half that knows `--paper`, because an
+untested paper mode on the side nobody runs is exactly the harness M1 warns
+about.
 
 ## Milestones
 
@@ -154,7 +164,16 @@ would have to beat that to break even. That is a real result: this strategy clas
 at this turnover, at retail fees, cannot work. Learning it from recorded data cost
 nothing.
 
-**M5's code is complete and rehearsed**; its fortnight is the one criterion still
+**M5's fortnight is running.** It started 2026-09-18 and ends 2026-10-02: two
+symbols, one `paper` process each, on the Mac, pinned to the tag `m5-run-start`
+and never pulled there — the running process would not change if it were, but the
+ability to say which code produced the result would. `paper` runs `LiveSource +
+SimulatedVenue` with the capture and the engine fed from **one ingress** — the
+same records with the same timestamps, which is what makes "paper P&L must match
+a backtest over the same window" checkable exactly rather than approximately. A
+three-minute rehearsal against Binance gave 4552 frames captured and 4552 events
+reaching the engine, with `verify` clean and the journal reconciling.
+`docs/paper-run.md` is the procedure.
 outstanding. `paper` runs `LiveSource + SimulatedVenue` with the capture and the
 engine fed from **one ingress** — the same records with the same timestamps, which
 is what makes "paper P&L must match a backtest over the same window" checkable
@@ -233,8 +252,15 @@ startup and warns above a one-second offset.
 # parse every frame in a capture file; reports anything that will not parse
 cargo run --release -p quant-binance --example parse_all -- <path to part-*.bin.zst>
 
-# replay a capture file through a book and check the invariants at every tick
-cargo run --release -p quant-binance --example replay -- <path to part-*.bin.zst>
+# replay a whole session through a book and check the invariants at every tick
+cargo run --release -p quant-normalize --bin normalize -- data
+```
+
+The per-file replay example is gone, deliberately. A single file starts
+mid-stream with no anchor, which is where those 7,000 to 34,000 dropped deltas
+came from; joining a session's segments takes it to zero. Keeping it would also
+have left two implementations of *apply recorded events to a book and check every
+tick*, and the one nobody maintains is the one that quietly stops agreeing.
 ```
 
 The normalized tier holds **events, not books**: `trades/`, `book_deltas/`,
@@ -266,6 +292,16 @@ cargo run --release -p quant-normalize --bin normalize -- data --check   # raw v
 # and run a strategy over it
 cargo run --release -p quant-backtest --bin backtest -- data --symbol BTCUSDT
 cargo run --release -p quant-backtest --bin backtest -- data --equity-csv equity.csv
+cargo run --release -p quant-backtest --bin backtest -- data --realistic \
+  --max-order 100 --max-position 100 --max-daily-loss 5 --max-orders 200
+```
+
+The limits are quote-currency notionals and a daily order count, and they are
+unset by default, so a bare run is byte-identical to the one before limits
+existed — the same reason costs are off by default. `paper` defaults the other
+way and says why: a fortnight unattended is the wrong place for no limits,
+whereas a backtest whose limits changed under it would stop being a measurement
+of the strategy.
 ```
 
 Exit 0 means every discontinuity in every session is explained by a record in the

@@ -171,11 +171,22 @@ data/
     exchange=binance/symbol=BTCUSDT/date=2026-07-26/
       session=<uuid>/part-00000.bin.zst
   normalized/
-    trades/exchange=binance/symbol=BTCUSDT/date=2026-07-26/part-*.parquet
-    book_deltas/...
-    book_snapshots/...
-    gaps/...
+    exchange=binance/symbol=BTCUSDT/date=2026-07-26/
+      trades/part-00000.parquet
+      book_deltas/part-00000.parquet
+      book_snapshots/...
+      gaps/...
 ```
+
+The dataset is the **innermost** directory, below the partition keys, so both
+tiers share the same `exchange / symbol / date` prefix and line up directory for
+directory — which is the only cheap cross-check between them, and the reason §8
+inherits a record's day from raw rather than re-deriving it.
+
+A normalized day holds one **part per contributing capture session**: usually
+just `part-00000`, and more only where a recorder restarted inside the day. §8
+has why a file boundary is the right encoding of that, and why the parts are
+ordered by the venue's update ids rather than by our clock.
 
 Partitioning by `exchange / symbol / date` is chosen because every query the
 backtester makes is "this instrument, this date range". Hive-style
@@ -183,14 +194,30 @@ directories are readable by DuckDB, Polars, pandas, Spark and ClickHouse
 without any of them being told about our schema — which keeps the research
 side of the project free to use whatever tool fits.
 
-One file per capture session, never appended across a restart, so a crashed
-process can never corrupt a file another process is reading.
+One file per capture session **per UTC day**, never appended across a restart, so
+a crashed process can never corrupt a file another process is reading. A session
+that runs a week therefore leaves seven files and not one, and `ingest_seq` spans
+the **session** rather than the file — which is why a hole straddling midnight is
+invisible to a per-file check, and why §7's replay criteria join a session's
+segments before they go looking for one. The `part` index exists for the
+size-based rolling that has never been needed; today it is always `00000`.
 
 ---
 
 ## 6. Versioning
 
-`EVENT_SCHEMA_VERSION` is stamped in every raw file header.
+**Two** versions are stamped in every raw file header, and they are independent.
+`CONTAINER_VERSION` versions the file format — framing, block layout, which frame
+kinds exist — and is currently **2**. `EVENT_SCHEMA_VERSION` versions the event
+vocabulary and is currently **1**.
+
+They are separate because a new frame kind and a new field on a `Trade` are not
+the same kind of change. Conflating them would mean bumping a number that makes
+older readers refuse a whole file for a change they could have read straight
+through — which is the opposite of the diagnostic argument the v1 → v2 note below
+makes.
+
+The rules apply to both:
 
 Rules:
 
@@ -216,9 +243,19 @@ file and then report `UnknownFrameKind`, which is indistinguishable from
 corruption. Refusing at the header says what is actually wrong.
 
 No re-derive was required, because no archival capture had been written when the
-change landed — the format was still inside the window §7 exists to protect. That
-window is now closing, and the next container change will need the full
-procedure.
+change landed — the format was still inside the window §7 exists to protect. No re-derive was required, because no archival capture had been written when the
+change landed — the format was still inside the window §7 exists to protect.
+**That window is shut.** There is a week of acceptance capture and a fortnight of
+paper session on disk in v2, so the next container change owes the full
+procedure: a migration note here, and a successful re-derive of the whole
+normalized tier before the v2 reader is removed.
+
+There is a narrower rule on top of that while a judged run is in flight: the
+container version is **frozen for its duration** (`docs/paper-run.md`). Bumping
+it would not change the running recorder — that is a binary already loaded — but
+the artifacts have to stay readable by the tools that will judge the run, and two
+weeks of capture that newer tools refuse is the same data loss arriving by a
+different route.
 
 ---
 
@@ -226,26 +263,48 @@ procedure.
 
 The recorder is not done when it prints JSON. It is done when:
 
-- [ ] It runs **7 consecutive days** unattended.
-- [ ] Killing the network mid-stream produces a `Gap{Disconnect}`, an
-      automatic reconnect with backoff, and a fresh snapshot resync.
-- [ ] Every recorded depth delta is preceded, somewhere in its session, by a
-      book snapshot — or by a `SnapshotFailed` record saying why not. A capture
-      whose deltas can never be turned into a book is not a usable capture,
-      however complete it is.
-- [ ] `SIGKILL` mid-write leaves the last file readable up to the last
-      complete frame — no partial-frame corruption.
-- [ ] Replaying every recorded file shows `ingest_seq` contiguous within each
-      session, with every discontinuity explained by a recorded `Gap`.
-- [ ] Replaying every recorded file shows the depth **update-id chain**
+- [x] It runs **7 consecutive days** unattended. *(met: 2026-08-21 → 2026-08-28
+      on an Apple Silicon Mac, two symbols, one recorder process each, and
+      **zero restarts** — the restart path the format was built for went
+      unused.)*
+- [x] Killing the network mid-stream produces a `Gap{Disconnect}`, an
+      automatic reconnect with backoff, and a fresh snapshot resync. *(met, and
+      not by contrivance: 36 `Disconnect` gaps off flaky Wi-Fi, each with its
+      reconnect and its resync snapshot.)*
+- [x] Every recorded depth delta is preceded, somewhere in its **connection
+      episode**, by a book snapshot — or by a `SnapshotFailed` record saying why
+      not. A capture whose deltas can never be turned into a book is not a usable
+      capture, however complete it is. *(met: zero errors, and the one episode
+      that lost its resync snapshot — day 3, four timed-out attempts — carries
+      the `SnapshotFailed{Resync}` the second half of this criterion asks for.)*
+- [x] `SIGKILL` mid-write leaves the last file readable up to the last
+      complete frame — no partial-frame corruption. *(met as an ordinary unit
+      test rather than an operational anecdote:
+      `truncation_at_every_byte_offset_loses_only_the_tail` cuts a capture at
+      every byte offset it has.)*
+- [x] Replaying every recorded file shows `ingest_seq` contiguous within each
+      session, with every discontinuity explained by a recorded `Gap`. *(met:
+      70,545,346 frames, `missing 0`, `dropped 0`, 38 gap frames and an
+      explanation for every one.)*
+- [x] Replaying every recorded file shows the depth **update-id chain**
       contiguous — each message's `first_update_id` continuing the previous
       message's `final_update_id` — with every discontinuity explained by a
-      recorded `Gap`.
-- [ ] Recorder-side metrics exist for: messages/sec, bytes/sec, queue depth,
-      venue latency percentiles, gap count by cause.
+      recorded `Gap`. *(met: zero chain breaks, and confirmed a second time in
+      M2 by `quant-normalize`, which shares no counting code with the
+      verifier.)*
+- [x] Recorder-side metrics exist for: messages/sec, bytes/sec, queue depth,
+      venue latency percentiles, gap count by cause. *(met at M1.e; the line
+      below is the one the run emitted every minute for seven days.)*
 
 The last one is not optional polish. If we cannot see queue depth we cannot
 tell the difference between a quiet market and a stalled consumer.
+
+**M1 is complete.** `quant-verify` exit 0, verdict *"every discontinuity is
+explained by a record in the capture"*. `CLAUDE.md` carries the full account of
+the week; what belongs here is that the criterion the whole format was designed
+around — a gap is a record, not a silence — is the one the week actually
+exercised, thirty-eight times, and none of those thirty-eight had to be
+explained after the fact.
 
 ### How the metrics are reported
 
@@ -255,8 +314,7 @@ One structured log line per minute, plus a whole-run summary at shutdown:
 metrics symbol=BTCUSDT msgs_per_sec=37 bytes_per_sec=13070
         queue=0 queue_peak=18 queue_capacity=4096 dropped=0
         latency_p50_ms=41 latency_p90_ms=88 latency_p99_ms=140
-        latency_samples=2276 clock_skew=0
-        gap_disconnect=0 gap_overflow=0 gap_sequence=0
+        latency_max_ms=612 latency_samples=2276 clock_skew=0
 ```
 
 Rates are deltas between two readings, not totals, because a total that has
@@ -266,6 +324,14 @@ over seven days is hundreds of millions of values — with the reported value be
 each bucket's **upper** bound, so a percentile never understates what was
 observed.
 
+That guarantee needs one correction to stay readable, and it is a correction we
+made after seeing it: a bucket's upper bound can exceed every value that landed
+in it, so an unclamped p99 came out *above* the observed maximum in the same
+line. Both numbers were defensible and the pair was nonsense to whoever read it.
+Percentiles are now clamped to the maximum, which keeps the never-understate
+property — a percentile is always ≤ the max — and loses nothing. Hence
+`latency_max_ms` on the line: it is what the percentiles are held against, not
+decoration.
 The histogram is reported per interval and reset, so a degradation that begins on
 day five is visible rather than averaged away across the week; a second,
 never-reset histogram supplies the whole-run figure. Queue depth and its
@@ -423,7 +489,7 @@ double loses precision silently on large notionals. The column type is how the
 invariant survives the process boundary.
 
 Precision 18 at scale 8 holds values below `10^10`, where `i64` holds nine times
-that. A value past the bound is a **loud error on write**, per §5's "parse
+that. A value past the bound is a **loud error on write**, per §4's "parse
 failures are loud" — never a truncation.
 
 Timestamps are `TIMESTAMP(NANOS, UTC)` on the same argument. This is the first
@@ -460,7 +526,7 @@ forced rather than chosen — `normalize --check` compares whole events, and
 
 **This paragraph used to say "ordered by `local_recv_ts`", and that was wrong.**
 `local_recv_ts` is `SystemTime`: it steps, and it is not monotone even within one
-session — §6's never-roll-backwards rule and the `backdated_records` counter
+session — §5's never-roll-backwards rule and the `backdated_records` counter
 exist because of it. Ordering two sessions by a quantity that can run backwards
 either refuses a healthy day after an NTP step or, worse, silently reverses them.
 Parts are ordered by the **venue's own update-id span**, recorded per part in the

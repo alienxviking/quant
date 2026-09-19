@@ -239,13 +239,23 @@ accounts for the difference.
 **What the rehearsal does not cover.** One session, one segment, one day
 partition, and the only gap is the mandatory `RecorderRestart` first frame. Untested
 here: joining segments across UTC midnight (M2.c's whole reason for existing), a
-real `Disconnect` gap with its resync, `LocalOverflow`, `SnapshotFailed`, the hourly
-periodic and stale-snapshot paths, and above all **a recorder restart producing two
-sessions on one symbol-day, which `normalize --write` refuses rather than merges**
+real `Disconnect` gap with its resync, `LocalOverflow`, `SnapshotFailed`, and the
+hourly periodic and stale-snapshot paths.
+
+**The one that would have stopped the fortnight being judgeable is closed.** A
+recorder restart producing two sessions on one symbol-day used to make
+`normalize --write` refuse the day rather than merge it — safe rather than lossy,
+and it would have cost the whole window. M2.e makes such a day a sequence of parts,
+one per contributing session, ordered by the venue's own update-id span recorded in
+each part's footer rather than by `local_recv_ts`, which is `SystemTime`, steps, and
+is what the contract's own sentence about the merge had wrongly named. Overlapping
+spans mean the sessions were concurrent, and that is still refused: there is no
+ordering of two simultaneous recordings that is the truth. What is left is a reading
+obligation, and it is the narrow exception above.**
 (M2.d, still open). That last one is the likeliest thing to stop the fortnight being
 judgeable at all.
 
-**That hole is now closed.** `backtest` used to wire `AllowAll` while `paper` wired
+**The risk-limit hole is now closed.** `backtest` used to wire `AllowAll` while `paper` wired
 a real `RiskEngine`, so one refusal or one kill-switch trip during the fortnight
 would have made the exact comparison impossible — the backtest would send an order
 paper had refused, and every number after it would differ for a reason that is not

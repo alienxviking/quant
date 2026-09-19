@@ -2,12 +2,22 @@
 
 **Status:** procedure · **Owner:** whoever starts it
 
-Five of the six criteria in `data-contract.md` §7 are settled by a test suite and
+Six of the seven criteria in `data-contract.md` §7 are settled by a test suite and
+a command. The seventh is not:
 a command. The sixth is not:
 
 > It runs **7 consecutive days** unattended.
 
-Nothing but time satisfies that, and this document is how it is spent.
+Nothing but time satisfies that, and this document is how it was spent.
+
+**It passed.** 2026-08-21 → 2026-08-28, two symbols on an Apple Silicon MacBook
+Air, zero recorder restarts: `quant-verify` exit `0`, 70,545,346 frames,
+`dropped=0`, 38 gap frames and every one of them explained by a record inside the
+capture. The run's own account — what the week did, and the handful of things it
+taught — is in `CLAUDE.md` under *The acceptance run, and how it went*.
+
+What follows stays in the imperative, because it is the procedure for the *next*
+run rather than a memoir of the first. M5's fortnight already borrows most of it.
 
 ---
 
@@ -57,7 +67,12 @@ ops/stop-run.sh
 ```
 
 Rehearse the whole chain first — a harness that has never been run is not a
-harness: `ops/start-run.sh --minutes 5` runs start → supervise → record → verify →
+harness: Rehearse the whole chain first — a harness that has never been run is not a
+harness: `ops/start-run.sh --minutes 5 --root ~/rehearsal` runs start → supervise
+→ record → verify → status → stop in a few minutes. Pass `--root`: `--minutes`
+shortens the run but does not move it, so a rehearsal without one files its frames
+in `data/acceptance` and preflight blocks the real run on a root that already
+holds captures — the check doing its job at the least convenient moment.
 status → stop in a few minutes against a throwaway root.
 
 macOS specifics, all handled by the scripts unless noted:
@@ -103,7 +118,14 @@ six months later.
 
 | Script | Job |
 |---|---|
-| `preflight.ps1` | Refuse to waste a week. Clock, disk, build, clean root, power. |
+| Script | Job |
+|---|---|
+| `preflight.{ps1,sh}` | Refuse to waste a week. Clock, disk, build, clean root, power. `preflight.sh` builds `--workspace --bins` rather than a named list, because a list of what the run needs went stale the moment `--paper` existed. |
+| `supervise.{ps1,sh}` | Keep one symbol recording; restart it if it dies. `supervise.sh` takes a mode, so it supervises a paper session the same way — a parameter rather than a second script, because two harnesses would have to agree forever. |
+| `verify-loop.{ps1,sh}` | Run the verifier every six hours, *during* the capture. `verify-loop.sh` reconciles any paper journals under the root on the same tick, for the same reason. |
+| `status.{ps1,sh}` | Answer "how is it going" in one command. |
+| `stop-run.{ps1,sh}` | Stop it in a way that still seals the files. |
+| `fix-clock.{ps1,sh}` | Turn network time on and step the clock: `w32time` on Windows (Administrator), `systemsetup` and `sntp` on macOS (sudo). |
 | `supervise.ps1` | Keep one symbol recording; restart it if it dies. |
 | `verify-loop.ps1` | Run the verifier every six hours, *during* the capture. |
 | `status.ps1` | Answer "how is it going" in one command. |
@@ -146,7 +168,7 @@ One line per minute per symbol:
 ```text
 metrics symbol=BTCUSDT msgs_per_sec=37 bytes_per_sec=13070
         queue=0 queue_peak=18 queue_capacity=4096 dropped=0
-        latency_p50_ms=41 latency_p90_ms=88 latency_p99_ms=140
+        latency_p50_ms=41 latency_p90_ms=88 latency_p99_ms=140 latency_max_ms=212
         latency_samples=2276 clock_skew=0
         gap_disconnect=0 gap_overflow=0 gap_sequence=0
 ```
@@ -164,6 +186,10 @@ Read in this order:
 - **`gap_disconnect`** — a few a day is Binance behaving as documented. Dozens an
   hour is a network problem.
 - **latency percentiles** — a step change matters more than the absolute value.
+  `latency_max_ms` is beside them because a percentile reports its bucket's
+  *upper* bound; a line reading `p99=3145 max=3071` was correct by derivation and
+  nonsense to read, which is why percentiles are now clamped to the observed
+  maximum.
 
 ---
 
@@ -209,7 +235,7 @@ layout the verifier depends on. Don't re-compress — the payload is already zst
 
 ```bash
 # macOS/Linux, from the capture root's parent (e.g. quant/data)
-COPYFILE_DISABLE=1 tar cf ~/quant-acceptance.tar acceptance   # raw/ + logs/ + run.json
+COPYFILE_DISABLE=1 tar cf ~/quant-acceptance.tar acceptance   # raw/ + logs/ + run.json, and a paper run's paper-*.jsonl
 shasum -a 256 ~/quant-acceptance.tar | tee ~/quant-acceptance.tar.sha256
 ```
 
