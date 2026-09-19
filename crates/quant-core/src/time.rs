@@ -90,6 +90,46 @@ impl UtcDate {
             day: u8::try_from(day).expect("day is 1..=31 by construction"),
         }
     }
+
+    /// The inverse: days since 1970-01-01 for a calendar date.
+    ///
+    /// Howard Hinnant's `days_from_civil`, the counterpart to the above and
+    /// exact over the same range. It existed nowhere until M7 needed to *parse*
+    /// a time rather than only render one -- and the absence is the interesting
+    /// part, because three binaries were about to grow their own.
+    #[must_use]
+    pub fn days_since_epoch(&self) -> i64 {
+        let y = i64::from(self.year) - i64::from(self.month <= 2);
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400; // [0, 399]
+        let m = i64::from(self.month);
+        let d = i64::from(self.day);
+        let mp = if m > 2 { m - 3 } else { m + 9 }; // shifted month, [0, 11]
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    /// Is this a date the calendar actually has?
+    ///
+    /// Checked rather than assumed, because a parser must reject `2026-02-30`
+    /// loudly instead of silently rolling it into March. Invariant 5 applied to
+    /// time: a malformed input means our model of the world is wrong.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        if self.month < 1 || self.month > 12 || self.day < 1 {
+            return false;
+        }
+        let leap = (self.year % 4 == 0 && self.year % 100 != 0) || self.year % 400 == 0;
+        let last = match self.month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return false,
+        };
+        self.day <= last
+    }
 }
 
 impl fmt::Display for UtcDate {
@@ -101,6 +141,29 @@ impl fmt::Display for UtcDate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:04}-{:02}-{:02}", self.year, self.month, self.day)
     }
+}
+
+/// Split an RFC 3339 string into its datetime part and its offset in nanoseconds.
+///
+/// `None` when there is no offset at all, which the caller reports rather than
+/// guessing at -- see [`Ts::parse_rfc3339`].
+fn split_offset(text: &str) -> Option<(&str, i64)> {
+    if let Some(rest) = text.strip_suffix(['Z', 'z']) {
+        return Some((rest, 0));
+    }
+    // Scan from the end so the date's own hyphens cannot be mistaken for the
+    // sign of an offset.
+    let sign_at = text.rfind(['+', '-'])?;
+    let (datetime, offset) = text.split_at(sign_at);
+    let negative = offset.starts_with('-');
+    let (hours, minutes) = offset[1..].split_once(':')?;
+    let hours: i64 = hours.parse().ok()?;
+    let minutes: i64 = minutes.parse().ok()?;
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    let magnitude = (hours * 3_600 + minutes * 60) * 1_000_000_000;
+    Some((datetime, if negative { -magnitude } else { magnitude }))
 }
 
 /// A point in time: nanoseconds since the Unix epoch, UTC.
@@ -155,6 +218,134 @@ impl Ts {
     #[must_use]
     pub const fn days_since_epoch(self) -> i64 {
         self.0.div_euclid(NANOS_PER_DAY)
+    }
+
+    /// Render as RFC 3339 with nanosecond precision, always UTC.
+    ///
+    /// `2026-09-18T14:46:54.123456789Z`. Always `Z` and always nine fractional
+    /// digits: a fixed-width rendering sorts lexicographically in
+    /// chronological order, which is the same property `UtcDate`'s `Display`
+    /// exists for, and a reader never has to wonder whether a shorter string
+    /// meant less precision or less time.
+    #[must_use]
+    pub fn to_rfc3339(self) -> String {
+        let date = self.utc_date();
+        // `rem_euclid` rather than subtracting `start_of_utc_day`, which
+        // multiplies days back up and overflows within a day of `i64::MIN`. A
+        // remainder cannot: it is always in `[0, NANOS_PER_DAY)`, and euclidean
+        // so a pre-epoch instant counts forward from its own midnight rather
+        // than backward from the next one.
+        let into_day = self.0.rem_euclid(NANOS_PER_DAY);
+        let secs = into_day / 1_000_000_000;
+        let nanos = into_day % 1_000_000_000;
+        format!(
+            "{date}T{:02}:{:02}:{:02}.{nanos:09}Z",
+            secs / 3_600,
+            (secs / 60) % 60,
+            secs % 60,
+        )
+    }
+
+    /// Parse an RFC 3339 timestamp into a `Ts`.
+    ///
+    /// Accepts `2026-09-18T14:46:54Z`, an optional fractional second of one to
+    /// nine digits, and either `Z` or an explicit `+HH:MM` / `-HH:MM` offset.
+    ///
+    /// # An offset is required, deliberately
+    ///
+    /// A bare `2026-09-18T14:46:54` is rejected rather than assumed to be UTC.
+    /// The operator asking "what was it doing at 03:14" is reading a wall clock
+    /// in their own zone while every artifact in this project is stamped UTC,
+    /// and silently choosing one of the two is how a query lands hours from
+    /// where it was aimed -- while still returning a confident, wrong answer.
+    /// Invariant 5: a parse failure means our model of the input is wrong, so it
+    /// is loud.
+    ///
+    /// Offsets only, never named zones: `Asia/Kolkata` needs a tz database,
+    /// which is a dependency this workspace does not have and which would make
+    /// the answer depend on the host's data files. Stated as a limitation rather
+    /// than discovered.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the string is not a timestamp, for showing to whoever
+    /// typed it.
+    pub fn parse_rfc3339(text: &str) -> Result<Self, String> {
+        let bad = |why: &str| Err(format!("{text:?} is not an RFC 3339 timestamp: {why}"));
+
+        let Some((datetime, offset_nanos)) = split_offset(text) else {
+            return bad(
+                "it needs a UTC offset -- `Z`, or `+05:30`. A bare local time would be \
+                 guessed at, and a query aimed hours from where it was meant still \
+                 returns a confident answer",
+            );
+        };
+        let Some((date_part, time_part)) = datetime.split_once(['T', 't', ' ']) else {
+            return bad("expected `<date>T<time>`");
+        };
+
+        let date_fields: Vec<&str> = date_part.split('-').collect();
+        let [year, month, day] = date_fields.as_slice() else {
+            return bad("expected a date as `YYYY-MM-DD`");
+        };
+        let (Ok(year), Ok(month), Ok(day)) =
+            (year.parse::<i32>(), month.parse::<u8>(), day.parse::<u8>())
+        else {
+            return bad("the date is not three numbers");
+        };
+        let date = UtcDate { year, month, day };
+        if !date.is_valid() {
+            return bad("no such date in the calendar");
+        }
+
+        let (clock, fraction) = match time_part.split_once('.') {
+            Some((clock, fraction)) => (clock, Some(fraction)),
+            None => (time_part, None),
+        };
+        let clock_fields: Vec<&str> = clock.split(':').collect();
+        let [hour, minute, second] = clock_fields.as_slice() else {
+            return bad("expected a time as `HH:MM:SS`");
+        };
+        let (Ok(hour), Ok(minute), Ok(second)) = (
+            hour.parse::<i64>(),
+            minute.parse::<i64>(),
+            second.parse::<i64>(),
+        ) else {
+            return bad("the time is not three numbers");
+        };
+        // 60 is a leap second, which UTC has and Unix time does not represent.
+        // Rejected rather than clamped: pretending it is :59 would place an
+        // event a second from where the input asked for.
+        if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..60).contains(&second) {
+            return bad("the time is out of range");
+        }
+
+        let nanos_of_second = match fraction {
+            None => 0,
+            Some(digits) => {
+                if digits.is_empty()
+                    || digits.len() > 9
+                    || !digits.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return bad("the fractional second must be one to nine digits");
+                }
+                let scale = 10_i64.pow(9 - u32::try_from(digits.len()).expect("at most 9"));
+                digits.parse::<i64>().expect("digits only") * scale
+            }
+        };
+
+        // In `i128`, and range-checked only at the end. Midnight of a day near
+        // the bottom of `Ts`'s range is itself below `i64::MIN` even when the
+        // instant asked for is comfortably inside it, so checking each
+        // intermediate would reject representable timestamps.
+        let nanos = i128::from(date.days_since_epoch()) * i128::from(NANOS_PER_DAY)
+            + i128::from((hour * 3_600 + minute * 60 + second) * 1_000_000_000)
+            + i128::from(nanos_of_second)
+            - i128::from(offset_nanos);
+        match i64::try_from(nanos) {
+            Ok(nanos) => Ok(Self(nanos)),
+            Err(_) => bad("outside the range of a nanosecond timestamp"),
+        }
     }
 
     /// The UTC calendar day this timestamp falls in.
@@ -411,5 +602,161 @@ mod tests {
         let now = SystemClock.now();
         assert!(now > Ts::from_secs(1_577_836_800));
         assert!(now < Ts::from_secs(4_102_444_800));
+    }
+}
+
+#[cfg(test)]
+mod rfc3339_tests {
+    use super::{Ts, UtcDate};
+
+    #[test]
+    fn a_timestamp_round_trips_through_its_rendering() {
+        // The property that matters: render then parse is the identity. Spot
+        // values are a weak test of a calendar, so this walks a range that
+        // crosses leap days, century boundaries and the epoch itself.
+        for day in [
+            -40_000, // 1860, well before the epoch
+            -1,      // 1969-12-31, the case euclidean division exists for
+            0,       // 1970-01-01
+            11_016,  // 2000-02-29, a leap year that is also a century
+            20_514,  // 2026-03-01, the day after a non-leap February
+            20_714,  // inside the fortnight
+            60_000,  // 2134
+        ] {
+            for into_day in [0_i64, 1, 86_399_999_999_999, 43_200_000_000_000] {
+                let ts = Ts::from_nanos(day * 86_400 * 1_000_000_000 + into_day);
+                let text = ts.to_rfc3339();
+                assert_eq!(
+                    Ts::parse_rfc3339(&text),
+                    Ok(ts),
+                    "{text} did not round-trip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_representable_range_is_about_three_centuries_and_is_stated() {
+        // `Ts` is i64 nanoseconds since the epoch, so it spans roughly
+        // 1677-09-21 to 2262-04-11 -- not the whole calendar `UtcDate` can
+        // describe. Found by a round-trip test that reached for year 1 and
+        // overflowed its own arithmetic, which is the right way to find it.
+        // Pinned here so the limit is a documented property rather than a
+        // surprise in whatever first needs a date outside it.
+        let far_past = Ts::from_nanos(i64::MIN + 1);
+        let far_future = Ts::from_nanos(i64::MAX);
+        assert_eq!(far_past.utc_date().year, 1677);
+        assert_eq!(far_future.utc_date().year, 2262);
+
+        // Note what this test found on the way: `start_of_utc_day` multiplies
+        // whole days back up to nanoseconds and so overflows within one day of
+        // `i64::MIN`. Unreachable in practice -- it exists for the recorder's
+        // day rolling, which runs on the system clock -- but it is why
+        // `to_rfc3339` takes a remainder instead of calling it. Left as it is
+        // rather than changed on a path the running capture depends on, and
+        // written down here instead of forgotten.
+
+        // And both ends still round-trip, which is what makes the range a range
+        // rather than a region where the rendering quietly stops working.
+        for ts in [far_past, far_future] {
+            let text = ts.to_rfc3339();
+            assert_eq!(Ts::parse_rfc3339(&text), Ok(ts), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_calendar_inverse_is_an_inverse() {
+        // `from_days_since_epoch` had no counterpart until now, so the pair is
+        // pinned against each other over four centuries rather than at a few
+        // points -- 146,097 days is one full Gregorian era, after which the
+        // pattern repeats.
+        for days in (-80_000..80_000).step_by(7) {
+            let date = UtcDate::from_days_since_epoch(days);
+            assert_eq!(date.days_since_epoch(), days, "{date} at {days}");
+            assert!(date.is_valid(), "{date} was produced but is not valid");
+        }
+    }
+
+    #[test]
+    fn an_offset_is_applied_in_the_right_direction() {
+        // The sign is the thing most likely to be wrong and least likely to be
+        // noticed: an hour out still looks like a plausible answer. 05:30 ahead
+        // of UTC means the UTC instant is *earlier*.
+        let utc = Ts::parse_rfc3339("2026-09-18T09:16:54Z").expect("valid");
+        let ist = Ts::parse_rfc3339("2026-09-18T14:46:54+05:30").expect("valid");
+        assert_eq!(ist, utc, "+05:30 must subtract, not add");
+
+        let behind = Ts::parse_rfc3339("2026-09-18T04:16:54-05:00").expect("valid");
+        assert_eq!(behind, utc, "-05:00 must add");
+    }
+
+    #[test]
+    fn a_time_with_no_offset_is_refused_rather_than_assumed() {
+        // The operator reads a wall clock in their own zone; every artifact here
+        // is UTC. Guessing either way returns a confident answer hours from
+        // where the question was aimed.
+        let e = Ts::parse_rfc3339("2026-09-18T14:46:54").expect_err("must refuse");
+        assert!(e.contains("UTC offset"), "{e}");
+    }
+
+    #[test]
+    fn a_date_the_calendar_does_not_have_is_refused() {
+        for bad in [
+            "2026-02-30T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-00-10T00:00:00Z",
+            "2026-09-31T00:00:00Z",
+        ] {
+            assert!(Ts::parse_rfc3339(bad).is_err(), "{bad} was accepted");
+        }
+        // And the one that is real: 2024 was a leap year.
+        assert!(Ts::parse_rfc3339("2024-02-29T00:00:00Z").is_ok());
+        assert!(Ts::parse_rfc3339("2026-02-29T00:00:00Z").is_err());
+    }
+
+    #[test]
+    fn a_leap_second_is_refused_rather_than_clamped() {
+        // UTC has :60; Unix time cannot represent it. Clamping to :59 would
+        // place the query a second from where it was asked for, silently.
+        let e = Ts::parse_rfc3339("2026-06-30T23:59:60Z").expect_err("must refuse");
+        assert!(e.contains("out of range"), "{e}");
+    }
+
+    #[test]
+    fn fractional_seconds_scale_by_their_digit_count() {
+        // `.5` is half a second, not five nanoseconds -- the mistake a naive
+        // parse of the digits makes.
+        let base = Ts::parse_rfc3339("2026-09-18T00:00:00Z").expect("valid");
+        for (text, expect) in [
+            (".5", 500_000_000),
+            (".05", 50_000_000),
+            (".123456789", 123_456_789),
+            (".000000001", 1),
+        ] {
+            let ts = Ts::parse_rfc3339(&format!("2026-09-18T00:00:00{text}Z")).expect("valid");
+            assert_eq!(ts.as_nanos() - base.as_nanos(), expect, "{text}");
+        }
+        assert!(Ts::parse_rfc3339("2026-09-18T00:00:00.Z").is_err());
+        assert!(Ts::parse_rfc3339("2026-09-18T00:00:00.1234567890Z").is_err());
+    }
+
+    #[test]
+    fn the_rendering_is_fixed_width_so_text_order_is_time_order() {
+        // The same property `UtcDate`'s Display exists for, extended to an
+        // instant: a sorted listing of these is chronological.
+        let mut rendered: Vec<String> = [
+            Ts::from_nanos(1),
+            Ts::from_nanos(0),
+            Ts::from_nanos(86_400_000_000_000),
+            Ts::from_nanos(-1),
+        ]
+        .iter()
+        .map(|t| t.to_rfc3339())
+        .collect();
+        let mut by_time = rendered.clone();
+        rendered.sort();
+        by_time.sort_by_key(|text| Ts::parse_rfc3339(text).expect("valid"));
+        assert_eq!(rendered, by_time);
+        assert!(rendered.iter().all(|r| r.len() == rendered[0].len()));
     }
 }
