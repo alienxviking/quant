@@ -184,9 +184,13 @@ directory — which is the only cheap cross-check between them, and the reason �
 inherits a record's day from raw rather than re-deriving it.
 
 A normalized day holds one **part per contributing capture session**: usually
-just `part-00000`, and more only where a recorder restarted inside the day. §8
-has why a file boundary is the right encoding of that, and why the parts are
-ordered by the venue's update ids rather than by our clock.
+just `part-00000`, and more only where a recorder restarted inside the day. Parts
+are concatenated in **index order**, and what makes that order trustworthy is a
+check when a part is published rather than a sort when the day is read: a part
+reaches its real path only if the venue's update-id span recorded in its Parquet
+footer begins after every already-published part's span ends. §8 has why a file
+boundary is the right encoding of a restart, why that span is the only key that
+can be trusted, and what the check refuses rather than reorders.
 
 Partitioning by `exchange / symbol / date` is chosen because every query the
 backtester makes is "this instrument, this date range". Hive-style
@@ -199,8 +203,32 @@ a crashed process can never corrupt a file another process is reading. A session
 that runs a week therefore leaves seven files and not one, and `ingest_seq` spans
 the **session** rather than the file — which is why a hole straddling midnight is
 invisible to a per-file check, and why §7's replay criteria join a session's
-segments before they go looking for one. The `part` index exists for the
-size-based rolling that has never been needed; today it is always `00000`.
+segments before they go looking for one. The `part` index in a *raw* file name
+means something different from the one in a normalized day: it exists for the
+size-based rolling that has never been needed, and today it is always `00000`.
+
+**Which file a record lands in is decided by the record's own `local_recv_ts`,
+and rolling is forward-only.** The writer runs behind the socket by design, so
+rolling on the *writer's* clock would file a 23:59:59.9 message under the next
+day whenever our disk happened to be busy — making the partition a property of
+our load rather than of the data. Two clauses follow from that. An idle stream
+still has to be sealed on a timer, because a timestamp can only roll a day when
+a message arrives, and a trailerless file reads as "killed": a healthy quiet
+symbol must not look crashed. And a record stamped *before* the open segment's
+day — the wall clock stepping backwards across midnight, an NTP correction — is
+written to the open segment and counted as `backdated_records`, never by
+reopening a sealed day. The record still tells the truth about itself; only the
+directory it can be found in is off, and a non-zero count is the signal to go
+and look at the host's clock.
+
+**That rule was cited twice in §8 before it was ever stated here.** Both
+citations pointed into this document — first at §6, then at §5 — in each case at
+a section that said nothing about rolling at the time. That is how a wrong
+reference survives: it has the shape of a pointer, so nobody follows it. The
+rule is implemented in `quant-recorder`'s `segment.rs` and narrated in
+`docs/overview.md` §7.4, but it decides which file a byte is filed under, which
+makes it a statement about data at rest and so this contract's business. §8's
+two references now point at the paragraph above.
 
 ---
 
@@ -243,12 +271,20 @@ file and then report `UnknownFrameKind`, which is indistinguishable from
 corruption. Refusing at the header says what is actually wrong.
 
 No re-derive was required, because no archival capture had been written when the
-change landed — the format was still inside the window §7 exists to protect. No re-derive was required, because no archival capture had been written when the
 change landed — the format was still inside the window §7 exists to protect.
-**That window is shut.** There is a week of acceptance capture and a fortnight of
-paper session on disk in v2, so the next container change owes the full
-procedure: a migration note here, and a successful re-derive of the whole
-normalized tier before the v2 reader is removed.
+**That window is shut.** The acceptance week by itself is 3.0 GB of v2 capture
+that nobody can re-record, so the next container change owes the full procedure:
+a migration note here, and a successful re-derive of the whole normalized tier
+before the v2 reader is removed.
+
+This used to say "a week of acceptance capture **and a fortnight of paper
+session** on disk", and the second half was not true when it was written. The
+paper run started 2026-09-18T14:46:54Z and ends 2026-10-02; as this is written
+there are two days of it and the recorder is still running. The conclusion does
+not depend on it — one irreplaceable week shuts the window on its own — which is
+precisely why a claim like that is easy to leave standing, and why it is worth
+striking before some later decision is taken on the strength of capture we do
+not have yet.
 
 There is a narrower rule on top of that while a judged run is in flight: the
 container version is **frozen for its duration** (`docs/paper-run.md`). Bumping
@@ -294,7 +330,8 @@ The recorder is not done when it prints JSON. It is done when:
       verifier.)*
 - [x] Recorder-side metrics exist for: messages/sec, bytes/sec, queue depth,
       venue latency percentiles, gap count by cause. *(met at M1.e; the line
-      below is the one the run emitted every minute for seven days.)*
+      below carries all five, and one like it went into the log every minute per
+      symbol for the whole week.)*
 
 The last one is not optional polish. If we cannot see queue depth we cannot
 tell the difference between a quiet market and a stalled consumer.
@@ -313,9 +350,22 @@ One structured log line per minute, plus a whole-run summary at shutdown:
 ```text
 metrics symbol=BTCUSDT msgs_per_sec=37 bytes_per_sec=13070
         queue=0 queue_peak=18 queue_capacity=4096 dropped=0
-        latency_p50_ms=41 latency_p90_ms=88 latency_p99_ms=140
-        latency_max_ms=612 latency_samples=2276 clock_skew=0
+        latency_p50_ms=41 latency_p90_ms=88 latency_p99_ms=140 latency_max_ms=612
+        latency_samples=2276 clock_skew=0
+        gap_disconnect=0 gap_overflow=0 gap_sequence=0
 ```
+
+The three `gap_*` counters went missing from this sample in an editing pass, so
+the criterion above asked for a gap count by cause and the document then printed
+a line without one. They are back, because the **field set** is the contractual
+part of this line: `quant-binance::capture` emits exactly these keys,
+`docs/acceptance-run.md` prints the same line, and M7's reader looks them up by
+name. The *numbers* are one minute's worth and illustrative, which is worth
+saying plainly: this copy and the one in `docs/acceptance-run.md` disagree about
+`latency_max_ms` (612 against 212), and nothing in this repository can say which
+minute either was taken from. A real line, copied verbatim out of the running
+fortnight's log, is pinned by `a_real_line_from_the_running_fortnight_parses` in
+`quant-explain`; that is the copy to hold an emitter against.
 
 Rates are deltas between two readings, not totals, because a total that has
 stopped growing looks exactly like one that never grew. Latency percentiles come
@@ -332,6 +382,7 @@ Percentiles are now clamped to the maximum, which keeps the never-understate
 property — a percentile is always ≤ the max — and loses nothing. Hence
 `latency_max_ms` on the line: it is what the percentiles are held against, not
 decoration.
+
 The histogram is reported per interval and reset, so a degradation that begins on
 day five is visible rather than averaged away across the week; a second,
 never-reset histogram supplies the whole-run figure. Queue depth and its
@@ -344,6 +395,21 @@ recorder checks itself against the venue's `/api/v3/time` at startup and warns
 above a one-second offset — the venue's own tolerance for a signed request. A
 negative latency is counted separately as `clock_skew` and never folded into the
 histogram, per §2.
+
+`clock_skew` on the line is that **count of samples**, not an offset in
+milliseconds. It sits among fields that all end in `_ms`, which makes the
+misreading close to inviting — and M7's reader took the invitation. That is
+still true as this is written: `quant-explain::health` parses the count into a
+field it calls `clock_skew_ms`, and `explain` prints it as `clock skew Nms`
+once it passes a threshold of 1000 — so a minute in which 1001 messages carried
+a venue timestamp ahead of ours would be reported as a second of clock offset.
+**Recorded here as owing, not as fixed**, because this contract is what defines
+the field; `docs/observability.md` carries the same item and the emitter switch
+it is to be repaired with.
+
+The millisecond offset is a different measurement: the startup check above, and
+`ops/preflight.sh` before a run. It never appears on this line, which is the
+other half of why reading `clock_skew` as one was so easy to do.
 
 ### How the replay criteria are actually checked
 
@@ -518,35 +584,79 @@ sources at once.
 A restart is **sequential**: `ops/supervise.sh` runs the recorder in the
 foreground of its restart loop and reads its exit code before respawning. So a
 shared day is a **concatenation**, not an interleave, and a file boundary is the
-exact and free encoding of one. The ordering key is `(part, ingest_seq)`: within
-a part `ingest_seq` is one session's and strictly increasing, and across parts
-the index is enforced to be capture order. Nothing inside a row changes, which is
-forced rather than chosen — `normalize --check` compares whole events, and
-`EventMeta` includes `ingest_seq`, so renumbering would fail at the first event.
+exact and free encoding of one. Within a part, `ingest_seq` is one session's and
+strictly increasing, which is what merges that part's four dataset files into one
+stream; across parts it means nothing at all, because it restarts at 1 for every
+new session. Nothing inside a row changes, which is forced rather than chosen —
+`normalize --check` compares whole events, and `EventMeta` includes `ingest_seq`,
+so renumbering would fail at the first event.
 
-**This paragraph used to say "ordered by `local_recv_ts`", and that was wrong.**
-`local_recv_ts` is `SystemTime`: it steps, and it is not monotone even within one
-session — §5's never-roll-backwards rule and the `backdated_records` counter
-exist because of it. Ordering two sessions by a quantity that can run backwards
-either refuses a healthy day after an NTP step or, worse, silently reverses them.
-Parts are ordered by the **venue's own update-id span**, recorded per part in the
-footer, which is strictly increasing per symbol across disconnects and is immune
-to anything our host's clock does. Two sessions whose spans overlap were
-concurrent rather than sequential, and that is refused: there is no ordering of
-two simultaneous recordings of the same messages that is the truth.
+**This section used to say the merge is "ordered by `local_recv_ts`", and that
+was wrong.** `local_recv_ts` is `SystemTime`: it steps, and it is not monotone
+even within one session — §5's forward-only rolling rule and the
+`backdated_records` counter exist because of it. Ordering two sessions by a
+quantity that can run backwards either refuses a healthy day after an NTP step
+or, worse, silently reverses them. Parts are ordered by the **venue's own
+update-id span**, recorded per part in the footer, which is strictly increasing
+per symbol across disconnects and is immune to anything our host's clock does.
+
+**The full ordering key is `(day, part, ingest_seq)`, and the index earns its
+place by a refusal rather than by a sort.** A part's index is simply the order
+the parts reached the writer, which is the order `catalog` yields sessions — a
+text sort of paths, so within a shared day it is a text sort of v4 UUIDs and
+carries no chronology of its own. What makes index order capture order is a
+check at publish time (`PartitionWriter::check_follows`): a part is published
+only if its span begins after every already-published part's span ends, and
+otherwise the write is refused as `PartsOutOfOrder`. The reader then
+concatenates parts in index order and never re-sorts, because by the time it
+looks the question has already been settled.
+
+**That is a refusal and not a repair, and the difference is worth being explicit
+about rather than left for someone to discover.** Two sessions whose spans
+overlap were concurrent rather than sequential, and refusing those is the
+outcome we want: there is no ordering of two simultaneous recordings of the same
+messages that is the truth. But the same check is the only thing standing behind
+the index, so it also fires when two *genuinely sequential* sessions happen to
+be handed over in the wrong order — which UUID text decides, and which is
+therefore a coin toss. `normalize` drops its writer on a write error, so the
+rest of that session's days go unwritten behind the refusal, and because the
+catalog's order is deterministic a re-derive reproduces the refusal exactly
+rather than clearing it.
+
+Nothing is lost when that happens — raw is intact and this tier is disposable,
+per §1 — but the day does not normalize until it is dealt with, and it is stated
+here as owing rather than dressed up as handled. The shape of the fix is not in
+doubt: order the parts by their spans **at read time**, where a reader holds
+every part of the day at once, and leave the writer refusing only genuine
+overlap, which is the one refusal that is about the data rather than about the
+order we happened to walk it in.
 
 A day's partition is also **published by rename**: written to a `.tmp` sibling
 and moved into place once its footer lands, so a reader never finds a truncated
 file at a real path.
 
+**What the parts make whole is the data, and that is all they make whole.** This
+section is easy to read as "a restart inside a day is handled", and for this
+contract it is: the day normalizes, every event is there, and a replay across the
+boundary sees them in the venue's own order. The *process* is a separate
+question, and not this document's to answer. `JournalEntry` records fills,
+checkpoints, a risk trip and a stop, but nothing of the strategy, and
+`Engine::resuming` replaces only the portfolio — so a restarted paper process
+comes back with the right cash and position and with empty indicator windows, a
+zeroed equity sampler and a zeroed daily risk tally, while the backtest it is
+compared against runs all three continuously across the same instant. That
+belongs to M5 and to `docs/paper-run.md`; it is named here only so the merge is
+not mistaken for a guarantee it does not make.
+
 ### The partition day is inherited, not re-derived
 
 A record is filed under the day the **raw tier** filed it under, read off the
 segment it came from — not recomputed from `local_recv_ts`. The two agree except
-in the case §5's rolling rule carves out: a record stamped before the open
-segment's day, after an NTP step, is written to the open segment on purpose. A
-re-derivation would file it elsewhere, and the two tiers would stop lining up
-directory for directory — which is the only cheap cross-check between them.
+in the case §5's forward-only rolling rule carves out: a record stamped before
+the open segment's day, after an NTP step, is written to the open segment on
+purpose. A re-derivation would file it elsewhere, and the two tiers would stop
+lining up directory for directory — which is the only cheap cross-check between
+them.
 
 ### An invalidated book is cleared, not flagged
 

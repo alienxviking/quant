@@ -18,8 +18,10 @@ ends up describing a system that was never run.
 > **A strategy must not be able to tell which sources it is wired to.**
 
 Backtest is `HistoricalSource + SimulatedVenue`. Paper is
-`LiveSource + SimulatedVenue` — see §9, there is no separate paper venue. Live is
-`LiveSource + LiveVenue`. One strategy
+`LiveSource + SimulatedVenue` — see §9, there is no separate paper venue. Live
+is `LiveSource + LiveVenue` **[M8]** — and the mark is not decoration:
+`LiveVenue` does not exist in the workspace yet, so the third wiring names what
+this seam is built for rather than something that runs today. One strategy
 binary, three worlds, no code changes between them.
 
 If a strategy *can* tell, the backtest is measuring a system that will never
@@ -260,8 +262,24 @@ a number.
 - **Market impact.** Nobody in the recording reacted to us, because we were not
   there. Not recoverable from recorded data at any price.
 
-Both are why **M5 exists**: paper trading against the live venue is the only
-instrument that can measure them.
+This used to end: *"Both are why **M5 exists**: paper trading against the live
+venue is the only instrument that can measure them."* **That was wrong**, and it
+is corrected here rather than quietly deleted because the mistake is the
+instructive part. §9 recorded the correction on 2026-09-02; this sentence
+survived eighteen days further up the same file, through a documentation pass
+whose own commit message (`f211430`) says it fixed the claim here, while
+`docs/paper-run.md` went on to tell readers the correction was recorded in this
+document. It was — once, a section later, beneath the version that contradicted
+it. That is the silent-miss failure this project has twice recorded for scripted
+edits to source, arriving in prose, and the remedy is the same one: after an
+edit, grep for the thing that should now be gone.
+
+A paper venue's fills are *simulated*. Our orders are still not in the book and
+nobody is still reacting to them, so a fortnight of paper trading measures
+neither of these two — it is the same recorded book, arriving live. Both are why
+**M8 exists**: real orders resting in the real book are the only instrument that
+can measure them. §9's *What paper trading cannot measure* carries the full
+correction and what M5 is worth instead.
 
 ---
 
@@ -271,13 +289,43 @@ The seam is proven in a second world when:
 
 - [ ] The **same strategy binary** runs against `LiveSource + SimulatedVenue` for
       **two weeks**, unattended, with no code change from the backtest wiring.
+      *(In flight: started 2026-09-18T14:46:54Z, due 2026-10-02.)*
 - [ ] **Paper P&L matches a backtest over the data captured during the same
       window.** See below — this replaces "reconciles against an independent
-      recompute", which was a weaker question.
+      recompute", which was a weaker question. *(Judgeable only once the run
+      ends; it is the whole point of the fortnight.)*
 - [ ] Every fill is journalled, and P&L recomputed from the journal alone agrees
-      with the engine's running portfolio.
+      with the engine's running portfolio. *(The machinery is proven at the
+      unit level — `a_recomputed_portfolio_matches_one_built_by_applying_the_same_fills`
+      pins the recompute, `a_checkpoint_that_matches_the_recompute_agrees` pins
+      the comparison, and `a_journal_with_no_checkpoint_reports_nothing_to_check`
+      pins that a journal with nothing to check is not a pass — and `reconcile`
+      has reported AGREES on both of the run's journals at every six-hourly pass
+      so far.)*
 - [ ] The run survives restarts: position and cash are recovered from the
-      journal, not lost.
+      journal, not lost. *(The recompute half is proven at the unit level; the
+      run itself has not restarted, and "A restart forfeits the exact match"
+      below is why we would rather it did not.)*
+
+### Why none of these is ticked while the run is clean
+
+`docs/paper-run.md` has the same four, in the same order, and says only the
+first, third and fourth can be judged *during* the run. They are being judged,
+every six hours, and they are clean. That is evidence and it is deliberately not
+a tick.
+
+Three of the four are statements about **two weeks**. A criterion about an
+unattended fortnight is not met at hour thirty, any more than M1's seventh
+criterion was met on day two — that one was spent in full rather than shortened
+for convenience, and it is the precedent this one follows. So a box here is
+ticked at judging, by the commands in `docs/paper-run.md` run against the
+finished artifacts, or not at all; a clean six-hourly pass is the evidence that
+the run is still worth finishing, not a partial pass.
+
+The two documents carry the same four criteria in the same order on purpose. One
+is the procedure and this one is the bar, and if they were free to describe
+different criteria the run could pass the procedure and miss the bar with nobody
+noticing.
 
 ### Why the criterion is live-versus-replay, not an arithmetic check
 
@@ -289,12 +337,62 @@ result this platform ever produces.
 So the criterion is sharper: run the strategy live on a paper venue, capture the
 raw stream while doing it, then **backtest the identical strategy over that
 capture and require the two to agree**. If they diverge, one of the two paths is
-lying and we find out which. It is the live analogue of §8's raw-versus-Parquet
-agreement, and it is the strongest statement available without real money.
+lying and we find out which. It is the live analogue of the *data* contract's
+§8 raw-versus-Parquet agreement — §8 of this file is fees — and it is the
+strongest statement available without real money.
 
 Exact agreement is the target and is achievable, because both sides consume the
 same events with the same `local_recv_ts` and the same `ingest_seq` — see the
 tee below. Any divergence is a bug, not a tolerance.
+
+### A restart forfeits the exact match, and the reason is state, not reading
+
+Criteria 2 and 4 pull against each other, and this was not understood when they
+were written. Every document in this repository has framed a mid-run supervisor
+restart as a **reader** problem: two sessions land on one symbol-day, and until
+M2.e that made `normalize --write` refuse the day rather than merge it. That
+half is closed — such a day is now a sequence of parts, concatenated in index
+order. What makes that index order trustworthy is established when the parts are
+*written*, not when they are read: a later session is refused rather than
+reordered unless the venue's own update-id span in its Parquet footer starts
+after every published part's ends, because overlapping spans mean the two
+recordings were concurrent and there is no ordering of them that is the truth.
+The half that is not closed is **state**, and it is the half that decides the
+criterion.
+
+`JournalEntry` records a start, fills, checkpoints, a kill-switch trip and a
+stop (`crates/quant-engine/src/journal.rs`). There is no entry for what the
+*strategy* held, and `Engine::resuming` (`crates/quant-engine/src/lib.rs`)
+replaces the **portfolio** and nothing else. So a restarted paper process comes
+back up with the right cash and the right position — which is exactly what
+criterion 4 asks for, and it is worth having — and with **empty `MaCrossover`
+windows, a zeroed equity sampler and a zeroed daily risk tally**.
+`RiskEngine::recover` carries the switch across and deliberately not the day's
+counters, per §10.
+
+The judging backtest has no such boundary. It runs the indicator, the sampler and
+the risk tally continuously across the same instant, so after a restart the two
+sides are not the same system in the same state: the crossings differ, therefore
+the fill counts differ, therefore criterion 2 fails — **for a reason that is not
+live-versus-replay**, which is the only thing it was asked to test. And it cannot
+be repaired afterwards. The windows the live process would have held are not
+recorded anywhere, so no amount of re-reading the capture reconstructs them.
+
+**The fallback, if the fortnight does restart, is to compare per segment between
+restarts rather than end to end.** Each stretch of run between two restarts is a
+continuous paper session; a backtest over exactly that window is a fair
+comparison; and the claim the milestone can then make is "every segment agrees
+exactly" rather than "the run agrees exactly". That is genuinely weaker — it
+says nothing about the boundary itself, which is where the divergence would be —
+and whatever reports the run has to say so in those words rather than quoting the
+segments as though they were the run. The strong form needs a fortnight with no
+restart, which is what this one has had so far.
+
+Carrying strategy state across a restart is the real fix and it is not this
+milestone's. It needs a new journal entry for what the strategy held, which is a
+schema change — and rule 2 of `docs/paper-run.md` freezes the journal schema
+until the run ends. So it belongs with the run log, the first thing due when the
+freeze lifts.
 
 ### Slices, and where this stands
 
@@ -310,9 +408,15 @@ tee below. Any divergence is a bug, not a tolerance.
 The procedure is `docs/paper-run.md`. Everything except wall clock is built and
 rehearsed against the live venue.
 
-**M5's fortnight is running.** It started 2026-09-18T14:46:54Z and ends 2026-10-02 — two symbols on the Mac, one paper process each, pinned to the tag `m5-run-start` (`aff848d`). As of 2026-09-19 there had been no restart on either supervisor, every six-hourly `verify` pass was clean, and `reconcile` reported AGREES on both journals from the first checkpoint onward. None of that is the criterion: the criterion is the comparison at the end, and until 2026-10-02 the honest status is *in flight*. That is the same shape M1 had — code complete 2026-08-11, acceptance run passed 2026-08-28, seventeen days apart and nothing rotted, because the harness was rehearsed and the reasoning was written down. That is the same shape M1
-had: code complete 2026-08-11, acceptance run passed 2026-08-28, seventeen days
-apart and nothing rotted — because the harness was rehearsed and the reasoning
+**M5's fortnight is running.** It started 2026-09-18T14:46:54Z and ends
+2026-10-02 — two symbols on the Mac, one paper process each, pinned to the tag
+`m5-run-start` (`aff848d`). As of the last check, on 2026-09-19, there had been
+no restart on either supervisor, every six-hourly `verify` pass was clean, and
+`reconcile` reported AGREES on both journals from the first checkpoint onward.
+None of that is the criterion: the criterion is the comparison at the end, and
+until 2026-10-02 the honest status is *in flight*. That is the same shape M1 had
+— code complete 2026-08-11, acceptance run passed 2026-08-28, seventeen days
+apart and nothing rotted, because the harness was rehearsed and the reasoning
 was written down.
 
 ### There is no `PaperVenue`

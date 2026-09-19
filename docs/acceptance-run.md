@@ -2,9 +2,9 @@
 
 **Status:** procedure · **Owner:** whoever starts it
 
-Six of the seven criteria in `data-contract.md` §7 are settled by a test suite and
-a command. The seventh is not:
-a command. The sixth is not:
+`data-contract.md` §7 lists seven criteria — count the boxes there, because that
+list is the authority on how many there are. Six of them are settled by a test
+suite and a command. The remaining one, which is the first in that list, is not:
 
 > It runs **7 consecutive days** unattended.
 
@@ -17,7 +17,8 @@ capture. The run's own account — what the week did, and the handful of things 
 taught — is in `CLAUDE.md` under *The acceptance run, and how it went*.
 
 What follows stays in the imperative, because it is the procedure for the *next*
-run rather than a memoir of the first. M5's fortnight already borrows most of it.
+run rather than a memoir of the first. M5's fortnight — in flight as this is
+written, 2026-09-18 → 2026-10-02 — borrows most of it.
 
 ---
 
@@ -37,9 +38,19 @@ whole raw tier was built to make checkable.
 ## Running it
 
 The harness exists twice: PowerShell (`ops/*.ps1`) for the Windows host it was
-written on, and a line-for-line macOS/bash port (`ops/*.sh`) for the Apple Silicon
-machine the run actually moved to. The two are behaviourally the same; the reasons
-are in each script's header and the design decisions did not change in the port.
+written on, and a macOS/bash port (`ops/*.sh`) for the Apple Silicon machine the
+run actually moved to. The reasons are in each script's header, and no design
+decision changed in the port.
+
+This used to say the port was *line-for-line* and that the two halves are
+behaviourally the same. That was true when it was written and is no longer true.
+M5 taught the bash half to run a paper session — `start-run.sh --paper`,
+`supervise.sh`'s mode argument, `verify-loop.sh` reconciling any journals it finds
+— and the PowerShell half was deliberately left alone, because those scripts exist
+for a Windows run that is not happening and an untested paper mode there would be
+exactly the harness-that-has-never-been-run this document insists on rehearsing.
+So: for **recording**, the halves still do the same thing and either may be used.
+For **paper**, only `ops/*.sh` can do it at all.
 
 ### macOS (Apple Silicon)
 
@@ -67,13 +78,12 @@ ops/stop-run.sh
 ```
 
 Rehearse the whole chain first — a harness that has never been run is not a
-harness: Rehearse the whole chain first — a harness that has never been run is not a
 harness: `ops/start-run.sh --minutes 5 --root ~/rehearsal` runs start → supervise
-→ record → verify → status → stop in a few minutes. Pass `--root`: `--minutes`
-shortens the run but does not move it, so a rehearsal without one files its frames
-in `data/acceptance` and preflight blocks the real run on a root that already
-holds captures — the check doing its job at the least convenient moment.
-status → stop in a few minutes against a throwaway root.
+→ record → verify → status → stop in a few minutes against a throwaway root. Pass
+`--root`: `--minutes` shortens the run but does not move it, so a rehearsal
+without one files its frames in `data/acceptance` and preflight blocks the real
+run on a root that already holds captures — the check doing its job at the least
+convenient moment.
 
 macOS specifics, all handled by the scripts unless noted:
 
@@ -118,19 +128,12 @@ six months later.
 
 | Script | Job |
 |---|---|
-| Script | Job |
-|---|---|
 | `preflight.{ps1,sh}` | Refuse to waste a week. Clock, disk, build, clean root, power. `preflight.sh` builds `--workspace --bins` rather than a named list, because a list of what the run needs went stale the moment `--paper` existed. |
 | `supervise.{ps1,sh}` | Keep one symbol recording; restart it if it dies. `supervise.sh` takes a mode, so it supervises a paper session the same way — a parameter rather than a second script, because two harnesses would have to agree forever. |
 | `verify-loop.{ps1,sh}` | Run the verifier every six hours, *during* the capture. `verify-loop.sh` reconciles any paper journals under the root on the same tick, for the same reason. |
 | `status.{ps1,sh}` | Answer "how is it going" in one command. |
 | `stop-run.{ps1,sh}` | Stop it in a way that still seals the files. |
 | `fix-clock.{ps1,sh}` | Turn network time on and step the clock: `w32time` on Windows (Administrator), `systemsetup` and `sntp` on macOS (sudo). |
-| `supervise.ps1` | Keep one symbol recording; restart it if it dies. |
-| `verify-loop.ps1` | Run the verifier every six hours, *during* the capture. |
-| `status.ps1` | Answer "how is it going" in one command. |
-| `stop-run.ps1` | Stop it in a way that still seals the files. |
-| `fix-clock.ps1` | Start and sync `w32time`. Needs Administrator. |
 
 ### Restarting is outside the recorder, deliberately
 
@@ -139,15 +142,36 @@ a process that knows it can no longer do its job should stop rather than carry o
 pretending. Keeping something running is a different concern with a different
 lifetime, and it lives in the supervisor.
 
-Nothing is lost across a restart, because the format was designed for it. A new
-process takes a **new session id**, writes its own files, and puts a
-`Gap{RecorderRestart}` in the very first frame — so a resumed capture states that
-coverage was interrupted rather than quietly abutting two runs and looking
-continuous. The verifier reads that record as the explanation for the
+Nothing is lost *from the capture* across a restart, because the format was
+designed for it. A new process takes a **new session id**, writes its own files,
+and puts a `Gap{RecorderRestart}` in the very first frame — so a resumed capture
+states that coverage was interrupted rather than quietly abutting two runs and
+looking continuous. The verifier reads that record as the explanation for the
 discontinuity it is about to find.
 
+**That sentence used to read "nothing is lost across a restart", flat, and the
+qualifier is load-bearing.** It is a claim about the raw tier and about nothing
+else. `supervise.sh` takes a mode, so the same loop restarts a *paper* process —
+and a paper process holds state that the journal does not carry. `JournalEntry`
+has `Started`, `Filled`, `Checkpoint`, `Tripped` and `Stopped`, and no strategy
+entry at all; `Engine::resuming` replaces the portfolio and only the portfolio. So
+a restarted paper session comes back with the right cash and the right position,
+which is exactly what the journal was built to guarantee, and with **empty
+indicator windows, a zeroed equity sampler and a zeroed daily risk tally**.
+
+For a capture that costs nothing. For M5's criterion it is fatal: the judging
+backtest runs that state continuously across the same boundary, so it takes a
+different set of trades, and an exact paper-versus-backtest comparison then fails
+for a reason that has nothing to do with live-versus-replay — which is the only
+thing the comparison is asking. It cannot be repaired after the fact. The
+consequence belongs to `paper-run.md`; it is recorded here because this is the
+document that says restarts are safe, and for a paper session they are safe only
+for the bytes.
+
 On a server this script is four lines of systemd (`Restart=always`). It is a
-script because this host is Windows, not because supervision wants to be bespoke.
+script — and by now two scripts, one per host — because the machines this has
+actually run on are a Windows laptop and a Mac, not because supervision wants to
+be bespoke.
 
 ### Verification runs during, not after
 
@@ -181,8 +205,33 @@ Read in this order:
 - **`queue` / `queue_peak` against `queue_capacity`** — the number §7 singles out.
   A steady zero means the writer keeps up. A peak approaching capacity means we
   came close to dropping without doing so.
-- **`clock_skew`** — venue timestamps *ahead* of ours. Non-zero means the host
-  clock is wrong, which makes every latency figure below it meaningless.
+- **`clock_skew`** — a **count of samples, not a duration**: how many messages in
+  the window carried a venue timestamp *ahead* of ours. Read it against
+  `latency_samples`, which is the count on the same line it is a fraction of. It
+  is deliberately kept out of the histogram, because folding a negative latency in
+  would turn a broken clock into an implausibly good number. A steady non-zero
+  count means the host clock is wrong, and then every latency figure on the line
+  is meaningless.
+
+  The millisecond *offset* — how far wrong, and the quantity the one-second
+  tolerance actually applies to — is a different measurement and **does not appear
+  on this line at all**. `preflight.{ps1,sh}` takes it before the run starts, and
+  the recorder takes it again at startup against the venue's `/api/v3/time`.
+  Reading `clock_skew` as milliseconds is an easy mistake, and **this repository
+  is still making it.** Present tense on purpose: this is open, not a war story.
+  `quant-explain::health` parses the field straight into one it calls
+  `clock_skew_ms`, and `explain` prints `clock skew <n>ms -- past Binance's own
+  tolerance for a signed request` whenever that number exceeds 1000 — so a window
+  carrying 1,200 skewed *samples* reads as a 1,200 ms offset, a count wearing a
+  duration's units against a threshold that means nothing to it. It is latent
+  rather than visible only because `clock_skew` has been 0 all fortnight, which is
+  the worst way for a defect to wait: nothing prints the wrong number until the
+  day the clock is genuinely wrong and the line is being read in a hurry. The fix
+  is to rename it `clock_skew_samples` and print it beside `latency_samples`,
+  which is the company it keeps — a change to `quant-explain`, not to this
+  procedure, which is why this paragraph names it rather than claiming it. Until
+  then: the field on this line is a count, and the `_ms` in `explain`'s rendering
+  of it is wrong.
 - **`gap_disconnect`** — a few a day is Binance behaving as documented. Dozens an
   hour is a network problem.
 - **latency percentiles** — a step change matters more than the absolute value.
@@ -203,8 +252,12 @@ Exit `0` is the run passing. Then walk §7 explicitly:
 
 - [ ] Seven consecutive days — `run.json` and the supervisor logs.
 - [ ] Disconnects produced a gap, a backoff reconnect, and a fresh snapshot —
-      `gap_disconnect` counts against `snapshots` in the logs, and the verifier
-      finding no `unanchored-deltas`.
+      `gap_disconnect` counts against `snapshots` in the logs.
+- [ ] Every delta is anchored somewhere inside its connection **episode**, by a
+      snapshot or by a recorded `SnapshotFailed` saying why not — the verifier
+      finding no `unanchored-deltas`. This is a criterion of its own in §7, and it
+      used to be folded into the line above, which is how this checklist came to
+      carry six boxes for seven criteria.
 - [ ] `SIGKILL` mid-write leaves a readable file — already an ordinary unit test
       (`truncation_at_every_byte_offset_loses_only_the_tail`); if the run had a
       hard kill, the affected segment should verify with a `torn-tail` warning and
