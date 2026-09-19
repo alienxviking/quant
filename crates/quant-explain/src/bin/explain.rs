@@ -92,6 +92,7 @@ fn main() -> ExitCode {
         &args.symbol,
         instrument,
         args.at,
+        args.window_nanos,
     ) {
         Ok(market) => market,
         Err(e) => {
@@ -110,6 +111,7 @@ fn main() -> ExitCode {
         Err(e) => outln!("ours      could not read {}: {e}", journal.display()),
     }
 
+    print_window(&market);
     print_health(&args);
     print_provenance(&args, &market);
     ExitCode::SUCCESS
@@ -291,6 +293,47 @@ fn print_ours(
 /// 60-second-window figures with nothing marking which is which, and
 /// `queue_peak=270` beside `queue=0` is how an operator concludes the wrong
 /// thing at 3am.
+/// What happened across the span, when one was asked for.
+fn print_window(market: &MarketAt) {
+    let Some(window) = &market.window else {
+        return;
+    };
+    outln!(
+        "window    the {} to {}: {} trades, {} deltas, {} snapshots",
+        span(window.span_nanos),
+        market.at.to_rfc3339(),
+        window.trades,
+        window.deltas,
+        window.snapshots
+    );
+    if let (Some(low), Some(high)) = (window.low, window.high) {
+        outln!("          traded {low} to {high}, {} volume", window.volume);
+    } else {
+        // A fact, not a zero: nothing traded is different from a price of zero.
+        outln!("          nothing traded in this span");
+    }
+    if window.gaps.is_empty() {
+        outln!("          no gaps -- we could see the whole span");
+    } else {
+        outln!("          {} gaps inside the span:", window.gaps.len());
+        for gap in &window.gaps {
+            outln!("            {:?} at {}", gap.cause, gap.at.to_rfc3339());
+        }
+    }
+}
+
+/// A nanosecond span in the units it was probably asked in.
+fn span(nanos: i64) -> String {
+    let secs = nanos / 1_000_000_000;
+    if secs % 3_600 == 0 {
+        format!("{}h", secs / 3_600)
+    } else if secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn print_health(args: &Args) {
     match quant_explain::health_at(&args.root, &args.symbol, args.at) {
         Err(why) => outln!("health    {why}"),
@@ -374,6 +417,9 @@ struct Args {
     as_typed: String,
     journal: Option<PathBuf>,
     check_journal: Option<PathBuf>,
+    /// Zero means "just the instant", which is the window of length zero and
+    /// takes the same code path.
+    window_nanos: i64,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -383,6 +429,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut as_typed = String::new();
     let mut journal = None;
     let mut check_journal = None;
+    let mut window_nanos = 0_i64;
 
     let mut remaining = std::env::args().skip(1);
     while let Some(arg) = remaining.next() {
@@ -395,6 +442,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-h" | "--help" => {
                 outln!(
                     "usage: explain [DATA_ROOT] --at <RFC3339> [--symbol SYM] [--journal PATH]\n\
+                     \x20      [--window 5m]  summarise the span ending at --at\n\
                      \x20      explain --check-journal PATH\n\
                      \x20      --at needs a UTC offset: `...Z` or `...+05:30`"
                 );
@@ -408,6 +456,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--symbol" => symbol = value()?,
             "--journal" => journal = Some(PathBuf::from(value()?)),
             "--check-journal" => check_journal = Some(PathBuf::from(value()?)),
+            "--window" => window_nanos = parse_span(&value()?)?,
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other => root = PathBuf::from(other),
         }
@@ -420,6 +469,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             as_typed: String::new(),
             journal,
             check_journal: Some(path),
+            window_nanos: 0,
         }));
     }
     let at = at.ok_or_else(|| {
@@ -434,5 +484,37 @@ fn parse_args() -> Result<Option<Args>, String> {
         as_typed,
         journal,
         check_journal: None,
+        window_nanos,
     }))
+}
+
+/// A span like `5m`, `90s` or `2h`, in nanoseconds.
+///
+/// The same unit-suffixed shape `ops/verify-loop.sh` takes, for the same reason:
+/// an unsuffixed number would need a documented default that every reader has to
+/// remember. Here there is no sensible default at all -- a bare `5` could be
+/// seconds or minutes and the difference is a factor of sixty -- so the suffix is
+/// required rather than merely allowed.
+fn parse_span(text: &str) -> Result<i64, String> {
+    let (digits, scale) = match text.as_bytes().last() {
+        Some(b's') => (&text[..text.len() - 1], 1_000_000_000_i64),
+        Some(b'm') => (&text[..text.len() - 1], 60 * 1_000_000_000),
+        Some(b'h') => (&text[..text.len() - 1], 3_600 * 1_000_000_000),
+        _ => {
+            return Err(format!(
+                "--window {text:?} needs a unit: `30s`, `5m` or `2h`. A bare number \
+                 would need a default nobody would remember, and seconds versus \
+                 minutes is a factor of sixty"
+            ))
+        }
+    };
+    let magnitude: i64 = digits
+        .parse()
+        .map_err(|_| format!("--window {text:?} is not a number and a unit"))?;
+    if magnitude <= 0 {
+        return Err("--window must be positive; a span ends at --at and runs backwards".to_owned());
+    }
+    magnitude
+        .checked_mul(scale)
+        .ok_or_else(|| format!("--window {text:?} is longer than time"))
 }
