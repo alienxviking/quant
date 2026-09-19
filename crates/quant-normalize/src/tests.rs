@@ -153,7 +153,6 @@ impl Frame {
     }
 }
 
-/// A `depthUpdate` covering `[first, last]` that moves the best bid.
 /// The UTC date the fixtures file day `d` under.
 fn day(d: u8) -> UtcDate {
     UtcDate {
@@ -163,6 +162,7 @@ fn day(d: u8) -> UtcDate {
     }
 }
 
+/// A `depthUpdate` covering `[first, last]` that moves the best bid.
 fn delta(seq: u64, first: u64, last: u64, bid: &str) -> Frame {
     Frame::Stream {
         seq,
@@ -1212,20 +1212,15 @@ fn a_days_parts_are_read_in_venue_order_not_index_order() {
     let _ = normalize_session(second[0], instrument(), Some(&out));
     let _ = normalize_session(first[0], instrument(), Some(&out));
 
-    let ids: Vec<u64> = TierReplay::open(
-        &out,
-        Exchange::Binance,
-        SYMBOL,
-        instrument(),
-        vec![day(21)],
-    )
-    .map(|e| e.expect("replay"))
-    .filter_map(|e| match e {
-        MarketEvent::BookDelta(d) => Some(d.final_update_id),
-        MarketEvent::BookSnapshot(s) => Some(s.last_update_id),
-        MarketEvent::Trade(_) | MarketEvent::Gap(_) => None,
-    })
-    .collect();
+    let ids: Vec<u64> =
+        TierReplay::open(&out, Exchange::Binance, SYMBOL, instrument(), vec![day(21)])
+            .map(|e| e.expect("replay"))
+            .filter_map(|e| match e {
+                MarketEvent::BookDelta(d) => Some(d.final_update_id),
+                MarketEvent::BookSnapshot(s) => Some(s.last_update_id),
+                MarketEvent::Trade(_) | MarketEvent::Gap(_) => None,
+            })
+            .collect();
 
     assert_eq!(
         ids,
