@@ -363,10 +363,15 @@ fn print_health(args: &Args) {
                     health.gap_sequence
                 );
             }
-            if health.clock_skew_ms.abs() > 1_000 {
+            if health.clock_skew_samples > 0 {
+                // A count, not a duration. This line used to read
+                // "clock skew {}ms -- past Binance's own tolerance", which
+                // reported the number of affected messages as an offset in
+                // milliseconds and fired at a thousand of them.
                 outln!(
-                    "          clock skew {}ms -- past Binance's own tolerance for a signed request",
-                    health.clock_skew_ms
+                    "          {} of {} latency samples that minute were stamped ahead of our clock",
+                    health.clock_skew_samples,
+                    health.latency_samples
                 );
             }
         }
