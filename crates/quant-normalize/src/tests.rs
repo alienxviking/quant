@@ -153,7 +153,6 @@ impl Frame {
     }
 }
 
-/// A `depthUpdate` covering `[first, last]` that moves the best bid.
 /// The UTC date the fixtures file day `d` under.
 fn day(d: u8) -> UtcDate {
     UtcDate {
@@ -163,6 +162,7 @@ fn day(d: u8) -> UtcDate {
     }
 }
 
+/// A `depthUpdate` covering `[first, last]` that moves the best bid.
 fn delta(seq: u64, first: u64, last: u64, bid: &str) -> Frame {
     Frame::Stream {
         seq,
@@ -830,7 +830,7 @@ fn concurrent_sessions_are_refused_rather_than_concatenated() {
         result
             .write_error
             .as_ref()
-            .is_some_and(|e| e.contains("not sequential")),
+            .is_some_and(|e| e.contains("overlap")),
         "{:?}",
         result.write_error
     );
@@ -1107,4 +1107,124 @@ fn a_tampered_value_is_caught_rather_than_averaged_away() {
 
     let agreement = check_session(&session, instrument(), &out);
     assert!(!agreement.agrees(), "one altered price must not pass");
+}
+
+#[test]
+fn a_restart_merges_whichever_order_the_sessions_are_normalized_in() {
+    // The defect this test was written for, and it went red on the code that
+    // shipped in M2.e. `two_sessions_on_one_day_are_merged_into_parts` always
+    // normalizes the earlier session first -- so it pinned the lucky half of a
+    // coin flip and never saw the other half.
+    //
+    // A part's index comes from arrival order, arrival order is `catalog` order,
+    // and `catalog` sorts paths whose session component is a v4 UUID. Nothing
+    // about that is chronological. The old check demanded that the arriving part
+    // start after every published one, so the *earlier* session was refused
+    // whenever it happened to be normalized second -- and `normalize` abandons
+    // the writer on a refusal, taking the rest of that session's days with it.
+    //
+    // One restart in the fortnight would have hit this with probability one half.
+    use crate::normalize_session;
+
+    const RESTARTED: [u8; 16] = [0xaa; 16];
+
+    let tree = Tree::new("restart-either-order");
+    two_day_session(&tree);
+    tree.segment_for(
+        RESTARTED,
+        21,
+        &[snapshot(1, 200), delta(2, 201, 201, "201.00000000")],
+    );
+    let out = tree.root.join("out");
+
+    let sessions = tree.sessions();
+    let (first, second) = sessions
+        .iter()
+        .partition::<Vec<_>, _>(|s| s.session_id == SESSION);
+
+    // Deliberately backwards: the session that recorded *later* is normalized
+    // first, which is what a UUID sort does half the time.
+    let b = normalize_session(second[0], instrument(), Some(&out));
+    assert!(b.write_error.is_none(), "{:?}", b.write_error);
+    let a = normalize_session(first[0], instrument(), Some(&out));
+    assert!(
+        a.write_error.is_none(),
+        "the earlier session must not be refused for arriving second: {:?}",
+        a.write_error
+    );
+
+    // The index records arrival, not chronology, and that is now allowed to be
+    // true -- the later session holds part 0 here.
+    let shared = a
+        .written
+        .as_ref()
+        .expect("written")
+        .days
+        .iter()
+        .find(|d| d.date == day(21))
+        .expect("the shared day was written");
+    assert_eq!(shared.part, 1, "arrival order still assigns the index");
+
+    // And nothing about the day it does *not* share was lost to the refusal.
+    assert!(
+        a.written
+            .as_ref()
+            .expect("written")
+            .days
+            .iter()
+            .any(|d| d.date == day(22)),
+        "the rest of the abandoned session's days must still be written"
+    );
+
+    for files in &sessions {
+        let agreement = crate::check_session(files, instrument(), &out);
+        assert!(agreement.agrees(), "{:?}", agreement.divergence);
+    }
+}
+
+#[test]
+fn a_days_parts_are_read_in_venue_order_not_index_order() {
+    // The other half of the same defect, and the more dangerous half: the old
+    // reader walked parts by index. Had the write above been allowed, a backtest
+    // over the shared day would have seen the afternoon before the morning with
+    // nothing anywhere saying so -- a book reconstructed from events in the
+    // wrong order, which is the failure this project has spent two milestones
+    // making impossible.
+    use crate::normalize_session;
+    use crate::tier::TierReplay;
+
+    const RESTARTED: [u8; 16] = [0xaa; 16];
+
+    let tree = Tree::new("read-venue-order");
+    two_day_session(&tree);
+    tree.segment_for(
+        RESTARTED,
+        21,
+        &[snapshot(1, 200), delta(2, 201, 201, "201.00000000")],
+    );
+    let out = tree.root.join("out");
+
+    let sessions = tree.sessions();
+    let (first, second) = sessions
+        .iter()
+        .partition::<Vec<_>, _>(|s| s.session_id == SESSION);
+    // Backwards again, so the later stretch of the market is in part 0.
+    let _ = normalize_session(second[0], instrument(), Some(&out));
+    let _ = normalize_session(first[0], instrument(), Some(&out));
+
+    let ids: Vec<u64> =
+        TierReplay::open(&out, Exchange::Binance, SYMBOL, instrument(), vec![day(21)])
+            .map(|e| e.expect("replay"))
+            .filter_map(|e| match e {
+                MarketEvent::BookDelta(d) => Some(d.final_update_id),
+                MarketEvent::BookSnapshot(s) => Some(s.last_update_id),
+                MarketEvent::Trade(_) | MarketEvent::Gap(_) => None,
+            })
+            .collect();
+
+    assert_eq!(
+        ids,
+        vec![100, 101, 102, 200, 201],
+        "the day must read back in the venue's order, not in part-index order"
+    );
 }

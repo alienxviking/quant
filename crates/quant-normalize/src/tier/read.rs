@@ -364,7 +364,8 @@ impl TierReplay {
     /// Open the next part's four files. `false` when there is nothing left.
     ///
     /// Walks parts within the open day first, then moves to the next day, so the
-    /// stream is day order outside and part order inside.
+    /// stream is day order outside and venue-sequence order inside — see
+    /// [`Self::order_by_span`] for why that is not the same as part-index order.
     fn advance(&mut self) -> Result<bool, TierError> {
         loop {
             if let Some(part) = self.parts.next() {
@@ -412,8 +413,62 @@ impl TierReplay {
                 });
             }
             self.open_date = Some(date);
-            self.parts = parts.into_iter();
+            self.parts = self.order_by_span(date, parts)?.into_iter();
         }
+    }
+
+    /// Put a day's parts into the order the *market* was in.
+    ///
+    /// A part's index is not its position in time. `PartitionWriter::place`
+    /// assigns it in arrival order — which session happened to be normalized
+    /// first — and that order comes from `catalog`, which sorts paths whose
+    /// session component is a **v4 UUID**. Reading parts by index therefore put a
+    /// restart's two halves in a random order half the time, and a backtest over
+    /// that day would have seen the afternoon before the morning with nothing
+    /// anywhere saying so.
+    ///
+    /// The venue's update-id span in each footer is the honest key: strictly
+    /// increasing per symbol across disconnects, immune to anything our clock
+    /// does, and already written into all four files of every part by
+    /// [`super::partition`]. The writer guarantees the spans are disjoint, so
+    /// ordering by either end gives the same answer.
+    ///
+    /// **One part is not charged a footer read**, which is every ordinary day.
+    /// That keeps this a fix to the merge case rather than a change to how each
+    /// of the 16 single-session days already on disk is read.
+    fn order_by_span(&self, date: UtcDate, parts: Vec<u32>) -> Result<Vec<u32>, TierError> {
+        if parts.len() < 2 {
+            return Ok(parts);
+        }
+        let mut keyed = Vec::with_capacity(parts.len());
+        for part in parts {
+            let target = TierTarget {
+                exchange: self.exchange,
+                symbol: self.symbol.clone(),
+                date,
+                dataset: Dataset::ALL[0],
+                part,
+            };
+            let path = target.file(&self.root);
+            // Refusing beats guessing, and index order is a guess. The writer
+            // will not publish a second part unless every part of the day has a
+            // span, so reaching this means the directory was assembled by
+            // something else -- and the tier is disposable, so re-deriving is
+            // cheap where handing out a wrong order is not.
+            let Some((first, _)) = super::Provenance::book_span_of(&path)? else {
+                return Err(TierError::PartOrderUnknowable {
+                    date: date.to_string(),
+                    detail: format!(
+                        "{} records no venue sequence, so this day's {} parts cannot be put in order",
+                        path.display(),
+                        keyed.len() + 1
+                    ),
+                });
+            };
+            keyed.push((first, part));
+        }
+        keyed.sort_unstable();
+        Ok(keyed.into_iter().map(|(_, part)| part).collect())
     }
 
     /// Open one part's four dataset files and prime a head from each.

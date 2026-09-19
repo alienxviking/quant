@@ -24,17 +24,29 @@
 //! foreground of its restart loop and reads its exit code before respawning, so
 //! the dead process is dead before the next one starts. A merged day is therefore
 //! a **concatenation**, not an interleave, and a file boundary is the exact and
-//! free encoding of a concatenation: one part per contributing session, in
-//! capture order. Nothing inside a row changes, which is forced rather than
-//! chosen — `normalize --check` compares whole `MarketEvent` values with `==`,
-//! and `EventMeta` includes `ingest_seq`, so renumbering rows would fail at the
-//! first event with no tolerance available.
+//! free encoding of a concatenation: one part per contributing session. Nothing
+//! inside a row changes, which is forced rather than chosen — `normalize
+//! --check` compares whole `MarketEvent` values with `==`, and `EventMeta`
+//! includes `ingest_seq`, so renumbering rows would fail at the first event with
+//! no tolerance available.
 //!
-//! The ordering key is `(part, ingest_seq)`, lexicographic. Within a part
-//! `ingest_seq` is unique and strictly increasing; across parts the index is
-//! distinct by construction *and* is enforced to be capture order, so a reader
-//! that concatenates parts in index order gets the stream a single uninterrupted
-//! consumer would have seen.
+//! # A part's index is its name, not its position
+//!
+//! The ordering key is `(book_seq_first, ingest_seq)`. Within a part
+//! `ingest_seq` is unique and strictly increasing, so it orders the four
+//! datasets against each other. **Across parts the order comes from the venue's
+//! update-id span in each file's footer, never from the index.**
+//!
+//! This paragraph used to say the index *was* capture order, and that was wrong.
+//! `PartitionWriter::place` assigns an index in arrival order — which session
+//! happened to be normalized first — and that order comes from `catalog`, which
+//! sorts paths whose session component is a v4 UUID. A restart's two halves
+//! therefore landed in a random order, and the writer's order check refused the
+//! earlier session outright about half the time. `PartitionWriter::check_disjoint`
+//! and `TierReplay::order_by_span` carry both halves of the repair.
+//!
+//! What the index still does is make a part a distinct file with a stable name,
+//! which is all a concatenation needs from it.
 //!
 //! The two interesting encoding decisions — money as `DECIMAL(18,8)` and the
 //! instrument being absent — are argued in [`schema`].
@@ -71,8 +83,10 @@ pub struct TierTarget {
     pub dataset: Dataset,
     /// Which contributing session's slice of the day this is, from zero.
     ///
-    /// Not a session id: the index says *order*, which is the only thing a
-    /// reader needs, and the id is in the footer for anyone who wants identity.
+    /// Not a session id, and **not a position in time**: it is a short unique
+    /// name for one session's slice, assigned in the order slices happened to be
+    /// written. The id is in the footer for anyone who wants identity, and the
+    /// update-id span beside it is what puts the slices in order.
     pub part: u32,
 }
 
@@ -89,9 +103,10 @@ impl TierTarget {
 
     /// Full path of this part's file.
     ///
-    /// Zero-padded so lexical order is numeric order, which is what lets a
-    /// reader sort names as text and get capture order. The raw tier pins the
-    /// same property for the same reason.
+    /// Zero-padded so lexical order is numeric order, which keeps a directory
+    /// listing readable and makes `part-00010` sort after `part-00009` for every
+    /// tool that globs. The raw tier pins the same property. It is *not* what
+    /// orders a day's parts — see this module's header.
     #[must_use]
     pub fn file(&self, root: &Path) -> PathBuf {
         self.directory(root).join(part_file_name(self.part))
@@ -215,16 +230,24 @@ pub enum TierError {
     NoPartsForDay {
         date: String,
     },
-    /// The incoming part does not follow the parts already published.
+    /// Two parts of one day cover overlapping venue update ids.
     ///
-    /// Sessions are sequential, so a later session's book sequence must start
-    /// after the earlier one's ends. When it does not, the two were not
-    /// sequential — concurrent recorders on one symbol — and concatenating them
-    /// would hand out an order the market never had.
-    PartsOutOfOrder {
+    /// A restart is sequential — `supervise.sh` reads the dead recorder's exit
+    /// code before starting the next — so two sessions on one symbol-day hold
+    /// disjoint stretches of the venue's sequence. Overlap means they were
+    /// *concurrent*: two recorders on one symbol at one time, and there is no
+    /// ordering of two simultaneous recordings of the same messages that is the
+    /// truth. So this refuses rather than picking one.
+    ///
+    /// It deliberately says nothing about which part arrived first. Parts are
+    /// published in the order sessions happen to be normalized, which is catalog
+    /// order, which is a v4 UUID sort — arrival order carries no information
+    /// about the market and is not evidence of anything. Order comes from the
+    /// spans at read time; this check only establishes that an order exists.
+    PartsConcurrent {
         date: String,
-        existing_last: u64,
-        writing_first: u64,
+        published: (u64, u64),
+        incoming: (u64, u64),
     },
 }
 
@@ -265,13 +288,14 @@ impl core::fmt::Display for TierError {
             Self::NoPartsForDay { date } => {
                 write!(f, "{date} holds no parts under the normalized tier")
             }
-            Self::PartsOutOfOrder {
+            Self::PartsConcurrent {
                 date,
-                existing_last,
-                writing_first,
+                published,
+                incoming,
             } => write!(
                 f,
-                "on {date} the published parts run to venue update id {existing_last} but the incoming part starts at {writing_first}, so these sessions were not sequential"
+                "on {date} a published part covers venue update ids {}..={} and the incoming part covers {}..={}; these overlap, so the two sessions recorded the same messages at the same time and cannot be concatenated",
+                published.0, published.1, incoming.0, incoming.1
             ),
         }
     }
