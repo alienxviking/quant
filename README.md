@@ -113,15 +113,16 @@ ops/
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | done |
 | M3 | Engine seam + SimulatedVenue + MA crossover | Equity curve produced, and it is unimpressive | done |
 | M4 | Fee, slippage and latency modelling | Results degrade sensibly under realistic costs | done |
-| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | code done, run pending |
+| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | **run in flight** |
 | M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | done |
-| M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | |
+| M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | done |
 | M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance | |
 
 Milestones have **acceptance criteria, not feature lists**. "Done" means the
-criterion passes — which is why M5 sits at *code done, run pending*: everything is
-built and rehearsed against the live venue, and its criterion is two weeks of wall
-clock. `docs/paper-run.md` is the procedure.
+criterion passes — which is why M5 sits at *run in flight*: everything is built
+and rehearsed against the live venue, and its criterion is two weeks of wall
+clock, started 2026-09-18 and ending 2026-10-02. `docs/paper-run.md` is the
+procedure and `docs/observability.md` is M7's.
 
 **M1's acceptance run** — the one criterion only time can satisfy — was spent in
 full: seven days unattended on an Apple Silicon Mac, 2026-08-21 → 2026-08-28,
