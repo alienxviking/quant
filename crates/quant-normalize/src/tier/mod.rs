@@ -24,17 +24,29 @@
 //! foreground of its restart loop and reads its exit code before respawning, so
 //! the dead process is dead before the next one starts. A merged day is therefore
 //! a **concatenation**, not an interleave, and a file boundary is the exact and
-//! free encoding of a concatenation: one part per contributing session, in
-//! capture order. Nothing inside a row changes, which is forced rather than
-//! chosen — `normalize --check` compares whole `MarketEvent` values with `==`,
-//! and `EventMeta` includes `ingest_seq`, so renumbering rows would fail at the
-//! first event with no tolerance available.
+//! free encoding of a concatenation: one part per contributing session. Nothing
+//! inside a row changes, which is forced rather than chosen — `normalize
+//! --check` compares whole `MarketEvent` values with `==`, and `EventMeta`
+//! includes `ingest_seq`, so renumbering rows would fail at the first event with
+//! no tolerance available.
 //!
-//! The ordering key is `(part, ingest_seq)`, lexicographic. Within a part
-//! `ingest_seq` is unique and strictly increasing; across parts the index is
-//! distinct by construction *and* is enforced to be capture order, so a reader
-//! that concatenates parts in index order gets the stream a single uninterrupted
-//! consumer would have seen.
+//! # A part's index is its name, not its position
+//!
+//! The ordering key is `(book_seq_first, ingest_seq)`. Within a part
+//! `ingest_seq` is unique and strictly increasing, so it orders the four
+//! datasets against each other. **Across parts the order comes from the venue's
+//! update-id span in each file's footer, never from the index.**
+//!
+//! This paragraph used to say the index *was* capture order, and that was wrong.
+//! `PartitionWriter::place` assigns an index in arrival order — which session
+//! happened to be normalized first — and that order comes from `catalog`, which
+//! sorts paths whose session component is a v4 UUID. A restart's two halves
+//! therefore landed in a random order, and the writer's order check refused the
+//! earlier session outright about half the time. `PartitionWriter::check_disjoint`
+//! and `TierReplay::order_by_span` carry both halves of the repair.
+//!
+//! What the index still does is make a part a distinct file with a stable name,
+//! which is all a concatenation needs from it.
 //!
 //! The two interesting encoding decisions — money as `DECIMAL(18,8)` and the
 //! instrument being absent — are argued in [`schema`].
@@ -71,8 +83,10 @@ pub struct TierTarget {
     pub dataset: Dataset,
     /// Which contributing session's slice of the day this is, from zero.
     ///
-    /// Not a session id: the index says *order*, which is the only thing a
-    /// reader needs, and the id is in the footer for anyone who wants identity.
+    /// Not a session id, and **not a position in time**: it is a short unique
+    /// name for one session's slice, assigned in the order slices happened to be
+    /// written. The id is in the footer for anyone who wants identity, and the
+    /// update-id span beside it is what puts the slices in order.
     pub part: u32,
 }
 
@@ -89,9 +103,10 @@ impl TierTarget {
 
     /// Full path of this part's file.
     ///
-    /// Zero-padded so lexical order is numeric order, which is what lets a
-    /// reader sort names as text and get capture order. The raw tier pins the
-    /// same property for the same reason.
+    /// Zero-padded so lexical order is numeric order, which keeps a directory
+    /// listing readable and makes `part-00010` sort after `part-00009` for every
+    /// tool that globs. The raw tier pins the same property. It is *not* what
+    /// orders a day's parts — see this module's header.
     #[must_use]
     pub fn file(&self, root: &Path) -> PathBuf {
         self.directory(root).join(part_file_name(self.part))
