@@ -154,6 +154,7 @@ fn an_instant_inside_the_capture_gets_a_book() {
         SYMBOL,
         instrument(),
         at(21, 102),
+        0,
     )
     .expect("the instant is covered");
 
@@ -179,6 +180,7 @@ fn an_instant_before_the_capture_refuses_rather_than_answering() {
         SYMBOL,
         instrument(),
         at(21, 50),
+        0,
     );
     assert!(
         answer.is_err(),
@@ -214,6 +216,7 @@ fn a_gap_is_reported_as_blindness_and_never_as_a_stale_book() {
         SYMBOL,
         instrument(),
         at(21, 103),
+        0,
     )
     .expect("the instant is covered");
 
@@ -248,6 +251,7 @@ fn a_gap_after_the_instant_says_when_the_blindness_began() {
         SYMBOL,
         instrument(),
         at(21, 101),
+        0,
     )
     .expect("covered");
 
@@ -271,6 +275,7 @@ fn an_unanchored_stretch_refuses_rather_than_inventing_a_book() {
         SYMBOL,
         instrument(),
         at(21, 101),
+        0,
     )
     .expect("covered -- there are events, just no anchor");
 
@@ -298,6 +303,7 @@ fn the_previous_day_is_read_when_the_instant_has_no_anchor_of_its_own() {
         SYMBOL,
         instrument(),
         at(22, 101),
+        0,
     )
     .expect("covered");
 
@@ -319,6 +325,7 @@ fn an_empty_root_says_so_rather_than_answering_emptily() {
         SYMBOL,
         instrument(),
         at(21, 100),
+        0,
     );
     assert!(answer.is_err(), "no capture is an error, not an empty book");
 }
@@ -337,6 +344,123 @@ fn a_symbol_that_was_never_captured_is_not_answered_from_another() {
         "ETHUSDT",
         instrument(),
         at(21, 101),
+        0,
     );
     assert!(answer.is_err(), "a symbol with no capture must refuse");
+}
+
+#[test]
+fn a_window_summarises_what_happened_across_the_span() {
+    // Deltas at 100..103, so a 2-second window ending at 102 covers the events
+    // at 101 and 102 and excludes the one at 100.
+    let tree = Tree::new("window");
+    tree.segment(
+        21,
+        100,
+        1,
+        &[
+            Frame::Snapshot(100),
+            Frame::Delta(101),
+            Frame::Delta(102),
+            Frame::Delta(103),
+        ],
+    );
+
+    let answer = market_at(
+        &tree.root,
+        Exchange::Binance,
+        SYMBOL,
+        instrument(),
+        at(21, 102),
+        2 * 1_000_000_000,
+    )
+    .expect("covered");
+
+    // Half-open, `(at - span, at]`: the deltas at 101 and 102 are in, and the
+    // snapshot exactly on the opening seam at 100 is out. Inclusive at both ends
+    // would put a seam event into two adjacent windows, so stepping through a
+    // run five minutes at a time would count it twice.
+    let window = answer.window.expect("a window was asked for");
+    assert_eq!(window.deltas, 2, "the deltas at 101 and 102");
+    assert_eq!(window.snapshots, 0, "the snapshot is on the opening seam");
+    assert_eq!(window.trades, 0);
+}
+
+#[test]
+fn a_window_reports_the_gaps_inside_it() {
+    // The question a span is usually asked in order to answer: were we blind at
+    // any point in this stretch, not merely at its end?
+    let tree = Tree::new("window-gap");
+    tree.segment(
+        21,
+        100,
+        1,
+        &[
+            Frame::Snapshot(100),
+            Frame::Gap,
+            Frame::Snapshot(200),
+            Frame::Delta(201),
+        ],
+    );
+
+    let answer = market_at(
+        &tree.root,
+        Exchange::Binance,
+        SYMBOL,
+        instrument(),
+        at(21, 103),
+        10 * 1_000_000_000,
+    )
+    .expect("covered");
+
+    // The book is live again -- the second snapshot re-anchored it -- so the
+    // instant alone would say nothing was wrong. The window is what shows the
+    // blindness in the middle.
+    assert!(answer.book.is_some(), "re-anchored by the second snapshot");
+    let window = answer.window.expect("a window");
+    assert_eq!(window.gaps.len(), 1, "the gap inside the span is reported");
+    assert_eq!(window.gaps[0].at, at(21, 101));
+}
+
+#[test]
+fn no_window_asked_for_means_no_window_reported() {
+    // The instant is the window of length zero and takes the same path, but it
+    // must not *claim* a span it was not asked about.
+    let tree = Tree::new("window-none");
+    tree.segment(21, 100, 1, &[Frame::Snapshot(100), Frame::Delta(101)]);
+
+    let answer = market_at(
+        &tree.root,
+        Exchange::Binance,
+        SYMBOL,
+        instrument(),
+        at(21, 101),
+        0,
+    )
+    .expect("covered");
+    assert!(answer.window.is_none());
+}
+
+#[test]
+fn a_window_that_reaches_before_the_data_summarises_what_there_is() {
+    // Not an error. Asking for the last hour of a run that started ten minutes
+    // ago is an ordinary thing to do, and the honest answer is the ten minutes
+    // -- the span is a filter on what was read, not a claim that the whole span
+    // was covered.
+    let tree = Tree::new("window-long");
+    tree.segment(21, 100, 1, &[Frame::Snapshot(100), Frame::Delta(101)]);
+
+    let answer = market_at(
+        &tree.root,
+        Exchange::Binance,
+        SYMBOL,
+        instrument(),
+        at(21, 101),
+        3_600 * 1_000_000_000,
+    )
+    .expect("covered");
+
+    let window = answer.window.expect("a window");
+    assert_eq!(window.deltas, 1);
+    assert_eq!(window.snapshots, 1, "everything there is, and no more");
 }

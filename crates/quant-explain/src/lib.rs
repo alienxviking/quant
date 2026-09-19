@@ -74,6 +74,33 @@ pub struct MarketAt {
     pub no_book_reason: Option<String>,
     /// Events read to get here, for the report.
     pub events_read: u64,
+    /// What happened across the window ending at `at`, when one was asked for.
+    ///
+    /// The instant answer is the window of length zero, and the code path is
+    /// the same either way: the replay already walks every event up to `at`, so
+    /// summarising the tail of that walk costs one comparison per event and no
+    /// second pass. A separate "window mode" would have been a second traversal
+    /// that must agree with the first forever.
+    pub window: Option<WindowSummary>,
+}
+
+/// What the market did over a span, as a byproduct of reaching its end.
+#[derive(Debug, Clone, Default)]
+pub struct WindowSummary {
+    /// How long the span is.
+    pub span_nanos: i64,
+    pub trades: u64,
+    pub deltas: u64,
+    pub snapshots: u64,
+    /// Gaps inside the window, with their causes -- the question a span is
+    /// usually asked in order to answer.
+    pub gaps: Vec<GapAt>,
+    /// The extremes of the traded price across the span. `None` if nothing
+    /// traded, which is a fact rather than a zero.
+    pub low: Option<quant_core::fixed::Px>,
+    pub high: Option<quant_core::fixed::Px>,
+    /// Traded volume, in base units.
+    pub volume: quant_core::fixed::Qty,
 }
 
 /// The touch, and how deep the book was.
@@ -176,6 +203,7 @@ pub fn market_at(
     symbol: &str,
     instrument: InstrumentId,
     at: Ts,
+    window_nanos: i64,
 ) -> Result<MarketAt, ExplainError> {
     let found = catalog(root);
     if found.sessions.is_empty() {
@@ -207,10 +235,10 @@ pub fn market_at(
         if !covers {
             continue;
         }
-        let answer = scan(files, instrument, at, false);
+        let answer = scan(files, instrument, at, window_nanos, false);
         // An unanchored book is the boundary case the previous day fixes.
         let answer = if answer.book.is_none() && answer.events_read > 0 {
-            scan(files, instrument, at, true)
+            scan(files, instrument, at, window_nanos, true)
         } else {
             answer
         };
@@ -232,7 +260,13 @@ pub fn market_at(
 }
 
 /// Replay one session up to `at`, optionally including the preceding day.
-fn scan(files: &SessionFiles, instrument: InstrumentId, at: Ts, widen: bool) -> MarketAt {
+fn scan(
+    files: &SessionFiles,
+    instrument: InstrumentId,
+    at: Ts,
+    window_nanos: i64,
+    widen: bool,
+) -> MarketAt {
     let day = at.utc_date();
     let previous = quant_core::time::UtcDate::from_days_since_epoch(day.days_since_epoch() - 1);
 
@@ -264,6 +298,10 @@ fn scan(files: &SessionFiles, instrument: InstrumentId, at: Ts, widen: bool) -> 
         gap_after: None,
         no_book_reason: None,
         events_read: 0,
+        window: (window_nanos > 0).then(|| WindowSummary {
+            span_nanos: window_nanos,
+            ..WindowSummary::default()
+        }),
     };
     if wanted.is_empty() {
         out.no_book_reason = Some("no segment covers that day".to_owned());
@@ -303,6 +341,15 @@ fn scan(files: &SessionFiles, instrument: InstrumentId, at: Ts, widen: bool) -> 
                 out.events_read += 1;
                 out.last_event_ts = Some(ts);
                 book.apply(&event);
+                if let Some(window) = out.window.as_mut() {
+                    // Half-open: `(at - span, at]`. Inclusive at both ends would
+                    // put an event exactly on the seam into two adjacent
+                    // windows, so walking a run in five-minute steps would count
+                    // it twice and the steps would not sum to the whole.
+                    if ts.as_nanos() > at.as_nanos() - window.span_nanos {
+                        accumulate(window, &event, ts);
+                    }
+                }
                 match &event {
                     MarketEvent::Trade(trade) => {
                         out.last_trade = Some(TradeAt {
@@ -364,4 +411,34 @@ fn settle_book(out: &mut MarketAt, book: &Book, unreadable: Option<&str>) {
              stretch arrives later"
             .to_owned(),
     });
+}
+
+/// Fold one event into the window summary.
+///
+/// Only the facts a span answers questions about: how much happened, what the
+/// price did, and — the usual reason for asking — whether we went blind inside
+/// it. Deliberately not a second book: M2 already decided the normalized tier
+/// holds events rather than books because a book is re-derivable in seconds, and
+/// the same argument applies to a summary.
+fn accumulate(window: &mut WindowSummary, event: &MarketEvent, ts: Ts) {
+    match event {
+        MarketEvent::Trade(trade) => {
+            window.trades += 1;
+            window.volume = quant_core::fixed::Qty::from_raw(window.volume.raw() + trade.qty.raw());
+            window.low = Some(match window.low {
+                Some(low) if low.raw() <= trade.px.raw() => low,
+                _ => trade.px,
+            });
+            window.high = Some(match window.high {
+                Some(high) if high.raw() >= trade.px.raw() => high,
+                _ => trade.px,
+            });
+        }
+        MarketEvent::BookDelta(_) => window.deltas += 1,
+        MarketEvent::BookSnapshot(_) => window.snapshots += 1,
+        MarketEvent::Gap(gap) => window.gaps.push(GapAt {
+            at: ts,
+            cause: gap.cause,
+        }),
+    }
 }

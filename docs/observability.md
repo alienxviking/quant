@@ -223,9 +223,49 @@ partition, applied to a reader.
 | e | Operational state, with its time bases labelled | The prose metrics parser — **the cut line** |
 | f | Refusal fixtures, provenance, and this document | P3, `--window`, the reasoning |
 
-Slice (e) is the one to drop if the week runs long: the prose line already
-answers its own question for anyone willing to grep, and P1, P2 and P3 all stand
-without it.
+Slice (e) was the one to drop if the week ran long. It did not, and it turned out
+to be the slice that found something — see §7.
+
+---
+
+## 5a. What it does, and how the criteria came out
+
+All six slices landed. The command:
+
+```bash
+explain ~/paper --at 2026-09-19T10:00:00Z --symbol BTCUSDT [--window 5m]
+explain --check-journal ~/paper/paper-BTCUSDT.jsonl
+```
+
+Measured against the fortnight while it ran, rather than against fixtures:
+
+| | result |
+|---|---|
+| **P1** — 20 random instants, cold | **worst 4951 ms**, mean 2031 ms, budget 10 s |
+| **P2** — every checkpoint in both live journals | **18 of 18 agree** |
+| **P3** — refusals | 8 tests assert an absence *and* a reason |
+
+P2's independence is the part worth re-reading before changing it. Checking
+`explain` against `reconcile` would hold **by construction** — both call
+`journal::replay` — which is M5.c's vacuous identity in a new costume. The real
+pair is a `Checkpoint` (what the engine believed in memory, written by a process
+now gone) against a fold of the fill lines (what the file says). All three
+sabotages turn it red: a checkpoint off by one satoshi, a deleted fill, and a
+journal with no checkpoint at all, which exits 2 rather than 0 because "nobody
+disagreed" is not "two answers matched".
+
+**`--window` is the instant generalised, not a second mode.** The replay already
+walks every event up to `at`, so summarising the tail of that walk costs one
+comparison per event and no second pass; the instant is simply the window of
+length zero. A separate window traversal would have been a second implementation
+that must agree with the first forever.
+
+The span is **half-open — `(at - span, at]`**. Inclusive at both ends would put
+an event exactly on the seam into two adjacent windows, so stepping through a run
+five minutes at a time would count it twice and the steps would not sum to the
+whole. A window reaching back before the data is *not* an error: asking for the
+last hour of a run that started ten minutes ago is ordinary, and the honest
+answer is the ten minutes.
 
 ---
 
@@ -256,3 +296,48 @@ and a dropped record makes the first smaller — the engine finds the
 `ingest_seq` hole itself. So this is a gap in *surveillance*, not in
 recoverability. `explain` reports both numbers in its provenance block; wiring
 the counter into the metrics line is a freeze change and waits.
+
+---
+
+## 7. What it found on first use
+
+The five-block report was run against the fortnight on its second day and the
+health block read:
+
+```
+health    queue 0 now, 270 at its worst since start, of 4096 capacity
+          in the 60s to 2026-09-19T10:00:52Z: 26 msg/s, 0 dropped,
+          latency p50 4194ms p99 14155ms max 14808ms
+```
+
+Against 57–73 ms for the rest of the run's first nineteen hours. Two such
+excursions so far, at 07:47 and 10:00, each recovering within the hour.
+
+**Benign, and checked rather than assumed.** `queue=0`, `dropped=0` and
+`clock_skew=0` throughout: nothing was backed up, nothing was lost, and the host
+clock is fine — so this is transport delay between the venue and us, the same
+signature M1's acceptance run saw on hostel Wi-Fi. It affects no completeness
+criterion. It does mean the strategy sampled slightly stale prices for a few
+minutes, which `local_recv_ts` ordering handles correctly by construction.
+
+The point is that it was invisible before. Finding it meant grepping 1388 log
+lines by hand and knowing which of them to compare, which is precisely the
+question this milestone exists to make cheap.
+
+## 8. What M7 did not do, and what is next
+
+Unchanged from §2, and worth restating now that the reader exists:
+
+- **The run log.** Orders that never filled, refusals, cancels, strategy state.
+  Still not recorded anywhere, and still not recoverable by any reader. The
+  immediate next milestone, to start when the freeze lifts. Building the reader
+  first was the right order: it made concrete what those entries have to contain.
+- **The prose metrics parser is debt with a scheduled repayment.** Switch the
+  emitter to `.json()` and delete `health.rs` in the same commit as the run log.
+- **The three scoping defects in §6** are unfixed by design, for the same reason.
+
+The honest structural caveat, restated because it has not changed: `explain`'s
+market answers are what the *replay* says the book was, not what the *engine*
+saw. M5's criterion is the claim that those are identical, and it has not passed
+yet. Until it does, this is a debugger whose foundation is the thing under
+examination.
