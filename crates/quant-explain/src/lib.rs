@@ -41,12 +41,14 @@ use quant_normalize::{ReplayItem, SessionReplay};
 use quant_recorder::{catalog, SessionFiles};
 
 pub mod checkpoints;
+pub mod health;
 pub mod ours;
 
 #[cfg(test)]
 mod tests;
 
 pub use checkpoints::check_all;
+pub use health::{health_at, HealthAt, NoHealth};
 pub use ours::{ours_at, OurState};
 
 /// The market as the recording says it was, at an instant.

@@ -110,6 +110,7 @@ fn main() -> ExitCode {
         Err(e) => outln!("ours      could not read {}: {e}", journal.display()),
     }
 
+    print_health(&args);
     print_provenance(&args, &market);
     ExitCode::SUCCESS
 }
@@ -281,6 +282,51 @@ fn print_ours(
             fill.qty,
             duration(fill.at.as_nanos() - market.at.as_nanos())
         );
+    }
+}
+
+/// The operational picture for the containing minute, with time bases.
+///
+/// The labels are the point. One line mixes instantaneous, lifetime and
+/// 60-second-window figures with nothing marking which is which, and
+/// `queue_peak=270` beside `queue=0` is how an operator concludes the wrong
+/// thing at 3am.
+fn print_health(args: &Args) {
+    match quant_explain::health_at(&args.root, &args.symbol, args.at) {
+        Err(why) => outln!("health    {why}"),
+        Ok(health) => {
+            outln!(
+                "health    queue {} now, {} at its worst since start, of {} capacity",
+                health.queue,
+                health.queue_peak,
+                health.queue_capacity
+            );
+            outln!(
+                "          in the 60s to {}: {} msg/s, {} dropped, latency p50 {}ms p99 {}ms max {}ms",
+                health.emitted_at.to_rfc3339(),
+                health.msgs_per_sec,
+                health.dropped,
+                health.latency_p50_ms,
+                health.latency_p99_ms,
+                health.latency_max_ms
+            );
+            let gaps = health.gap_disconnect + health.gap_overflow + health.gap_sequence;
+            if gaps > 0 {
+                outln!(
+                    "          and {} gaps that minute ({} disconnect, {} overflow, {} sequence)",
+                    gaps,
+                    health.gap_disconnect,
+                    health.gap_overflow,
+                    health.gap_sequence
+                );
+            }
+            if health.clock_skew_ms.abs() > 1_000 {
+                outln!(
+                    "          clock skew {}ms -- past Binance's own tolerance for a signed request",
+                    health.clock_skew_ms
+                );
+            }
+        }
     }
 }
 
