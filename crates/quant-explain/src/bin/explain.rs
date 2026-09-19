@@ -1,0 +1,392 @@
+//! What was the system doing at a given instant.
+//!
+//! ```text
+//! explain [DATA_ROOT] --at <RFC3339> [--symbol SYM]
+//! explain ~/paper --at 2026-09-18T14:46:54Z --symbol BTCUSDT
+//! explain ~/paper --at "2026-09-18T20:16:54+05:30"      # your wall clock
+//! ```
+//!
+//! Five blocks, every one of them named so that its absence is visible: when,
+//! market, ours, health, provenance. A block that cannot be filled says why
+//! rather than printing nothing — a blank is indistinguishable from "nothing
+//! happened", and the characteristic failure of a tool like this is
+//! confabulation.
+//!
+//! Exit 0 means the instant was answered, including "we were blind then, and
+//! here is the gap that says so". Non-zero means no answer could be given at
+//! all.
+//!
+//! ```text
+//! explain --check-journal ~/paper/paper-BTCUSDT.jsonl
+//! ```
+//!
+//! checks every checkpoint in a journal against a replay of the entries it
+//! describes -- M7's P2. Exit 1 on a disagreement, 2 when there was nothing to
+//! check, because "nobody disagreed" and "two answers matched" are different
+//! statements and only one of them is evidence.
+
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+/// `println!`, but a closed pipe ends the program quietly instead of panicking.
+///
+/// This tool is meant to be piped into `head`, `grep` or `less`, and Rust
+/// ignores `SIGPIPE` by default -- so the write returns `EPIPE` and the default
+/// `println!` turns that into a panic with a backtrace. A debugging tool that
+/// panics when you pipe it into `head` teaches you not to pipe it into `head`.
+///
+/// The usual fix is to restore the default signal handler, which needs `unsafe`
+/// and the workspace forbids it. Writing through a locked handle and treating a
+/// broken pipe as a normal end is the same outcome in safe code.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        // Deliberately ignored rather than propagated: once the reader has gone
+        // there is nobody to tell, and the work already done is still correct.
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, $($arg)*);
+    }};
+}
+
+use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
+use quant_core::time::Ts;
+use quant_explain::{market_at, ours_at, MarketAt, OurState};
+
+fn main() -> ExitCode {
+    let args = match parse_args() {
+        Ok(Some(args)) => args,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Some(path) = &args.check_journal {
+        return check_journal(path);
+    }
+
+    let mut registry = InstrumentRegistry::new();
+    let instrument = registry.register(InstrumentDef {
+        exchange: Exchange::Binance,
+        symbol: args.symbol.clone(),
+        base: String::new(),
+        quote: String::new(),
+        kind: InstrumentKind::Spot,
+        tick_size: "0.01".parse().expect("tick"),
+        lot_size: "0.00001".parse().expect("lot"),
+        min_notional: "5".parse().expect("notional"),
+    });
+
+    outln!("when      {}", args.at.to_rfc3339());
+    if args.as_typed != args.at.to_rfc3339() {
+        // Echoed in both forms, always. The offset is the first thing to get
+        // wrong and the last thing anyone suspects: a query aimed five and a
+        // half hours from where it was meant still returns a confident answer.
+        outln!("          {} as given", args.as_typed);
+    }
+
+    let market = match market_at(
+        &args.root,
+        Exchange::Binance,
+        &args.symbol,
+        instrument,
+        args.at,
+    ) {
+        Ok(market) => market,
+        Err(e) => {
+            outln!("market    {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print_market(&market);
+
+    let journal = args
+        .journal
+        .clone()
+        .unwrap_or_else(|| args.root.join(format!("paper-{}.jsonl", args.symbol)));
+    match ours_at(&journal, instrument, &mut registry, args.at) {
+        Ok(ours) => print_ours(&ours, instrument, &market),
+        Err(e) => outln!("ours      could not read {}: {e}", journal.display()),
+    }
+
+    print_provenance(&args, &market);
+    ExitCode::SUCCESS
+}
+
+/// P2, as a command: every checkpoint against the entries it describes.
+fn check_journal(path: &std::path::Path) -> ExitCode {
+    match quant_explain::check_all(path) {
+        Err(e) => {
+            eprintln!("could not read {}: {e}", path.display());
+            ExitCode::FAILURE
+        }
+        Ok(agreement) => {
+            outln!("journal   {}", path.display());
+            match agreement.divergence {
+                Some(why) => {
+                    outln!(
+                        "checked   {} before the first disagreement",
+                        agreement.matched
+                    );
+                    outln!();
+                    outln!("verdict   DISAGREES: {why}");
+                    ExitCode::FAILURE
+                }
+                None if agreement.matched == 0 => {
+                    outln!();
+                    outln!(
+                        "verdict   NOTHING TO CHECK: this journal holds no checkpoint, so no \
+                         claim was compared"
+                    );
+                    ExitCode::from(2)
+                }
+                None => {
+                    outln!(
+                        "checked   {} checkpoints against the entries each describes",
+                        agreement.matched
+                    );
+                    outln!();
+                    outln!(
+                        "verdict   AGREES: what the engine believed matches what the file replays to"
+                    );
+                    ExitCode::SUCCESS
+                }
+            }
+        }
+    }
+}
+
+fn print_market(market: &MarketAt) {
+    match (&market.book, &market.no_book_reason) {
+        (Some(book), _) => {
+            let touch = match (&book.bid, &book.ask) {
+                (Some(bid), Some(ask)) => format!(
+                    "bid {} x {}   ask {} x {}",
+                    bid.px, bid.qty, ask.px, ask.qty
+                ),
+                (Some(bid), None) => format!("bid {} x {}   ask none", bid.px, bid.qty),
+                (None, Some(ask)) => format!("bid none   ask {} x {}", ask.px, ask.qty),
+                (None, None) => "the book is live but empty on both sides".to_owned(),
+            };
+            outln!("market    {touch}");
+            if let (Some(mid), Some(spread)) = (book.mid(), book.spread()) {
+                outln!("          mid {mid}, spread {spread}");
+            }
+            outln!(
+                "          {} bid levels, {} ask levels",
+                book.bid_levels,
+                book.ask_levels
+            );
+        }
+        // The refusal. Never a stale book, and never a blank.
+        (None, Some(reason)) => outln!("market    no book: {reason}"),
+        (None, None) => outln!("market    no book, and no reason recorded -- this is a bug"),
+    }
+
+    if let Some(trade) = &market.last_trade {
+        outln!(
+            "          last trade {} x {} ({:?}), {}",
+            trade.px,
+            trade.qty,
+            trade.aggressor,
+            ago(market.at, trade.at)
+        );
+    } else {
+        outln!("          no trade at or before this instant");
+    }
+
+    if let Some(gap) = &market.gap_before {
+        outln!(
+            "blind     last gap {:?} at {} ({})",
+            gap.cause,
+            gap.at.to_rfc3339(),
+            ago(market.at, gap.at)
+        );
+    } else {
+        outln!("blind     no gap before this instant in this day's capture");
+    }
+    if let Some(gap) = &market.gap_after {
+        outln!(
+            "          next gap {:?} at {} ({} later)",
+            gap.cause,
+            gap.at.to_rfc3339(),
+            duration(gap.at.as_nanos() - market.at.as_nanos())
+        );
+    }
+}
+
+fn print_ours(
+    ours: &OurState,
+    instrument: quant_core::instrument::InstrumentId,
+    market: &MarketAt,
+) {
+    if let Some(reason) = &ours.outside_session {
+        outln!("ours      {reason}");
+    }
+    let Some(portfolio) = &ours.portfolio else {
+        return;
+    };
+
+    let position = portfolio.position(instrument);
+    if position.is_flat() {
+        outln!("ours      flat");
+    } else {
+        outln!("ours      {} @ average {}", position.qty, position.avg_px);
+    }
+    outln!(
+        "          cash {}, realized {}, fees {}, {} fills",
+        portfolio.cash(),
+        portfolio.realized(),
+        portfolio.fees(),
+        portfolio.fills()
+    );
+
+    // Equity is `None` across a gap, and that is three earlier decisions
+    // composing rather than a rule written here: a gap clears the book, a
+    // cleared book has no mid, and `Portfolio::equity` refuses to value a
+    // position it cannot mark.
+    let mark = market.book.as_ref().and_then(quant_explain::BookAt::mid);
+    if let Some(equity) = portfolio.equity(instrument, mark) {
+        outln!("          equity {equity}");
+    } else {
+        outln!("          equity unknown -- a position is open and there is no mark");
+    }
+
+    if let Some(check) = &ours.checkpoint_here {
+        outln!(
+            "          the engine checkpointed here claiming cash {}, {} fills",
+            check.cash,
+            check.fills
+        );
+    }
+    if let Some(fill) = &ours.last_fill {
+        outln!(
+            "          last fill {:?} {} x {} fee {}, {} (fill #{})",
+            fill.side,
+            fill.px,
+            fill.qty,
+            fill.fee,
+            ago(market.at, fill.at),
+            fill.fill_ordinal
+        );
+    } else {
+        outln!("          no fill at or before this instant");
+    }
+    if let Some(fill) = &ours.next_fill {
+        outln!(
+            "          next fill {:?} {} x {}, {} later",
+            fill.side,
+            fill.px,
+            fill.qty,
+            duration(fill.at.as_nanos() - market.at.as_nanos())
+        );
+    }
+}
+
+fn print_provenance(args: &Args, market: &MarketAt) {
+    outln!(
+        "read      session {}",
+        quant_recorder::format_session_id(&market.session_id)
+    );
+    for path in &market.segments {
+        outln!("          {}", path.display());
+    }
+    outln!(
+        "          {} events replayed to reach the instant",
+        market.events_read
+    );
+    let _ = args;
+}
+
+/// How long before the instant something happened, in words.
+fn ago(at: Ts, then: Ts) -> String {
+    format!("{} before", duration(at.as_nanos() - then.as_nanos()))
+}
+
+/// A nanosecond span, rendered at whatever scale reads best.
+fn duration(nanos: i64) -> String {
+    let millis = nanos / 1_000_000;
+    if millis.abs() < 1_000 {
+        return format!("{millis}ms");
+    }
+    let secs = millis / 1_000;
+    if secs.abs() < 60 {
+        return format!("{}.{:03}s", secs, (millis % 1_000).abs());
+    }
+    if secs.abs() < 3_600 {
+        return format!("{}m{:02}s", secs / 60, (secs % 60).abs());
+    }
+    format!("{}h{:02}m", secs / 3_600, ((secs % 3_600) / 60).abs())
+}
+
+struct Args {
+    root: PathBuf,
+    symbol: String,
+    at: Ts,
+    /// Exactly what was typed, so the report can echo it beside the UTC form.
+    as_typed: String,
+    journal: Option<PathBuf>,
+    check_journal: Option<PathBuf>,
+}
+
+fn parse_args() -> Result<Option<Args>, String> {
+    let mut root = PathBuf::from("data");
+    let mut symbol = "BTCUSDT".to_owned();
+    let mut at = None;
+    let mut as_typed = String::new();
+    let mut journal = None;
+    let mut check_journal = None;
+
+    let mut remaining = std::env::args().skip(1);
+    while let Some(arg) = remaining.next() {
+        let mut value = || {
+            remaining
+                .next()
+                .ok_or_else(|| format!("{arg} needs a value"))
+        };
+        match arg.as_str() {
+            "-h" | "--help" => {
+                outln!(
+                    "usage: explain [DATA_ROOT] --at <RFC3339> [--symbol SYM] [--journal PATH]\n\
+                     \x20      explain --check-journal PATH\n\
+                     \x20      --at needs a UTC offset: `...Z` or `...+05:30`"
+                );
+                return Ok(None);
+            }
+            "--at" => {
+                let text = value()?;
+                at = Some(Ts::parse_rfc3339(&text)?);
+                as_typed = text;
+            }
+            "--symbol" => symbol = value()?,
+            "--journal" => journal = Some(PathBuf::from(value()?)),
+            "--check-journal" => check_journal = Some(PathBuf::from(value()?)),
+            other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
+            other => root = PathBuf::from(other),
+        }
+    }
+    if let Some(path) = check_journal {
+        return Ok(Some(Args {
+            root,
+            symbol,
+            at: Ts::from_nanos(0),
+            as_typed: String::new(),
+            journal,
+            check_journal: Some(path),
+        }));
+    }
+    let at = at.ok_or_else(|| {
+        "--at is required; this tool answers about a moment and there is no \
+         sensible default for which one"
+            .to_owned()
+    })?;
+    Ok(Some(Args {
+        root,
+        symbol,
+        at,
+        as_typed,
+        journal,
+        check_journal: None,
+    }))
+}

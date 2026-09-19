@@ -1,0 +1,33 @@
+[package]
+name = "quant-explain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The time cursor: what was the system doing at a given instant.
+#
+# Like `quant-verify` this sits at the *top* of the graph and nothing may ever
+# depend on it. It is also the only crate that reads across every tier at once --
+# raw for the market, the journal for our own position, the process log for the
+# operational picture -- which is exactly why nothing may depend on it: a
+# component that needed this would be reaching for a conclusion it should be
+# computing itself.
+#
+# It must never become a dependency of `quant-verify` or `quant-normalize`, for
+# the reason those two must never depend on each other: they answer different
+# questions, and a tool that conflated them would have to call one a failure.
+#
+# **This crate writes nothing.** No index, no cache, no sidecar. That is the one
+# property that keeps it structurally unable to become a second source of truth,
+# and it is why M7 needs no change to the data contract's tier table.
+[dependencies]
+quant-core = { workspace = true }
+quant-storage = { workspace = true }
+quant-recorder = { workspace = true }
+quant-normalize = { workspace = true }
+quant-book = { workspace = true }
+quant-engine = { workspace = true }
+
+[lints]
+workspace = true
