@@ -81,7 +81,11 @@ A strategy sees, per event:
 - the [`MarketEvent`](../crates/quant-core/src/event.rs) itself, including `Gap`;
 - a **read-only reconstructed book**, maintained by the engine;
 - the engine clock;
-- its own execution events.
+- its own execution events;
+- its **position, cash and equity**, maintained by the engine rather than by the
+  strategy — same argument as the book, and it is the accounting a restart has to
+  restore (§9), so there is exactly one of it. `equity` is `None` when there is a
+  position and no price to mark it at.
 
 It does **not** see the venue, the event source, wall-clock time, or any other
 strategy's orders.
@@ -301,12 +305,12 @@ tee below. Any divergence is a bug, not a tolerance.
 | c | The journal, and a reconciliation that can fail | **done** |
 | d | The `paper` binary: `record()` extracted so it can feed the tee | **done** |
 | e | Ops harness and rehearsal | **done** |
-| — | The fortnight itself | **the remaining criterion** |
+| — | The fortnight itself | **running since 2026-09-18, ends 2026-10-02** |
 
 The procedure is `docs/paper-run.md`. Everything except wall clock is built and
 rehearsed against the live venue.
 
-**M5 is in progress**, and the criterion is the run. That is the same shape M1
+**M5's fortnight is running.** It started 2026-09-18T14:46:54Z and ends 2026-10-02 — two symbols on the Mac, one paper process each, pinned to the tag `m5-run-start` (`aff848d`). As of 2026-09-19 there had been no restart on either supervisor, every six-hourly `verify` pass was clean, and `reconcile` reported AGREES on both journals from the first checkpoint onward. None of that is the criterion: the criterion is the comparison at the end, and until 2026-10-02 the honest status is *in flight*. That is the same shape M1 had — code complete 2026-08-11, acceptance run passed 2026-08-28, seventeen days apart and nothing rotted, because the harness was rehearsed and the reasoning was written down. That is the same shape M1
 had: code complete 2026-08-11, acceptance run passed 2026-08-28, seventeen days
 apart and nothing rotted — because the harness was rehearsed and the reasoning
 was written down.
