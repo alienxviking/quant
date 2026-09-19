@@ -3,7 +3,8 @@
 Context for any Claude session working in this repo. Read `README.md`,
 `docs/data-contract.md` and `docs/engine-contract.md` too — this file is the
 working agreement; those are the design. The data contract governs data at rest;
-the engine contract governs the seam a strategy sees.
+the engine contract governs the seam a strategy sees. `docs/observability.md`
+(M7) and `docs/paper-run.md` (M5) cover their own milestones.
 
 ## What this is
 
@@ -100,10 +101,17 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 ## State
 
-**M0–M4 and M6 are complete. M5's code is complete and rehearsed; its fortnight
-is the one remaining criterion.** 373 tests green in debug and release, clippy
-and fmt clean, 26,905 lines across 11 crates. To start the run, see *Picking up
-the paper run on the Mac* near the bottom of this file.
+**M0–M4, M6 and M7 are complete. M5's fortnight is running** (started
+2026-09-18T14:46:54Z, ends 2026-10-02) **and is the one remaining criterion.**
+411 tests green in debug and release, clippy and fmt clean, 30,423 lines across
+12 crates.
+
+While it runs: **do not `git pull` or `cargo build` in the run's checkout.**
+`supervise.sh` execs `target/release/paper` on every restart, so a rebuild would
+silently continue the run on different code — and bash reads a script file
+lazily, so editing `ops/*.sh` underneath the running supervisor can make its loop
+jump mid-execution. Develop in a separate worktree (`git worktree add`), which is
+where M2.e and M7 were built.
 
 - **M0 complete** (2026-07-26): workspace, `crates/quant-core` (fixed-point
   money, `Ts`/`Clock`, instrument registry with venue filters, the
@@ -709,6 +717,74 @@ the paper run on the Mac* near the bottom of this file.
   columns up **by name**, because positional access is a second silent copy of the
   field order that only the reader knows.
 
+- **M2.e complete** (2026-09-19): two sessions on one symbol-day are **merged**,
+  not refused. M2.d left this as work owing and the fortnight made it due — one
+  recorder restart inside a day would have made the whole window unjudgeable,
+  because M5's criterion needs `normalize --write --check` over it.
+
+  A restart is **sequential**: `supervise.sh` runs the recorder in the foreground
+  of its restart loop and reads its exit code before respawning. So a shared day
+  is a **concatenation, not an interleave**, and a file boundary is the exact and
+  free encoding of one — `part-00000.parquet` is the first session's slice,
+  `part-00001.parquet` the second's. Nothing inside a row changes, which is
+  *forced* rather than chosen: `--check` compares whole `MarketEvent` values and
+  `EventMeta` includes `ingest_seq`, so renumbering would fail at the first event
+  with no tolerance available. Every file still names exactly one session, so no
+  footer has to describe two sources.
+
+  The ordering key is `(day, part, ingest_seq)`, and **only the last is compared
+  inside the four-way merge**. `ingest_seq` restarts at 1 for a new session, so
+  merging across a part boundary on it would interleave the second session's
+  opening events into the middle of the first.
+
+  **The data contract's own sentence about this was wrong, and is corrected
+  rather than implemented.** It said the merge should be "ordered by
+  `local_recv_ts`". That is `SystemTime`: it steps, and it is **not monotone even
+  within one session** — §6's never-roll-backwards rule and the
+  `backdated_records` counter exist because of it. Ordering two sessions by a
+  quantity that can run backwards either refuses a healthy day after an NTP step
+  or, worse, silently reverses them. Parts are ordered by the **venue's own
+  update-id span**, recorded per part in the footer: strictly increasing per
+  symbol across disconnects, immune to anything our clock does, and available
+  from `BookDelta`'s range in the M0 event contract — so no venue knowledge
+  enters `quant-normalize`. Overlapping spans mean the sessions were
+  *concurrent*, which is refused: there is no ordering of two simultaneous
+  recordings of the same messages that is the truth.
+
+  **The span is a property of the part, not of each file.** Written into all four
+  datasets including the empty ones — keyed to each file's own rows, the ordinary
+  day with no gaps at all (the acceptance week had 38 gap frames in total) would
+  leave its `gaps` file unable to say where it belongs and refuse the restart on
+  a completely normal day. Found by an adversarial review before it shipped.
+
+  Four guards exist because "open one exact path" became "enumerate a directory",
+  which makes new things reachable: the four dataset directories must agree on
+  which parts exist (the old per-path ownership check guarded a half-deleted day
+  incidentally); indices must be contiguous from zero (a hole means a part was
+  removed, or a rename died between unlink and rename — counting would overwrite
+  an occupant); only names `part_file_name` emits are recognised (the `.tmp`
+  sibling survives a `SIGKILL`); and a day resolving to no parts is an error, not
+  a shorter stream.
+
+  `check_session` reads back only its own session's parts, selected by the footer
+  rather than by remembering which index was written, so both sides of the check
+  stay independent.
+
+  Verified on real captures rather than fixtures — two rehearsal sessions that
+  genuinely share 2026-09-18 for BTCUSDT. The pre-merge binary reports `write
+  ABANDONED … not implemented`; this one writes both, prints a `merged` line, and
+  passes `--check` on each session independently (18,925 and 18,435 events). A
+  backtest over the merged day sees **37,360 events — exactly the sum** — so the
+  reader concatenates rather than truncating.
+
+  **One procedural consequence.** A build from `m5-run-start` reads `part-00000`
+  alone. If a recorder restarts mid-day, run judging steps 3 and 4 from a build
+  containing the parts reader; `normalize --write` prints a `merged` line
+  whenever that applies. `docs/paper-run.md` records why that does not breach the
+  freeze: the freeze exists so the *system under comparison* does not change, and
+  a reader that reads all of the data rather than some of it is not the system
+  under test.
+
 - **`normalize --check` is the criterion, and it is event by event.** Two
   reconstructions can produce identical book statistics from different events — a
   transposed pair of timestamps, a level moved from one delta to the next, an
@@ -1131,6 +1207,107 @@ the paper run on the Mac* near the bottom of this file.
   edit, grep for the thing that should now be there rather than trusting that the
   patch matched.**
 
+- **M7 complete** (2026-09-19): observability. 411 tests green in debug and
+  release, clippy and fmt clean. Criterion — *"what was it doing at 03:14 last
+  Tuesday?" answered in a minute* — met, and measured against the fortnight
+  **while it was running**. Full reasoning in `docs/observability.md`.
+
+  **The scoping call, which re-scopes the milestone.** M7 is a **time cursor over
+  artifacts that already exist — a reader, not a recorder and not an exporter.**
+  Same shape as M1.d: sort the facts the question needs by which ones a later
+  milestone can still recover, and keep only what this one must supply. The book,
+  the mark, whether we were blind, our position and P&L are pure functions of raw
+  plus the journal, and cheap — `normalize` replayed 3.4M frames of the live run
+  in 4.70 s, so a symbol-day is about six seconds.
+
+  The tempting conclusion is that what *isn't* recoverable (orders that never
+  filled, refusals, strategy state) is urgent, so M7 should be a recorder. **That
+  is right about the loss and wrong about the remedy:** the fortnight is pinned
+  and rule 1 is never to pull there, so a run log merged tomorrow would not be
+  written by the running process. That column's loss for this run is already
+  sunk.
+
+  **The defect fixed is not missing data. It is that nothing had a notion of a
+  moment** — every tool was either present-tense (`status.sh`) or whole-run
+  aggregate (`dump`, `normalize`, `verify`, `reconcile`). `reconcile` had no
+  `--at`; `dump` printed no timestamps at all; and raw, the one time-indexed
+  durable record, had no reader that took a timestamp.
+
+  **Conventional metric export was argued down, not skipped.** No Prometheus, no
+  OTel, no `/metrics`. It does not touch the criterion; a time-series store would
+  be a fourth copy of numbers derived from artifacts we already keep, with no way
+  to notice when it disagreed — the pattern refused three times already; and it
+  puts a listening socket in a process built `panic = "abort"` whose own history
+  includes **a metric that killed the recorder**. The good idea inside that
+  argument is kept: M1.e's line mixes instantaneous, lifetime and 60-second-window
+  figures unmarked, so the reader **labels each figure's time base**.
+
+  | | Slice | Status |
+  |---|---|---|
+  | a | `Ts` ⇄ RFC 3339 in `quant-core` | **done** |
+  | b | `explain --at`: market state from raw | **done** |
+  | c | `explain --at`: our state from the journal | **done** |
+  | d | The checkpoint agreement, and proof it can go red | **done** |
+  | e | Operational state, with time bases labelled | **done** |
+  | f | `--window`, refusal fixtures, the document | **done** |
+
+  **`quant-explain` writes nothing** — no index, no cache, no sidecar. That is the
+  one property keeping it structurally unable to become a second source of truth,
+  and it is why M7 needed no change to the data contract's tier table. It sits at
+  the top of the graph beside `quant-verify`; nothing may depend on it, and it
+  must never become a dependency of `quant-verify` or `quant-normalize` for the
+  reason those two must never depend on each other.
+
+  **`--at` is `local_recv_ts`**, per invariant 2. Seeking on `exchange_ts` would
+  answer a question the engine never asked.
+
+  **The day rule is self-correcting.** A day's file begins mid-stream, so the book
+  stays unanchored until the next snapshot — up to an hour. Read the instant's
+  day; if still unanchored on arrival, read again including the previous day.
+  Always reading two days doubles the cost of every query to fix a minority.
+
+  **Every absence carries a reason.** A query tool's characteristic failure is
+  *confabulation* — printing a stale book as though observed, which looks entirely
+  plausible. M2.b already made that safe by clearing an invalid book rather than
+  flagging it, so there is no stale state to print even by accident. Eight tests
+  assert an absence *and* a reason rather than a value.
+
+  **The agreement check is deliberately not against `reconcile`.** Both call
+  `journal::replay`, so that would hold by construction — M5.c's vacuous identity
+  in a new costume. The independent pair is already in the journal: a `Checkpoint`
+  is what the engine **believed in memory**, written by a process now gone; a fold
+  of the fill lines is what **the file says**. `--check-journal` compares every
+  checkpoint against the entries it describes, and exits **2** rather than 0 on a
+  journal with none.
+
+  Criteria, measured against the live run: **P1** 20 random instants, cold, all
+  five blocks present — worst 5799 ms of a 10 s budget. **P2** 24 of 24
+  checkpoints across both journals agree. **P3** the refusal fixtures.
+
+- **M7's first real use found something** (worth remembering). The health block
+  read `latency p50 4194ms p99 14155ms` at 2026-09-19T10:00Z, against 57–73 ms
+  for the rest of the run's first nineteen hours. **Benign, and checked rather
+  than assumed**: `queue=0`, `dropped=0`, `clock_skew=0` throughout, so nothing
+  was backed up, nothing lost, and the host clock is fine — transport delay, the
+  same signature M1 saw on hostel Wi-Fi. The point is that finding it previously
+  meant grepping 1388 log lines and knowing which to compare.
+
+- **Two boundary decisions came from tests rather than from me** (M7). The window
+  is half-open, `(at - span, at]` — inclusive at both ends puts a seam event into
+  two adjacent windows, so stepping through a run five minutes at a time would
+  count it twice. And RFC 3339 parsing does its arithmetic in `i128`: midnight of
+  1677-09-21 is below `i64::MIN` even though instants later that day are
+  representable, so checking each intermediate rejected valid input. `Ts` spans
+  roughly 1677-09-21 to 2262-04-11, now pinned.
+
+- **A status.sh line the run itself falsified** (2026-09-19). It counted
+  `session=*` **directories**, and the raw layout nests session inside day — so an
+  uninterrupted recorder gets a fresh directory at every UTC midnight. The line
+  went from "2 sessions" to "4 sessions" with no restart, and would have read 28
+  by day fourteen, which is indistinguishable from 26 restarts. Same class as the
+  "no recorder running" line, found the same way: **by looking at what the real
+  run printed rather than at what the code was supposed to do.**
+
 Milestone table: see `README.md`.
 
 ## The acceptance run, and how it went
@@ -1271,17 +1448,29 @@ turns out to be.
 
 ---
 
-## Picking up the paper run on the Mac
+## The paper run, in flight
 
-**Everything M5 needs is built and rehearsed. The only thing left is wall clock.**
-This section is what a session on the MacBook needs and nothing else; the full
-procedure is `docs/paper-run.md`.
+**It started 2026-09-18T14:46:54Z and ends 2026-10-02.** Two symbols, one paper
+process each, capturing and trading from one ingress. The sections below are the
+record of how it was set up; the full procedure is `docs/paper-run.md`.
 
 ### Where things stand
 
-M0–M4 and M6 are complete. M5's code is complete and rehearsed against the live
-venue; **the fortnight is the remaining criterion**. 373 tests green in debug and
-release, clippy and fmt clean, 26,905 lines across 11 crates.
+M0–M4, M6 and M7 are complete. **M5's fortnight is the one remaining criterion
+and it is spending its wall clock now.** 411 tests green in debug and release,
+clippy and fmt clean, 30,423 lines across 12 crates.
+
+Watching it:
+
+```bash
+ops/status.sh --root ~/paper
+explain ~/paper --at 2026-09-19T10:00:00Z --symbol BTCUSDT [--window 5m]
+explain --check-journal ~/paper/paper-BTCUSDT.jsonl
+```
+
+The verify loop runs every six hours and reconciles both journals on the same
+cadence, so the honest signal is that `~/paper/logs/verify.log` stays all-`OK`.
+A `msgs_per_sec=0` line is not a stall; the capture file growing is.
 
 ### The three rules, and the third is the one that bites
 
@@ -1346,18 +1535,37 @@ gives the fortnight two independent samples.
 
 ### While it runs
 
-**M7 (observability) is the safe thing to build**, because it does not touch
-either frozen format. Do **not** build M8 on top of an unvalidated live path — it
-depends on M5's live-versus-replay agreement having actually passed.
+**Build in a separate worktree** (`git worktree add ~/quant-dev`), never in the
+run's checkout. Two reasons, and the second is easy to miss: `supervise.sh` execs
+`target/release/paper` on every restart, so a rebuild would silently continue the
+run on different code; and bash reads a script file *lazily, by byte offset*, so
+changing `ops/*.sh` underneath the running supervisor can make its loop jump
+mid-execution. Merging to `main` is safe — only pulling *there* is not.
+
+M2.e and M7 were both built this way and neither touched the run.
+
+Do **not** build M8 on top of an unvalidated live path — it depends on M5's
+live-versus-replay agreement having actually passed. Note too that everything
+`explain` says about the market is what the *replay* claims the book was, and
+M5's criterion is exactly the claim that that equals what the engine saw: until
+it passes, M7 is a debugger whose foundation is the thing under examination.
 
 ---
 
 ### Still open
 
-- **M5's fortnight is the one remaining criterion** (deferred at the user's
-  request, 2026-09-02, which is fine — M1 did the same, seventeen days between
-  code complete and the run passing). All of M5.a–e is built and rehearsed. See
-  *Picking up the paper run on the Mac* above and `docs/paper-run.md`.
+- **M5's fortnight is the one remaining criterion, and it is running.** Started
+  2026-09-18T14:46:54Z on the Mac, ends 2026-10-02, two symbols, one paper
+  process each. Judge it per `docs/paper-run.md`. Until then: no `git pull` and
+  no `cargo build` in the run's checkout, and the raw container version and
+  journal schema stay frozen.
+
+- **The run log is the next milestone**, and it starts when the freeze lifts.
+  Orders that never filled, risk refusals, cancels and strategy state are
+  recorded nowhere and are **not recoverable by any reader** — M7 established
+  that boundary rather than crossing it, and building the reader first made
+  concrete what those entries have to contain. It also unblocks three things
+  below that are all waiting on the same unfreeze.
 - **A hard kill between a risk trip and shutdown loses the trip**, because the
   kill switch is journalled at shutdown. Harmless in paper, where nothing is at
   stake; **must be fixed before M8**, by recovering the day's tally from the
@@ -1370,10 +1578,23 @@ depends on M5's live-versus-replay agreement having actually passed.
   platform being trustworthy, not about this strategy — and a lower-turnover or
   maker-side idea is the shape that could work, which is a thing to try *after* the
   platform can measure it honestly.
-- **Two sessions covering one symbol-day are refused, not merged** (M2.d). Cannot
-  happen on the acceptance capture, where each symbol ran one session for the whole
-  week; it will the first time a recorder restarts mid-day. The merge is ordered by
-  `local_recv_ts`, since `ingest_seq` cannot order across sessions.
+- **Three defects M7's scoping surfaced, all waiting on the run log.** The
+  journal's `client_order_id` is a *fill ordinal*, not the engine's id, because
+  `FillObserver::on_fill` is never handed the real one — and refused orders
+  consume an id before the risk check, so the first refusal desynchronises it
+  permanently (harmless so far: nothing has been refused). `Started.at` is
+  hard-coded to zero, so a journal cannot date its own beginning. And
+  `TeeSink::secondary_dropped()` is called from nowhere, so nothing watches the
+  tee *during* a run — it is checkable afterwards, since `events N reached the
+  engine` against the capture's `records=N` would differ, but M5's criterion
+  assumes it was zero and nothing says so.
+
+- **`quant-explain::health` parses prose, and that is debt with a scheduled
+  repayment.** An emitter and parser that must agree forever through a format
+  neither owns, with no test that they agree, is the pattern this project
+  refuses — accepted only because switching the emitter to `.json()` changes the
+  running binary. **Switch the emitter and delete `health.rs` in the same commit
+  as the run log.**
 - Minor: CI annotates `Node.js 20 is deprecated` for `actions/checkout@v4` on both
   jobs. Harmless; fixed by bumping to `@v5` whenever CI is next touched.
 
