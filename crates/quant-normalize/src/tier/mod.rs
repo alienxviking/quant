@@ -215,16 +215,24 @@ pub enum TierError {
     NoPartsForDay {
         date: String,
     },
-    /// The incoming part does not follow the parts already published.
+    /// Two parts of one day cover overlapping venue update ids.
     ///
-    /// Sessions are sequential, so a later session's book sequence must start
-    /// after the earlier one's ends. When it does not, the two were not
-    /// sequential — concurrent recorders on one symbol — and concatenating them
-    /// would hand out an order the market never had.
-    PartsOutOfOrder {
+    /// A restart is sequential — `supervise.sh` reads the dead recorder's exit
+    /// code before starting the next — so two sessions on one symbol-day hold
+    /// disjoint stretches of the venue's sequence. Overlap means they were
+    /// *concurrent*: two recorders on one symbol at one time, and there is no
+    /// ordering of two simultaneous recordings of the same messages that is the
+    /// truth. So this refuses rather than picking one.
+    ///
+    /// It deliberately says nothing about which part arrived first. Parts are
+    /// published in the order sessions happen to be normalized, which is catalog
+    /// order, which is a v4 UUID sort — arrival order carries no information
+    /// about the market and is not evidence of anything. Order comes from the
+    /// spans at read time; this check only establishes that an order exists.
+    PartsConcurrent {
         date: String,
-        existing_last: u64,
-        writing_first: u64,
+        published: (u64, u64),
+        incoming: (u64, u64),
     },
 }
 
@@ -265,13 +273,14 @@ impl core::fmt::Display for TierError {
             Self::NoPartsForDay { date } => {
                 write!(f, "{date} holds no parts under the normalized tier")
             }
-            Self::PartsOutOfOrder {
+            Self::PartsConcurrent {
                 date,
-                existing_last,
-                writing_first,
+                published,
+                incoming,
             } => write!(
                 f,
-                "on {date} the published parts run to venue update id {existing_last} but the incoming part starts at {writing_first}, so these sessions were not sequential"
+                "on {date} a published part covers venue update ids {}..={} and the incoming part covers {}..={}; these overlap, so the two sessions recorded the same messages at the same time and cannot be concatenated",
+                published.0, published.1, incoming.0, incoming.1
             ),
         }
     }

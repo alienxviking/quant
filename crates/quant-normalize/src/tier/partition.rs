@@ -257,17 +257,35 @@ impl PartitionWriter {
         Ok(n)
     }
 
-    /// Refuse to publish a part that does not follow the ones already there.
+    /// Refuse to publish a part that overlaps one already there.
     ///
     /// Only reached when this session is appending — a first part has nothing to
-    /// follow, which is why the single-session case never runs this at all.
+    /// be disjoint from, which is why the single-session case never runs this at
+    /// all.
+    ///
+    /// **This used to require that the incoming part start after every published
+    /// part ended, and that was wrong.** A part index is assigned by `place` in
+    /// arrival order, arrival order is the order `catalog` yields sessions, and
+    /// `catalog` sorts by paths whose session component is a **v4 UUID**. So for
+    /// two perfectly sequential recorders — one restart, the ordinary case this
+    /// whole slice exists to serve — which one landed at part 0 was a coin flip,
+    /// and the earlier session lost that flip half the time. Losing it refused
+    /// the write, and `normalize` abandons the writer on a refusal, so the rest
+    /// of that session's days went unwritten too. The check was rejecting the
+    /// case it was built for.
+    ///
+    /// What is actually checkable here is **disjointness**, and that is all this
+    /// asks. Sessions on one symbol-day hold non-overlapping stretches of the
+    /// venue's sequence because a restart is sequential: `supervise.sh` reads the
+    /// dead recorder's exit code before starting the next. Overlap means they ran
+    /// at the same time, which is the one case with no true ordering and is what
+    /// the error now says. *Which* stretch came first is read off the spans at
+    /// read time, where it is a fact about the market rather than about the order
+    /// we happened to derive things in.
     ///
     /// The comparison is on the venue's update ids and deliberately not on
-    /// `local_recv_ts`; [`provenance`] carries the argument. Note which direction
-    /// this fails in: it refuses rather than reordering, because a part that does
-    /// not follow means the sessions were concurrent, and there is no ordering of
-    /// two simultaneous recordings of the same messages that is the truth.
-    fn check_follows(
+    /// `local_recv_ts`; [`provenance`] carries the argument.
+    fn check_disjoint(
         &self,
         date: UtcDate,
         part: u32,
@@ -276,7 +294,7 @@ impl PartitionWriter {
         if part == 0 {
             return Ok(());
         }
-        let Some((first, _)) = span else {
+        let Some((first, last)) = span else {
             return Err(TierError::PartOrderUnknowable {
                 date: date.to_string(),
                 detail: "the incoming part saw no book event, so it has no venue sequence"
@@ -292,7 +310,7 @@ impl PartitionWriter {
                 part: index,
             };
             let path = target.file(&self.root);
-            let Some((_, last)) = Provenance::book_span_of(&path)? else {
+            let Some(published) = Provenance::book_span_of(&path)? else {
                 return Err(TierError::PartOrderUnknowable {
                     date: date.to_string(),
                     detail: format!(
@@ -301,11 +319,15 @@ impl PartitionWriter {
                     ),
                 });
             };
-            if first <= last {
-                return Err(TierError::PartsOutOfOrder {
+            // Disjoint in either direction is fine; only an intersection is a
+            // defect. Equality at a boundary counts as overlap: a shared update
+            // id means both sessions saw the same message, which is the very
+            // thing that cannot happen sequentially.
+            if first <= published.1 && published.0 <= last {
+                return Err(TierError::PartsConcurrent {
                     date: date.to_string(),
-                    existing_last: last,
-                    writing_first: first,
+                    published,
+                    incoming: (first, last),
                 });
             }
         }
@@ -321,7 +343,7 @@ impl PartitionWriter {
         // as abandoning a day -- and it is why the check is here rather than at
         // `roll`, where only the first row of the part is known and its span is
         // not.
-        self.check_follows(open.date, open.part, open.book_seq)?;
+        self.check_disjoint(open.date, open.part, open.book_seq)?;
 
         let mut rows = [0_u64; Dataset::ALL.len()];
         for (i, (mut writer, (temp, final_path))) in
