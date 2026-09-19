@@ -127,8 +127,20 @@ Refusing by default would make the tool unusable for its main purpose. This is
 deliberately *not* the "an invalid book is cleared, not flagged" precedent: that
 rule exists because stale prices can be mistaken for real ones and acted on,
 whereas a provenance mismatch is a fact about the reader rather than a number
-that could be traded. Both commits are printed in the provenance block, every
-time, so the reader states the discrepancy rather than hiding it.
+that could be traded.
+
+**This paragraph used to end "both commits are printed in the provenance block,
+every time, so the reader states the discrepancy rather than hiding it", and
+that was never built.** `print_provenance` in
+`crates/quant-explain/src/bin/explain.rs` prints the capture session id, every
+segment path it read, and how many events it replayed to reach the instant —
+and then discards its arguments outright (`let _ = args;`). Nothing in the
+workspace reads `run.json` at all; `grep -rn run.json crates` comes back empty.
+The decision above stands as a decision, and shipping it is **owed work**. Until
+it is done, a report gives no way to tell which build produced it — the one
+question a provenance block exists to answer — and it is worth doing *because*
+the mismatch is the expected case rather than the alarming one, which is exactly
+what makes it easy to stop noticing.
 
 **The metrics reader parses prose, and that is named debt.** `tracing`'s default
 `fmt` output is a format we do not own, and an emitter/parser pair that must
@@ -136,8 +148,37 @@ agree forever with no test that they do is the pattern this project refuses. It
 is accepted here only because the alternative — switching the emitter to
 `.json()` — cannot happen while the fortnight runs a pinned binary. **The
 replacement is scheduled, not hoped for:** switch the emitter and delete the
-parser in the same commit as the run log. Until then the parser is strict and
-loud on an unrecognised line rather than silently skipping it.
+parser in the same commit as the run log.
+
+Until then the parser is strict in one place and silent in another, and the
+sentence that used to stand here named only the first. A line that *looks* like
+a metrics line and will not parse is reported as `NoHealth::Unparseable` rather
+than skipped — that half is built. But a line is only looked at at all if it
+contains the `metrics symbol=` sentinel, and that literal is itself part of the
+format we do not own, so the day the emitter changed every line would stop
+matching at once and the reader fell through to `NoHealth::NotCovered` — *"no
+metrics line covers this instant -- the process may not have been running"*.
+That is P3's confabulation arriving through the one block whose figures cannot
+be re-derived from any artifact: a stale reader blaming the run.
+
+**Fixed 2026-09-20.** A log holding lines of which none is recognisable is now
+its own absence: `NoHealth::FormatUnrecognised` names the log, says how many
+lines it read, and states in as many words that this is not a statement about
+the run. `METRICS_SENTINEL` is a named constant rather than an inlined literal,
+because it is the seam — field names can drift one at a time and produce a loud
+`Unparseable`, but the sentinel failing takes every line out at once and looks
+like silence. The freeze did not block it: the sentinel lives in
+`quant-explain`, the reader, and not in the system under comparison.
+
+Both sides of that boundary are pinned by tests that were watched going red —
+disable the new variant and the drift case fails; make it greedy by dropping its
+`candidates == 0` guard and the ordinary `NotCovered` case fails.
+
+What is missing beyond that is a **test pinning the emitter to this parser**,
+which is what would make the debt safe rather than merely declared. That one
+*is* blocked — pinning the emitter means running it, and `quant-binance` is
+frozen. It belongs in the same commit as the `.json()` switch, and is named here
+so it is owed rather than forgotten.
 
 ---
 
@@ -173,6 +214,21 @@ failure:
 
 *Fails if* the **slowest** of the twenty exceeds 10 s, any block is absent, or any
 block is present but silently empty rather than stating a reason.
+
+**Two of those bullets are not met as written, and §5a's results are scored
+against the blocks that shipped.** The provenance block names the session, names
+every segment path and says how many events were replayed to reach the instant;
+of the four things asked for it prints two, neither commit among them, and it
+reads no `run.json` — see §3. And the health block labels `queue` instantaneous
+and `queue_peak` lifetime as asked, but prints the metrics line's `clock_skew` —
+a *count of messages whose venue stamp was ahead of ours* — as `clock skew Nms`,
+through a field this crate named `clock_skew_ms`. A figure printed in the wrong
+unit is worse than an unlabelled one; §7 is where that was caught.
+
+Both blocks are present rather than absent, so the timing figure stands. But the
+criterion is the standard and by the criterion these parts are unfinished, and
+they are recorded here rather than quietly rescoped: a criterion edited to match
+what was built stops being a criterion.
 
 ### P2 — agreement, against a genuinely independent computation
 
@@ -230,20 +286,34 @@ to be the slice that found something — see §7.
 
 ## 5a. What it does, and how the criteria came out
 
-All six slices landed. The command:
+All six slices landed, with two parts still owed: (f)'s provenance block does
+not print the commits §4 asks it for, and (e)'s health block prints a count as a
+duration. The command:
 
 ```bash
 explain ~/paper --at 2026-09-19T10:00:00Z --symbol BTCUSDT [--window 5m]
 explain --check-journal ~/paper/paper-BTCUSDT.jsonl
 ```
 
-Measured against the fortnight while it ran, rather than against fixtures:
+Measured against the fortnight *while it runs*, rather than against fixtures —
+so P1 and P2 are readings taken on day two, not final results:
 
 | | result |
 |---|---|
-| **P1** — 20 random instants, cold | **worst 4951 ms**, mean 2031 ms, budget 10 s |
-| **P2** — every checkpoint in both live journals | **18 of 18 agree** |
+| **P1** — 20 random instants, cold, 2026-09-19 | **worst 4951 ms**, mean 2031 ms, budget 10 s |
+| **P2** — every checkpoint in both live journals, 2026-09-19 | **18 of 18 agree** |
 | **P3** — refusals | 8 tests assert an absence *and* a reason |
+
+**Those two figures disagree with the ones `CLAUDE.md` records — worst 5799 ms,
+and 24 of 24 — and neither pair can be checked from this repository**, because
+the journals and the capture are on the Mac and rule 1 keeps them there until the
+run ends. The likeliest account is that they were taken hours apart on
+2026-09-19 and both were true when taken: checkpoints accrue while the run goes,
+so a later reading sees more of them, and a cold-cache timing is a property of
+the machine at that moment. **Neither is picked over the other here**, because
+picking would mean inventing the measurement that settles it. P1 and P2 are
+re-taken at judging against the finished run and those are the figures that
+count; the pair above stands as what day two looked like.
 
 P2's independence is the part worth re-reading before changing it. Checking
 `explain` against `reconcile` would hold **by construction** — both call
@@ -282,8 +352,17 @@ Harmless today because nothing has been refused, and `explain` will print it
 labelled as an ordinal rather than as an id. Fix it with the run log.
 
 **`Started.at` is hard-coded to zero.** Both live journals read `"at":0`, so the
-journal cannot say when its session began. `explain` derives the session start
-from the first raw frame instead. Fix it with the run log.
+journal cannot say when its session began. This used to end *"`explain` derives
+the session start from the first raw frame instead"*, and that is not what it
+does: `ours_at` is handed the journal path and no data root at all, and takes the
+earliest instant the journal can speak for from the journal's *own* entries —
+the first `Filled`, `Checkpoint`, `Tripped` or `Stopped` line, `Started` being
+the one entry whose timestamp is the zero. No raw frame is consulted. An instant
+before that is refused with a reason naming it, which is P3's rule and is what
+makes the defect survivable rather than silent. What it costs is the stretch
+between the process starting and its first journalled event: there the honest
+answer is *nothing had happened yet*, where a dated `Started` would say *the
+session was up and flat*. Fix it with the run log.
 
 **Nothing watches the tee during a run.** `TeeSink::secondary_dropped()` exists
 and is called from nowhere outside its own module, so no line of output says
@@ -291,11 +370,21 @@ whether the engine missed records the capture received. This matters because M5'
 exact-agreement criterion silently assumes it was zero.
 
 It *is* checkable after the fact, and the rehearsals did check it: the paper
-binary prints `events N reached the engine` and the capture prints `records=N`,
-and a dropped record makes the first smaller — the engine finds the
-`ingest_seq` hole itself. So this is a gap in *surveillance*, not in
-recoverability. `explain` reports both numbers in its provenance block; wiring
-the counter into the metrics line is a freeze change and waits.
+binary prints `events N reached the engine` in its shutdown summary and the
+capture's own summary carries `records=N`, and a dropped record makes the first
+smaller — the engine finds the `ingest_seq` hole itself. So this is a gap in
+*surveillance*, not in recoverability.
+
+**This used to end "`explain` reports both numbers in its provenance block", and
+it reports neither.** The `events_read` it does print is a third quantity
+altogether — how many events *this replay* walked to reach the instant, over the
+instant's day plus the previous one when the book needs it — so it is neither
+the engine's whole-run count nor the capture's, and quoting it as either would
+be worse than printing nothing. Both real numbers live in process output at
+shutdown, which makes the after-the-fact check a matter of reading two log lines
+rather than of running `explain`. Wiring the counter into the metrics line is a
+freeze change and waits; teaching the provenance block to quote that pair is
+not, and belongs with the commits it also does not print.
 
 ---
 
@@ -313,16 +402,42 @@ health    queue 0 now, 270 at its worst since start, of 4096 capacity
 Against 57–73 ms for the rest of the run's first nineteen hours. Two such
 excursions so far, at 07:47 and 10:00, each recovering within the hour.
 
-**Benign, and checked rather than assumed.** `queue=0`, `dropped=0` and
-`clock_skew=0` throughout: nothing was backed up, nothing was lost, and the host
-clock is fine — so this is transport delay between the venue and us, the same
-signature M1's acceptance run saw on hostel Wi-Fi. It affects no completeness
-criterion. It does mean the strategy sampled slightly stale prices for a few
-minutes, which `local_recv_ts` ordering handles correctly by construction.
+**Benign, and checked rather than assumed — but one leg of the check was weaker
+than it read.** `queue=0` and `dropped=0` throughout, so nothing was backed up
+and nothing was lost. The third figure was quoted as `clock_skew=0` meaning *the
+host clock is fine*, and it does not mean that. `clock_skew` is a **count of
+messages whose venue timestamp was ahead of ours**, not an offset: zero of them
+rules out our clock running *behind* the venue and says nothing about it running
+*ahead*, which is the direction that inflates every latency figure — M1's
+machine sat ~2 s ahead and read p50 2883 ms for exactly that reason.
+
+**And the reader repeated the mistake rather than catching it.**
+`quant-explain` parsed that count into a field it called `clock_skew_ms` and
+printed `clock skew Nms` once it passed a thousand — so a thousand skewed
+messages would have been reported as a second of offset. The emitter's own
+`latency_samples`, which is what makes the count read as a proportion, was not
+parsed at all. The millisecond offset the figure is mistaken for is a different
+measurement entirely: taken round-trip-corrected against `/api/v3/time` by
+`ops/preflight.sh` and the recorder's startup check, and never on the metrics
+line.
+
+**Fixed 2026-09-20**: the field is `clock_skew_samples`, `latency_samples` is
+parsed, and the two print together. The freeze did not block it, because
+renaming a field inside a reader touches no frozen crate.
+
+The conclusion survives the correction, on other evidence: the excursion
+recovered within the hour and the nineteen hours around it read 57–73 ms, which
+a clock offset does not do. So this is transport delay between the venue and us,
+the same signature M1's acceptance run saw on hostel Wi-Fi. It affects no
+completeness criterion. It does mean the strategy sampled slightly stale prices
+for a few minutes, which `local_recv_ts` ordering handles correctly by
+construction.
 
 The point is that it was invisible before. Finding it meant grepping 1388 log
 lines by hand and knowing which of them to compare, which is precisely the
 question this milestone exists to make cheap.
+
+---
 
 ## 8. What M7 did not do, and what is next
 
@@ -333,11 +448,44 @@ Unchanged from §2, and worth restating now that the reader exists:
   immediate next milestone, to start when the freeze lifts. Building the reader
   first was the right order: it made concrete what those entries have to contain.
 - **The prose metrics parser is debt with a scheduled repayment.** Switch the
-  emitter to `.json()` and delete `health.rs` in the same commit as the run log.
+  emitter to `.json()` and delete `health.rs` in the same commit as the run
+  log, and write the emitter-to-parser test there too — §3 explains why it
+  cannot be written until then.
 - **The three scoping defects in §6** are unfixed by design, for the same reason.
+- **Two things inside the health block are owed, and the freeze blocks neither.**
+  It prints the metrics line's `clock_skew` count as `clock skew Nms`, a
+  duration (§7), and a log whose lines it no longer recognises reads as *"the
+  process may not have been running"* rather than as a stale reader (§3). Both
+  live entirely in `quant-explain`.
+- **The provenance block prints neither commit and reads no `run.json`.** §3 and
+  §4 record it; it is the other part of P1 that is owed rather than done, and the
+  freeze is not what blocks it — `quant-explain` is the reader, not the system
+  under comparison, which is the same licence §1 claims for the whole milestone.
+- **A doc comment in `explain.rs` is misfiled**, and it is the same defect this
+  document was repaired for. The summary line and the paragraph explaining the
+  health block's time bases — *"`queue_peak=270` beside `queue=0` is how an
+  operator concludes the wrong thing at 3am"* — sit on `print_window`, with
+  `print_window`'s own one-line summary stranded beneath them as the last line
+  of the block, while `print_health`, which they describe, carries no doc
+  comment at all. A search-and-replace whose tail survived, in code rather than
+  in prose. Harmless to run and misleading to read, which is the whole objection
+  to it.
 
 The honest structural caveat, restated because it has not changed: `explain`'s
 market answers are what the *replay* says the book was, not what the *engine*
 saw. M5's criterion is the claim that those are identical, and it has not passed
-yet. Until it does, this is a debugger whose foundation is the thing under
-examination.
+yet — the fortnight started 2026-09-18T14:46:54Z and ends 2026-10-02. Until it
+does, this is a debugger whose foundation is the thing under examination.
+
+One thing learned since sharpens that caveat rather than softening it: **a
+supervisor restart inside the fortnight forfeits the exact comparison outright**,
+and nothing a reader does afterwards repairs it. `Engine::resuming` replaces the
+portfolio and nothing else, and `JournalEntry` has no strategy entry — so a
+restarted paper process comes back holding the right cash and position but with
+empty crossover windows, a zeroed equity sampler and a zeroed daily risk tally,
+while the judging backtest runs all three continuously across that same
+boundary. The fill counts then differ for a reason that has nothing to do with
+live-versus-replay, which is the only thing being asked. Where a mid-run restart
+has been discussed it has been treated as a *reader* problem about M2.e's parts;
+it is a **state** problem, and if one happens the honest report is that M5's
+criterion was not testable on this run.

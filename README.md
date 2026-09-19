@@ -10,7 +10,7 @@ One strategy binary, three worlds, no code changes between them:
 
 ```
               ┌── HistoricalSource   (Parquet replay, as fast as possible)
-EventSource ──┼── ReplaySource       (raw capture, wall-clock paced)
+EventSource ──┼── ReplaySource       (raw capture, wall-clock paced)  [not built]
               └── LiveSource         (venue WebSocket)
                         │
                         ▼
@@ -36,6 +36,16 @@ showed — which is exactly `SimulatedVenue`. What separates a backtest from pap
 trading is the **source** and the **durability**, not the matching, so writing a
 second fill model would have created two things that must agree forever with no
 way to notice when they stopped.
+
+**`ReplaySource` is not built either.** This diagram used to list it unmarked,
+beside a `LiveVenue` that carries its `[M8]` — and a diagram that marks one
+unbuilt thing and not another is claiming the unmarked ones exist. Two types
+implement `EventSource` outside the tests: `HistoricalSource` over the Parquet
+tier and `LiveSource` over the socket. Wall-clock-paced replay of raw capture is
+a shape the seam leaves room for and nothing has needed yet — M5 does not get its
+live-versus-replay comparison by pacing a capture afterwards, it gets it from one
+ingress feeding both paths at once. Same class of claim as `PaperVenue` above,
+corrected the same way.
 
 **A strategy must not be able to tell which pair it is wired to.** If it can,
 that is a bug. Divergence between these three paths is how backtests end up
@@ -109,10 +119,10 @@ ops/
 ```
 
 Every `ops/` script has a PowerShell half beside the bash one. The bash half is
-the one that has been run — M1's seven days and M5's fortnight were both
-conducted from it — and it is the only half that knows `--paper`, because an
-untested paper mode on the side nobody runs is exactly the harness M1 warns
-about.
+the one that has been run — M1's seven days were conducted from it and M5's
+fortnight is being conducted from it now — and it is the only half that knows
+`--paper`, because an untested paper mode on the side nobody runs is exactly the
+harness M1 warns about.
 
 ## Milestones
 
@@ -174,16 +184,33 @@ a backtest over the same window" checkable exactly rather than approximately. A
 three-minute rehearsal against Binance gave 4552 frames captured and 4552 events
 reaching the engine, with `verify` clean and the journal reconciling.
 `docs/paper-run.md` is the procedure.
-outstanding. `paper` runs `LiveSource + SimulatedVenue` with the capture and the
-engine fed from **one ingress** — the same records with the same timestamps, which
-is what makes "paper P&L must match a backtest over the same window" checkable
-exactly rather than approximately. A three-minute rehearsal against Binance gave
-4552 frames captured and 4552 events reaching the engine, with `verify` clean and
-the journal reconciling. `docs/paper-run.md` is the procedure.
 
 The rehearsal also produced M4's finding in miniature, from live data: one round
 trip bought at 77,634.64 and sold at 77,637.67 — **three tenths of a cent of price
 against fifteen and a half cents of fees.**
+
+**A restart during the fortnight would forfeit the exact match**, and that is
+newly understood — a mid-run restart had been framed throughout as a *reader*
+problem, this document included. The reader half is settled, and it is settled at
+**write** time rather than at read time: a reader concatenates a day's parts in
+index order and never merges them, and that index is trustworthy only because the
+writer earned it. Two sessions sharing a UTC day are written as separate parts,
+and before publishing the second the writer compares the venue's own update-id
+span out of each part's Parquet footer against the parts already there and
+refuses one that does not follow — refuses rather than reorders, because a part
+that does not follow means the sessions were concurrent, and there is no ordering
+of two simultaneous recordings of the same messages that is the truth. The span
+and not `local_recv_ts`, which the data contract originally called for: our clock
+steps, so ordering by it would reverse two sessions at the seam without saying
+so. The half that is not settled is **state**. The journal holds fills,
+checkpoints and the kill switch, and `Engine::resuming` replaces the portfolio
+— nothing in it carries the strategy. So a restarted `paper` process comes back
+with the right cash and position but with empty crossover windows, a zeroed
+equity sampler and a zeroed daily risk tally, while the judging backtest runs
+all three continuously across that same instant. Fill counts would then differ
+for reasons that have nothing to do with live-versus-replay, which is the only
+thing M5 asks, and nothing at judging time can undo it. The exact comparison
+needs a fortnight with no restarts.
 
 **M6 is complete**, built before M5's fortnight on purpose so one long run
 exercises the limits too. Two deliberately misbehaving strategies live in the test
@@ -261,7 +288,6 @@ mid-stream with no anchor, which is where those 7,000 to 34,000 dropped deltas
 came from; joining a session's segments takes it to zero. Keeping it would also
 have left two implementations of *apply recorded events to a book and check every
 tick*, and the one nobody maintains is the one that quietly stops agreeing.
-```
 
 The normalized tier holds **events, not books**: `trades/`, `book_deltas/`,
 `book_snapshots/`, `gaps/`. A book is derived at replay time, never stored —
@@ -296,14 +322,6 @@ cargo run --release -p quant-backtest --bin backtest -- data --realistic \
   --max-order 100 --max-position 100 --max-daily-loss 5 --max-orders 200
 ```
 
-The limits are quote-currency notionals and a daily order count, and they are
-unset by default, so a bare run is byte-identical to the one before limits
-existed — the same reason costs are off by default. `paper` defaults the other
-way and says why: a fortnight unattended is the wrong place for no limits,
-whereas a backtest whose limits changed under it would stop being a measurement
-of the strategy.
-```
-
 Exit 0 means every discontinuity in every session is explained by a record in the
 capture; non-zero means it is not. That is what makes it runnable from cron
 *during* a long capture rather than something a person reads afterwards.
@@ -322,6 +340,13 @@ The unit is the **session**, not the file: `ingest_seq` spans a session, so a ho
 straddling midnight is invisible to a per-file check. Errors fail the run and
 warnings do not, because a torn tail on a file still being written is normal and
 failing on it would train everyone to ignore the exit code.
+
+The risk limits on that last `backtest` line are quote-currency notionals and a
+daily order count, and they are unset by default, so a bare run is byte-identical
+to the one before limits existed — the same reason costs are off by default.
+`paper` defaults the other way and says why: a fortnight unattended is the wrong
+place for no limits, whereas a backtest whose limits changed under it would stop
+being a measurement of the strategy.
 
 ### Metadata (optional)
 

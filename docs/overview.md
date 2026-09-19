@@ -13,8 +13,10 @@ version is named. Read those when they disagree.
 | The milestone table | `README.md` |
 | How the 7-day run is conducted and judged | `docs/acceptance-run.md` |
 | The seam a strategy sees, and why | `docs/engine-contract.md` |
+| How the 2-week paper run is conducted and judged | `docs/paper-run.md` |
+| Why M7 is a reader and not an exporter | `docs/observability.md` |
 
-*State as of 2026-09-19: **M0 through M4, M6 and M7 complete; M5's fortnight is running.** M1's acceptance run was
+*State as of 2026-09-20: **M0 through M4, M6 and M7 complete; M5's fortnight is running.** M1's acceptance run was
 spent in full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. Both
 weeks now replay as two joined 8-day sessions with book invariants holding at all 70.5M
 ticks, and the normalized Parquet tier reproduces the raw stream event for event. M3's
@@ -51,7 +53,7 @@ to tell whether a result is real.
 ### What this is not
 
 - **Not a bot.** No "buy when RSI < 30" logic anywhere, by design.
-- **Not a moneymaker yet.** - **Not a moneymaker yet.** Nothing built so far says any strategy *has* edge. The one
+- **Not a moneymaker yet.** Nothing built so far says any strategy *has* edge. The one
   question that has been asked — does a moving-average crossover survive retail fees? —
   was answered at M4, and the answer is no.
 - **Not fast.** Latency is not the edge being pursued. The system is built to be
@@ -66,7 +68,7 @@ One strategy binary, three worlds, no code changes between them.
 
 ```
               ┌── HistoricalSource   (Parquet replay, as fast as possible)
-EventSource ──┼── ReplaySource       (raw capture, wall-clock paced)
+EventSource ──┼── ReplaySource       (raw capture, wall-clock paced)  [not built]
               └── LiveSource         (venue WebSocket)
                         │
                         ▼
@@ -78,7 +80,7 @@ EventSource ──┼── ReplaySource       (raw capture, wall-clock paced)
                         ▼
                  ┌── SimulatedVenue   (fills, fees, slippage, latency model)
 ExecutionVenue ──┼── (no PaperVenue: paper uses SimulatedVenue -- see M5)
-                 └── LiveVenue        (real orders)
+                 └── LiveVenue        (real orders)                  [M8]
 ```
 
 | Mode | Source | Venue |
@@ -89,6 +91,23 @@ ExecutionVenue ──┼── (no PaperVenue: paper uses SimulatedVenue -- see 
 
 **A strategy must not be able to tell which pair it is wired to.** If it can, that
 is a bug, not a feature.
+
+**Two of those boxes are not code, and this diagram used to mark only one of
+them.** `LiveVenue` has always carried its `[M8]`. `ReplaySource` carried nothing,
+and an unmarked box in an architecture diagram reads as a description of what is
+implemented — which it is not: `grep -rn ReplaySource crates --include=*.rs`
+finds two doc comments and no type, and the only `impl EventSource` outside the
+test suites are `HistoricalSource` (`quant-normalize/src/tier/read.rs`) and
+`LiveSource` (`quant-binance/src/live.rs`). Nothing has needed it yet. A backtest
+wants the archive replayed as fast as the disk allows, which is
+`HistoricalSource`; paper wants the socket, which is `LiveSource`; wall-clock
+pacing of a *raw* capture is for demonstrating and debugging a strategy at human
+speed, and nothing has asked for that. It stays in the drawing because the seam
+is designed to take a third source without the engine noticing, which is the
+claim this section is making — but it is drawn as a plan, not as an inventory. This is the
+same correction M5 already made for `PaperVenue`, and it is worth making the same
+way rather than quietly deleting the box: the interesting fact is *why* a box in
+the design has no code behind it.
 
 ### Why this matters more than it looks
 
@@ -234,8 +253,6 @@ use whatever tool fits, with no schema registration.
 | M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | **run in flight** |
 | M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | **done** |
 | M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | **done** |
-| M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | **done** |
-| M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | |
 | M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance | |
 
 Milestones have **acceptance criteria, not feature lists**. "Done" means the
@@ -513,12 +530,17 @@ venue is **reported as unchecked**, which is the part that matters.
 One structured line per minute per symbol:
 
 ```
-metrics symbol=BTCUSDT msgs_per_sec=37 bytes_per_sec=13070
-        queue=0 queue_peak=18 queue_capacity=4096 dropped=0
-        latency_p50_ms=41 latency_p90_ms=88 latency_p99_ms=140
-        latency_samples=2276 clock_skew=0
+metrics symbol=BTCUSDT msgs_per_sec=42 bytes_per_sec=14067
+        queue=0 queue_peak=270 queue_capacity=4096 dropped=0
+        latency_p50_ms=63 latency_p90_ms=81 latency_p99_ms=110
+        latency_max_ms=153 latency_samples=2524 clock_skew=0
         gap_disconnect=0 gap_overflow=0 gap_sequence=0
 ```
+
+Wrapped for the page; on disk it is one line. It is a real one, from the
+fortnight at 2026-09-19T13:54:52Z — the illustrative line this document used to
+print was missing `latency_max_ms`, which is the field the last paragraph of this
+section turns on.
 
 The contract puts the case plainly: *"if we cannot see queue depth we cannot tell the
 difference between a quiet market and a stalled consumer."* Both look identical from
@@ -528,6 +550,28 @@ the other is losing data.
 Read in this order: **`dropped`** (should always be 0), **`queue`/`queue_peak` against
 capacity**, **`clock_skew`**, **`gap_disconnect`** (a few a day is Binance behaving as
 documented), then the percentiles — where a step change matters more than the value.
+
+**`clock_skew` is a count of samples, not a millisecond offset.** It is the number
+of messages in the window whose `exchange_ts` was *ahead* of our `local_recv_ts` —
+counted apart rather than clamped to zero, because the data contract is explicit
+that a negative latency is an alert rather than something to fold into a
+histogram, where it would turn a broken clock into an implausibly good latency
+figure. The millisecond offset is a different measurement, taken against
+`/api/v3/time` by `ops/preflight.sh` and by the recorder's startup check, which
+warns above 1000 ms; it does not appear on this line at all.
+
+**Worth spelling out because `quant-explain` did not make the distinction, and
+this document claimed it had.** `health.rs` parsed `clock_skew` into a field
+called `clock_skew_ms`, and `explain` printed `clock skew NNNms -- past Binance's
+own tolerance for a signed request` once it passed 1000 — so a minute with a
+thousand skewed samples was reported as a one-second clock offset, which is a
+different fact about a different measurement.
+
+**Fixed 2026-09-20**: `clock_skew_samples`, printed beside `latency_samples`.
+Note what did *not* have to wait for the freeze to lift — renaming a field inside
+a reader touches no frozen crate, so this was separable from the larger repair
+(switching the emitter to `.json()` and deleting `health.rs`) that
+`docs/observability.md` still schedules for afterwards.
 
 Latency percentiles come from a hand-rolled log-bucketed histogram (16 sub-buckets per
 octave, ~6% error, pinned by a test) rather than a dependency, because it is forty lines
@@ -696,8 +740,9 @@ Three decisions inside it are worth keeping.
 
 **The replay is an iterator of events, not a program that checks a book.** The book is
 the consumer that happens to exist first; the Parquet writer at M2.d and the engine's
-historical and replay sources at M3 want the identical stream. Written the other way,
-both would have to take it apart again to get at the events.
+`HistoricalSource` at M3 — and the wall-clock-paced `ReplaySource` whenever anything
+needs one, which §2 notes nothing has — want the identical stream. Written the other
+way, both would have to take it apart again to get at the events.
 
 **The archive's own discontinuities are items in that stream.** A segment that will not
 open, a torn tail, a hole in `ingest_seq` — each means what follows does not continue
@@ -749,13 +794,27 @@ new session, and two sessions can cover one symbol-day; publishing the second ov
 the first would lose a day and leave a file that looks complete. Each file carries
 its source session in the Parquet footer. M2.d used that to **refuse** the second
 session — safe rather than lossy, and deferrable only until a restart actually
-happened. The fortnight made it due: one restart inside a day would have made the
-whole window unjudgeable, because M5's criterion needs `normalize --write --check`
-over it. So M2.e makes the day a sequence of **parts** — `part-00000.parquet`,
-`part-00001.parquet`, one per contributing session — and every file still names
-exactly one source, so no footer has to describe two. A restart is *sequential*
-(`supervise.sh` reads the recorder's exit code before respawning), so a shared day
-is a concatenation and a file boundary is the exact and free encoding of one.
+happened. The fortnight made it due: one restart inside a day would have left the
+normalized tier unable to hold the window at all, and M5's criterion needs
+`normalize --write --check` over it. So M2.e makes the day a sequence of
+**parts** — `part-00000.parquet`, `part-00001.parquet`, one per contributing
+session — and every file still names exactly one source, so no footer has to
+describe two. A restart is *sequential* (`supervise.sh` reads the recorder's exit
+code before respawning), so a shared day is a concatenation rather than an
+interleave, and a file boundary is the exact and free encoding of *that* — of
+where one session's slice stops and the next begins.
+
+That solved the *reading* of a restart and not the *surviving* of one, which is a
+distinction this document did not draw until now: see M5 below, where a restart
+forfeits the criterion for a reason no tier layout can repair.
+
+What a file boundary is **not** is an encoding of which slice came first, and this
+paragraph used to imply that it was. A part's index is handed out in arrival
+order, and arrival order is `catalog` order — a text sort of paths, which comes
+out chronological by luck rather than by construction, and the third decision
+below says exactly when the luck runs out. So the index carries no chronological
+information of its own. The order has to come from the data, which is the next
+decision.
 
 **The ordering key was specified wrong, and the correction is the interesting part.**
 The contract said the merge should be ordered by `local_recv_ts`. That is
@@ -766,9 +825,43 @@ day after an NTP step or, worse, silently reverses them. Parts are ordered inste
 by the **venue's own update-id span**, recorded per part in the footer: strictly
 increasing per symbol across disconnects, immune to anything our clock does, and
 already present as `BookDelta`'s range in the M0 event contract — so no venue
-knowledge enters `quant-normalize`. Overlapping spans mean the sessions were
-*concurrent*, and that is refused: there is no ordering of two simultaneous
-recordings of the same messages that is the truth.
+knowledge enters `quant-normalize`.
+
+**M2.e then tried to make the index chronological instead, and that was the
+defect.** `PartitionWriter::check_follows` refused to publish a part whose first
+update id was not past the last update id of every part already there, and
+`TierReplay` walked parts in index order on the strength of it. But a part's
+index is the count of parts already published, so it is handed out in `catalog`
+order, and `catalog` sorts paths as text. A session first appears under its
+earliest UTC day — so a restart on any day *after* the session's first puts the
+two in the right order for free, which is the shape a mid-fortnight restart would
+take. A restart on the session's **own** first day does not: both sessions'
+earliest path shares its `date=` component, the next component is
+`session=<v4 uuid>`, and which one `catalog` hands over first is a coin flip.
+Lose it and the earlier session was refused as out of order — and since the
+writer is abandoned on a refusal, the rest of that session's days went unwritten
+with it, including days it did not share. The check was rejecting the case the
+slice existed to serve.
+
+**Fixed 2026-09-20 by separating two questions the slice had run together.**
+Write time asks only what is answerable there: **are the spans disjoint?**
+Overlap means the recorders ran at once, which is the single case with no true
+ordering, and `PartsConcurrent` now says exactly that and nothing about arrival.
+Read time takes the order from the spans already in every footer —
+`TierReplay::order_by_span` — so the key is `(day, book_seq_first, ingest_seq)`
+and the index is demoted to what it always was: a unique file name. A day with
+one part is charged no footer read, so every single-session day on disk reads
+exactly as before.
+
+It never bit in practice: the fortnight has had zero restarts, and M2.e's
+rehearsal pair genuinely shared a first day and merged, so the flip landed the
+right way there. The lesson is one this project has recorded before in a
+different costume: when an identifier carries no ordering information, the danger
+is not that someone reads order out of it deliberately — it is that a check
+quietly assumes it. The second lesson is about the test. M2.e shipped with a
+merge test that always normalized the earlier session first, so it pinned one
+half of the coin flip and never took the other; it stays **green** under the
+sabotage that reddens the regression tests written with the fix.
 
 **The partition day is inherited from raw, not recomputed.** The first version
 re-derived it from `local_recv_ts` with a "never backwards" clamp — reimplementing
@@ -866,20 +959,12 @@ which way. It becomes a systematic cost only for a strategy fast enough that the
 market's move during the round trip correlates with the reason it traded.
 
 **Queue position and market impact are still not modelled, and cannot be.** Our order
-was never in the recorded book, and nobody in the recording reacted to it. **Queue position and market impact are still not modelled, and cannot be.** Our order
 was never in the recorded book, and nobody in the recording reacted to it. No amount of
 cleverness recovers that from a capture — and the conclusion drawn from that at the end
 of M4, that M5 was therefore the instrument, was **wrong**. A paper venue fills against
 the same reconstructed book, so our orders are still not in it and nobody is still
 reacting to them. Only M8 puts an order somewhere other participants can see, so only
 M8 can measure these.
-
-### M5 — Paper trading
-
-(delete these six lines — heading, criterion and the two-sentence body — and keep the section that follows, which states the sharpened criterion and the reason it was sharpened)
-
-Live prices, simulated fills. The reconciliation matters more than the P&L: two
-independent calculations agreeing is evidence; one calculation is an assertion.
 
 ### M5 — Paper trading *(the run is in flight)*
 
@@ -903,6 +988,30 @@ systems and fails for a reason that has nothing to do with live-versus-replay,
 which is the only thing being asked. M2.e and M7 were built in a separate worktree
 on exactly that licence — a reader that reads all of the data rather than some of
 it is not the system under test.
+
+**A supervisor restart forfeits the criterion, and that is newly understood.**
+Every document here, this one included, has framed a mid-run restart as a
+*reader* problem: two sessions land on one symbol-day, and M2.e taught the
+normalized tier to hold both. That half is solved. The other half is a **state**
+problem and is not. `JournalEntry` records the session start, the fills, the
+checkpoints and the kill switch — and nothing about the strategy — while
+`Engine::resuming` (`crates/quant-engine/src/lib.rs`) replaces the portfolio and
+only the portfolio. So a restarted paper process comes back up holding the right
+position and the right cash, and with **empty `MaCrossover` windows, a zeroed
+equity sampler and a zeroed daily risk tally**. The judging backtest runs all
+three straight through the same boundary, because nothing interrupted it. An
+indicator that was mid-warm-up live is warm in the replay, so the two disagree
+about when a crossing fires, so the fill counts differ — and the comparison fails
+for a reason that has nothing to do with live-versus-replay, which is the only
+thing it is being asked. Nor can it be repaired afterwards: what the strategy
+believed at the moment the process died was never written down, and M7's scoping
+note below is the general form of it — no reader recovers a fact nobody recorded.
+
+So the run's zero-restart record is not a nicety, it is the criterion's
+precondition, and a restart on day nine would mean the fortnight has to be spent
+again rather than salvaged. Closing the hole means journalling strategy state,
+which is a change to `quant-engine` and therefore cannot happen until the freeze
+lifts — it belongs with the run log in the same unfreeze.
 
 That criterion was sharpened during M5. "P&L reconciles against an independent
 recompute" checks arithmetic against itself and would pass on a system whose live
@@ -974,15 +1083,28 @@ The chokepoint designed at M3 gets filled in: max order notional, max position, 
 loss, kill switch. "Provably, under test" means a deliberately misbehaving strategy is
 part of the suite.
 
-### M7 — Observability
-
-**Criterion:** "what was it doing at 03:14 last Tuesday?" answered in a minute.
-
 ### M7 — Observability *(complete)*
 
 **Criterion:** "what was it doing at 03:14 last Tuesday?" answered in a minute. Met, and
-measured against the fortnight *while it was running*: twenty random instants, cold, no
-cache and no index — worst **4951 ms** of a 10 s budget.
+measured against the fortnight *while it runs*: twenty random instants, cold, no
+cache and no index — worst **4951 ms** of a 10 s budget, plus every checkpoint in both
+live journals agreeing with a fold of the fill lines beneath it.
+
+**Both of those numbers need a timestamp, and neither has a reliable one.** They
+were taken against a run that is still going, so they describe the artifacts as
+they stood at the moment of measurement and not as they will stand at judging:
+the journals gain a checkpoint every six hours, and the seek's cost is a function
+of how much of a day it has to walk. And the figures recorded elsewhere in the
+repository **do not match these**. `CLAUDE.md` says worst 5799 ms and 24 of 24
+checkpoints; `docs/observability.md` says worst 4951 ms and 18 of 18; this
+document carried the second pair and no checkpoint count at all. The likeliest
+explanation is that the passes ran at different points in the fortnight and each
+was true when taken — the difference is six checkpoints across two journals, which
+at a six-hourly cadence is what a later pass looks like rather than what a
+different measurement looks like. But the
+journals and the capture are on the Mac, this repository cannot settle it, and
+guessing which pair is canonical would be inventing a measurement. **Re-run P1
+and P2 at judging and record each number with the instant it was taken.**
 
 **M7 is a time cursor over artifacts that already exist — a reader, not a recorder and not
 an exporter.** The same re-scope M1.d made: sort the facts the question needs by which
@@ -1064,9 +1186,10 @@ the simulation was honest. See §11.
   total shown separately from the price result so the two cannot be confused
 - **The engine runs against a live venue**, with the capture and the engine fed from one
   ingress — first in rehearsal (4552 frames captured, 4552 events reaching the engine)
-  and now for real. A day into the fortnight: 5,501,204 frames, `missing 0`, zero
-  restarts, `quant-verify` exit 0, and `reconcile` AGREES on both journals at every
-  six-hourly pass
+  and now for real. Measured 2026-09-19, a day into the fortnight: 5,501,204 frames,
+  `missing 0`, zero restarts, `quant-verify` exit 0, and `reconcile` AGREES on both
+  journals at every six-hourly pass. None of it is the criterion, which is settled
+  only by the comparison at the end
 
 ### The acceptance run
 
@@ -1111,22 +1234,24 @@ second check were themselves evidence:
    economically irrelevant — but it means the *slippage* half of M4 is modelled and
    unvalidated, while the *fee* half is simply arithmetic on a published number.
 3. **Queue position and market impact are unmeasured, not merely unmodelled.** They are
-   3. **Queue position and market impact are unmeasured, not merely unmodelled.** They are
    not recoverable from recorded data at any price — and not from paper either, which is
    what this said until M5 corrected it. A paper venue uses simulated fills, so our
    orders are still not in the book and nobody is still reacting to them. **M8 is the
    instrument**, because it is the first one that puts an order where others can see it.
+4. **M5's criterion is not met, and it now has a precondition nothing guarantees.** The
+   comparison happens at the end of the fortnight and settles nothing before then. It
+   also requires the run to reach the end without a supervisor restart, because a
+   restarted process resumes its cash and position but not its strategy state, and the
+   judging backtest never restarts — the argument is in M5 above. Zero restarts so far
+   is a good sign and not a guarantee, and there is no fallback if one happens.
 
 ### Honest proportion
 
 By milestone count this is seven of nine, with the eighth in flight. By risk it is further
 along than that: the irreversible part — the format that all future data is written in — is
 done, tested, and proven over seven days of live capture, in the order where mistakes were
-cheapest. What remains is two weeks of wall clock and then M8, which is the first milestone
-where a mistake costs money rather than a re-derive. By risk it is further along than that: the
-irreversible part — the format that all future data is written in — is done, tested, and
-proven over seven days of live capture, in the order where mistakes were cheapest. What
-remains is mostly work where a mistake costs a re-derive.
+cheapest. What remains is the rest of the fortnight's wall clock and then M8, the first milestone
+where a mistake costs money rather than a re-derive.
 
 ---
 
@@ -1214,6 +1339,10 @@ cargo run --release -p quant-backtest  --bin backtest      -- data --realistic
 # M5: paper trade live, then check the journal accounts for itself
 cargo run --release -p quant-backtest  --bin paper     -- --symbol BTCUSDT data --minutes 10
 cargo run --release -p quant-backtest  --bin reconcile -- data/paper-BTCUSDT.jsonl
+
+# M7: what was it doing at that instant, and does the journal account for itself
+cargo run --release -p quant-explain   --bin explain -- data --at 2026-09-19T10:00:00Z --symbol BTCUSDT
+cargo run --release -p quant-explain   --bin explain -- --check-journal data/paper-BTCUSDT.jsonl
 ```
 
 Warnings are errors in CI. Commits explain **why** in the body — the rationale is the
@@ -1221,8 +1350,6 @@ point, because the code shows the what.
 
 ### The crates
 
-| Crate | Lines | Knows about |
-|---|---|---|
 | Crate | Lines | Knows about |
 |---|---|---|
 | `quant-core` | 2,672 | Money, time, instruments, the event contract. No I/O. |
@@ -1237,16 +1364,13 @@ point, because the code shows the what.
 | `quant-sim` | 1,478 | The simulated counterparty. Every backtest modelling assumption. |
 | `quant-backtest` | 2,431 | Top of the graph. The only crate that knows both where events come from and what fills them. |
 | `quant-explain` | 2,123 | Top of the graph, beside `quant-verify`. Asks what was happening at an instant, and writes nothing. |
-| `quant-storage` | 2,702 | The raw format. No venue, no network. |
-| `quant-recorder` | 4,204 | Ingress, overload policy, day rolling. Venue-agnostic, async-free. |
-| `quant-binance` | 2,971 | The only crate that knows a venue. |
-| `quant-book` | 971 | Book reconstruction and its invariants. Depends only on `quant-core`. |
-| `quant-meta` | 1,075 | Postgres. Sits above the recorder; optional. |
-| `quant-verify` | 2,056 | Near the top. Asks whether the capture is complete. Nothing may depend on it. |
-| `quant-normalize` | 3,752 | Near the top. Asks what the market did, and writes the normalized tier. |
-| `quant-engine` | 3,136 | The seam: the loop, the four traits, the portfolio. No venue, no format, no network. |
-| `quant-sim` | 1,478 | The simulated counterparty. Every backtest modelling assumption. |
-| `quant-backtest` | 2,234 | Top of the graph. The only crate that knows both where events come from and what fills them. |
+
+Twelve crates, 30,423 lines — the same total the header of this document quotes,
+which is the point of writing it down once. This table used to be printed twice,
+the second copy carrying pre-M2.e line counts and no `quant-explain` row, so the
+document disagreed with itself about how big the workspace is. The numbers are
+`find crates/<crate> -name '*.rs' | xargs wc -l`; re-derive them rather than
+editing a digit.
 
 The dependency arrows only point one way. That is checked by the fact that adding a second
 venue should mean writing a new adapter and touching nothing else.

@@ -41,7 +41,7 @@ One strategy binary, three worlds, no code changes between them:
 
 ```
               ┌── HistoricalSource   (Parquet replay, as fast as possible)
-EventSource ──┼── ReplaySource       (raw capture, wall-clock paced)
+EventSource ──┼── ReplaySource       (raw capture, wall-clock paced)  [not built]
               └── LiveSource         (venue WebSocket)
                         │
                         ▼
@@ -56,6 +56,15 @@ ExecutionVenue ──┴── LiveVenue        (M8)
 ```
 
 Backtest = Historical + Simulated · Paper = **Live + Simulated** · Live = Live + Live.
+
+`ReplaySource` is marked because it **does not exist** — `HistoricalSource` and
+`LiveSource` are the only `impl EventSource` in the workspace. It was in the M0
+design as the wall-clock-paced rehearsal path, and M5 turned out not to need it:
+paper is `LiveSource`, and a backtest wants Parquet at full speed. Marked rather
+than deleted because it is still the obvious way to rehearse against a recorded
+day in real time, and unmarked it made the diagram read as a description of what
+is implemented — the same defect the project corrected for `PaperVenue`, found
+the same way.
 
 M5 established there is no `PaperVenue`: a paper venue fills against a
 reconstructed book at prices the book showed, which is exactly `SimulatedVenue`.
@@ -103,7 +112,7 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0–M4, M6 and M7 are complete. M5's fortnight is running** (started
 2026-09-18T14:46:54Z, ends 2026-10-02) **and is the one remaining criterion.**
-411 tests green in debug and release, clippy and fmt clean, 30,423 lines across
+416 tests green in debug and release, clippy and fmt clean, ~30,700 lines across
 12 crates.
 
 While it runs: **do not `git pull` or `cargo build` in the run's checkout.**
@@ -120,8 +129,8 @@ where M2.e and M7 were built.
   clippy and fmt clean.
 - **M1 complete** (code 2026-08-11, acceptance run passed 2026-08-28): the Binance
   recorder. Every slice is written, tested and committed; 179 tests green in debug
-  and release, clippy and fmt clean. Five of §7's six criteria were settled by the
-  test suite and `quant-verify`; the sixth — **7 consecutive days unattended** —
+  and release, clippy and fmt clean. Six of §7's seven criteria were settled by the
+  test suite and `quant-verify`; the seventh — **7 consecutive days unattended** —
   has now been spent. See **"The acceptance run, and how it went"** at the bottom of
   this file. That section replaces the old "Picking up the acceptance run" notes,
   which described a run that had not started yet.
@@ -732,16 +741,23 @@ where M2.e and M7 were built.
   with no tolerance available. Every file still names exactly one session, so no
   footer has to describe two sources.
 
-  The ordering key is `(day, part, ingest_seq)`, and **only the last is compared
-  inside the four-way merge**. `ingest_seq` restarts at 1 for a new session, so
-  merging across a part boundary on it would interleave the second session's
-  opening events into the middle of the first.
+  The ordering key is `(day, book_seq_first, ingest_seq)`, and **only the last is
+  compared inside the four-way merge**. `ingest_seq` restarts at 1 for a new
+  session, so merging across a part boundary on it would interleave the second
+  session's opening events into the middle of the first.
+
+  **This said `(day, part, ingest_seq)` and that was wrong — see the M2.e
+  ordering defect below.** A part's index says which session was normalized
+  first, not which recorded first.
 
   **The data contract's own sentence about this was wrong, and is corrected
   rather than implemented.** It said the merge should be "ordered by
   `local_recv_ts`". That is `SystemTime`: it steps, and it is **not monotone even
-  within one session** — §6's never-roll-backwards rule and the
-  `backdated_records` counter exist because of it. Ordering two sessions by a
+  within one session** — `quant-recorder::segment`'s never-roll-backwards rule
+  and the `backdated_records` counter exist because of it. (That rule is
+  documented in the code and in M1.c1's notes above, and **nowhere in the data
+  contract** — this used to cite a §6 of it that does not say any such thing,
+  and `docs/data-contract.md` carried the same dangling citation to its own §5.) Ordering two sessions by a
   quantity that can run backwards either refuses a healthy day after an NTP step
   or, worse, silently reverses them. Parts are ordered by the **venue's own
   update-id span**, recorded per part in the footer: strictly increasing per
@@ -750,6 +766,40 @@ where M2.e and M7 were built.
   enters `quant-normalize`. Overlapping spans mean the sessions were
   *concurrent*, which is refused: there is no ordering of two simultaneous
   recordings of the same messages that is the truth.
+
+- **The M2.e ordering defect** (found 2026-09-20 by auditing this file against
+  the code, and it is the reason that audit was worth running). M2.e shipped a
+  merge that **refused the ordinary case about half the time** and would have
+  read it back in a random order the rest of the time.
+
+  A part's index is assigned by `place` in **arrival order**. Arrival order is
+  the order `catalog` yields sessions, and `catalog` sorts paths whose session
+  component is a **v4 UUID** — so for two perfectly sequential recorders, which
+  one landed at part 0 was a coin flip. `check_follows` then demanded the
+  incoming part start after every published part ended, so the *earlier* session
+  was refused whenever it lost the flip — and `normalize` abandons the writer on
+  a refusal, so the rest of that session's days went unwritten too, **including
+  days it did not share**. The error said "these sessions were not sequential"
+  about two sessions that were. One restart in the fortnight would have hit this
+  with probability one half, and judging step 3 needs `normalize --write --check`
+  over that window.
+
+  The fix separates two things this slice had conflated. **Write time asks only
+  what is checkable there: disjointness.** Overlap means the recorders ran at
+  once, which is the one case with no true ordering, and `PartsConcurrent` now
+  says that and nothing about arrival. **Read time takes the order off the spans
+  already in every footer**, where it is a fact about the market rather than
+  about the order we happened to derive things in. `order_by_span` charges no
+  footer read for a day with one part, so every single-session day on disk reads
+  exactly as before.
+
+  **The lesson is about the test, not the code.** M2.e shipped with
+  `two_sessions_on_one_day_are_merged_into_parts`, which always normalizes the
+  earlier session first — it pinned one half of a coin flip and never took the
+  other. Both new regression tests go red on the old semantics and both of M2.e's
+  own tests stay **green** under that same sabotage. A fixture that fixes the
+  order of an input whose order is the thing under test proves less than it
+  looks like it does.
 
   **The span is a property of the part, not of each file.** Written into all four
   datasets including the empty ones — keyed to each file's own rows, the ordinary
@@ -1284,6 +1334,17 @@ where M2.e and M7 were built.
   five blocks present — worst 5799 ms of a 10 s budget. **P2** 24 of 24
   checkpoints across both journals agree. **P3** the refusal fixtures.
 
+  **Both figures need re-confirming at judging, and this file and
+  `docs/observability.md` disagree about them.** That file records worst 4951 ms
+  and 18 of 18; `docs/overview.md` sides with it on the latency and gives no
+  checkpoint count. Neither is checkable from this repository — the journals and
+  capture are on the Mac — and the likeliest explanation is benign: they were
+  measured hours apart on a run that was still accumulating checkpoints, so 18
+  and 24 were each true when taken and neither was stamped. **Neither number was
+  picked over the other**, because guessing between two measurements is exactly
+  what this project does not do. Re-run both against the finished artifacts on
+  2026-10-02 and record the time of measurement beside the value.
+
 - **M7's first real use found something** (worth remembering). The health block
   read `latency p50 4194ms p99 14155ms` at 2026-09-19T10:00Z, against 57–73 ms
   for the rest of the run's first nineteen hours. **Benign, and checked rather
@@ -1457,8 +1518,8 @@ record of how it was set up; the full procedure is `docs/paper-run.md`.
 ### Where things stand
 
 M0–M4, M6 and M7 are complete. **M5's fortnight is the one remaining criterion
-and it is spending its wall clock now.** 411 tests green in debug and release,
-clippy and fmt clean, 30,423 lines across 12 crates.
+and it is spending its wall clock now.** 416 tests green in debug and release,
+clippy and fmt clean, ~30,700 lines across 12 crates.
 
 Watching it:
 
@@ -1505,7 +1566,7 @@ git checkout m5-run-start && cargo build --release
 # the fortnight's 10/30 on one-minute mids needs half an hour before it can cross,
 # so a short rehearsal on those settings would leave the journal, the fills and
 # the reconciliation untested.
-ops/start-run.sh --paper --minutes 10 --symbols "BTCUSDT" --root ~/rehearsal \
+ops/start-run.sh --paper --minutes 10 --symbols "BTCUSDT" --root ~/paper-rehearsal \
     --paper-args "--qty 0.001 --fast 2 --slow 4 --interval-secs 5"
 
 ops/start-run.sh --paper --days 14 --symbols "BTCUSDT ETHUSDT" --root ~/paper \
@@ -1542,7 +1603,50 @@ run on different code; and bash reads a script file *lazily, by byte offset*, so
 changing `ops/*.sh` underneath the running supervisor can make its loop jump
 mid-execution. Merging to `main` is safe — only pulling *there* is not.
 
-M2.e and M7 were both built this way and neither touched the run.
+M2.e and M7 were both built this way and neither touched the run. Development on
+the *Windows* box is safer still and needs no worktree: it is a different machine
+and cannot reach the Mac at all.
+
+**Fix readers only, until 2026-10-02.** The freeze exists so the system under
+comparison does not change, and that is a checkable property rather than a
+matter of care: `git diff --stat m5-run-start..HEAD` must show **no change**
+under `quant-engine`, `quant-sim`, `quant-backtest`, `quant-book`,
+`quant-binance`, `quant-recorder` or `quant-storage`. It currently shows none —
+`quant-core`'s only change is purely additive RFC 3339 support in `time.rs` — so
+a judging `backtest` built at `HEAD` links byte-identical engine, sim and
+strategy code to the pinned build. That is what licenses judging steps 3 and 4
+from a newer build at all, and it stops being true the first time a "small"
+engine fix lands. Readers (`quant-normalize`, `quant-explain`, `quant-verify`),
+docs and `ops/` are free. Re-run the check before judging.
+
+**A newer tool may be pointed at the run's artifacts; `normalize --write` may
+not.** `explain` and `status.sh` write nothing, which is `quant-explain`'s whole
+design constraint. But `TierTarget::directory` is `root.join("normalized")`, so
+`normalize --write ~/paper` publishes **into the live run's directory** — parts
+derived from a still-open capture, which then sit there looking complete. That
+step belongs after the run ends, which is where `docs/paper-run.md` puts it.
+
+**A restart forfeits M5's exact-match criterion, and this is not the problem
+every document says it is.** Every one of them frames a mid-run restart as a
+*reader* problem, which is what M2.e was for. It is a **state** problem.
+`JournalEntry` has no strategy entry and `Engine::resuming` replaces only the
+portfolio, so a restarted `paper` process comes back with the right cash and
+position and with **empty `MaCrossover` windows, a zeroed `Recorded` sampler and
+a zeroed daily risk tally**. The judging backtest runs all of that *continuously*
+across the same boundary: different crossings, different fill counts, and the
+exact comparison fails for reasons unrelated to live-versus-replay. It cannot be
+repaired after the fact, and the fallback — compare per-segment *between*
+restarts rather than end to end — is written down now, before there is a number
+to rationalise. Whether it applies is checkable from the artifacts: a distinct
+session count above one per symbol, a `Gap{RecorderRestart}` first-frame, or
+more than one `Started` entry in a journal.
+
+**Bring the logs back, not just the capture and the journals.** M5's criterion
+assumes the tee dropped nothing, and the only evidence of that is two numbers
+that live nowhere else: `paper` prints `events {N} reached the engine` to stdout
+and the capture emits `records = {N}` through tracing. `TeeSink::secondary_dropped()`
+is read by nothing but its own tests, so without `~/paper/logs/` that check
+cannot be made at all.
 
 Do **not** build M8 on top of an unvalidated live path — it depends on M5's
 live-versus-replay agreement having actually passed. Note too that everything
@@ -1594,7 +1698,33 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   neither owns, with no test that they agree, is the pattern this project
   refuses — accepted only because switching the emitter to `.json()` changes the
   running binary. **Switch the emitter and delete `health.rs` in the same commit
-  as the run log.**
+  as the run log**, and write the emitter↔parser test there: it cannot be written
+  now, because pinning the emitter means running it and the emitter is frozen.
+
+  Two of that debt's interest payments came due on 2026-09-20 and are paid. The
+  module claimed "an unrecognised line is reported as unparseable rather than
+  skipped, so the day the format changes is the day this says so" — **half true**.
+  A line that *looked like* a metrics line and would not parse was loud, but a
+  line was only examined if it contained `metrics symbol=`, and that literal is as
+  much part of the borrowed format as the field names. Switch the emitter and
+  every line stops matching at once, whereupon the old code fell through to
+  `NotCovered`, whose message says the process may not have been running — blaming
+  a healthy run for a stale parser. `NoHealth::FormatUnrecognised` now separates
+  the two, and says in as many words that it is not a statement about the run.
+
+  And `clock_skew` was **a sample count reported as milliseconds**.
+  `quant-recorder::metrics` increments it once per message whose venue timestamp
+  is ahead of ours and records no duration anywhere; `explain` called it
+  `clock_skew_ms` and warned above 1000 "ms", citing Binance's tolerance for a
+  *signed-request offset* against a *count*. So a thousand ordinary samples
+  produced a clock alarm in units nothing had measured. Now `clock_skew_samples`,
+  printed against `latency_samples` so it reads as a proportion. The millisecond
+  offset it was mistaken for is a different measurement entirely and lives in
+  `preflight.sh` and the recorder's startup check. **A tool whose whole purpose is
+  answering "what was it doing at 03:14" must not invent the units of its own
+  answer** — this is the same class of defect as the verifier crying wolf on good
+  data, and it was found the same way: by reading what the code does rather than
+  what its docs say.
 - Minor: CI annotates `Node.js 20 is deprecated` for `actions/checkout@v4` on both
   jobs. Harmless; fixed by bumping to `@v5` whenever CI is next touched.
 
@@ -1633,6 +1763,33 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   would mean force-pushing shared history, which is a worse habit than an
   inconsistent log; the convention applies going forward.
 - Commit messages explain *why*, in the body. The rationale is the point.
+- **After a scripted edit, grep for what should now be there — and for what
+  should now be *gone*.** (Set 2026-09-20.) The first half was recorded twice
+  already, both times about code: M4's cost flags and M6's `FillObserver` were
+  edits `cargo fmt` had shifted out from under, so the patch matched nothing and
+  the change silently did not happen. The second half is the docs' version and
+  cost a milestone's worth of documentation: PRs #25 and #26 replaced paragraphs
+  with search-and-replace and **the tail of the replaced text survived** fourteen
+  times over. `docs/paper-run.md` ended up saying M2.e closed the merge hole and,
+  two lines later, that it was still open and "the likeliest thing to stop the
+  fortnight being judgeable at all". `docs/overview.md` shipped an un-executed
+  instruction to the author as body text. `README.md` grew two stray code fences
+  that made its verify commands render as prose.
+
+  None of it was caught by CI, because none of it is code. The check that works
+  is cheap and is the same one either way: after replacing text, grep for a
+  distinctive phrase from the **old** version. If it is still there, the edit
+  took half.
+- **A green test proves nothing until you have seen it go red.** (Set
+  2026-09-20, and it is the M5.c lesson generalised.) Before trusting a test,
+  break the thing it tests and watch it fail — and prefer breaking it in *both*
+  directions where the test draws a boundary, so a new case cannot quietly
+  swallow the old one. This has now paid three times: the engine's step order
+  (verified against a deliberately inverted loop), M6's limits (neutered, three
+  tests went red), and M2.e's ordering, where the two tests that **shipped with
+  the slice stayed green** under the sabotage that reddened the new ones. That
+  last one is the warning: a fixture that fixes the order of an input whose order
+  is the thing under test proves much less than it appears to.
 - Warnings are errors in CI (`RUSTFLAGS: -D warnings`). Run before committing:
 
   ```bash
