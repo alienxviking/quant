@@ -1110,6 +1110,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "quant-explain"
+version = "0.1.0"
+dependencies = [
+ "quant-book",
+ "quant-core",
+ "quant-engine",
+ "quant-normalize",
+ "quant-recorder",
+ "quant-storage",
+]
+
+[[package]]
 name = "quant-meta"
 version = "0.1.0"
 dependencies = [

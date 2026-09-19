@@ -5,6 +5,7 @@ members = [
     "crates/quant-binance",
     "crates/quant-book",
     "crates/quant-core",
+    "crates/quant-explain",
     "crates/quant-engine",
     "crates/quant-meta",
     "crates/quant-normalize",
@@ -37,6 +38,7 @@ quant-binance = { path = "crates/quant-binance" }
 quant-book = { path = "crates/quant-book" }
 quant-core = { path = "crates/quant-core" }
 quant-engine = { path = "crates/quant-engine" }
+quant-explain = { path = "crates/quant-explain" }
 quant-meta = { path = "crates/quant-meta" }
 quant-normalize = { path = "crates/quant-normalize" }
 quant-recorder = { path = "crates/quant-recorder" }
