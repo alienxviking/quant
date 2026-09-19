@@ -560,16 +560,18 @@ figure. The millisecond offset is a different measurement, taken against
 `/api/v3/time` by `ops/preflight.sh` and by the recorder's startup check, which
 warns above 1000 ms; it does not appear on this line at all.
 
-**Worth spelling out because `quant-explain` does not yet make the distinction,
-and this document claimed it had.** `health.rs` parses `clock_skew` into a field
-called `clock_skew_ms`, and `explain` prints `clock skew NNNms -- past Binance's
-own tolerance for a signed request` once it passes 1000 — so a minute with a
-thousand skewed samples would be reported as a one-second clock offset, which is
-a different fact about a different measurement. Named here rather than fixed,
-because the honest repair renames a field in a parser that only exists to read an
-emitter nobody owns: it belongs in the commit that switches the emitter to
-`.json()` and deletes `health.rs`, which `docs/observability.md` already
-schedules for when the freeze lifts.
+**Worth spelling out because `quant-explain` did not make the distinction, and
+this document claimed it had.** `health.rs` parsed `clock_skew` into a field
+called `clock_skew_ms`, and `explain` printed `clock skew NNNms -- past Binance's
+own tolerance for a signed request` once it passed 1000 — so a minute with a
+thousand skewed samples was reported as a one-second clock offset, which is a
+different fact about a different measurement.
+
+**Fixed 2026-09-20**: `clock_skew_samples`, printed beside `latency_samples`.
+Note what did *not* have to wait for the freeze to lift — renaming a field inside
+a reader touches no frozen crate, so this was separable from the larger repair
+(switching the emitter to `.json()` and deleting `health.rs`) that
+`docs/observability.md` still schedules for afterwards.
 
 Latency percentiles come from a hand-rolled log-bucketed histogram (16 sub-buckets per
 octave, ~6% error, pinned by a test) rather than a dependency, because it is forty lines
@@ -823,44 +825,43 @@ day after an NTP step or, worse, silently reverses them. Parts are ordered inste
 by the **venue's own update-id span**, recorded per part in the footer: strictly
 increasing per symbol across disconnects, immune to anything our clock does, and
 already present as `BookDelta`'s range in the M0 event contract — so no venue
-knowledge enters `quant-normalize`. A part whose span does not begin after the
-ones already published is refused rather than reordered — the case that argument
-is aimed at is *concurrent* recorders, where the spans genuinely overlap and
-there is no ordering of two simultaneous recordings of the same messages that is
-the truth.
+knowledge enters `quant-normalize`.
 
-**So the index has to be *made* chronological, and the writer is what makes it
-so.** `PartitionWriter::check_follows` refuses to publish a part whose first
-update id is not past the last update id of every part already there — the
-refusal is `PartsOutOfOrder`, and `normalize_session` abandons that session's
-write when it fires. Nothing mis-ordered is ever published, which is what lets a
-reader take the index at face value afterwards: `TierReplay`'s key is
-`(day, part, ingest_seq)`, and it walks parts in index order rather than opening
-four footers to sort them.
-
-**That check is a statement about arrival order, though, and arrival order is
-only usually chronological.** Worth naming rather than implying away, because
-this document previously described a fix for it that does not exist in the code.
-A part's index is the count of parts already published, so it is handed out in
-`catalog` order, and `catalog` sorts paths as text. A session first appears under
-its earliest UTC day — so a restart on any day after the session's first puts the
+**M2.e then tried to make the index chronological instead, and that was the
+defect.** `PartitionWriter::check_follows` refused to publish a part whose first
+update id was not past the last update id of every part already there, and
+`TierReplay` walked parts in index order on the strength of it. But a part's
+index is the count of parts already published, so it is handed out in `catalog`
+order, and `catalog` sorts paths as text. A session first appears under its
+earliest UTC day — so a restart on any day *after* the session's first puts the
 two in the right order for free, which is the shape a mid-fortnight restart would
-take. A restart on the session's *own* first day does not: both sessions'
-earliest path shares its `date=` component, the next one is `session=<v4 uuid>`,
-and which of them `catalog` hands over first is a coin flip. Lose it and the
-earlier session is refused as out of order — and since the writer is abandoned on
-a refusal, the rest of that session's days go unwritten with it.
+take. A restart on the session's **own** first day does not: both sessions'
+earliest path shares its `date=` component, the next component is
+`session=<v4 uuid>`, and which one `catalog` hands over first is a coin flip.
+Lose it and the earlier session was refused as out of order — and since the
+writer is abandoned on a refusal, the rest of that session's days went unwritten
+with it, including days it did not share. The check was rejecting the case the
+slice existed to serve.
 
-It has not bitten: the fortnight has had zero restarts, and M2.e's rehearsal pair
-genuinely shared a first day and merged, so the flip landed the right way there.
-It is **open rather than fixed**, and the repair is to sort the sessions by their
-spans before writing rather than to trust the order they were walked in. Unlike
-the run log it is not waiting on the freeze — `quant-normalize` reads and writes
-a disposable tier and is not the system under comparison, which is the same
-licence M2.e was built on. The lesson is one this project has recorded before in
-a different costume: when an identifier carries no ordering information, the
-danger is not that someone reads order out of it deliberately, it is that a check
-quietly assumes it.
+**Fixed 2026-09-20 by separating two questions the slice had run together.**
+Write time asks only what is answerable there: **are the spans disjoint?**
+Overlap means the recorders ran at once, which is the single case with no true
+ordering, and `PartsConcurrent` now says exactly that and nothing about arrival.
+Read time takes the order from the spans already in every footer —
+`TierReplay::order_by_span` — so the key is `(day, book_seq_first, ingest_seq)`
+and the index is demoted to what it always was: a unique file name. A day with
+one part is charged no footer read, so every single-session day on disk reads
+exactly as before.
+
+It never bit in practice: the fortnight has had zero restarts, and M2.e's
+rehearsal pair genuinely shared a first day and merged, so the flip landed the
+right way there. The lesson is one this project has recorded before in a
+different costume: when an identifier carries no ordering information, the danger
+is not that someone reads order out of it deliberately — it is that a check
+quietly assumes it. The second lesson is about the test. M2.e shipped with a
+merge test that always normalized the earlier session first, so it pinned one
+half of the coin flip and never took the other; it stays **green** under the
+sabotage that reddens the regression tests written with the fix.
 
 **The partition day is inherited from raw, not recomputed.** The first version
 re-derived it from `local_recv_ts` with a "never backwards" clamp — reimplementing

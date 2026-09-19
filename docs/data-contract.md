@@ -398,14 +398,17 @@ histogram, per §2.
 
 `clock_skew` on the line is that **count of samples**, not an offset in
 milliseconds. It sits among fields that all end in `_ms`, which makes the
-misreading close to inviting — and M7's reader took the invitation. That is
-still true as this is written: `quant-explain::health` parses the count into a
-field it calls `clock_skew_ms`, and `explain` prints it as `clock skew Nms`
-once it passes a threshold of 1000 — so a minute in which 1001 messages carried
-a venue timestamp ahead of ours would be reported as a second of clock offset.
-**Recorded here as owing, not as fixed**, because this contract is what defines
-the field; `docs/observability.md` carries the same item and the emitter switch
-it is to be repaired with.
+misreading close to inviting — and M7's reader took the invitation:
+`quant-explain::health` parsed the count into a field it called `clock_skew_ms`
+and `explain` printed it as `clock skew Nms` once it passed a threshold of 1000,
+so a minute in which 1001 messages carried a venue timestamp ahead of ours would
+have been reported as a second of clock offset.
+
+**Fixed 2026-09-20**, in the reader rather than here: the field is
+`clock_skew_samples` and prints beside `latency_samples`. Kept in this contract
+because this is where the field is *defined*, and the naming that invited the
+mistake — one count among a dozen `_ms` figures — is a property of the line and
+not of whoever read it.
 
 The millisecond offset is a different measurement: the startup check above, and
 `ops/preflight.sh` before a run. It never appears on this line, which is the
@@ -600,36 +603,34 @@ or, worse, silently reverses them. Parts are ordered by the **venue's own
 update-id span**, recorded per part in the footer, which is strictly increasing
 per symbol across disconnects and is immune to anything our host's clock does.
 
-**The full ordering key is `(day, part, ingest_seq)`, and the index earns its
-place by a refusal rather than by a sort.** A part's index is simply the order
-the parts reached the writer, which is the order `catalog` yields sessions — a
-text sort of paths, so within a shared day it is a text sort of v4 UUIDs and
-carries no chronology of its own. What makes index order capture order is a
-check at publish time (`PartitionWriter::check_follows`): a part is published
-only if its span begins after every already-published part's span ends, and
-otherwise the write is refused as `PartsOutOfOrder`. The reader then
-concatenates parts in index order and never re-sorts, because by the time it
-looks the question has already been settled.
+**The full ordering key is `(day, book_seq_first, ingest_seq)`, and a part's
+index is a name rather than a position.** A part's index is simply the order the
+parts reached the writer, which is the order `catalog` yields sessions — a text
+sort of paths, so within a shared day it is a text sort of v4 UUIDs and carries
+no chronology of its own.
 
-**That is a refusal and not a repair, and the difference is worth being explicit
-about rather than left for someone to discover.** Two sessions whose spans
-overlap were concurrent rather than sequential, and refusing those is the
-outcome we want: there is no ordering of two simultaneous recordings of the same
-messages that is the truth. But the same check is the only thing standing behind
-the index, so it also fires when two *genuinely sequential* sessions happen to
-be handed over in the wrong order — which UUID text decides, and which is
-therefore a coin toss. `normalize` drops its writer on a write error, so the
-rest of that session's days go unwritten behind the refusal, and because the
-catalog's order is deterministic a re-derive reproduces the refusal exactly
-rather than clearing it.
+**M2.e tried to make index order mean capture order, and that was a defect**
+corrected on 2026-09-20. A publish-time check (`check_follows`) published a part
+only if its span began after every already-published part's span ended, and the
+reader then concatenated in index order on the strength of it. Refusing genuine
+overlap is right — two sessions whose spans intersect were concurrent rather
+than sequential, and there is no ordering of two simultaneous recordings of the
+same messages that is the truth. But that same check was the only thing standing
+behind the index, so it *also* fired when two genuinely sequential sessions were
+handed over in the wrong order, which UUID text decides and which is therefore a
+coin toss. `normalize` drops its writer on a write error, so the rest of that
+session's days went unwritten behind the refusal — and because the catalog's
+order is deterministic, a re-derive reproduced the refusal exactly rather than
+clearing it.
 
-Nothing is lost when that happens — raw is intact and this tier is disposable,
-per §1 — but the day does not normalize until it is dealt with, and it is stated
-here as owing rather than dressed up as handled. The shape of the fix is not in
-doubt: order the parts by their spans **at read time**, where a reader holds
-every part of the day at once, and leave the writer refusing only genuine
-overlap, which is the one refusal that is about the data rather than about the
-order we happened to walk it in.
+Nothing was ever lost when that happened — raw is intact and this tier is
+disposable, per §1 — but the day did not normalize. The two questions are now
+separated. **The writer refuses only genuine overlap** (`PartsConcurrent`),
+which is the one refusal that is about the data rather than about the order we
+happened to walk it in. **The reader orders the day's parts by their spans**,
+where it holds every part at once and the footers already carry what it needs; a
+day with a single part is charged no footer read, so the ordinary day is read
+exactly as it was before.
 
 A day's partition is also **published by rename**: written to a `.tmp` sibling
 and moved into place once its footer lands, so a reader never finds a truncated

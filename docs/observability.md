@@ -155,19 +155,24 @@ sentence that used to stand here named only the first. A line that *looks* like
 a metrics line and will not parse is reported as `NoHealth::Unparseable` rather
 than skipped — that half is built. But a line is only looked at at all if it
 contains the `metrics symbol=` sentinel, and that literal is itself part of the
-format we do not own, so the day the emitter changes every line stops matching
-at once and the reader falls through to `NoHealth::NotCovered` — *"no metrics
-line covers this instant -- the process may not have been running"*. That is
-P3's confabulation arriving through the one block whose figures cannot be
-re-derived from any artifact: a stale reader blaming the run.
+format we do not own, so the day the emitter changed every line would stop
+matching at once and the reader fell through to `NoHealth::NotCovered` — *"no
+metrics line covers this instant -- the process may not have been running"*.
+That is P3's confabulation arriving through the one block whose figures cannot
+be re-derived from any artifact: a stale reader blaming the run.
 
-**The remedy is named here rather than claimed as built.** A log holding lines
-of which none is recognisable should be its own absence — a fourth `NoHealth`
-saying which log was read, how many lines it held, and that this reader no
-longer recognises the format. `NoHealth` today has three variants, `NoLog`,
-`NotCovered` and `Unparseable`, and that fourth is **owed work**. The freeze
-does not block it: the sentinel lives in `quant-explain`, which is the reader
-and not the system under comparison.
+**Fixed 2026-09-20.** A log holding lines of which none is recognisable is now
+its own absence: `NoHealth::FormatUnrecognised` names the log, says how many
+lines it read, and states in as many words that this is not a statement about
+the run. `METRICS_SENTINEL` is a named constant rather than an inlined literal,
+because it is the seam — field names can drift one at a time and produce a loud
+`Unparseable`, but the sentinel failing takes every line out at once and looks
+like silence. The freeze did not block it: the sentinel lives in
+`quant-explain`, the reader, and not in the system under comparison.
+
+Both sides of that boundary are pinned by tests that were watched going red —
+disable the new variant and the drift case fails; make it greedy by dropping its
+`candidates == 0` guard and the ordinary `NotCovered` case fails.
 
 What is missing beyond that is a **test pinning the emitter to this parser**,
 which is what would make the debt safe rather than merely declared. That one
@@ -406,17 +411,19 @@ rules out our clock running *behind* the venue and says nothing about it running
 *ahead*, which is the direction that inflates every latency figure — M1's
 machine sat ~2 s ahead and read p50 2883 ms for exactly that reason.
 
-**And the reader repeats the mistake rather than having fixed it.**
-`quant-explain` parses that count into a field it calls `clock_skew_ms` and
-prints `clock skew Nms` once it passes a thousand — so a thousand skewed
-messages would be reported as a second of offset. The emitter's own
-`latency_samples`, which is what would make the count read as a proportion, is
-not parsed at all. The millisecond offset the figure is mistaken for is a
-different measurement entirely: taken round-trip-corrected against
-`/api/v3/time` by `ops/preflight.sh` and the recorder's startup check, and never
-on the metrics line. Renaming the field and printing it beside `latency_samples`
-is **owed work** inside the reader, which the freeze does not block; §4 scores
-P1 against it.
+**And the reader repeated the mistake rather than catching it.**
+`quant-explain` parsed that count into a field it called `clock_skew_ms` and
+printed `clock skew Nms` once it passed a thousand — so a thousand skewed
+messages would have been reported as a second of offset. The emitter's own
+`latency_samples`, which is what makes the count read as a proportion, was not
+parsed at all. The millisecond offset the figure is mistaken for is a different
+measurement entirely: taken round-trip-corrected against `/api/v3/time` by
+`ops/preflight.sh` and the recorder's startup check, and never on the metrics
+line.
+
+**Fixed 2026-09-20**: the field is `clock_skew_samples`, `latency_samples` is
+parsed, and the two print together. The freeze did not block it, because
+renaming a field inside a reader touches no frozen crate.
 
 The conclusion survives the correction, on other evidence: the excursion
 recovered within the hour and the nineteen hours around it read 57–73 ms, which

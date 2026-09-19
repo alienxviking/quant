@@ -218,20 +218,18 @@ Read in this order:
   on this line at all**. `preflight.{ps1,sh}` takes it before the run starts, and
   the recorder takes it again at startup against the venue's `/api/v3/time`.
   Reading `clock_skew` as milliseconds is an easy mistake, and **this repository
-  is still making it.** Present tense on purpose: this is open, not a war story.
-  `quant-explain::health` parses the field straight into one it calls
-  `clock_skew_ms`, and `explain` prints `clock skew <n>ms -- past Binance's own
-  tolerance for a signed request` whenever that number exceeds 1000 — so a window
-  carrying 1,200 skewed *samples* reads as a 1,200 ms offset, a count wearing a
-  duration's units against a threshold that means nothing to it. It is latent
-  rather than visible only because `clock_skew` has been 0 all fortnight, which is
+  made it for the whole of M7.** `quant-explain::health` parsed the field straight
+  into one it called `clock_skew_ms`, and `explain` printed `clock skew <n>ms --
+  past Binance's own tolerance for a signed request` whenever that number exceeded
+  1000 — so a window carrying 1,200 skewed *samples* read as a 1,200 ms offset, a
+  count wearing a duration's units against a threshold that means nothing to it.
+  It stayed latent only because `clock_skew` has been 0 all fortnight, which is
   the worst way for a defect to wait: nothing prints the wrong number until the
-  day the clock is genuinely wrong and the line is being read in a hurry. The fix
-  is to rename it `clock_skew_samples` and print it beside `latency_samples`,
-  which is the company it keeps — a change to `quant-explain`, not to this
-  procedure, which is why this paragraph names it rather than claiming it. Until
-  then: the field on this line is a count, and the `_ms` in `explain`'s rendering
-  of it is wrong.
+  day the clock is genuinely wrong and the line is being read in a hurry.
+
+  **Fixed 2026-09-20.** The field is `clock_skew_samples` and is printed beside
+  `latency_samples`, which is the company it keeps. The field on this line was
+  always a count; it is now read as one.
 - **`gap_disconnect`** — a few a day is Binance behaving as documented. Dozens an
   hour is a network problem.
 - **latency percentiles** — a step change matters more than the absolute value.
