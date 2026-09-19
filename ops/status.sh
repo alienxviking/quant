@@ -255,7 +255,14 @@ shopt -u nullglob
 echo ""
 files="$(find "$root/raw" -name 'part-*.bin.zst' 2>/dev/null | wc -l | tr -d ' ')"
 mb="$(find "$root/raw" -name 'part-*.bin.zst' 2>/dev/null -exec stat -f '%z' {} + 2>/dev/null | awk '{s+=$1} END{printf "%.1f", s/1024/1024}')"
-sessions="$(find "$root/raw" -type d -name 'session=*' 2>/dev/null | wc -l | tr -d ' ')"
+# Distinct session *ids*, not session directories. The layout nests the session
+# inside the day -- exchange/symbol/date/session -- so one uninterrupted recorder
+# gets a fresh directory every UTC midnight. Counting directories therefore read
+# "4 sessions" on day two of a two-symbol run and would have read "28" by day
+# fourteen, which is indistinguishable from 26 restarts: the most alarming number
+# in this view, wrong, every day, for a fortnight. The same class of bug as the
+# "no recorder running" line, and found the same way -- by watching the real run.
+sessions="$(find "$root/raw" -type d -name 'session=*' 2>/dev/null | sed 's|.*/session=||' | sort -u | wc -l | tr -d ' ')"
 printf 'capture  %s files in %s session(s), %s MB\n' "$files" "$sessions" "${mb:-0}"
 free_gb="$(df -g "$root" | awk 'NR==2 {print $4}')"
 printf 'disk     %s GB free\n' "$free_gb"
