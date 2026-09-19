@@ -112,7 +112,7 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0–M4, M6 and M7 are complete. M5's fortnight is running** (started
 2026-09-18T14:46:54Z, ends 2026-10-02) **and is the one remaining criterion.**
-414 tests green in debug and release, clippy and fmt clean, ~30,700 lines across
+416 tests green in debug and release, clippy and fmt clean, ~30,700 lines across
 12 crates.
 
 While it runs: **do not `git pull` or `cargo build` in the run's checkout.**
@@ -1518,7 +1518,7 @@ record of how it was set up; the full procedure is `docs/paper-run.md`.
 ### Where things stand
 
 M0–M4, M6 and M7 are complete. **M5's fortnight is the one remaining criterion
-and it is spending its wall clock now.** 414 tests green in debug and release,
+and it is spending its wall clock now.** 416 tests green in debug and release,
 clippy and fmt clean, ~30,700 lines across 12 crates.
 
 Watching it:
