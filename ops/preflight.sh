@@ -46,10 +46,15 @@ done
 # an unrecorded answer gets re-derived. M5's ten-minute rehearsal wrote 1.22 MB
 # of raw -- 176 MB/day/symbol, which is the ~160 above and the same order either
 # way -- against 4.5 KB of journal and 8 KB of logs. The journal grows by one
-# line per fill plus one checkpoint per 25 of them, so a fortnight at M3's
-# observed turnover is ~160 KB: four ten-thousandths of a single day's raw. Paper
-# trades the stream it is already recording, so it writes no materially
-# different volume and there is nothing here to parameterise by mode.
+# line per fill plus one checkpoint per *five* of them -- this said 25, which was
+# the cadence before 766b784 lowered it so that every six-hourly reconcile pass
+# has something new to check. At M4's observed turnover of ~60 fills a day that
+# is ~840 fills and ~170 checkpoints over a fortnight, so call it 200 KB rather
+# than the 160 KB written here before. The conclusion is untouched: it is still
+# four ten-thousandths of a single day's raw, which is why the stale number cost
+# nothing and is corrected rather than merely deleted. Paper trades the stream it
+# is already recording, so it writes no materially different volume and there is
+# nothing here to parameterise by mode.
 mb_per_symbol_per_day=1024
 max_clock_offset_ms=1000
 
