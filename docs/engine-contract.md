@@ -287,40 +287,47 @@ correction and what M5 is worth instead.
 
 The seam is proven in a second world when:
 
-- [ ] The **same strategy binary** runs against `LiveSource + SimulatedVenue` for
+- [x] The **same strategy binary** runs against `LiveSource + SimulatedVenue` for
       **two weeks**, unattended, with no code change from the backtest wiring.
-      *(In flight: started 2026-09-18T14:46:54Z, due 2026-10-02.)*
-- [ ] **Paper P&L matches a backtest over the data captured during the same
-      window.** See below — this replaces "reconciles against an independent
-      recompute", which was a weaker question. *(Judgeable only once the run
-      ends; it is the whole point of the fortnight.)*
-- [ ] Every fill is journalled, and P&L recomputed from the journal alone agrees
-      with the engine's running portfolio. *(The machinery is proven at the
-      unit level — `a_recomputed_portfolio_matches_one_built_by_applying_the_same_fills`
-      pins the recompute, `a_checkpoint_that_matches_the_recompute_agrees` pins
-      the comparison, and `a_journal_with_no_checkpoint_reports_nothing_to_check`
-      pins that a journal with nothing to check is not a pass — and `reconcile`
-      has reported AGREES on both of the run's journals at every six-hourly pass
-      so far.)*
-- [ ] The run survives restarts: position and cash are recovered from the
-      journal, not lost. *(The recompute half is proven at the unit level; the
-      run itself has not restarted, and "A restart forfeits the exact match"
-      below is why we would rather it did not.)*
+      *(met: 2026-09-18T14:46:54Z → 2026-10-02T14:47:08Z, two symbols, zero
+      supervisor restarts until the deliberate one at the deadline.)*
+- [x] **Paper P&L matches a backtest over the data captured during the same
+      window.** *(met, exactly, on both symbols: BTCUSDT 824 fills and cash
+      31.64743842 on each side; ETHUSDT 822 and 97.65757574. Realized and fees
+      identical to the satoshi. Not a tolerance — equality.)*
+- [x] Every fill is journalled, and P&L recomputed from the journal alone agrees
+      with the engine's running portfolio. *(met: 166 checkpoints per symbol,
+      `reconcile` AGREES on both, plus 110 clean in-run reconciliations over the
+      fortnight.)*
+- [x] The run survives restarts: position and cash are recovered from the
+      journal, not lost. *(met, and not by design: the supervisor's deadline ran
+      46 s past its child's, so it started a second 60-second attempt after the
+      paper binary had finished. That attempt resumed from the journal — 824
+      fills already booked, starting cash taken from the recompute — and the
+      exact match survived it. "A restart forfeits the exact match" below was
+      the fear; what actually happened is that a restart producing no fills
+      forfeits nothing.)*
 
-### Why none of these is ticked while the run is clean
+### Why none of these was ticked until the run ended
 
 `docs/paper-run.md` has the same four, in the same order, and says only the
-first, third and fourth can be judged *during* the run. They are being judged,
-every six hours, and they are clean. That is evidence and it is deliberately not
-a tick.
+first, third and fourth can be judged *during* the run. They were judged, every
+six hours for a fortnight, and all 110 passes were clean. That was evidence and
+it was deliberately not a tick.
 
 Three of the four are statements about **two weeks**. A criterion about an
 unattended fortnight is not met at hour thirty, any more than M1's seventh
 criterion was met on day two — that one was spent in full rather than shortened
-for convenience, and it is the precedent this one follows. So a box here is
+for convenience, and it is the precedent this one followed. So a box here was
 ticked at judging, by the commands in `docs/paper-run.md` run against the
-finished artifacts, or not at all; a clean six-hourly pass is the evidence that
-the run is still worth finishing, not a partial pass.
+finished artifacts; a clean six-hourly pass was evidence that the run was still
+worth finishing, not a partial pass.
+
+Worth keeping now that it has been exercised: the tick came from re-running the
+judging pipeline *twice*. The first pass used a build carrying a part-ordering
+bug found mid-run; the numbers were re-derived from raw on the fixed build before
+anything was ticked. Raw being the source of truth and the normalized tier being
+disposable is what made that cost about ten minutes rather than the fortnight.
 
 The two documents carry the same four criteria in the same order on purpose. One
 is the procedure and this one is the bar, and if they were free to describe
@@ -408,16 +415,20 @@ freeze lifts.
 The procedure is `docs/paper-run.md`. Everything except wall clock is built and
 rehearsed against the live venue.
 
-**M5's fortnight is running.** It started 2026-09-18T14:46:54Z and ends
-2026-10-02 — two symbols on the Mac, one paper process each, pinned to the tag
-`m5-run-start` (`aff848d`). As of the last check, on 2026-09-19, there had been
-no restart on either supervisor, every six-hourly `verify` pass was clean, and
-`reconcile` reported AGREES on both journals from the first checkpoint onward.
-None of that is the criterion: the criterion is the comparison at the end, and
-until 2026-10-02 the honest status is *in flight*. That is the same shape M1 had
-— code complete 2026-08-11, acceptance run passed 2026-08-28, seventeen days
-apart and nothing rotted, because the harness was rehearsed and the reasoning
-was written down.
+**M5's fortnight ran 2026-09-18T14:46:54Z → 2026-10-02T14:47:08Z and passed.**
+Two symbols on the Mac, one paper process each, pinned to the tag `m5-run-start`
+(`aff848d`). 97,937,822 frames captured with `missing 0` and zero findings; both
+symbols replay with 0 chain breaks and book invariants holding at every tick; the
+Parquet tier reproduces the raw stream event for event; and the comparison came
+out exact on both symbols.
+
+Same shape M1 had — code complete 2026-08-11, acceptance run passed 2026-08-28,
+seventeen days apart and nothing rotted, because the harness was rehearsed and
+the reasoning was written down. Here it was thirty days, and in the middle of it
+two whole slices (M2.e and M7) were built in a worktree without touching the
+run — one of which is the only reason the fortnight is judgeable, since the
+harness restarted the recorders in the final minute and put two sessions on the
+last day.
 
 ### There is no `PaperVenue`
 
