@@ -850,7 +850,11 @@ mod tests {
         }
         // Not a gap: no messages were lost, and treating it as one would make
         // "refuse to trade across a gap" reject data that is perfectly good.
-        assert!(causes(&ing.sink().accepted).is_empty());
+        assert!(
+            causes(&ing.sink().accepted).is_empty(),
+            "{:?}",
+            causes(&ing.sink().accepted)
+        );
         assert_eq!(
             ing.stats().gaps_recorded,
             0,

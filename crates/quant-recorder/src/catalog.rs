@@ -296,8 +296,8 @@ mod tests {
         let tree = Tree::new("empty");
         std::fs::create_dir_all(&tree.root).expect("create root");
         let catalog = catalog(&tree.root);
-        assert!(catalog.sessions.is_empty());
-        assert!(catalog.strays.is_empty());
+        assert!(catalog.sessions.is_empty(), "{:?}", catalog.sessions);
+        assert!(catalog.strays.is_empty(), "{:?}", catalog.strays);
         assert!(catalog.unreadable.is_empty());
     }
 }

@@ -348,12 +348,25 @@ impl Metrics {
     /// Ordering makes an underflow impossible today, but a metric must never be
     /// able to take the recorder down: if this pairing is ever got wrong again, the
     /// cost should be a wrong number in a log line, not a panicking capture.
+    ///
+    /// A compare-exchange loop rather than `fetch_update`, which Rust 1.99
+    /// deprecated in favour of `try_update`. Taking the rename would raise this
+    /// workspace's `rust-version` from 1.85 to 1.99 for a cosmetic change, and
+    /// the floor is meant to be what our dependencies impose. The loop is stable
+    /// since 1.10 and says the same thing: stop at zero rather than wrap.
     fn decrement_depth(&self) {
-        let _ = self
-            .queue_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
-                Some(depth.saturating_sub(1))
-            });
+        let mut depth = self.queue_depth.load(Ordering::Relaxed);
+        while depth > 0 {
+            match self.queue_depth.compare_exchange_weak(
+                depth,
+                depth - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(seen) => depth = seen,
+            }
+        }
     }
 
     #[must_use]

@@ -482,7 +482,7 @@ mod tests {
         // The first run of a session has not written one yet.
         let scratch = Scratch::new("absent");
         let recovered = read(&scratch.path).expect("a missing file is fine");
-        assert!(recovered.entries.is_empty());
+        assert!(recovered.entries.is_empty(), "{:?}", recovered.entries);
     }
 
     #[test]
