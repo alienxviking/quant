@@ -245,7 +245,7 @@ mod tests {
     fn a_closed_channel_is_the_end_of_the_stream_not_an_error() {
         // A recorder that has stopped has already said why in its own logs.
         let (events, stats) = drain(Vec::new());
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "{events:?}");
         assert_eq!(stats.records, 0);
     }
 
@@ -263,7 +263,7 @@ mod tests {
         // The parsers are strict about what they claim and tolerant of the rest,
         // so a new Binance message type cannot stop a paper run.
         let (events, stats) = drain(vec![venue(1, KLINE)]);
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "{events:?}");
         assert_eq!(stats.ignored, 1);
         assert_eq!(stats.parse_failures, 0);
     }

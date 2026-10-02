@@ -620,7 +620,7 @@ mod tests {
 
         let mut reader = RawReader::open(closed.as_slice()).unwrap();
         let (frames, truncation) = reader.read_all().unwrap();
-        assert!(frames.is_empty());
+        assert!(frames.is_empty(), "{frames:?}");
         assert_eq!(truncation, None, "an empty capture is not a truncated one");
         assert!(reader.is_finalized());
         assert_eq!(reader.trailer().unwrap().frames, 0);
@@ -632,7 +632,7 @@ mod tests {
         let killed = &closed[..FILE_HEADER_LEN];
         let mut reader = RawReader::open(killed).unwrap();
         let (frames, truncation) = reader.read_all().unwrap();
-        assert!(frames.is_empty());
+        assert!(frames.is_empty(), "{frames:?}");
         assert_eq!(
             truncation, None,
             "nothing was torn: there was nothing there"
@@ -779,7 +779,7 @@ mod tests {
 
         let mut reader = RawReader::open(bytes.as_slice()).unwrap();
         let (frames, truncation) = reader.read_all().unwrap();
-        assert!(frames.is_empty());
+        assert!(frames.is_empty(), "{frames:?}");
         let t = truncation.expect("misalignment was not reported");
         assert_eq!(t.reason, TruncationReason::BadSync);
         assert!(t.reason.is_corruption());
@@ -794,7 +794,7 @@ mod tests {
 
         let mut reader = RawReader::open(bytes.as_slice()).unwrap();
         let (frames, truncation) = reader.read_all().unwrap();
-        assert!(frames.is_empty());
+        assert!(frames.is_empty(), "{frames:?}");
         assert_eq!(
             truncation.unwrap().reason,
             TruncationReason::ImplausibleBlockLength
@@ -867,7 +867,7 @@ mod tests {
 
         let mut reader = RawReader::open(sink.as_slice()).unwrap();
         let (frames, truncation) = reader.read_all().unwrap();
-        assert!(frames.is_empty());
+        assert!(frames.is_empty(), "{frames:?}");
         assert_eq!(truncation, None);
         assert!(
             !reader.is_finalized(),

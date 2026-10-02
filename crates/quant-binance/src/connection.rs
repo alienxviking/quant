@@ -486,7 +486,7 @@ mod tests {
         ];
         let rendered: Vec<String> = reasons.iter().map(ToString::to_string).collect();
         for (i, a) in rendered.iter().enumerate() {
-            assert!(!a.is_empty());
+            assert_ne!(a, "");
             for b in rendered.iter().skip(i + 1) {
                 assert_ne!(a, b);
             }

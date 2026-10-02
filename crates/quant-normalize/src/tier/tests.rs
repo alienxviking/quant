@@ -250,7 +250,7 @@ fn an_empty_dataset_writes_a_readable_file() {
     // A day with no gaps still gets a gaps file. An absent file and an empty one
     // are different claims, and only the empty one says "nothing happened".
     let back = round_trip("empty", Dataset::Gaps, &[]);
-    assert!(back.is_empty());
+    assert!(back.is_empty(), "{back:?}");
 }
 
 #[test]

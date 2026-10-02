@@ -345,7 +345,11 @@ fn a_malformed_request_is_refused_at_the_seam() {
         CASH,
     );
     engine.run().expect("run");
-    assert!(engine.venue().received.is_empty());
+    assert!(
+        engine.venue().received.is_empty(),
+        "{:?}",
+        engine.venue().received
+    );
     assert!(matches!(
         engine.strategy().executions[0],
         ExecutionEvent::Rejected {

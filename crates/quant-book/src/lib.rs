@@ -442,7 +442,6 @@ impl Book {
     /// depth. Handing out ascending bids would make each of them remember to
     /// reverse, and the one that forgets fills at the worst price in the book
     /// and calls it a touch.
-    #[must_use]
     pub fn bids(&self) -> impl DoubleEndedIterator<Item = Level> + '_ {
         self.bids
             .iter()
@@ -451,7 +450,6 @@ impl Book {
     }
 
     /// Asks from the best upward.
-    #[must_use]
     pub fn asks(&self) -> impl DoubleEndedIterator<Item = Level> + '_ {
         self.asks.iter().map(|(px, qty)| Level::new(*px, *qty))
     }
@@ -462,7 +460,6 @@ impl Book {
     /// the caller is doing rather than for which half of the book it is, because
     /// "a buy order eats the ask side" is exactly the inversion that gets written
     /// backwards at a call site.
-    #[must_use]
     pub fn takeable(&self, side: Side) -> Box<dyn Iterator<Item = Level> + '_> {
         match side {
             Side::Buy => Box::new(self.asks()),

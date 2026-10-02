@@ -714,7 +714,7 @@ fn a_fill_that_never_arrives_is_counted_rather_than_flushed() {
         Ts::from_nanos(0),
     );
     let out = tick_through(&mut venue, &[MILLI]);
-    assert!(out.is_empty());
+    assert!(out.is_empty(), "{out:?}");
     // Two: the acknowledgement and the fill. Both are things the venue knows
     // and we do not, which is the whole point of an inbound number.
     assert_eq!(venue.stats().undelivered, 2);
