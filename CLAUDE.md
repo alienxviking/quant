@@ -110,17 +110,22 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 ## State
 
-**M0–M4, M6 and M7 are complete. M5's fortnight is running** (started
-2026-09-18T14:46:54Z, ends 2026-10-02) **and is the one remaining criterion.**
-416 tests green in debug and release, clippy and fmt clean, ~30,700 lines across
-12 crates.
+**M0 through M7 are complete.** M5's fortnight ran 2026-09-18 → 2026-10-02 and
+**passed**: paper P&L reproduced a backtest over the same window exactly, on both
+symbols, to the satoshi. 416 tests green in debug and release, clippy and fmt
+clean, ~30,700 lines across 12 crates.
 
-While it runs: **do not `git pull` or `cargo build` in the run's checkout.**
-`supervise.sh` execs `target/release/paper` on every restart, so a rebuild would
-silently continue the run on different code — and bash reads a script file
-lazily, so editing `ops/*.sh` underneath the running supervisor can make its loop
-jump mid-execution. Develop in a separate worktree (`git worktree add`), which is
-where M2.e and M7 were built.
+The freeze is over. The next milestone is the run log, which is what unblocks
+deleting `quant-explain::health`'s prose parser and the three defects M7's
+scoping surfaced — all of them `quant-engine`/`quant-backtest` changes that the
+fortnight forbade.
+
+The worktree discipline that made M2.e and M7 buildable *during* a run is worth
+keeping for the next one: `supervise.sh` execs `target/release/paper` on every
+restart, so a rebuild in the run's checkout silently continues it on different
+code — and bash reads a script file lazily by byte offset, so editing `ops/*.sh`
+underneath a running supervisor can make its loop jump mid-execution. Merging to
+`main` is safe; pulling *there* is not.
 
 - **M0 complete** (2026-07-26): workspace, `crates/quant-core` (fixed-point
   money, `Ts`/`Clock`, instrument registry with venue filters, the
@@ -1369,6 +1374,104 @@ where M2.e and M7 were built.
   "no recorder running" line, found the same way: **by looking at what the real
   run printed rather than at what the code was supposed to do.**
 
+- **M5 complete** (run 2026-09-18 → 2026-10-02): the fortnight was spent and the
+  criterion **passed**. Paper P&L reproduced a backtest over the same window
+  **exactly, to the satoshi, on both symbols** — not within a tolerance.
+
+  | | paper | backtest |
+  |---|---|---|
+  | BTCUSDT fills | 824 | 824 |
+  | cash | 31.64743842 | 31.64743842 |
+  | realized | +0.7312598 | +0.7312598 |
+  | fees | 69.08382138 | 69.08382138 |
+  | ETHUSDT fills | 822 | 822 |
+  | cash | 97.65757574 | 97.65757574 |
+  | realized | −0.1335 | −0.1335 |
+  | fees | 2.20892426 | 2.20892426 |
+
+  **The capture**: 97,937,822 frames across 4 sessions and 32 segments —
+  74.8M trades, 23.1M depth deltas, 664 snapshots, 34 gaps. `missing 0`, zero
+  findings, `quant-verify` exit 0. Both symbols replay with **0 chain breaks** and
+  book invariants holding at every tick, and the Parquet tier reproduces the raw
+  stream event for event (50,158,468 and 47,770,284).
+
+  **The journals**: 166 checkpoints each, `reconcile` AGREES on both, both ending
+  flat. 110 in-run reconciliations over the fortnight, zero failures.
+
+  **The network was the least reliable component, and the capture says so
+  honestly.** 15 reconnects, each paired with a resync snapshot, including a
+  **12-hour outage** overnight on 2026-09-29 (Wi-Fi down, ~160 DNS failures an
+  hour, reconnected on attempt 2036) and a 42-minute one on 10-01. Roughly 13 of
+  336 hours blind — about 3.9% — every minute of it recorded as a `Gap` rather
+  than left as a silence, which is why verify still passes.
+
+  And the composed property held under a real failure rather than a test: **zero
+  fills during the 12-hour window.** Last fill before it at 18:04:55Z, next at
+  06:48:38Z — eleven seconds after reconnection. Gap clears the book → no mid →
+  no sample → the indicator does not advance → no crossing can fire, with
+  `MaCrossover` containing no mention of gaps at all.
+
+- **The fortnight's last 48 seconds are the most interesting thing in it.** The
+  paper binary hit its 20,160-minute duration limit and exited cleanly at
+  14:46:06; `supervise.sh`, reading its own deadline, saw 46 s remaining and
+  started **attempt 2**, which ran 60 s and exited. That created a **second
+  session on 2026-10-02 for both symbols** — the exact case M2.e was built for,
+  arriving on the one day nobody could have arranged.
+
+  `normalize --write` printed `merged 2026-10-02 (part 1)` and both parts
+  round-tripped. **Without M2.e the second session would have been refused and
+  the entire fortnight would have been unjudgeable** — a criterion lost to a
+  48-second coda. It was built *during* the run, in a worktree, on the reasoning
+  that a mid-day restart was the likeliest thing to make the window unreadable.
+  That reasoning was right for the wrong reason: the restart came from the
+  harness, not from a crash.
+
+  Worth fixing before the next long run: a supervisor whose deadline is 46 s
+  ahead of its child's will always start a doomed final attempt. The child
+  exiting *because it finished* is not the same as the child dying, and only the
+  second deserves a restart.
+
+- **A bug in M2.e, found and fixed while the run was in flight** (PR #27, not by
+  me — worth reading before trusting anything else in that slice). `place`
+  assigned a part index by **arrival order**, and arrival order is whatever
+  `catalog` yields, which sorts paths whose session component is a v4 UUID. So
+  for two perfectly sequential recorders, **which one landed at part 0 was a coin
+  flip** — and `check_follows`, demanding the incoming part start after every
+  published one, refused the *earlier* session half the time. A refusal abandons
+  the writer, so the rest of that session's days went unwritten too, including
+  days it did not share. The check was rejecting the case the slice exists to
+  serve.
+
+  The fix separates what is checkable at write time from what is a fact about the
+  market: write time asks only **disjointness** (overlap means the recorders ran
+  at once, which has no true ordering), and **order is read off the spans at read
+  time**. The judging above was re-run end to end on the fixed build; the numbers
+  are identical, which they would be — these two sessions were genuinely
+  sequential, so the coin flip happened to land right.
+
+  General lesson, and it is one this project keeps relearning: **a property
+  asserted in a doc comment is not a property the code has.** M2.e's own module
+  docs claimed parts were ordered by the venue's span. They were ordered by
+  arrival, and the span was only validated afterwards.
+
+- **The economics, from 1,646 live round trips over 14 days.** BTCUSDT: realized
+  **+0.73** on price against **−69.08** in commission, $100 → $31.65. ETHUSDT:
+  −0.13 against −2.21. The price result wandered between −1.8 and +1.8 for the
+  whole fortnight and ended statistically indistinguishable from zero; the fee
+  counter rose at every one of the fourteen daily checks and never once fell.
+  M4 predicted this shape from a week of replayed data and live trading confirmed
+  it over twice the window.
+
+  ETHUSDT is **not a second sample of the same experiment**, and this is worth
+  knowing before reading the two side by side: `--qty 0.001` is a quantity in
+  *base units*, so one position is ~$80 of BTC and ~$2.58 of ETH — a 31× size
+  difference. Per dollar traded ETH did slightly *worse* on price (−0.021% vs
+  −0.014%). It looks healthier only because 97% of the account never moved. And
+  at $2.58 an order it is **below Binance's minimum notional**, which a live
+  venue would reject outright — `min_notional` is registered on the instrument and
+  read by nothing in `quant-sim` or `quant-engine`. That is an M8 problem and it
+  is in *Still open*.
+
 Milestone table: see `README.md`.
 
 ## The acceptance run, and how it went
@@ -1509,19 +1612,19 @@ turns out to be.
 
 ---
 
-## The paper run, in flight
+## The paper run, and how it went
 
-**It started 2026-09-18T14:46:54Z and ends 2026-10-02.** Two symbols, one paper
-process each, capturing and trading from one ingress. The sections below are the
-record of how it was set up; the full procedure is `docs/paper-run.md`.
+**It ran 2026-09-18T14:46:54Z → 2026-10-02T14:47:08Z and passed.** Two symbols,
+one paper process each, capturing and trading from one ingress. The result and
+what it cost are in the M5 entry above; the sections below are the record of how
+it was conducted, kept because the next long run — M8 — repeats most of it.
 
 ### Where things stand
 
-M0–M4, M6 and M7 are complete. **M5's fortnight is the one remaining criterion
-and it is spending its wall clock now.** 416 tests green in debug and release,
-clippy and fmt clean, ~30,700 lines across 12 crates.
+**M0 through M7 are complete.** 416 tests green in debug and release, clippy and
+fmt clean, ~30,700 lines across 12 crates. The next milestone is the run log.
 
-Watching it:
+How it was watched, which worked and is worth repeating:
 
 ```bash
 ops/status.sh --root ~/paper
@@ -1594,7 +1697,7 @@ gives the fortnight two independent samples.
 - **Supervision is a plain bash loop, not `launchd`/`KeepAlive`.** A run should be
   watched and should stop when told to, not silently resurrect itself.
 
-### While it runs
+### While it ran — and what to repeat at M8
 
 **Build in a separate worktree** (`git worktree add ~/quant-dev`), never in the
 run's checkout. Two reasons, and the second is easy to miss: `supervise.sh` execs
@@ -1603,21 +1706,28 @@ run on different code; and bash reads a script file *lazily, by byte offset*, so
 changing `ops/*.sh` underneath the running supervisor can make its loop jump
 mid-execution. Merging to `main` is safe — only pulling *there* is not.
 
-M2.e and M7 were both built this way and neither touched the run. Development on
+M2.e and M7 were both built this way and neither touched the run — and M2.e is
+why the fortnight is judgeable at all, so the discipline paid for itself inside a
+single run. Development on
 the *Windows* box is safer still and needs no worktree: it is a different machine
 and cannot reach the Mac at all.
 
-**Fix readers only, until 2026-10-02.** The freeze exists so the system under
-comparison does not change, and that is a checkable property rather than a
-matter of care: `git diff --stat m5-run-start..HEAD` must show **no change**
-under `quant-engine`, `quant-sim`, `quant-backtest`, `quant-book`,
-`quant-binance`, `quant-recorder` or `quant-storage`. It currently shows none —
-`quant-core`'s only change is purely additive RFC 3339 support in `time.rs` — so
-a judging `backtest` built at `HEAD` links byte-identical engine, sim and
-strategy code to the pinned build. That is what licenses judging steps 3 and 4
-from a newer build at all, and it stops being true the first time a "small"
-engine fix lands. Readers (`quant-normalize`, `quant-explain`, `quant-verify`),
-docs and `ops/` are free. Re-run the check before judging.
+**Fix readers only.** The freeze exists so the system under comparison does not
+change, and it is a *checkable* property rather than a matter of care:
+`git diff --stat m5-run-start..HEAD` must show **no change** under
+`quant-engine`, `quant-sim`, `quant-backtest`, `quant-book`, `quant-binance`,
+`quant-recorder` or `quant-storage`. Readers (`quant-normalize`,
+`quant-explain`, `quant-verify`), docs and `ops/` are free. Re-run the check
+immediately before judging.
+
+**It held, and the check was run.** At judging time the diff over all seven
+crates was empty, and `quant-core`'s only change was 347 purely additive lines of
+RFC 3339 support in `time.rs`. So the judging `backtest` linked byte-identical
+engine, sim and strategy code to the pinned build — which is what made steps 3
+and 4 from a newer build legitimate rather than merely convenient. Two whole
+slices (M2.e and M7) landed on `main` during the fortnight and neither touched
+the comparison. Run this check at M8 too; it stops being true the first time a
+"small" engine fix lands, and nothing but the check would tell you.
 
 **A newer tool may be pointed at the run's artifacts; `normalize --write` may
 not.** `explain` and `status.sh` write nothing, which is `quant-explain`'s whole
@@ -1658,13 +1768,23 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
 
 ### Still open
 
-- **M5's fortnight is the one remaining criterion, and it is running.** Started
-  2026-09-18T14:46:54Z on the Mac, ends 2026-10-02, two symbols, one paper
-  process each. Judge it per `docs/paper-run.md`. Until then: no `git pull` and
-  no `cargo build` in the run's checkout, and the raw container version and
-  journal schema stay frozen.
+- **M5 passed and the freeze is over.** `quant-engine`, `quant-sim` and the
+  strategy are editable again, which is what every item below was waiting for.
 
-- **The run log is the next milestone**, and it starts when the freeze lifts.
+- **A supervisor can start a doomed final attempt.** `supervise.sh`'s deadline ran
+  46 s past its child's, so when the paper binary exited *because it had finished*
+  the supervisor restarted it for a 60-second coda — creating a second session on
+  the last day. Harmless here only because M2.e had landed three days earlier.
+  A child exiting because it completed is not a child dying; only the second
+  deserves a restart. Fix before M8.
+
+- **`min_notional` is registered and enforced by nothing.** Nothing in `quant-sim`
+  or `quant-engine` reads it, so the fortnight happily filled 822 ETHUSDT orders
+  at ~$2.58 each — below Binance's spot minimum, which a live venue would have
+  rejected outright. The first symptom at M8 would be order flow that simply does
+  not happen. `tick_size` and `lot_size` are in the same position.
+
+- **The run log is the next milestone**, and it can start now.
   Orders that never filled, risk refusals, cancels and strategy state are
   recorded nowhere and are **not recoverable by any reader** — M7 established
   that boundary rather than crossing it, and building the reader first made
@@ -1674,9 +1794,10 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   kill switch is journalled at shutdown. Harmless in paper, where nothing is at
   stake; **must be fixed before M8**, by recovering the day's tally from the
   journal rather than only the switch.
-- **Queue position and market impact remain unmeasured** after M5 and cannot be
-  measured by it: a paper venue uses simulated fills, so our orders are still not
-  in the book and nobody is still reacting to them. **Only M8 can measure them.**
+- **Queue position and market impact remain unmeasured**, as predicted, and the
+  fortnight could not change that: a paper venue uses simulated fills, so our
+  orders were never in the book and nobody in the recording reacted to them.
+  **Only M8 can measure them.**
 - **The strategy question is answered and the answer is no.** A crossover at 209
   round trips a week cannot survive 10 bps a side. M5 and beyond are about the
   platform being trustworthy, not about this strategy — and a lower-turnover or

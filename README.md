@@ -133,16 +133,16 @@ harness M1 warns about.
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | done |
 | M3 | Engine seam + SimulatedVenue + MA crossover | Equity curve produced, and it is unimpressive | done |
 | M4 | Fee, slippage and latency modelling | Results degrade sensibly under realistic costs | done |
-| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | **run in flight** |
+| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | done |
 | M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | done |
 | M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | done |
 | M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance | |
 
 Milestones have **acceptance criteria, not feature lists**. "Done" means the
-criterion passes — which is why M5 sits at *run in flight*: everything is built
-and rehearsed against the live venue, and its criterion is two weeks of wall
-clock, started 2026-09-18 and ending 2026-10-02. `docs/paper-run.md` is the
-procedure and `docs/observability.md` is M7's.
+criterion passes, and M5's took two weeks of wall clock to satisfy: the fortnight
+ran 2026-09-18 → 2026-10-02 and paper P&L reproduced a backtest over the same
+window exactly. `docs/paper-run.md` is the procedure and `docs/observability.md`
+is M7's.
 
 **M1's acceptance run** — the one criterion only time can satisfy — was spent in
 full: seven days unattended on an Apple Silicon Mac, 2026-08-21 → 2026-08-28,
@@ -174,15 +174,19 @@ would have to beat that to break even. That is a real result: this strategy clas
 at this turnover, at retail fees, cannot work. Learning it from recorded data cost
 nothing.
 
-**M5's fortnight is running.** It started 2026-09-18 and ends 2026-10-02: two
-symbols, one `paper` process each, on the Mac, pinned to the tag `m5-run-start`
-and never pulled there — the running process would not change if it were, but the
-ability to say which code produced the result would. `paper` runs `LiveSource +
+**M5's fortnight ran 2026-09-18 → 2026-10-02 and passed.** Two symbols, one
+`paper` process each, on the Mac, pinned to the tag `m5-run-start` and never
+pulled there — the running process would not change if it were, but the ability
+to say which code produced the result would. `paper` runs `LiveSource +
 SimulatedVenue` with the capture and the engine fed from **one ingress** — the
 same records with the same timestamps, which is what makes "paper P&L must match
-a backtest over the same window" checkable exactly rather than approximately. A
-three-minute rehearsal against Binance gave 4552 frames captured and 4552 events
-reaching the engine, with `verify` clean and the journal reconciling.
+a backtest over the same window" checkable exactly rather than approximately.
+
+It did match, to the satoshi, on both symbols: 824 fills and cash 31.64743842 on
+BTCUSDT, 822 and 97.65757574 on ETHUSDT, identical on each side. The capture is
+97,937,822 frames with `missing 0`, zero findings, and 15 reconnects each paired
+with a resync — including a 12-hour Wi-Fi outage recorded as a gap rather than
+left as a silence, during which the strategy placed no orders at all.
 `docs/paper-run.md` is the procedure.
 
 The rehearsal also produced M4's finding in miniature, from live data: one round

@@ -16,7 +16,7 @@ version is named. Read those when they disagree.
 | How the 2-week paper run is conducted and judged | `docs/paper-run.md` |
 | Why M7 is a reader and not an exporter | `docs/observability.md` |
 
-*State as of 2026-09-20: **M0 through M4, M6 and M7 complete; M5's fortnight is running.** M1's acceptance run was
+*State as of 2026-10-02: **M0 through M7 complete — M5's fortnight ran 2026-09-18 to 2026-10-02 and passed, paper P&L reproducing a backtest over the same window exactly on both symbols.** M1's acceptance run was
 spent in full, 2026-08-21 to 2026-08-28 on an Apple Silicon MacBook Air, and passed. Both
 weeks now replay as two joined 8-day sessions with book invariants holding at all 70.5M
 ticks, and the normalized Parquet tier reproduces the raw stream event for event. M3's
@@ -250,7 +250,7 @@ use whatever tool fits, with no schema registration.
 | M2 | Normalizer + book reconstruction | Book invariants hold at every tick of a replayed day | **done** |
 | M3 | Engine seam + SimulatedVenue + MA crossover | An equity curve exists, **and it is unimpressive** | **done** |
 | M4 | Fee, slippage, latency modelling | Results degrade sensibly under realistic costs | **done** |
-| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | **run in flight** |
+| M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | **done** |
 | M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | **done** |
 | M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | **done** |
 | M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance | |

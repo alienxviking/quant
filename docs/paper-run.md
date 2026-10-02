@@ -503,10 +503,10 @@ and not wired.
 ## What this run cannot tell us
 
 **Queue position and market impact.** A paper venue uses simulated fills, so our
-orders are never in the book and nobody is reacting to them — present tense,
-because the fortnight is running as this is written and finishing it changes
-nothing about that. Both remain unmeasured after this run, and only M8 — real
-orders, real money — can measure them.
+orders were never in the book and nobody in the recording reacted to them.
+Finishing the fortnight changed nothing about that, exactly as this section said
+it would not: both remain unmeasured, and only M8 — real orders, real money — can
+measure them.
 
 An earlier draft of the engine contract claimed otherwise. The correction is
 recorded there rather than quietly fixed, because the wrong version made this run
