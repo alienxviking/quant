@@ -90,6 +90,37 @@ struct Resting {
     arrives_at: Ts,
     /// Whether the engine has been told this order exists yet.
     announced: bool,
+    /// Whether the venue has looked at this order even once.
+    ///
+    /// Separate from `announced` on purpose, even though they flip together
+    /// today: `announced` is about what the *engine* has been told, and this is
+    /// about what the *venue* has seen. Marketability is a question about the
+    /// second, and tying it to the first would make a reporting detail decide a
+    /// fee.
+    seen: bool,
+}
+
+/// Which side of the trade we were on, which is what a fee schedule charges by.
+///
+/// **Not** "did the order carry a limit price", which is what this used to be.
+/// That is the same thing only when every limit order rests, and a limit order
+/// does not have to rest: a buy limit at or above the best ask crosses on
+/// arrival and pays the taker rate, exactly as a market order does. Deriving it
+/// from the order's *shape* rather than from what actually happened charged the
+/// maker rate for taking liquidity.
+///
+/// Invisible on Binance spot, where maker and taker are both ten basis points —
+/// which is why the fortnight did not catch it. It is not invisible on any
+/// schedule with a split, and a maker-side strategy is the one shape this
+/// project has said is worth trying next. The error ran in our favour, by the
+/// whole maker-taker spread, on every marketable limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liquidity {
+    /// We crossed the spread: a market order, or a limit that was marketable
+    /// when the venue first saw it.
+    Taken,
+    /// We rested and someone came to us.
+    Provided,
 }
 
 /// An execution report waiting for its delivery time.
@@ -115,6 +146,14 @@ pub struct SimStats {
     pub multi_level_fills: u64,
     /// Market orders that could not be filled in full because the book ran out.
     pub exhausted_book: u64,
+    /// Limit orders that crossed the book on arrival and so paid the taker rate.
+    ///
+    /// Reported because the distinction is invisible on a venue whose maker and
+    /// taker rates are equal — Binance spot, where every run so far has been
+    /// priced — and becomes the difference between a maker strategy that works
+    /// and one that only appeared to. A non-zero count on a split schedule means
+    /// orders meant to provide liquidity were taking it.
+    pub marketable_limits: u64,
     /// Orders refused because there was no book to price against — a gap, or
     /// before the first snapshot.
     pub no_market: u64,
@@ -152,8 +191,10 @@ impl SimStats {
     #[must_use]
     pub const fn caveats() -> &'static [&'static str] {
         &[
-            "no queue position: a resting order is filled only on a trade-through, \
-             which understates passive fills rather than overstating them",
+            "no queue position: a resting order fills only on a trade-through, and \
+             then in full. Whether it fills at all is understated; how much of \
+             the print would have reached us is overstated, because we cannot \
+             know what was ahead of us in the queue",
             "no market impact: our orders are invisible to everyone else, which is \
              false at any size that matters and is not recoverable from recorded data",
             "fees are charged in the quote currency; a spot venue takes them in the \
@@ -258,7 +299,7 @@ impl SimulatedVenue {
     /// strategy that had to reassemble three prints into an average price would
     /// be doing arithmetic the venue already did. The price is the size-weighted
     /// average actually paid, which is the number a P&L must use.
-    fn take(&mut self, order: &mut Resting, book: &Book, now: Ts) {
+    fn take(&mut self, order: &mut Resting, book: &Book, now: Ts, liquidity: Liquidity) {
         let mut taken = Qty::from_raw(0);
         let mut cost = Notional::from_raw(0);
         let mut levels = 0_u32;
@@ -294,9 +335,7 @@ impl SimulatedVenue {
             self.stats.multi_level_fills += 1;
         }
 
-        // A market order took liquidity; a resting order that filled on a
-        // trade-through was the passive side.
-        let is_maker = order.request.limit().is_some();
+        let is_maker = liquidity == Liquidity::Provided;
         // The stress concession, always against us: a buyer pays more, a seller
         // receives less. Zero unless somebody deliberately turned it on.
         let concession = self.costs.adverse_per_fill.raw() * order.request.side.sign();
@@ -319,6 +358,55 @@ impl SimulatedVenue {
                     is_maker,
                 },
                 remaining,
+                ts: now,
+            },
+        );
+    }
+
+    /// Fill a resting order that the market came to, **at its own limit**.
+    ///
+    /// Separate from [`Self::take`] because the two fill at different prices,
+    /// and conflating them hid a defect for three milestones. A taker walks the
+    /// opposite side of the book and pays what it finds there. A maker does not
+    /// walk anything: the counterparty crossed to *us*, so we get the price we
+    /// posted — which is the entire economic point of resting an order.
+    ///
+    /// Routing passive fills through `take` meant a resting buy at 97 tried to
+    /// fill from asks at 99, refused to pay worse than its limit, and filled
+    /// nothing. The only limit orders that could fill were the ones whose limit
+    /// already crossed the book — i.e. the marketable ones — so **a passive fill
+    /// was structurally impossible**, and every "maker" fill the simulator ever
+    /// reported had actually taken liquidity.
+    ///
+    /// Size is not rationed by the book here, and that is the honest limit of
+    /// this model rather than an oversight: we have no queue position, so we
+    /// cannot know how much of the print would have reached us. Filling in full
+    /// is the optimistic end of that unknown, and it is named in `caveats()`.
+    fn provide(&mut self, order: &mut Resting, now: Ts) {
+        let Some(limit) = order.request.limit() else {
+            return;
+        };
+        let taken = order.remaining;
+        // The concession applies as it does to a taker: always against us.
+        let concession = self.costs.adverse_per_fill.raw() * order.request.side.sign();
+        let px = Px::from_raw(limit.raw() + concession);
+        let fee = self.costs.fees.fee(notional(px, taken), true);
+        self.stats.fees_charged = Notional::from_raw(self.stats.fees_charged.raw() + fee.raw());
+
+        order.remaining = Qty::from_raw(0);
+        self.stats.fills += 1;
+        let id = order.id;
+        self.report(
+            now,
+            ExecutionEvent::Filled {
+                client_order_id: id,
+                fill: Fill {
+                    px,
+                    qty: taken,
+                    fee,
+                    is_maker: true,
+                },
+                remaining: Qty::from_raw(0),
                 ts: now,
             },
         );
@@ -358,6 +446,23 @@ impl SimulatedVenue {
         self.cancels = still_flying;
     }
 
+    /// Whether a limit order would cross the book the moment the venue sees it.
+    ///
+    /// Asked **once, on arrival**, and that is the whole subtlety. An order that
+    /// rests and is reached later because the market came to it is passive — the
+    /// counterparty crossed, not us. Re-asking this on every event would turn
+    /// every resting order into a taker the moment the market touched it, which
+    /// is backwards.
+    fn marketable(order: &Resting, book: &Book) -> bool {
+        let Some(limit) = order.request.limit() else {
+            return false;
+        };
+        match order.request.side {
+            Side::Buy => book.best_ask().is_some_and(|ask| limit >= ask.px),
+            Side::Sell => book.best_bid().is_some_and(|bid| limit <= bid.px),
+        }
+    }
+
     /// Whether a print at `px` went strictly past a resting order's limit.
     ///
     /// Strictly, per the module docs: a print *at* our price does not prove we
@@ -385,6 +490,7 @@ impl ExecutionVenue for SimulatedVenue {
             remaining: request.qty,
             arrives_at: Ts::from_nanos(now.as_nanos() + self.costs.latency.outbound),
             announced: false,
+            seen: false,
         });
     }
 
@@ -432,6 +538,11 @@ impl ExecutionVenue for SimulatedVenue {
                 );
             }
 
+            // Marketable *on arrival* and never re-asked, so a resting order
+            // that the market later reaches stays passive.
+            let crosses_now = !order.seen && book.is_live() && Self::marketable(order, book);
+            order.seen = true;
+
             let is_market = order.request.limit().is_none();
             if is_market {
                 if !book.is_live() {
@@ -443,7 +554,7 @@ impl ExecutionVenue for SimulatedVenue {
                     order.remaining = Qty::from_raw(0);
                     continue;
                 }
-                self.take(order, book, now);
+                self.take(order, book, now, Liquidity::Taken);
                 if order.remaining.raw() > 0 {
                     // A market order is immediate by nature: whatever the book
                     // could not fill is gone, not resting at an unknown price.
@@ -452,8 +563,15 @@ impl ExecutionVenue for SimulatedVenue {
                     self.cancelled(now, id, remaining);
                     order.remaining = Qty::from_raw(0);
                 }
+            } else if crosses_now {
+                // A limit that crosses on arrival takes liquidity and pays for
+                // it. `take` already refuses to pay worse than the limit, so a
+                // buy at 100 against asks of 99 and 101 fills at 99 and stops —
+                // the remainder rests, as it would on a real venue.
+                self.stats.marketable_limits += 1;
+                self.take(order, book, now, Liquidity::Taken);
             } else if printed.is_some_and(|px| Self::traded_through(order, px)) && book.is_live() {
-                self.take(order, book, now);
+                self.provide(order, now);
             } else if order.request.time_in_force == TimeInForce::Ioc {
                 // Immediate-or-cancel: one look once it arrives, then gone.
                 let (id, remaining) = (order.id, order.remaining);
