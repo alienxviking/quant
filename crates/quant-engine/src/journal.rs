@@ -65,7 +65,24 @@ pub enum JournalEntry {
     /// authority on starting capital, and later ones mark restarts — so the
     /// number a report quotes is the capital the whole session began with, not
     /// whatever it happened to have when it last came up.
-    Started { at: Ts, cash: Notional },
+    Started {
+        at: Ts,
+        cash: Notional,
+        /// Which shape of this file the writer spoke.
+        ///
+        /// Added at M7.5, which widened this enum from five variants to a
+        /// dozen. A pre-M7.5 reader meeting a decision entry treats the unknown
+        /// tag as corruption, because `read` has no version to refuse at — the
+        /// same problem M1.d1 had when the raw container went 1 → 2, without
+        /// M1.d1's header to refuse in. This is here so the *next* change can
+        /// say what is actually wrong rather than reporting a readable file as
+        /// damaged.
+        ///
+        /// Defaulted on read so every journal written before it existed still
+        /// parses, and reports as schema 1.
+        #[serde(default = "schema_v1")]
+        schema: u32,
+    },
     /// Something traded.
     Filled {
         at: Ts,
@@ -256,27 +273,45 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
     let mut portfolio = Portfolio::new(starting);
 
     for entry in entries {
-        if let JournalEntry::Filled {
-            instrument,
-            side,
-            px,
-            qty,
-            fee,
-            is_maker,
-            ..
-        } = entry
-        {
-            let id = resolve(registry, instrument);
-            portfolio.apply_fill(
-                id,
-                *side,
-                &Fill {
-                    px: *px,
-                    qty: *qty,
-                    fee: *fee,
-                    is_maker: *is_maker,
-                },
-            );
+        // Exhaustive, with no `_` arm, and that is the point rather than style.
+        // M7.5 widens this enum from five variants to a dozen, and the one
+        // failure that must be impossible is a new variant that silently fails
+        // to move money -- a decision record quietly treated as a position
+        // record, or the reverse. With a catch-all the compiler says nothing and
+        // the defect surfaces as a reconciliation mismatch weeks later; without
+        // one, adding a variant does not build until somebody has decided what
+        // it does to the portfolio. A compile error instead of a paragraph.
+        match entry {
+            JournalEntry::Filled {
+                instrument,
+                side,
+                px,
+                qty,
+                fee,
+                is_maker,
+                ..
+            } => {
+                let id = resolve(registry, instrument);
+                portfolio.apply_fill(
+                    id,
+                    *side,
+                    &Fill {
+                        px: *px,
+                        qty: *qty,
+                        fee: *fee,
+                        is_maker: *is_maker,
+                    },
+                );
+            }
+            // `Started` is read above, where the *first* one wins: a restart
+            // must not reset the capital the session began with.
+            JournalEntry::Started { .. }
+            // A claim about the fold, never an input to it -- folding a
+            // checkpoint back in would make the check compare itself.
+            | JournalEntry::Checkpoint { .. }
+            // Controls, not money.
+            | JournalEntry::Tripped { .. }
+            | JournalEntry::Stopped { .. } => {}
         }
     }
     portfolio
@@ -383,6 +418,39 @@ pub fn agrees(entries: &[JournalEntry]) -> Agreement {
     Agreement::Agrees
 }
 
+/// The shape this build writes.
+pub const SCHEMA: u32 = 2;
+
+/// What a journal with no `schema` field was: everything before M7.5.
+const fn schema_v1() -> u32 {
+    1
+}
+
+/// The next client order id a resumed run should mint.
+///
+/// `max(id) + 1` over every entry that carries one, or 1 for a journal that has
+/// none. Derived from the ids rather than stored beside them, so there is
+/// nothing that can disagree with the record.
+///
+/// Returns 1 for an empty journal, which is what a fresh run uses anyway — so a
+/// caller does not have to special-case the first session.
+#[must_use]
+pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
+    entries
+        .iter()
+        .filter_map(|e| match e {
+            JournalEntry::Filled {
+                client_order_id, ..
+            } => Some(client_order_id.0),
+            JournalEntry::Started { .. }
+            | JournalEntry::Checkpoint { .. }
+            | JournalEntry::Tripped { .. }
+            | JournalEntry::Stopped { .. } => None,
+        })
+        .max()
+        .map_or(1, |highest| highest + 1)
+}
+
 /// Find or register an instrument by its persisted identity.
 fn resolve(registry: &mut InstrumentRegistry, key: &InstrumentKey) -> InstrumentId {
     use quant_core::instrument::{InstrumentDef, InstrumentKind};
@@ -452,6 +520,7 @@ mod tests {
             JournalEntry::Started {
                 at: Ts::from_nanos(0),
                 cash: amount("100"),
+                schema: SCHEMA,
             },
             filled(1, Side::Buy, "76650", "0.001", "0.0766"),
             filled(2, Side::Sell, "76700", "0.001", "0.0767"),
@@ -496,6 +565,7 @@ mod tests {
             &[JournalEntry::Started {
                 at: Ts::from_nanos(10),
                 cash: amount("64"),
+                schema: SCHEMA,
             }],
         );
         let recovered = read(&scratch.path).expect("read");
@@ -511,6 +581,7 @@ mod tests {
         restarted.push(JournalEntry::Started {
             at: Ts::from_nanos(10),
             cash: amount("64"),
+            schema: SCHEMA,
         });
         let mut registry = InstrumentRegistry::new();
         let portfolio = replay(&restarted, &mut registry);
@@ -774,5 +845,130 @@ mod tests {
         assert_eq!(realized, portfolio.realized());
         assert_eq!(fees, portfolio.fees());
         assert_eq!(fills, portfolio.fills());
+    }
+}
+
+#[cfg(test)]
+mod m75a_tests {
+    use super::{next_order_id, read, replay, JournalEntry, SCHEMA};
+    use quant_core::execution::ClientOrderId;
+    use quant_core::instrument::InstrumentRegistry;
+    use quant_core::time::Ts;
+    use std::io::Write as _;
+
+    /// A journal written before M7.5 existed, byte for byte.
+    const PRE_M75: &str = concat!(
+        r#"{"type":"started","at":0,"cash":10000000000}"#,
+        "\n",
+        r#"{"type":"filled","at":1000,"client_order_id":1,"instrument":{"exchange":"binance","symbol":"BTCUSDT"},"side":"buy","px":10000000000,"qty":100000,"fee":1000,"is_maker":false}"#,
+        "\n",
+    );
+
+    fn temp(name: &str, body: &str) -> std::path::PathBuf {
+        let thread = std::thread::current();
+        let unique = thread.name().unwrap_or("unnamed").replace("::", "-");
+        let path = std::env::temp_dir().join(format!("quant-m75a-{name}-{unique}.jsonl"));
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(body.as_bytes()).expect("write");
+        path
+    }
+
+    #[test]
+    fn a_journal_written_before_the_schema_field_still_reads() {
+        // The compatibility the `serde(default)` buys, pinned rather than
+        // assumed. The fortnight's two journals are this shape, and they are
+        // the only live evidence M5 ever produced — a reader that could not
+        // open them would make the milestone's result unverifiable.
+        let recovered = read(&temp("pre-m75", PRE_M75)).expect("readable");
+        assert_eq!(recovered.entries.len(), 2);
+        let JournalEntry::Started { schema, cash, .. } = &recovered.entries[0] else {
+            panic!("the first entry is a start")
+        };
+        assert_eq!(*schema, 1, "absent means the shape before M7.5");
+        assert_eq!(cash.to_string(), "100");
+    }
+
+    #[test]
+    fn the_schema_this_build_writes_is_not_the_one_it_defaults_to() {
+        // Otherwise the field is decoration: every journal would report the
+        // same number whether or not the writer knew about it, and the next
+        // change would have nothing to refuse at.
+        assert_ne!(SCHEMA, 1);
+    }
+
+    #[test]
+    fn ids_continue_across_a_restart_rather_than_repeating() {
+        // `next_id` resets to 1 with the process, and `resuming` replaces only
+        // the portfolio. Without recovery a resumed run mints id 1 again and the
+        // file holds two different orders claiming it — which would make M7.5's
+        // hole check report holes that are not there, the "cries wolf on good
+        // data" failure the verifier already taught this project once.
+        let entries = vec![
+            JournalEntry::Started {
+                at: Ts::from_nanos(1),
+                cash: "100".parse().expect("amount"),
+                schema: SCHEMA,
+            },
+            filled(7),
+            filled(9),
+        ];
+        assert_eq!(next_order_id(&entries), 10, "max + 1, not a count");
+    }
+
+    #[test]
+    fn an_empty_journal_mints_from_one() {
+        // So a first session needs no special case.
+        assert_eq!(next_order_id(&[]), 1);
+    }
+
+    #[test]
+    fn the_id_recovered_is_the_highest_not_the_last() {
+        // Entries are appended in time order, but ids are only dense, not
+        // sorted: a fill for an older order can land after a newer one once
+        // latency is on. Taking the last would then hand out an id already used.
+        let entries = vec![filled(9), filled(7)];
+        assert_eq!(next_order_id(&entries), 10);
+    }
+
+    #[test]
+    fn replaying_a_journal_ignores_everything_that_is_not_a_fill() {
+        // The exhaustive match's behaviour, stated as a property rather than
+        // left to the compiler: a checkpoint is a *claim about* the fold and
+        // folding it back in would make the check compare itself.
+        let mut registry = InstrumentRegistry::new();
+        let fills_only = vec![filled(1)];
+        let with_noise = vec![
+            filled(1),
+            JournalEntry::Checkpoint {
+                at: Ts::from_nanos(5),
+                cash: "999".parse().expect("amount"),
+                realized: "999".parse().expect("amount"),
+                fees: "999".parse().expect("amount"),
+                fills: 99,
+            },
+            JournalEntry::Stopped {
+                at: Ts::from_nanos(6),
+            },
+        ];
+        let a = replay(&fills_only, &mut registry);
+        let b = replay(&with_noise, &mut InstrumentRegistry::new());
+        assert_eq!(a.cash(), b.cash());
+        assert_eq!(a.fills(), b.fills());
+    }
+
+    fn filled(id: u64) -> JournalEntry {
+        JournalEntry::Filled {
+            at: Ts::from_nanos(i64::try_from(id).expect("small") * 1_000),
+            client_order_id: ClientOrderId(id),
+            instrument: super::InstrumentKey {
+                exchange: quant_core::instrument::Exchange::Binance,
+                symbol: "BTCUSDT".to_owned(),
+            },
+            side: quant_core::event::Side::Buy,
+            px: "100".parse().expect("px"),
+            qty: "0.001".parse().expect("qty"),
+            fee: "0.0001".parse().expect("fee"),
+            is_maker: false,
+        }
     }
 }
