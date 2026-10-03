@@ -518,10 +518,16 @@ fn a_maker_rebate_is_a_negative_fee() {
         bids: vec![level("98.0", "1")],
         asks: vec![level("99.0", "1")],
     });
+    // A buy limit at 97, which is *below* the best bid and so cannot cross: it
+    // rests. The earlier version of this test bought at a limit of 100 against
+    // a best ask of 99 — an order that crosses instantly on any real venue and
+    // pays taker — and asserted it earned a rebate. It passed, because
+    // `is_maker` was derived from "carries a limit price" rather than from what
+    // happened, so the test encoded the defect it should have caught.
     let events = run(
         &mut venue,
-        order(Side::Buy, "1", limit("100.0")),
-        &print_at("99.0"),
+        order(Side::Buy, "1", limit("97.0")),
+        &print_at("96.0"),
         &book,
     );
     let ExecutionEvent::Filled { fill, .. } = events
@@ -531,8 +537,95 @@ fn a_maker_rebate_is_a_negative_fee() {
     else {
         unreachable!()
     };
-    assert!(fill.is_maker, "a resting order that was traded through");
+    assert!(fill.is_maker, "rested below the touch, then traded through");
     assert!(fill.fee.raw() < 0, "a rebate: {}", fill.fee);
+}
+
+#[test]
+fn a_limit_that_crosses_on_arrival_pays_taker() {
+    // The other half, and the one that was wrong. A buy limit at 100 against a
+    // best ask of 99 crosses immediately on any real venue. It must take
+    // liquidity and pay for it — not rest, and not collect a maker rebate for
+    // an order that never provided anything.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        fees: crate::FeeSchedule {
+            maker: "-0.0001".parse().expect("rate"),
+            taker: "0.001".parse().expect("rate"),
+        },
+        ..crate::Costs::NONE
+    });
+    let mut book = Book::new();
+    book.apply_snapshot(&BookSnapshot {
+        meta: meta(),
+        last_update_id: 10,
+        bids: vec![level("98.0", "1")],
+        asks: vec![level("99.0", "1")],
+    });
+    // Driven by a *snapshot*, not a print: crossing on arrival does not need a
+    // trade-through, which is the behavioural difference. The old model could
+    // only fill a limit when someone printed past it.
+    let tick = MarketEvent::BookSnapshot(BookSnapshot {
+        meta: meta(),
+        last_update_id: 11,
+        bids: vec![level("98.0", "1")],
+        asks: vec![level("99.0", "1")],
+    });
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "1", limit("100.0")),
+        &tick,
+        &book,
+    );
+    let ExecutionEvent::Filled { fill, .. } = events
+        .iter()
+        .find(|e| matches!(e, ExecutionEvent::Filled { .. }))
+        .expect("it should have crossed immediately")
+    else {
+        unreachable!()
+    };
+    assert!(!fill.is_maker, "it crossed the spread");
+    assert!(fill.fee.raw() > 0, "taker fee, not a rebate: {}", fill.fee);
+    // And it pays the book's price, not its own limit: 99, never 100.
+    assert_eq!(fill.px.to_string(), "99");
+    assert_eq!(venue.stats().marketable_limits, 1);
+}
+
+#[test]
+fn a_resting_order_the_market_comes_to_stays_passive() {
+    // The subtlety that makes marketability an arrival-time question. This order
+    // cannot cross when it arrives; the market later moves through it. We did
+    // not cross — the counterparty did — so it is still a maker fill. Asking
+    // "is it marketable" on every event instead of once would turn every resting
+    // order into a taker the moment the market reached it, which is backwards.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        fees: crate::FeeSchedule {
+            maker: "-0.0001".parse().expect("rate"),
+            taker: "0.001".parse().expect("rate"),
+        },
+        ..crate::Costs::NONE
+    });
+    let mut book = Book::new();
+    book.apply_snapshot(&BookSnapshot {
+        meta: meta(),
+        last_update_id: 10,
+        bids: vec![level("98.0", "1")],
+        asks: vec![level("99.0", "1")],
+    });
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "1", limit("97.0")),
+        &print_at("96.0"),
+        &book,
+    );
+    let ExecutionEvent::Filled { fill, .. } = events
+        .iter()
+        .find(|e| matches!(e, ExecutionEvent::Filled { .. }))
+        .expect("a fill")
+    else {
+        unreachable!()
+    };
+    assert!(fill.is_maker, "we rested; they crossed");
+    assert_eq!(venue.stats().marketable_limits, 0);
 }
 
 #[test]
