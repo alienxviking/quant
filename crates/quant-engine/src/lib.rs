@@ -144,8 +144,21 @@ impl Default for Ledger {
 /// accumulated itself. A third independent tally would not be a check against
 /// the engine — it would be a check against itself.
 pub trait FillObserver {
+    /// `client_order_id` is **the engine's own id**, not a count of fills.
+    ///
+    /// It was absent until M7.5, so the only writer invented
+    /// `ClientOrderId(self.fills)` — a fill ordinal. That is right exactly while
+    /// nothing is ever refused, because `Ledger::mint` hands out ids densely and
+    /// a refused order consumes one *before* the risk check. The first refusal
+    /// in the project's history would have desynchronised the journal from the
+    /// engine permanently, silently, and in a file whose whole job is to be the
+    /// authority on what we did.
+    ///
+    /// The engine has the id two lines above this call, to look up the
+    /// instrument. It was a parameter list, not a missing fact.
     fn on_fill(
         &mut self,
+        client_order_id: ClientOrderId,
         instrument: InstrumentId,
         side: Side,
         fill: &Fill,
@@ -241,6 +254,29 @@ where
         self
     }
 
+    /// Continue minting client order ids from `next`, after a restart.
+    ///
+    /// `Ledger::mint` hands out ids densely from 1, and `next_id` resets to 1
+    /// with the process. [`Self::resuming`] replaces only the portfolio, so a
+    /// resumed run would mint id 1 again and the journal would hold two
+    /// different orders claiming it.
+    ///
+    /// That is not cosmetic. M7.5's first acceptance criterion is that a **hole
+    /// in the id sequence is a decision that was not written down** — a property
+    /// that only works if the ids are dense and unique across the whole file.
+    /// Duplicates would make the check report holes where there are none, which
+    /// is the "cries wolf on good data" failure M1's verifier already taught
+    /// this project once.
+    ///
+    /// Recovered as `max(id) + 1` over the journal rather than stored as a
+    /// counter: the ids themselves are the record, and a separate counter would
+    /// be a second thing that must agree with them forever.
+    #[must_use]
+    pub const fn minting_from(mut self, next: u64) -> Self {
+        self.ledger.next_id = next;
+        self
+    }
+
     /// Run to the end of the source.
     ///
     /// A source error stops the run and is returned, rather than being treated
@@ -311,7 +347,14 @@ where
                     // crash cannot erase a fill the strategy has already acted
                     // on.
                     if let Some(observer) = self.observer.as_mut() {
-                        observer.on_fill(instrument, side, fill, execution.ts(), &self.portfolio);
+                        observer.on_fill(
+                            execution.client_order_id(),
+                            instrument,
+                            side,
+                            fill,
+                            execution.ts(),
+                            &self.portfolio,
+                        );
                     }
                     // Risk keeps its own tally, so it has to see fills too. It
                     // deliberately does not read the portfolio: a limit computed

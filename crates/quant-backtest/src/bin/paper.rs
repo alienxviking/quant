@@ -58,7 +58,7 @@ use quant_backtest::{MaConfig, MaCrossover, Recorded};
 use quant_binance::capture::{self, CaptureConfig};
 use quant_binance::LiveSource;
 use quant_core::event::Side;
-use quant_core::execution::Fill;
+use quant_core::execution::{ClientOrderId, Fill};
 use quant_core::fixed::{Notional, Qty};
 use quant_core::instrument::{
     Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
@@ -128,6 +128,7 @@ impl JournalWriter {
 impl FillObserver for JournalWriter {
     fn on_fill(
         &mut self,
+        client_order_id: ClientOrderId,
         _instrument: InstrumentId,
         side: Side,
         fill: &Fill,
@@ -137,7 +138,7 @@ impl FillObserver for JournalWriter {
         self.fills += 1;
         let entry = JournalEntry::Filled {
             at,
-            client_order_id: quant_core::execution::ClientOrderId(self.fills),
+            client_order_id,
             instrument: InstrumentKey {
                 exchange: Exchange::Binance,
                 symbol: self.symbol.clone(),
@@ -267,8 +268,15 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     write(
         &journal,
         &JournalEntry::Started {
-            at: Ts::from_nanos(0),
+            // The wall clock, not a hard-coded zero. Both of the fortnight's
+            // `started` lines read `"at":0` and were byte-identical, so a
+            // journal that had recorded a restart could not date, or even
+            // distinguish, its own two sessions. Operational only, in
+            // `quant-meta`'s sense: nothing dispatches on it, and the engine's
+            // own clock is still the event stream.
+            at: quant_core::time::Clock::now(&quant_core::time::SystemClock),
             cash: starting,
+            schema: quant_engine::journal::SCHEMA,
         },
     )?;
 
