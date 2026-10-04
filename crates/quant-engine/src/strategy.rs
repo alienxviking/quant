@@ -36,6 +36,15 @@ pub struct Context<'a> {
     risk: &'a mut dyn RiskLayer,
     ledger: &'a mut Ledger,
     portfolio: &'a Portfolio,
+    /// Where decisions are written down, if anything is listening.
+    ///
+    /// Reached through `Context` because submissions and refusals happen here
+    /// and nowhere else. This is the one thing in `Context` that touches the
+    /// outside world, which is a real widening of the seam -- so it is
+    /// deliberately not something a *strategy* can reach: the field is private,
+    /// there is no accessor, and `Context`'s public surface is unchanged. A
+    /// strategy still cannot tell which pair it is wired to.
+    observer: Option<&'a mut (dyn crate::RunObserver + Send + 'static)>,
 }
 
 impl core::fmt::Debug for Context<'_> {
@@ -58,6 +67,7 @@ impl<'a> Context<'a> {
         risk: &'a mut dyn RiskLayer,
         ledger: &'a mut Ledger,
         portfolio: &'a Portfolio,
+        observer: Option<&'a mut (dyn crate::RunObserver + Send + 'static)>,
     ) -> Self {
         Self {
             books,
@@ -66,6 +76,7 @@ impl<'a> Context<'a> {
             risk,
             ledger,
             portfolio,
+            observer,
         }
     }
 
@@ -126,6 +137,15 @@ impl<'a> Context<'a> {
         let client_order_id = self.ledger.mint();
 
         if let Some(reason) = seam_check(&request) {
+            if let Some(observer) = self.observer.as_mut() {
+                observer.on_refused(
+                    client_order_id,
+                    &request,
+                    reason,
+                    crate::RefusedBy::Seam,
+                    self.now,
+                );
+            }
             self.ledger.refuse(client_order_id, reason, self.now);
             return client_order_id;
         }
@@ -139,10 +159,25 @@ impl<'a> Context<'a> {
         if let Some(reason) = self.risk.check(&request, mark, self.now) {
             // Refused here, so the venue never hears about it at all. That is
             // the chokepoint being a chokepoint.
+            if let Some(observer) = self.observer.as_mut() {
+                observer.on_refused(
+                    client_order_id,
+                    &request,
+                    reason,
+                    crate::RefusedBy::Risk,
+                    self.now,
+                );
+            }
             self.ledger.refuse(client_order_id, reason, self.now);
             return client_order_id;
         }
 
+        // Written down *before* the venue is told, which is the fill rule
+        // generalised: an order at a venue that we never recorded is an orphan
+        // position, and nothing read afterwards recovers it.
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_submitted(client_order_id, &request, mark, self.now);
+        }
         self.ledger.stats.submitted += 1;
         // Remembered so the fill can be booked: a fill names only the order.
         self.ledger
@@ -158,6 +193,9 @@ impl<'a> Context<'a> {
     /// it worked arrives as a `Cancelled` — or does not, because the order
     /// filled first.
     pub fn cancel(&mut self, client_order_id: ClientOrderId) {
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_cancel_requested(client_order_id, self.now);
+        }
         self.ledger.stats.cancels += 1;
         self.venue.cancel(client_order_id, self.now);
     }

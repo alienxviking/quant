@@ -39,8 +39,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use crate::RefusedBy;
 use quant_core::event::Side;
-use quant_core::execution::{ClientOrderId, Fill};
+use quant_core::execution::{ClientOrderId, Fill, RejectReason};
 use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::{Exchange, InstrumentId, InstrumentRegistry};
 use quant_core::time::Ts;
@@ -112,6 +113,68 @@ pub enum JournalEntry {
         fees: Notional,
         fills: u64,
     },
+    /// An order was minted and is about to reach the venue.
+    ///
+    /// Written **before** the wire, which is the fill rule generalised: an order
+    /// at a venue we never recorded is an orphan position.
+    ///
+    /// `mark` is the mid the risk layer priced it against. It is the one input
+    /// to a refusal that cannot be re-derived from raw, because it depends on
+    /// the book *as the engine saw it* — which a replay reconstructs but a
+    /// reader cannot attribute to a specific decision without this.
+    Submitted {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        instrument: InstrumentKey,
+        side: Side,
+        qty: Qty,
+        limit: Option<Px>,
+        mark: Option<Px>,
+    },
+    /// An order was refused, and the venue never heard about it.
+    Refused {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        instrument: InstrumentKey,
+        side: Side,
+        qty: Qty,
+        reason: RejectReason,
+        by: RefusedBy,
+    },
+    /// The venue acknowledged an order.
+    Accepted {
+        at: Ts,
+        client_order_id: ClientOrderId,
+    },
+    /// The venue declined an order it had been told about.
+    Rejected {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        reason: RejectReason,
+    },
+    /// A cancel was sent; whether it won the race is a separate entry.
+    CancelRequested {
+        at: Ts,
+        client_order_id: ClientOrderId,
+    },
+    /// An order was withdrawn, with whatever never traded.
+    Cancelled {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        remaining: Qty,
+    },
+    /// A fill arrived for an order this engine has no record of.
+    ///
+    /// Recorded rather than counted, because an orphan is the one fill that
+    /// cannot be reconciled: the portfolio never saw it, so `Checkpoint` and the
+    /// fold agree with each other while both disagree with the venue.
+    Orphaned {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        px: Px,
+        qty: Qty,
+        fee: Notional,
+    },
     /// The kill switch was thrown.
     ///
     /// Journalled because a switch held only in memory is re-armed by the
@@ -137,6 +200,13 @@ impl JournalEntry {
             | Self::Filled { at, .. }
             | Self::Checkpoint { at, .. }
             | Self::Tripped { at, .. }
+            | Self::Submitted { at, .. }
+            | Self::Refused { at, .. }
+            | Self::Accepted { at, .. }
+            | Self::Rejected { at, .. }
+            | Self::CancelRequested { at, .. }
+            | Self::Cancelled { at, .. }
+            | Self::Orphaned { at, .. }
             | Self::Stopped { at } => *at,
         }
     }
@@ -281,6 +351,14 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
         // the defect surfaces as a reconciliation mismatch weeks later; without
         // one, adding a variant does not build until somebody has decided what
         // it does to the portfolio. A compile error instead of a paragraph.
+        // `Orphaned` is kept as its own arm though its body matches the
+        // others'. The arms are the same *consequence* and different
+        // *decisions*: every other variant does nothing to the portfolio
+        // because it is not money, and an orphan does nothing because it is
+        // money we could not attribute. Merging them would delete the only
+        // place that distinction is written down, and the next person to touch
+        // this would have no reason not to fold it.
+        #[allow(clippy::match_same_arms)]
         match entry {
             JournalEntry::Filled {
                 instrument,
@@ -311,7 +389,26 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             | JournalEntry::Checkpoint { .. }
             // Controls, not money.
             | JournalEntry::Tripped { .. }
-            | JournalEntry::Stopped { .. } => {}
+            | JournalEntry::Stopped { .. }
+            // Decisions. None of them moves the portfolio: a submission is an
+            // intent, a refusal is an intent that stopped at the chokepoint,
+            // and an acceptance or a cancellation changes what is outstanding
+            // rather than what is held. Only `Filled` is money.
+            | JournalEntry::Submitted { .. }
+            | JournalEntry::Refused { .. }
+            | JournalEntry::Accepted { .. }
+            | JournalEntry::Rejected { .. }
+            | JournalEntry::CancelRequested { .. }
+            | JournalEntry::Cancelled { .. } => {}
+            // Deliberately *not* folded, and this is the one worth arguing. An
+            // orphan is a fill the engine could not attribute, so the live
+            // portfolio never saw it either -- folding it here would make the
+            // recompute disagree with a `Checkpoint` that is faithfully
+            // reporting what the engine believed. The disagreement would then
+            // read as an accounting bug rather than as what it is: a fill we
+            // cannot account for. It is recorded so a human can see it, and
+            // `runlog check` is where it becomes loud.
+            JournalEntry::Orphaned { .. } => {}
         }
     }
     portfolio
@@ -439,7 +536,32 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
     entries
         .iter()
         .filter_map(|e| match e {
+            // Every entry that carries an id contributes, not only fills: a
+            // refused order consumed an id without ever producing one, and a
+            // resumed run that reused it would make the hole check report holes
+            // where there are none.
             JournalEntry::Filled {
+                client_order_id, ..
+            }
+            | JournalEntry::Submitted {
+                client_order_id, ..
+            }
+            | JournalEntry::Refused {
+                client_order_id, ..
+            }
+            | JournalEntry::Accepted {
+                client_order_id, ..
+            }
+            | JournalEntry::Rejected {
+                client_order_id, ..
+            }
+            | JournalEntry::CancelRequested {
+                client_order_id, ..
+            }
+            | JournalEntry::Cancelled {
+                client_order_id, ..
+            }
+            | JournalEntry::Orphaned {
                 client_order_id, ..
             } => Some(client_order_id.0),
             JournalEntry::Started { .. }
