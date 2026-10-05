@@ -203,6 +203,85 @@ pub struct Instrument {
     pub min_notional: Notional,
 }
 
+/// A venue's own rules about what orders it will accept.
+///
+/// Split out of [`Instrument`] so something that enforces them need not also
+/// carry an identity — a simulated venue holds these per instrument and has no
+/// business knowing a symbol string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Filters {
+    pub tick_size: Px,
+    pub lot_size: Qty,
+    pub min_notional: Notional,
+}
+
+impl Filters {
+    /// Whether the venue would accept this order's size and price.
+    #[must_use]
+    pub fn accepts(&self, px: Px, qty: Qty) -> bool {
+        let abs_qty = qty.abs();
+        if abs_qty.is_zero() || !px.is_positive() {
+            return false;
+        }
+        if round_down(px.raw(), self.tick_size.raw()) != px.raw()
+            || round_down(abs_qty.raw(), self.lot_size.raw()) != abs_qty.raw()
+        {
+            return false;
+        }
+        match px.notional(abs_qty) {
+            Some(n) => n >= self.min_notional,
+            None => false,
+        }
+    }
+
+    /// Which rule it broke, for a report. `None` when it is acceptable.
+    #[must_use]
+    pub fn rejects(&self, px: Px, qty: Qty) -> Option<FilterBreach> {
+        let abs_qty = qty.abs();
+        if abs_qty.is_zero() || !px.is_positive() {
+            return Some(FilterBreach::NotAnOrder);
+        }
+        if round_down(px.raw(), self.tick_size.raw()) != px.raw() {
+            return Some(FilterBreach::TickSize);
+        }
+        if round_down(abs_qty.raw(), self.lot_size.raw()) != abs_qty.raw() {
+            return Some(FilterBreach::LotSize);
+        }
+        match px.notional(abs_qty) {
+            Some(n) if n >= self.min_notional => None,
+            _ => Some(FilterBreach::MinNotional),
+        }
+    }
+}
+
+/// Which venue rule an order broke.
+///
+/// Named rather than collapsed into one "malformed", because the remedies are
+/// different and a reader needs to know which: a tick-size breach is a rounding
+/// bug, and a min-notional breach means the *size* is wrong — which is a
+/// strategy configuration problem, not a code one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterBreach {
+    /// Zero quantity, or a non-positive price.
+    NotAnOrder,
+    /// The price is not a multiple of the tick.
+    TickSize,
+    /// The quantity is not a multiple of the lot.
+    LotSize,
+    /// The order is worth less than the venue will accept.
+    MinNotional,
+}
+
+/// Truncate toward zero to a multiple of `step`, or leave it alone if there is
+/// no step.
+const fn round_down(value: i64, step: i64) -> i64 {
+    if step == 0 {
+        return value;
+    }
+    value - value % step
+}
+
 impl Instrument {
     /// Round a price toward zero to a valid tick.
     ///
@@ -233,16 +312,16 @@ impl Instrument {
     /// would have been rejected in production.
     #[must_use]
     pub fn is_valid_order(&self, px: Px, qty: Qty) -> bool {
-        let abs_qty = qty.abs();
-        if abs_qty.is_zero() || !px.is_positive() {
-            return false;
-        }
-        if self.round_price(px) != px || self.round_qty(abs_qty) != abs_qty {
-            return false;
-        }
-        match px.notional(abs_qty) {
-            Some(n) => n >= self.min_notional,
-            None => false,
+        self.filters().accepts(px, qty)
+    }
+
+    /// This instrument's venue rules, without its identity.
+    #[must_use]
+    pub const fn filters(&self) -> Filters {
+        Filters {
+            tick_size: self.tick_size,
+            lot_size: self.lot_size,
+            min_notional: self.min_notional,
         }
     }
 }

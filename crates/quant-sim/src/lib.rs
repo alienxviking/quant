@@ -73,6 +73,7 @@ use quant_core::execution::{
     ClientOrderId, ExecutionEvent, Fill, OrderRequest, RejectReason, TimeInForce,
 };
 use quant_core::fixed::{Notional, Px, Qty};
+use quant_core::instrument::{FilterBreach, Filters, InstrumentId};
 use quant_core::time::Ts;
 use quant_engine::ExecutionVenue;
 
@@ -146,6 +147,18 @@ pub struct SimStats {
     pub multi_level_fills: u64,
     /// Market orders that could not be filled in full because the book ran out.
     pub exhausted_book: u64,
+    /// Orders the venue refused because they broke one of its own rules,
+    /// counted by which rule.
+    ///
+    /// Counted by kind rather than totalled, because the remedies differ: a
+    /// tick-size breach is a rounding bug in our code, and a min-notional breach
+    /// means the *size* is wrong, which is a strategy configuration problem. A
+    /// run that reports hundreds of the second has not found a bug -- it has
+    /// found that it was never going to trade.
+    pub filtered_tick_size: u64,
+    pub filtered_lot_size: u64,
+    pub filtered_min_notional: u64,
+    pub filtered_not_an_order: u64,
     /// Limit orders that crossed the book on arrival and so paid the taker rate.
     ///
     /// Reported because the distinction is invisible on a venue whose maker and
@@ -175,6 +188,25 @@ pub struct SimStats {
 }
 
 impl SimStats {
+    /// Tally a refusal by which rule it broke.
+    fn count_breach(&mut self, breach: FilterBreach) {
+        match breach {
+            FilterBreach::TickSize => self.filtered_tick_size += 1,
+            FilterBreach::LotSize => self.filtered_lot_size += 1,
+            FilterBreach::MinNotional => self.filtered_min_notional += 1,
+            FilterBreach::NotAnOrder => self.filtered_not_an_order += 1,
+        }
+    }
+
+    /// Every order the venue refused by its own rules.
+    #[must_use]
+    pub const fn filtered(&self) -> u64 {
+        self.filtered_tick_size
+            + self.filtered_lot_size
+            + self.filtered_min_notional
+            + self.filtered_not_an_order
+    }
+
     /// What this simulator cannot model **at all**, whatever it is configured
     /// with.
     ///
@@ -233,9 +265,37 @@ pub struct SimulatedVenue {
     cancels: Vec<(Ts, ClientOrderId)>,
     costs: Costs,
     stats: SimStats,
+    /// The venue's own order rules, per instrument index. Empty means a venue
+    /// that accepts anything, which is what every run before M4.c assumed.
+    filters: Vec<Option<Filters>>,
 }
 
 impl SimulatedVenue {
+    /// Enforce a venue's own order filters for one instrument.
+    ///
+    /// Without this a simulated venue accepts anything, and a strategy can
+    /// profit in backtest from orders a real venue would refuse outright. That
+    /// is not hypothetical: M5's fortnight submitted **822 ETHUSDT orders worth
+    /// $2.58 each** against Binance spot's $5 minimum. Every one would have been
+    /// rejected live, and the whole ETH leg of a two-symbol run measured an
+    /// experiment that could not exist.
+    ///
+    /// `Instrument` has carried `tick_size`, `lot_size` and `min_notional` since
+    /// M0, and `is_valid_order`'s own doc comment claimed it was "used by the
+    /// risk layer live *and* by the simulated venue in backtests". It was used
+    /// by neither. A property asserted in a doc comment is not a property the
+    /// code has -- the third time this project has found that, after M2.e's
+    /// part ordering and M4's maker classification.
+    #[must_use]
+    pub fn enforcing(mut self, instrument: InstrumentId, filters: Filters) -> Self {
+        let index = instrument.index();
+        if self.filters.len() <= index {
+            self.filters.resize(index + 1, None);
+        }
+        self.filters[index] = Some(filters);
+        self
+    }
+
     /// Free and instant: M3's venue.
     #[must_use]
     pub fn new() -> Self {
@@ -446,6 +506,28 @@ impl SimulatedVenue {
         self.cancels = still_flying;
     }
 
+    /// Which venue rule this order breaks, if any.
+    ///
+    /// Judged at the price the order would actually transact at: a limit order
+    /// at its limit, a market order at the touch it would pay. A market order
+    /// with no book to price against is *not* judged here -- that is
+    /// `NoMarket`'s case, which has its own reject reason precisely so the
+    /// expected post-disconnect rejection does not bury the unexpected ones.
+    fn breaches(filters: &[Option<Filters>], order: &Resting, book: &Book) -> Option<FilterBreach> {
+        let rules = filters
+            .get(order.request.instrument.index())
+            .copied()
+            .flatten()?;
+        let px = match order.request.limit() {
+            Some(limit) => limit,
+            None => match order.request.side {
+                Side::Buy => book.best_ask()?.px,
+                Side::Sell => book.best_bid()?.px,
+            },
+        };
+        rules.rejects(px, order.request.qty)
+    }
+
     /// Whether a limit order would cross the book the moment the venue sees it.
     ///
     /// Asked **once, on arrival**, and that is the whole subtlety. An order that
@@ -536,6 +618,22 @@ impl ExecutionVenue for SimulatedVenue {
                         ts: now,
                     },
                 );
+            }
+
+            // The venue's own rules, checked once when it first sees the order
+            // -- which is where a real venue checks them, on receipt against its
+            // own book. A market order has no price of its own, so the price
+            // judged is the touch it would actually pay; a limit order is judged
+            // at its limit.
+            if !order.seen {
+                if let Some(breach) = Self::breaches(&self.filters, order, book) {
+                    self.stats.count_breach(breach);
+                    let id = order.id;
+                    self.reject(id, RejectReason::Malformed, now);
+                    order.remaining = Qty::from_raw(0);
+                    order.seen = true;
+                    continue;
+                }
             }
 
             // Marketable *on arrival* and never re-asked, so a resting order
