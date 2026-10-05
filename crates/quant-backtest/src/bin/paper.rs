@@ -428,7 +428,12 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let mut engine = Engine::new(
         LiveSource::new(engine_rx, instrument),
-        SimulatedVenue::with_costs(costs),
+        // See `backtest`: the venue enforces the venue's rules in every world,
+        // so paper cannot fill what live would refuse.
+        SimulatedVenue::with_costs(costs).enforcing(
+            instrument,
+            registry.get(instrument).expect("just registered").filters(),
+        ),
         RiskEngine::recover(args.limits, tripped),
         strategy,
         starting,

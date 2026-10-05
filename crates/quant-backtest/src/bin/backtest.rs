@@ -142,7 +142,14 @@ fn main() -> ExitCode {
 
     let mut engine = Engine::new(
         source,
-        SimulatedVenue::with_costs(args.costs),
+        // The venue enforces its own rules, as a venue does. Without this a
+        // backtest fills orders a real venue would refuse -- which is not
+        // hypothetical: M5's ETHUSDT leg submitted 822 orders worth $2.58 each
+        // against a $5 minimum, and every one of them would have been rejected.
+        SimulatedVenue::with_costs(args.costs).enforcing(
+            instrument,
+            registry.get(instrument).expect("just registered").filters(),
+        ),
         RiskEngine::new(args.limits),
         strategy,
         args.cash,
@@ -261,6 +268,25 @@ fn print_sim(sim: SimStats) {
         "charged   {} in fees, {} reports still in flight when the data ran out",
         sim.fees_charged, sim.undelivered
     );
+    // Loud, and never silent when non-zero. A run whose orders are all refused
+    // by the venue's own rules reports `0 fills` and `cash 100 from 100`, which
+    // reads as "the strategy never fired" rather than "every order was invalid"
+    // -- and those need different fixes. M5's ETHUSDT leg is the case: 822
+    // orders at $2.58 against a $5 minimum, filled by a simulator that did not
+    // check and would have been refused by any real venue.
+    if sim.filtered() > 0 {
+        println!(
+            "refused   {} orders broke the venue's own rules: {} min notional, {} tick size, {} lot size, {} not an order",
+            sim.filtered(),
+            sim.filtered_min_notional,
+            sim.filtered_tick_size,
+            sim.filtered_lot_size,
+            sim.filtered_not_an_order
+        );
+        println!(
+            "          these would have been rejected live. The size is wrong, not the strategy."
+        );
+    }
 }
 
 /// What the numbers above do not include.

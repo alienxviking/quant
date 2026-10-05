@@ -869,3 +869,153 @@ fn zero_latency_is_indistinguishable_from_no_latency_at_all() {
     };
     assert_eq!(free, zeroed);
 }
+
+#[test]
+fn an_order_below_the_minimum_notional_is_refused_as_a_venue_would() {
+    // The defect this exists for, reproduced at the scale it actually happened:
+    // M5's fortnight submitted 822 ETHUSDT orders worth $2.58 each against
+    // Binance spot's $5 minimum, and a simulator that checked nothing filled
+    // every one of them. The whole ETH leg measured an experiment that could not
+    // exist.
+    let instrument = instrument();
+    let mut venue = SimulatedVenue::new().enforcing(
+        instrument,
+        quant_core::instrument::Filters {
+            tick_size: "0.01".parse().expect("tick"),
+            lot_size: "0.00001".parse().expect("lot"),
+            min_notional: "5".parse().expect("notional"),
+        },
+    );
+    let mut book = Book::new();
+    book.apply_snapshot(&BookSnapshot {
+        meta: meta(),
+        last_update_id: 10,
+        bids: vec![level("99.0", "10")],
+        asks: vec![level("100.0", "10")],
+    });
+
+    // 0.01 at 100 is 1.00 -- a fifth of the minimum.
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "0.01", OrderKind::Market),
+        &print_at("100.0"),
+        &book,
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ExecutionEvent::Rejected { .. })),
+        "the venue must refuse it: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ExecutionEvent::Filled { .. })),
+        "and must not fill it"
+    );
+    assert_eq!(venue.stats().filtered_min_notional, 1);
+    assert_eq!(venue.stats().filtered(), 1, "named, not merely counted");
+}
+
+#[test]
+fn an_order_at_the_minimum_is_accepted_because_the_bound_is_inclusive() {
+    // The boundary, in the direction that matters: a venue's minimum is a floor
+    // it accepts, not one it exceeds. Getting this backwards would refuse every
+    // order sized exactly to the limit, which is what a careful strategy does.
+    let instrument = instrument();
+    let mut venue = SimulatedVenue::new().enforcing(
+        instrument,
+        quant_core::instrument::Filters {
+            tick_size: "0.01".parse().expect("tick"),
+            lot_size: "0.00001".parse().expect("lot"),
+            min_notional: "5".parse().expect("notional"),
+        },
+    );
+    let mut book = Book::new();
+    book.apply_snapshot(&BookSnapshot {
+        meta: meta(),
+        last_update_id: 10,
+        bids: vec![level("99.0", "10")],
+        asks: vec![level("100.0", "10")],
+    });
+    // 0.05 at 100 is exactly 5.00.
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "0.05", OrderKind::Market),
+        &print_at("100.0"),
+        &book,
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ExecutionEvent::Filled { .. })),
+        "exactly at the minimum is acceptable: {events:?}"
+    );
+    assert_eq!(venue.stats().filtered(), 0);
+}
+
+#[test]
+fn a_market_order_is_judged_at_the_price_it_would_pay() {
+    // Not at its limit, because it has none. A market buy is judged against the
+    // ask it would lift -- which is the only price at which it will ever
+    // transact, and the one a real venue evaluates the filter against.
+    let instrument = instrument();
+    let mut venue = SimulatedVenue::new().enforcing(
+        instrument,
+        quant_core::instrument::Filters {
+            tick_size: "0.01".parse().expect("tick"),
+            lot_size: "0.00001".parse().expect("lot"),
+            min_notional: "5".parse().expect("notional"),
+        },
+    );
+    let mut book = Book::new();
+    // A wide book: the bid would pass the filter, the ask would not.
+    book.apply_snapshot(&BookSnapshot {
+        meta: meta(),
+        last_update_id: 10,
+        bids: vec![level("600.0", "10")],
+        asks: vec![level("100.0", "10")],
+    });
+    // 0.01 at the ask of 100 is 1.00 -- refused. At the bid of 600 it would be
+    // 6.00 and pass, so judging the wrong side would let it through.
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "0.01", OrderKind::Market),
+        &print_at("100.0"),
+        &book,
+    );
+    assert_eq!(
+        venue.stats().filtered_min_notional,
+        1,
+        "judged at the ask it would lift: {events:?}"
+    );
+}
+
+#[test]
+fn a_venue_given_no_filters_accepts_what_it_always_did() {
+    // The no-op property, and the reason the change is safe to make at all:
+    // every run before M4.c assumed a venue that accepts anything, and a
+    // `SimulatedVenue` with no filters must still behave exactly that way. The
+    // same shape as `zero_costs_reproduce_the_free_run_exactly`.
+    let mut venue = SimulatedVenue::new();
+    let mut book = Book::new();
+    book.apply_snapshot(&BookSnapshot {
+        meta: meta(),
+        last_update_id: 10,
+        bids: vec![level("99.0", "10")],
+        asks: vec![level("100.0", "10")],
+    });
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "0.00001", OrderKind::Market),
+        &print_at("100.0"),
+        &book,
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ExecutionEvent::Filled { .. })),
+        "a dust order fills when nothing is enforcing: {events:?}"
+    );
+    assert_eq!(venue.stats().filtered(), 0);
+}
