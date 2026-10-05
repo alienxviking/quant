@@ -1131,10 +1131,9 @@ underneath a running supervisor can make its loop jump mid-execution. Merging to
   sold at 77,637.67 — **+0.3 cents of price against 15.5 cents of fees**, which is
   M4's finding arriving from live data.
 
-- **A known hole to close before M8**: a hard kill between a risk trip and
-  shutdown loses the trip, because the switch is journalled at shutdown. Harmless
-  in paper; before real money the day's tally must be recovered from the journal
-  rather than only the switch.
+- **A known hole, closed by M7.5.d**: a hard kill between a risk trip and
+  shutdown lost the trip, because the switch was journalled at shutdown.
+  `RunObserver::on_tripped` now writes it at the instant it fires.
 
 - **M5's criterion was sharpened, and one of my claims was wrong.** "P&L
   reconciles against an independent recompute" checks arithmetic against itself
@@ -1754,9 +1753,12 @@ more than one `Started` entry in a journal.
 **Bring the logs back, not just the capture and the journals.** M5's criterion
 assumes the tee dropped nothing, and the only evidence of that is two numbers
 that live nowhere else: `paper` prints `events {N} reached the engine` to stdout
-and the capture emits `records = {N}` through tracing. `TeeSink::secondary_dropped()`
-is read by nothing but its own tests, so without `~/paper/logs/` that check
-cannot be made at all.
+and the capture emits `records = {N}` through tracing. That was the *only* way
+to make the check during M5, because `TeeSink::secondary_dropped()` was read by
+nothing but its own tests — so without `~/paper/logs/` it could not be made at
+all. Since M7.5.d the run reports a `tee` line directly and the engine journals
+a `blind` entry per drop, so at M8 the logs are corroboration rather than the
+sole evidence. Bring them anyway.
 
 Do **not** build M8 on top of an unvalidated live path — it depends on M5's
 live-versus-replay agreement having actually passed. Note too that everything
@@ -1790,10 +1792,16 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   that boundary rather than crossing it, and building the reader first made
   concrete what those entries have to contain. It also unblocks three things
   below that are all waiting on the same unfreeze.
-- **A hard kill between a risk trip and shutdown loses the trip**, because the
-  kill switch is journalled at shutdown. Harmless in paper, where nothing is at
-  stake; **must be fixed before M8**, by recovering the day's tally from the
-  journal rather than only the switch.
+- **A hard kill between a risk trip and shutdown used to lose the trip. Fixed
+  in M7.5.d**, and it was two defects wearing one coat. The known half: the
+  switch was journalled at shutdown, so a kill in between lost it and the
+  supervisor re-armed a switch that had fired. The half nobody had written
+  down: even on a *clean* exit the entry was stamped `stopped_at`, so the
+  record of the most serious thing the risk layer can do named the wrong
+  moment, by however long the session happened to run on. `on_tripped` now
+  fires from inside the seam at the instant the limit binds — the write-ahead
+  rule the journal already applied to fills and submissions, arriving at the
+  third place that needed it.
 - **Queue position and market impact remain unmeasured**, as predicted, and the
   fortnight could not change that: a paper venue uses simulated fills, so our
   orders were never in the book and nobody in the recording reacted to them.
@@ -1803,16 +1811,23 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   platform being trustworthy, not about this strategy — and a lower-turnover or
   maker-side idea is the shape that could work, which is a thing to try *after* the
   platform can measure it honestly.
-- **Three defects M7's scoping surfaced, all waiting on the run log.** The
-  journal's `client_order_id` is a *fill ordinal*, not the engine's id, because
-  `FillObserver::on_fill` is never handed the real one — and refused orders
-  consume an id before the risk check, so the first refusal desynchronises it
-  permanently (harmless so far: nothing has been refused). `Started.at` is
-  hard-coded to zero, so a journal cannot date its own beginning. And
-  `TeeSink::secondary_dropped()` is called from nowhere, so nothing watches the
-  tee *during* a run — it is checkable afterwards, since `events N reached the
-  engine` against the capture's `records=N` would differ, but M5's criterion
-  assumes it was zero and nothing says so.
+- **Three defects M7's scoping surfaced — all three now closed.** The journal's
+  `client_order_id` was a *fill ordinal* rather than the engine's id, and
+  `Started.at` was hard-coded to zero; both fell to M7.5.a. The third was the
+  interesting one: `TeeSink::secondary_dropped()` was called from nowhere, and
+  the reason was **structural rather than an oversight** — `capture::run` takes
+  a closure that builds the tee and moves it in, so no reference survived to
+  ask. The counter was correct for the whole fortnight and unreadable for all
+  of it. M7.5.d moves it behind an `Arc<AtomicU64>` the caller keeps, which is
+  M1.e's argument in a second place: atomic not for contention, but so the
+  value stays legible while its owner is borrowed for the length of the run.
+
+  It also gives the fact **two independent counts**, which is the shape this
+  project keeps reaching for. The tee counts what it could not hand over; the
+  engine finds the `ingest_seq` holes those drops leave and journals each as a
+  `blind` line with `GapCause::LocalOverflow`. Neither is derived from the
+  other, so a disagreement means one of them is wrong — and for the whole of
+  M5 only one of them existed.
 
 - **`quant-explain::health` parses prose, and that is debt with a scheduled
   repayment.** An emitter and parser that must agree forever through a format

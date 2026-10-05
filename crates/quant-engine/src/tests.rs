@@ -554,3 +554,175 @@ fn client_order_ids_are_unique_even_across_refusals() {
     let ids = &engine.strategy().ids;
     assert_eq!(ids, &[ClientOrderId(1), ClientOrderId(2)]);
 }
+
+/// Everything the engine told an observer, in order.
+///
+/// The first `RunObserver` in a test: slices (a) through (c) built the hooks and
+/// pinned their *payloads* in `journal.rs`, which leaves the wiring — whether
+/// the engine calls them at all, and when — resting on the paper binary. That is
+/// the shape of defect M6 found in M5.c, where `FillObserver` was never invoked
+/// and the durability the slice claimed did not exist.
+#[derive(Debug, Default)]
+struct Witness {
+    tripped: Vec<(crate::risk::TripCause, Ts)>,
+    blind: Vec<(GapCause, Ts, Ts)>,
+}
+
+impl crate::RunObserver for std::sync::Arc<std::sync::Mutex<Witness>> {
+    fn on_tripped(&mut self, cause: crate::risk::TripCause, at: Ts) {
+        self.lock().expect("witness").tripped.push((cause, at));
+    }
+
+    fn on_blind(&mut self, cause: GapCause, last_good_ts: Ts, at: Ts) {
+        self.lock()
+            .expect("witness")
+            .blind
+            .push((cause, last_good_ts, at));
+    }
+}
+
+/// Submits on every event, which is what makes an order-count limit bind.
+#[derive(Debug, Default)]
+struct Greedy;
+
+impl Strategy for Greedy {
+    fn on_market_event(&mut self, _event: &MarketEvent, ctx: &mut Context<'_>) {
+        ctx.submit(buy());
+    }
+}
+
+fn witnessed_run(events: Vec<MarketEvent>, limits: crate::risk::Limits) -> Witness {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(events),
+        RecordingVenue::default(),
+        crate::risk::RiskEngine::new(limits),
+        Greedy,
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    engine.run().expect("no source failure");
+    let out = std::mem::take(&mut *seen.lock().expect("witness"));
+    out
+}
+
+#[test]
+fn a_trip_is_reported_at_the_instant_it_trips_not_at_shutdown() {
+    // The defect this slice closes, and it is two defects wearing one coat. M5
+    // wrote `Tripped` during shutdown, so a hard kill in between lost it
+    // outright and the supervisor re-armed a switch that had fired; and even on
+    // a clean exit the entry carried the *shutdown* time, so the record of the
+    // most serious thing the risk layer can do named the wrong moment.
+    //
+    // Three events, a limit of one order a day: the second submission trips.
+    let events = vec![trade(1, "100.00"), trade(2, "100.00"), trade(3, "100.00")];
+    let seen = witnessed_run(
+        events,
+        crate::risk::Limits {
+            max_orders_per_day: Some(1),
+            ..crate::risk::Limits::default()
+        },
+    );
+    assert_eq!(
+        seen.tripped.len(),
+        1,
+        "exactly one trip: {:?}",
+        seen.tripped
+    );
+    let (cause, at) = seen.tripped[0];
+    assert_eq!(cause, crate::risk::TripCause::OrderCount);
+    // The instant of the *second* event, which is where the limit bound --
+    // not the third, and not whenever the run happened to end.
+    assert_eq!(
+        at,
+        meta(2).local_recv_ts,
+        "stamped at the breach, not at the end of the run"
+    );
+}
+
+#[test]
+fn a_switch_that_is_already_thrown_is_not_reported_again() {
+    // Every order after the trip is refused *by* the trip, and a layer that
+    // reported each one would write a `tripped` line per refused order -- a file
+    // claiming the limit fired eleven times when it fired once.
+    let events = vec![
+        trade(1, "100.00"),
+        trade(2, "100.00"),
+        trade(3, "100.00"),
+        trade(4, "100.00"),
+        trade(5, "100.00"),
+    ];
+    let seen = witnessed_run(
+        events,
+        crate::risk::Limits {
+            max_orders_per_day: Some(1),
+            ..crate::risk::Limits::default()
+        },
+    );
+    assert_eq!(
+        seen.tripped.len(),
+        1,
+        "one trip however many orders it refuses: {:?}",
+        seen.tripped
+    );
+}
+
+#[test]
+fn a_switch_recovered_from_a_previous_session_reports_nothing() {
+    // It is already on record -- that is where it was recovered from. Reporting
+    // it would add a `tripped` line at every restart, and `last_trip` reads the
+    // most recent one, so the file would say the limit fired at the start of the
+    // session that merely inherited it.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00"), trade(2, "100.00")]),
+        RecordingVenue::default(),
+        crate::risk::RiskEngine::recover(
+            crate::risk::Limits::default(),
+            Some(crate::risk::TripCause::DailyLoss),
+        ),
+        Greedy,
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    engine.run().expect("no source failure");
+    assert_eq!(
+        seen.lock().expect("witness").tripped,
+        Vec::new(),
+        "a recovered switch is not a new trip"
+    );
+}
+
+#[test]
+fn going_blind_is_reported_with_its_cause_and_how_long_it_lasted() {
+    // "Why did it not trade between 03:00 and 04:00" has four answers and three
+    // of them are already in the file. Without this one a quiet hour and a blind
+    // hour are the same silence.
+    let seen = witnessed_run(
+        vec![trade(1, "100.00"), gap(2), trade(3, "100.00")],
+        crate::risk::Limits::default(),
+    );
+    assert_eq!(seen.blind.len(), 1, "one gap, one line: {:?}", seen.blind);
+    let (cause, last_good, at) = seen.blind[0];
+    assert_eq!(cause, GapCause::Disconnect);
+    assert_eq!(
+        last_good,
+        Ts::from_nanos(1),
+        "the last instant we could see"
+    );
+    assert_eq!(at, meta(2).local_recv_ts, "and the instant we could not");
+    assert!(at > last_good, "the pair has to bound a real interval");
+}
+
+#[test]
+fn a_run_that_never_goes_blind_says_nothing_about_blindness() {
+    // The other half, and the one that stops the entry becoming noise: an
+    // absence of gaps must produce an absence of lines, or "were we blind" is
+    // answered the same way on every run.
+    let seen = witnessed_run(
+        vec![trade(1, "100.00"), trade(2, "100.00")],
+        crate::risk::Limits::default(),
+    );
+    assert_eq!(seen.blind, Vec::new());
+    assert_eq!(seen.tripped, Vec::new(), "and no limit bound either");
+}

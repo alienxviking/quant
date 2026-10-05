@@ -150,6 +150,27 @@ impl JournalWriter {
 }
 
 impl RunObserver for JournalWriter {
+    fn on_tripped(&mut self, cause: quant_engine::risk::TripCause, at: Ts) {
+        // At the instant, not at shutdown. A hard kill between the two used to
+        // lose the trip outright, and the supervisor would re-arm a switch that
+        // had fired -- the hole `CLAUDE.md` carried as *must be fixed before
+        // M8*. Written through the same failure-tolerant path as every other
+        // entry, because a journal write that killed the process on the way
+        // down would be a worse outcome than a missing line.
+        self.record(&JournalEntry::Tripped { at, cause }, "a kill switch trip");
+    }
+
+    fn on_blind(&mut self, cause: quant_core::event::GapCause, last_good_ts: Ts, at: Ts) {
+        self.record(
+            &JournalEntry::Blind {
+                at,
+                cause,
+                last_good_ts,
+            },
+            "a gap",
+        );
+    }
+
     fn on_fill(
         &mut self,
         client_order_id: ClientOrderId,
@@ -460,9 +481,16 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let config = CaptureConfig::new(args.symbol.clone(), args.root.clone())
         .for_at_most(Duration::from_secs(args.minutes * 60));
     let runtime = tokio::runtime::Runtime::new()?;
-    let capture = runtime.block_on(capture::run(config, |tx| {
-        quant_recorder::TeeSink::new(tx, engine_tx)
+    // The tee is moved into the closure and gone, so the only way to learn what
+    // it dropped is to hand it somewhere to count. Unreachable for the whole of
+    // M5's fortnight, which is why that run can only *assume* the engine saw
+    // every record.
+    let tee_drops = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = std::sync::Arc::clone(&tee_drops);
+    let capture = runtime.block_on(capture::run(config, move |tx| {
+        quant_recorder::TeeSink::new(tx, engine_tx).counting_into(std::sync::Arc::clone(&counter))
     }));
+    let tee_dropped = tee_drops.load(std::sync::atomic::Ordering::Relaxed);
 
     // The capture is finished, so its sender is gone, so the engine's channel is
     // closed, so `next_event` returns None and the thread ends on its own.
@@ -479,21 +507,16 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         &journal,
         &JournalEntry::checkpoint(stopped_at, engine.portfolio()),
     )?;
-    // A tripped switch outlives the process, so it has to be on disk before this
-    // one ends. See `RiskEngine::recover`.
+    // The trip itself is journalled by `on_tripped` at the instant it happens,
+    // so there is nothing to write here -- only something to say. Writing it
+    // again would put a second `tripped` line in the file stamped with the
+    // shutdown time, which is what this slice removed.
     if let Some(cause) = engine.risk().tripped() {
-        write(
-            &journal,
-            &JournalEntry::Tripped {
-                at: stopped_at,
-                cause,
-            },
-        )?;
         warn!(%cause, "the kill switch is thrown; the next session will refuse orders");
     }
     write(&journal, &JournalEntry::Stopped { at: stopped_at })?;
 
-    report(&engine, &journal_path)?;
+    report(&engine, &journal_path, tee_dropped)?;
     capture.map(|()| ExitCode::SUCCESS)
 }
 
@@ -555,6 +578,7 @@ fn print_banner(
 fn report<V, R, K>(
     engine: &Engine<LiveSource, V, R, K>,
     journal_path: &std::path::Path,
+    tee_dropped: u64,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     V: quant_engine::ExecutionVenue,
@@ -568,6 +592,19 @@ where
         "events    {} reached the engine ({} gaps), {} execution events",
         stats.events, stats.gaps, stats.execution_events
     );
+    // Two independent counts of one fact. The tee counts what it failed to hand
+    // over; the engine counts the `ingest_seq` holes those drops left, and
+    // journals each as a `blind` line. Neither is derived from the other, so a
+    // disagreement means one of them is wrong -- and for the whole of M5 only
+    // one of them could be read at all.
+    if tee_dropped == 0 {
+        println!("tee       0 records dropped on the way to the engine");
+    } else {
+        println!(
+            "tee       {tee_dropped} records DROPPED on the way to the engine -- \
+             the engine was blind for them, and journalled it"
+        );
+    }
     println!(
         "orders    {} sent, {} refused, {} fills",
         stats.submitted, stats.refused, stats.fills
