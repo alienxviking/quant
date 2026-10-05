@@ -18,7 +18,7 @@ use quant_core::source::{EventSource, SourceError};
 use quant_core::time::Ts;
 use quant_core::Notional;
 
-use crate::{AllowAll, Context, Engine, ExecutionVenue, RiskLayer, Strategy};
+use crate::{AllowAll, Context, Engine, ExecutionVenue, Refusal, RiskLayer, Strategy};
 
 /// Starting capital for the wiring tests. Any positive number; these tests are
 /// about the seam, and the accounting has its own.
@@ -282,8 +282,8 @@ fn a_refusing_risk_layer_means_no_order_reaches_the_venue() {
             _r: &OrderRequest,
             _mark: Option<quant_core::Px>,
             _now: Ts,
-        ) -> Option<RejectReason> {
-            Some(RejectReason::RiskLimit)
+        ) -> Option<Refusal> {
+            Some(Refusal::unnamed(RejectReason::RiskLimit))
         }
     }
 

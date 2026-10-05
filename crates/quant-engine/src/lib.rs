@@ -69,7 +69,7 @@ use quant_core::time::Ts;
 
 pub use journal::{InstrumentKey, Journal, JournalEntry};
 pub use portfolio::{Portfolio, Position};
-pub use risk::{AllowAll, Limits, RiskEngine, RiskLayer, TripCause};
+pub use risk::{AllowAll, Bound, Limits, Refusal, RiskEngine, RiskLayer, TripCause};
 pub use strategy::{Context, Strategy};
 pub use venue::ExecutionVenue;
 
@@ -172,11 +172,18 @@ pub trait RunObserver {
     /// `by` separates "we built a malformed order" from "we built a fine order
     /// the limits declined". Collapsing them would bury a bug of ours in a
     /// counter of events that are working as designed.
+    ///
+    /// `bound` names which limit stopped it, and is `None` for a seam refusal —
+    /// the seam is not a limit, and a malformed order breached nothing. It
+    /// deliberately does not reach the strategy: `RejectReason` stays two values
+    /// wide, because a strategy that could tell "too large" from "the daily loss
+    /// budget is spent" could trade around the limits.
     fn on_refused(
         &mut self,
         _client_order_id: ClientOrderId,
         _request: &OrderRequest,
         _reason: RejectReason,
+        _bound: Option<crate::risk::Bound>,
         _by: RefusedBy,
         _at: Ts,
     ) {

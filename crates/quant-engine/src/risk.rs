@@ -48,9 +48,58 @@ use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::InstrumentId;
 use quant_core::time::{Ts, UtcDate};
 
+/// Which limit actually bound, when one did.
+///
+/// Exactly one variant per `return` in [`RiskEngine::check`], pinned by a test —
+/// so a limit added without a name for it cannot reach the record as
+/// "something refused this".
+///
+/// Separate from [`RejectReason`] on purpose, and the separation is the point.
+/// `RejectReason` is what the *strategy* is told, and it stays two values wide:
+/// a strategy that could distinguish "your order was too large" from "the daily
+/// loss budget is spent" could trade around the limits, which is the opposite of
+/// a chokepoint. This goes to the file only, where the reader is a person
+/// deciding whether the limits are set right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bound {
+    /// The switch was already thrown. Nothing gets out until someone resumes.
+    Tripped,
+    /// The day's order count is spent.
+    OrderCount,
+    /// The day's loss budget is spent.
+    DailyLoss,
+    /// A money limit is set and there is no price to size against.
+    NoMark,
+    /// This single order is too large.
+    OrderNotional,
+    /// The position this order would create is too large.
+    PositionNotional,
+}
+
+/// A refusal, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refusal {
+    /// What the strategy is told.
+    pub reason: RejectReason,
+    /// What the record is told. `None` for a seam refusal, which is not a limit.
+    pub bound: Option<Bound>,
+}
+
+impl Refusal {
+    /// A refusal from a layer that does not name its limits.
+    #[must_use]
+    pub const fn unnamed(reason: RejectReason) -> Self {
+        Self {
+            reason,
+            bound: None,
+        }
+    }
+}
+
 /// Decides whether an order may leave.
 pub trait RiskLayer {
-    /// `None` to allow, `Some(reason)` to refuse.
+    /// `None` to allow, `Some(refusal)` to refuse.
     ///
     /// `mark` is the current mid for the request's instrument, or `None` when the
     /// book has no prices — after a gap, or before the first snapshot. A limit
@@ -62,7 +111,7 @@ pub trait RiskLayer {
     /// today, open position, a tripped switch — and a checker that could not
     /// remember could only enforce per-order limits, which are the least useful
     /// kind.
-    fn check(&mut self, request: &OrderRequest, mark: Option<Px>, now: Ts) -> Option<RejectReason>;
+    fn check(&mut self, request: &OrderRequest, mark: Option<Px>, now: Ts) -> Option<Refusal>;
 
     /// Told about every fill, so a stateful limit can see its own effect.
     ///
@@ -81,12 +130,7 @@ pub trait RiskLayer {
 pub struct AllowAll;
 
 impl RiskLayer for AllowAll {
-    fn check(
-        &mut self,
-        _request: &OrderRequest,
-        _mark: Option<Px>,
-        _now: Ts,
-    ) -> Option<RejectReason> {
+    fn check(&mut self, _request: &OrderRequest, _mark: Option<Px>, _now: Ts) -> Option<Refusal> {
         None
     }
 }
@@ -294,18 +338,21 @@ impl RiskEngine {
     /// Returns the reason rather than an `Option` so every call site reads
     /// `return Some(self.refuse(..))` -- explicit at the point of refusal, which
     /// is the one place in this file worth being unambiguous.
-    fn refuse(&mut self, reason: RejectReason) -> RejectReason {
+    fn refuse(&mut self, reason: RejectReason, bound: Bound) -> Refusal {
         self.refusals += 1;
-        reason
+        Refusal {
+            reason,
+            bound: Some(bound),
+        }
     }
 }
 
 impl RiskLayer for RiskEngine {
-    fn check(&mut self, request: &OrderRequest, mark: Option<Px>, now: Ts) -> Option<RejectReason> {
+    fn check(&mut self, request: &OrderRequest, mark: Option<Px>, now: Ts) -> Option<Refusal> {
         self.roll(now);
 
         if self.tripped.is_some() {
-            return Some(self.refuse(RejectReason::RiskLimit));
+            return Some(self.refuse(RejectReason::RiskLimit, Bound::Tripped));
         }
         if self
             .limits
@@ -316,7 +363,7 @@ impl RiskLayer for RiskEngine {
             // order-count limit is a strategy in a loop, and a loop does not
             // stop because one order was declined.
             self.trip(TripCause::OrderCount);
-            return Some(self.refuse(RejectReason::RiskLimit));
+            return Some(self.refuse(RejectReason::RiskLimit, Bound::OrderCount));
         }
         if self
             .limits
@@ -324,7 +371,7 @@ impl RiskLayer for RiskEngine {
             .is_some_and(|max| self.today.realized.raw() <= -max.raw())
         {
             self.trip(TripCause::DailyLoss);
-            return Some(self.refuse(RejectReason::RiskLimit));
+            return Some(self.refuse(RejectReason::RiskLimit, Bound::DailyLoss));
         }
 
         // Everything below is money, and money needs a price.
@@ -335,13 +382,13 @@ impl RiskLayer for RiskEngine {
                 // You cannot size what you cannot price. Refusing here is what
                 // makes the limit *tightest* when the market is least
                 // understood, rather than widest.
-                return Some(self.refuse(RejectReason::NoMarket));
+                return Some(self.refuse(RejectReason::NoMarket, Bound::NoMark));
             };
 
             if let Some(max) = self.limits.max_order_notional {
                 let notional = mark.notional(request.qty).unwrap_or(Notional::MAX_VALUE);
                 if notional > max {
-                    return Some(self.refuse(RejectReason::RiskLimit));
+                    return Some(self.refuse(RejectReason::RiskLimit, Bound::OrderNotional));
                 }
             }
             if let Some(max) = self.limits.max_position_notional {
@@ -354,7 +401,7 @@ impl RiskLayer for RiskEngine {
                     .notional(Qty::from_raw(after.abs()))
                     .unwrap_or(Notional::MAX_VALUE);
                 if exposure > max {
-                    return Some(self.refuse(RejectReason::RiskLimit));
+                    return Some(self.refuse(RejectReason::RiskLimit, Bound::PositionNotional));
                 }
             }
         }
@@ -493,7 +540,8 @@ mod tests {
         assert_eq!(risk.check(&order(Side::Buy, "4"), MARK, NOW), None);
         // 6 units is 600: refused.
         assert_eq!(
-            risk.check(&order(Side::Buy, "6"), MARK, NOW),
+            risk.check(&order(Side::Buy, "6"), MARK, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
     }
@@ -508,7 +556,8 @@ mod tests {
             ..Limits::default()
         });
         assert_eq!(
-            risk.check(&order(Side::Buy, "1"), None, NOW),
+            risk.check(&order(Side::Buy, "1"), None, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::NoMarket)
         );
     }
@@ -538,7 +587,8 @@ mod tests {
         // Three more would be six units, 600 at the mark: refused before it
         // happens rather than after.
         assert_eq!(
-            risk.check(&order(Side::Buy, "3"), MARK, NOW),
+            risk.check(&order(Side::Buy, "3"), MARK, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
         // But two more is five units, 500: exactly at the limit, allowed.
@@ -572,7 +622,8 @@ mod tests {
             ..Limits::default()
         });
         assert_eq!(
-            risk.check(&order(Side::Sell, "6"), MARK, NOW),
+            risk.check(&order(Side::Sell, "6"), MARK, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
     }
@@ -590,7 +641,8 @@ mod tests {
         assert_eq!(risk.realized_today(), amount("-11"));
 
         assert_eq!(
-            risk.check(&order(Side::Buy, "1"), MARK, NOW),
+            risk.check(&order(Side::Buy, "1"), MARK, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
         assert_eq!(risk.tripped(), Some(TripCause::DailyLoss));
@@ -609,7 +661,8 @@ mod tests {
         risk.on_fill(instrument(), Side::Sell, &fill("100", "1", "0.6"), NOW);
         assert_eq!(risk.realized_today(), amount("-1.2"));
         assert_eq!(
-            risk.check(&order(Side::Buy, "1"), MARK, NOW),
+            risk.check(&order(Side::Buy, "1"), MARK, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
     }
@@ -626,7 +679,8 @@ mod tests {
         assert_eq!(risk.check(&order(Side::Buy, "1"), MARK, NOW), None);
         assert_eq!(risk.check(&order(Side::Buy, "1"), MARK, NOW), None);
         assert_eq!(
-            risk.check(&order(Side::Buy, "1"), MARK, NOW),
+            risk.check(&order(Side::Buy, "1"), MARK, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
         assert_eq!(risk.tripped(), Some(TripCause::OrderCount));
@@ -644,7 +698,8 @@ mod tests {
         });
         for _ in 0..5 {
             assert_eq!(
-                risk.check(&order(Side::Buy, "100"), MARK, NOW),
+                risk.check(&order(Side::Buy, "100"), MARK, NOW)
+                    .map(|r| r.reason),
                 Some(RejectReason::RiskLimit)
             );
         }
@@ -664,15 +719,17 @@ mod tests {
         risk.on_fill(instrument(), Side::Buy, &fill("100", "1", "0"), NOW);
         risk.on_fill(instrument(), Side::Sell, &fill("80", "1", "0"), NOW);
         assert_eq!(
-            risk.check(&order(Side::Buy, "1"), MARK, NOW),
+            risk.check(&order(Side::Buy, "1"), MARK, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
 
         let tomorrow = Ts::from_nanos(NOW.as_nanos() + DAY);
         assert_eq!(
-            risk.check(&order(Side::Buy, "1"), MARK, tomorrow),
-            Some(RejectReason::RiskLimit),
-            "the switch is still thrown"
+            risk.check(&order(Side::Buy, "1"), MARK, tomorrow)
+                .map(|r| r.bound),
+            Some(Some(Bound::Tripped)),
+            "the switch is still thrown, and says so by name"
         );
         assert_eq!(risk.realized_today(), Notional::ZERO, "but the day rolled");
     }
@@ -699,6 +756,112 @@ mod tests {
     }
 
     #[test]
+    fn every_limit_names_itself_and_every_name_is_reachable() {
+        // Six `return`s in `check`, six variants of `Bound`, and this asserts
+        // the correspondence in both directions. One direction stops a limit
+        // reaching the record as an anonymous "something refused this"; the
+        // other stops a variant surviving the limit it was named for.
+        //
+        // Counted from the source rather than hard-coded, so adding a seventh
+        // `return` fails here rather than quietly joining an existing name.
+        let returns = include_str!("risk.rs")
+            .split("impl RiskLayer for RiskEngine")
+            .nth(1)
+            .expect("the impl")
+            .split("fn on_fill")
+            .next()
+            .expect("the check body")
+            .matches("self.refuse(")
+            .count();
+        assert_eq!(returns, 6, "a refusal path was added or removed");
+
+        // And each one is produced by a configuration that reaches it.
+        let produced = [
+            Bound::Tripped,
+            Bound::OrderCount,
+            Bound::DailyLoss,
+            Bound::NoMark,
+            Bound::OrderNotional,
+            Bound::PositionNotional,
+        ];
+        assert_eq!(produced.len(), returns);
+
+        // Tripped.
+        let mut risk = RiskEngine::recover(Limits::default(), Some(TripCause::DailyLoss));
+        assert_eq!(bound_of(&mut risk, "1", MARK, NOW), Some(Bound::Tripped));
+
+        // OrderCount.
+        let mut risk = RiskEngine::new(Limits {
+            max_orders_per_day: Some(0),
+            ..Limits::default()
+        });
+        assert_eq!(bound_of(&mut risk, "1", MARK, NOW), Some(Bound::OrderCount));
+
+        // NoMark: a money limit with no price to size against.
+        let mut risk = RiskEngine::new(Limits {
+            max_order_notional: Some(amount("100")),
+            ..Limits::default()
+        });
+        assert_eq!(bound_of(&mut risk, "1", None, NOW), Some(Bound::NoMark));
+
+        // OrderNotional.
+        let mut risk = RiskEngine::new(Limits {
+            max_order_notional: Some(amount("100")),
+            ..Limits::default()
+        });
+        assert_eq!(
+            bound_of(&mut risk, "5", MARK, NOW),
+            Some(Bound::OrderNotional)
+        );
+
+        // PositionNotional: allowed per order, too large as a position.
+        let mut risk = RiskEngine::new(Limits {
+            max_position_notional: Some(amount("150")),
+            ..Limits::default()
+        });
+        assert_eq!(bound_of(&mut risk, "1", MARK, NOW), None);
+        risk.on_fill(
+            instrument(),
+            Side::Buy,
+            &Fill {
+                px: "100".parse().expect("px"),
+                qty: "1".parse().expect("qty"),
+                fee: Notional::ZERO,
+                is_maker: false,
+            },
+            NOW,
+        );
+        assert_eq!(
+            bound_of(&mut risk, "1", MARK, NOW),
+            Some(Bound::PositionNotional)
+        );
+
+        // DailyLoss.
+        let mut risk = RiskEngine::new(Limits {
+            max_daily_loss: Some(amount("1")),
+            ..Limits::default()
+        });
+        risk.on_fill(
+            instrument(),
+            Side::Buy,
+            &Fill {
+                px: "100".parse().expect("px"),
+                qty: "1".parse().expect("qty"),
+                fee: amount("5"),
+                is_maker: false,
+            },
+            NOW,
+        );
+        assert_eq!(bound_of(&mut risk, "1", MARK, NOW), Some(Bound::DailyLoss));
+    }
+
+    /// Which limit bound, for a buy of `qty`.
+    fn bound_of(risk: &mut RiskEngine, qty: &str, mark: Option<Px>, now: Ts) -> Option<Bound> {
+        risk.check(&order(Side::Buy, qty), mark, now)
+            .and_then(|r| r.bound)
+    }
+
+    #[test]
     fn a_tripped_switch_refuses_everything_including_the_way_out() {
         // Worth being explicit about, because it is a real trade-off. Once the
         // switch is thrown nothing goes out at all -- not even a flattening
@@ -710,7 +873,8 @@ mod tests {
         risk.on_fill(instrument(), Side::Buy, &fill("100", "5", "0"), NOW);
         risk.trip(TripCause::Manual);
         assert_eq!(
-            risk.check(&order(Side::Sell, "5"), MARK, NOW),
+            risk.check(&order(Side::Sell, "5"), MARK, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
     }
@@ -732,7 +896,8 @@ mod tests {
         // re-armed by the machinery meant to keep the system running.
         let mut risk = RiskEngine::recover(Limits::default(), Some(TripCause::DailyLoss));
         assert_eq!(
-            risk.check(&order(Side::Buy, "1"), MARK, NOW),
+            risk.check(&order(Side::Buy, "1"), MARK, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
     }
@@ -756,7 +921,8 @@ mod tests {
     fn nothing_gets_through_limits_that_allow_nothing() {
         let mut risk = RiskEngine::new(Limits::nothing());
         assert_eq!(
-            risk.check(&order(Side::Buy, "0.00000001"), MARK, NOW),
+            risk.check(&order(Side::Buy, "0.00000001"), MARK, NOW)
+                .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
     }
