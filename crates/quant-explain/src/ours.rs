@@ -58,7 +58,7 @@ pub struct FillAt {
     /// The journal's `client_order_id`.
     ///
     /// **A fill ordinal, not the engine's order id.** `paper.rs` writes
-    /// `ClientOrderId(self.fills)` because `FillObserver::on_fill` is never
+    /// `ClientOrderId(self.fills)` because `RunObserver::on_fill` is never
     /// handed the real one, and refused orders consume an id before the risk
     /// check — so the first refusal desynchronises it permanently. Carried and
     /// labelled rather than printed as an id: an unlabelled wrong number is M4's
@@ -191,16 +191,26 @@ pub fn ours_at(
 
 /// The instant an entry describes, where it has a meaningful one.
 ///
-/// `Started` returns `None` rather than its stored zero: filtering on a hard-
-/// coded epoch would drop the starting cash from every prefix and silently reset
-/// the account to nothing — which is the shape of bug M5's first rehearsal hit
-/// when `.resuming()` met an empty recompute.
+/// `Started` returns `None` rather than its timestamp, and the reason survived
+/// M7.5 giving it a real one: filtering on it would drop the starting cash from
+/// every prefix whose instant precedes the session's own start — silently
+/// resetting the account to nothing, the shape of bug M5's first rehearsal hit
+/// when `.resuming()` met an empty recompute. The value is now the wall clock
+/// rather than a hard-coded zero, which makes it *readable*; it still must not
+/// be *filtered on*.
 const fn entry_ts(entry: &JournalEntry) -> Option<Ts> {
     match entry {
         JournalEntry::Started { .. } => None,
         JournalEntry::Filled { at, .. }
         | JournalEntry::Checkpoint { at, .. }
         | JournalEntry::Tripped { at, .. }
+        | JournalEntry::Submitted { at, .. }
+        | JournalEntry::Refused { at, .. }
+        | JournalEntry::Accepted { at, .. }
+        | JournalEntry::Rejected { at, .. }
+        | JournalEntry::CancelRequested { at, .. }
+        | JournalEntry::Cancelled { at, .. }
+        | JournalEntry::Orphaned { at, .. }
         | JournalEntry::Stopped { at } => Some(*at),
     }
 }

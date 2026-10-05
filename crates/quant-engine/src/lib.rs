@@ -62,6 +62,7 @@ use quant_book::Book;
 use quant_core::event::{MarketEvent, Side};
 use quant_core::execution::{ClientOrderId, ExecutionEvent, Fill, OrderRequest, RejectReason};
 use quant_core::fixed::Notional;
+use quant_core::fixed::{Px, Qty};
 use quant_core::instrument::InstrumentId;
 use quant_core::source::{EventSource, SourceError};
 use quant_core::time::Ts;
@@ -143,28 +144,95 @@ impl Default for Ledger {
 /// checkpoint records what the engine actually believes rather than a total it
 /// accumulated itself. A third independent tally would not be a check against
 /// the engine — it would be a check against itself.
-pub trait FillObserver {
-    /// `client_order_id` is **the engine's own id**, not a count of fills.
+pub trait RunObserver {
+    /// An order was minted and is about to reach the venue.
     ///
-    /// It was absent until M7.5, so the only writer invented
-    /// `ClientOrderId(self.fills)` — a fill ordinal. That is right exactly while
+    /// Called **before** `ExecutionVenue::submit`, which is the same rule fills
+    /// already follow for the same reason: at M8 an order at a live venue that
+    /// we never wrote down is an orphan position, and no amount of reading
+    /// afterwards recovers it. The cost is one durable append inside the
+    /// strategy's own call stack, which is charged identically in all three
+    /// worlds because production charges it anyway.
+    ///
+    /// `mark` is the mid the risk layer priced this request against, or `None`
+    /// when the book had no prices. The engine computes it and drops it today;
+    /// it is the one input to a refusal decision that cannot be re-derived,
+    /// because it depends on the book *as the engine saw it*.
+    fn on_submitted(
+        &mut self,
+        _client_order_id: ClientOrderId,
+        _request: &OrderRequest,
+        _mark: Option<Px>,
+        _at: Ts,
+    ) {
+    }
+
+    /// An order was refused before the venue heard about it.
+    ///
+    /// `by` separates "we built a malformed order" from "we built a fine order
+    /// the limits declined". Collapsing them would bury a bug of ours in a
+    /// counter of events that are working as designed.
+    fn on_refused(
+        &mut self,
+        _client_order_id: ClientOrderId,
+        _request: &OrderRequest,
+        _reason: RejectReason,
+        _by: RefusedBy,
+        _at: Ts,
+    ) {
+    }
+
+    /// The venue acknowledged an order.
+    fn on_accepted(&mut self, _client_order_id: ClientOrderId, _at: Ts) {}
+
+    /// The venue declined an order it had been told about.
+    fn on_rejected(&mut self, _client_order_id: ClientOrderId, _reason: RejectReason, _at: Ts) {}
+
+    /// A cancel was sent. Whether it won the race is a separate call.
+    fn on_cancel_requested(&mut self, _client_order_id: ClientOrderId, _at: Ts) {}
+
+    /// An order was withdrawn, with whatever never traded.
+    fn on_cancelled(&mut self, _client_order_id: ClientOrderId, _remaining: Qty, _at: Ts) {}
+
+    /// A fill arrived for an order this engine has no record of.
+    ///
+    /// The `else` the loop body does not have: `stats.fills` is incremented
+    /// unconditionally and the booking sits inside an `if let` with no
+    /// alternative, so a fill naming an unknown order is counted and then
+    /// silently dropped — not booked into the portfolio, not journalled, and
+    /// invisible in every output. Impossible with `SimulatedVenue`, which only
+    /// fills what it was given; **not** impossible at M8, where a venue can
+    /// report a fill for an order we lost track of across a restart. That is
+    /// exactly the case where silence is most expensive.
+    fn on_orphaned(&mut self, _client_order_id: ClientOrderId, _fill: &Fill, _at: Ts) {}
+
+    /// Something traded, and it was ours.
+    ///
+    /// `client_order_id` is **the engine's own id**, not a count of fills. It
+    /// was absent until M7.5, so the only writer invented
+    /// `ClientOrderId(self.fills)` — a fill ordinal, correct exactly while
     /// nothing is ever refused, because `Ledger::mint` hands out ids densely and
-    /// a refused order consumes one *before* the risk check. The first refusal
-    /// in the project's history would have desynchronised the journal from the
-    /// engine permanently, silently, and in a file whose whole job is to be the
-    /// authority on what we did.
-    ///
-    /// The engine has the id two lines above this call, to look up the
-    /// instrument. It was a parameter list, not a missing fact.
+    /// a refused order consumes one *before* the risk check.
     fn on_fill(
         &mut self,
-        client_order_id: ClientOrderId,
-        instrument: InstrumentId,
-        side: Side,
-        fill: &Fill,
-        at: Ts,
-        portfolio: &Portfolio,
-    );
+        _client_order_id: ClientOrderId,
+        _instrument: InstrumentId,
+        _side: Side,
+        _fill: &Fill,
+        _at: Ts,
+        _portfolio: &Portfolio,
+    ) {
+    }
+}
+
+/// Which layer refused an order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusedBy {
+    /// The seam: the request was not well-formed enough to send anywhere. Ours.
+    Seam,
+    /// The risk layer: a fine request the limits declined. Working as designed.
+    Risk,
 }
 
 /// The loop.
@@ -183,7 +251,7 @@ pub struct Engine<S, V, R, K> {
     portfolio: Portfolio,
     /// Optional, because a backtest has nothing worth journalling: it can be
     /// re-run from raw, and a two-week paper session cannot.
-    observer: Option<Box<dyn FillObserver + Send>>,
+    observer: Option<Box<dyn RunObserver + Send>>,
 }
 
 impl<S: core::fmt::Debug, V: core::fmt::Debug, R: core::fmt::Debug, K: core::fmt::Debug>
@@ -238,7 +306,7 @@ where
     /// The other order would allow a strategy to submit on a fill that a crash
     /// then erased from the record.
     #[must_use]
-    pub fn observing_fills(mut self, observer: Box<dyn FillObserver + Send>) -> Self {
+    pub fn observing_fills(mut self, observer: Box<dyn RunObserver + Send>) -> Self {
         self.observer = Some(observer);
         self
     }
@@ -306,6 +374,10 @@ where
                     &mut self.risk,
                     &mut self.ledger,
                     &self.portfolio,
+                    // Disjoint from the five borrows above, so this compiles
+                    // without restructuring the loop. `Context::new` is
+                    // `pub(crate)`, so no external signature moves.
+                    self.observer.as_deref_mut(),
                 )
             };
         }
@@ -361,6 +433,33 @@ where
                     // from the accounting can only be as correct as the
                     // accounting, and would fail in the same direction.
                     self.risk.on_fill(instrument, side, fill, execution.ts());
+                } else if let Some(observer) = self.observer.as_mut() {
+                    // The `else` this loop did not have. `stats.fills` is
+                    // already incremented above, so a fill naming an order we
+                    // have no record of was counted and then silently dropped --
+                    // not booked, not journalled, invisible in every output.
+                    // Impossible with `SimulatedVenue`, which only fills what it
+                    // was given; not impossible at M8, where a venue can report
+                    // a fill for an order we lost across a restart, which is
+                    // exactly when silence costs most.
+                    observer.on_orphaned(execution.client_order_id(), fill, execution.ts());
+                }
+            }
+            // The rest of the lifecycle, reported where the engine already
+            // dispatches it rather than anywhere new.
+            if let Some(observer) = self.observer.as_mut() {
+                match &execution {
+                    ExecutionEvent::Accepted { ts, .. } => {
+                        observer.on_accepted(execution.client_order_id(), *ts);
+                    }
+                    ExecutionEvent::Rejected { reason, ts, .. } => {
+                        observer.on_rejected(execution.client_order_id(), *reason, *ts);
+                    }
+                    ExecutionEvent::Cancelled { remaining, ts, .. } => {
+                        observer.on_cancelled(execution.client_order_id(), *remaining, *ts);
+                    }
+                    // Already reported above, with the portfolio it produced.
+                    ExecutionEvent::Filled { .. } => {}
                 }
             }
             if execution.is_terminal() {
