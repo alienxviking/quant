@@ -139,6 +139,8 @@ pub enum JournalEntry {
         side: Side,
         qty: Qty,
         reason: RejectReason,
+        /// Which limit bound. `None` for a seam refusal, which is not a limit.
+        bound: Option<crate::risk::Bound>,
         by: RefusedBy,
     },
     /// The venue acknowledged an order.

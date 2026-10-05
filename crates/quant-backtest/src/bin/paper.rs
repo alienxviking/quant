@@ -66,8 +66,8 @@ use quant_core::instrument::{
 use quant_core::time::Ts;
 use quant_engine::journal::{self, Agreement};
 use quant_engine::{
-    Engine, InstrumentKey, Journal, JournalEntry, Limits, RefusedBy, RiskEngine, RunObserver,
-    TripCause,
+    Bound, Engine, InstrumentKey, Journal, JournalEntry, Limits, RefusedBy, RiskEngine,
+    RunObserver, TripCause,
 };
 use quant_sim::{Costs, SimulatedVenue};
 use tracing::{error, info, warn};
@@ -206,6 +206,7 @@ impl RunObserver for JournalWriter {
         client_order_id: ClientOrderId,
         request: &OrderRequest,
         reason: RejectReason,
+        bound: Option<Bound>,
         by: RefusedBy,
         at: Ts,
     ) {
@@ -217,6 +218,7 @@ impl RunObserver for JournalWriter {
                 side: request.side,
                 qty: request.qty,
                 reason,
+                bound,
                 by,
             },
             "a refusal",

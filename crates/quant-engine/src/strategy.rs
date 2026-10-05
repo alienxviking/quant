@@ -138,10 +138,13 @@ impl<'a> Context<'a> {
 
         if let Some(reason) = seam_check(&request) {
             if let Some(observer) = self.observer.as_mut() {
+                // No `bound`: the seam is not a limit. A malformed order did not
+                // breach anything, it was never a well-formed order at all.
                 observer.on_refused(
                     client_order_id,
                     &request,
                     reason,
+                    None,
                     crate::RefusedBy::Seam,
                     self.now,
                 );
@@ -156,19 +159,25 @@ impl<'a> Context<'a> {
             let (bid, ask) = (book.best_bid()?, book.best_ask()?);
             Some(Px::from_raw((bid.px.raw() + ask.px.raw()) / 2))
         });
-        if let Some(reason) = self.risk.check(&request, mark, self.now) {
+        if let Some(refusal) = self.risk.check(&request, mark, self.now) {
             // Refused here, so the venue never hears about it at all. That is
             // the chokepoint being a chokepoint.
             if let Some(observer) = self.observer.as_mut() {
                 observer.on_refused(
                     client_order_id,
                     &request,
-                    reason,
+                    refusal.reason,
+                    refusal.bound,
                     crate::RefusedBy::Risk,
                     self.now,
                 );
             }
-            self.ledger.refuse(client_order_id, reason, self.now);
+            // Only `reason` reaches the strategy. Which limit bound is a fact
+            // for the record and for a person reading it, not something a
+            // strategy may condition on -- it could otherwise trade around the
+            // limits, which is the opposite of a chokepoint.
+            self.ledger
+                .refuse(client_order_id, refusal.reason, self.now);
             return client_order_id;
         }
 
