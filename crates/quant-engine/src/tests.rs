@@ -84,6 +84,19 @@ fn trade(seq: u64, px: &str) -> MarketEvent {
     })
 }
 
+/// A trade at an instant the sequence number does not imply.
+///
+/// `meta` derives `local_recv_ts` from the sequence, which is right for every
+/// ordinary fixture and makes it impossible to express the one thing M8.a has to
+/// handle: an event that arrives after another and is stamped before it.
+fn trade_at(seq: u64, px: &str, at: Ts) -> MarketEvent {
+    let MarketEvent::Trade(mut t) = trade(seq, px) else {
+        unreachable!("trade() builds a trade")
+    };
+    t.meta.local_recv_ts = at;
+    MarketEvent::Trade(t)
+}
+
 fn gap(seq: u64) -> MarketEvent {
     MarketEvent::Gap(Gap {
         meta: meta(seq),
@@ -878,4 +891,228 @@ fn an_engine_told_where_to_start_does_not_remint_ids_from_one() {
         ClientOrderId(825),
         "an engine resumed at 825 must not hand out 1"
     );
+}
+
+/// A source that goes quiet: it yields its events, then idles forever.
+///
+/// What a live source does when the market socket stalls. `Scripted` cannot
+/// express it — it ends the stream — and the difference is the whole of M8.a:
+/// an ended stream stops the engine, a quiet one leaves it running with nothing
+/// to do but ask the venue.
+#[derive(Debug)]
+struct GoesQuiet {
+    events: std::vec::IntoIter<MarketEvent>,
+    idles: usize,
+}
+
+impl GoesQuiet {
+    fn new(events: Vec<MarketEvent>, idles: usize) -> Self {
+        Self {
+            events: events.into_iter(),
+            idles,
+        }
+    }
+}
+
+impl EventSource for GoesQuiet {
+    fn next_event(&mut self) -> Option<Result<MarketEvent, SourceError>> {
+        self.events.next().map(Ok)
+    }
+
+    fn next_event_timeout(
+        &mut self,
+        _timeout: core::time::Duration,
+    ) -> Option<Result<quant_core::source::Wake, SourceError>> {
+        if let Some(event) = self.events.next() {
+            return Some(Ok(quant_core::source::Wake::Event(event)));
+        }
+        if self.idles == 0 {
+            return None;
+        }
+        self.idles -= 1;
+        Some(Ok(quant_core::source::Wake::Idle))
+    }
+}
+
+/// Idles once, then yields its events, then ends.
+///
+/// A live source before its first frame: the socket is up, nothing has arrived.
+#[derive(Debug)]
+struct IdlesFirst {
+    events: std::vec::IntoIter<MarketEvent>,
+    idled: bool,
+}
+
+impl IdlesFirst {
+    fn new(events: Vec<MarketEvent>) -> Self {
+        Self {
+            events: events.into_iter(),
+            idled: false,
+        }
+    }
+}
+
+impl EventSource for IdlesFirst {
+    fn next_event(&mut self) -> Option<Result<MarketEvent, SourceError>> {
+        self.events.next().map(Ok)
+    }
+
+    fn next_event_timeout(
+        &mut self,
+        _timeout: core::time::Duration,
+    ) -> Option<Result<quant_core::source::Wake, SourceError>> {
+        if !self.idled {
+            self.idled = true;
+            return Some(Ok(quant_core::source::Wake::Idle));
+        }
+        self.events
+            .next()
+            .map(|e| Ok(quant_core::source::Wake::Event(e)))
+    }
+}
+
+/// Reports a fill on a later `poll`, having been told nothing in between.
+///
+/// A live venue: the fill arrives from the user-data stream on the venue's
+/// schedule, not in response to anything the engine did.
+#[derive(Debug, Default)]
+struct SpeaksLater {
+    held: Option<ExecutionEvent>,
+    polls: usize,
+}
+
+impl ExecutionVenue for SpeaksLater {
+    fn submit(&mut self, client_order_id: ClientOrderId, _r: &OrderRequest, _now: Ts) {
+        self.held = Some(ExecutionEvent::Filled {
+            client_order_id,
+            fill: Fill {
+                px: "100.00".parse().expect("px"),
+                qty: "1".parse().expect("qty"),
+                fee: Notional::from_raw(0),
+                is_maker: false,
+            },
+            remaining: "0".parse().expect("qty"),
+            // Stamped by the venue, *later* than any market event in the
+            // fixture -- `meta` puts those near 2s. An earlier stamp is a
+            // legitimate thing for a venue to send and the clock clamps it,
+            // which is how the first draft of this fixture failed.
+            ts: Ts::from_nanos(3_000_000_000),
+        });
+    }
+
+    fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
+
+    fn poll(&mut self, _now: Ts, out: &mut Vec<ExecutionEvent>) {
+        self.polls += 1;
+        // Not on the poll that follows submission -- that one happens inside the
+        // same market event, and a venue answering there is the simulated one.
+        if self.polls > 1 {
+            if let Some(event) = self.held.take() {
+                out.push(event);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_fill_arriving_while_the_market_is_silent_is_still_booked() {
+    // The defect `docs/live-run.md` §1 found by reading, before any M8 code
+    // existed. `venue.poll` had one call site, inside the handling of a market
+    // event, and the source blocked forever -- so a fill arriving while the
+    // market socket was stalled could not be booked, the strategy could not be
+    // told, and the risk layer's daily tally could not move.
+    //
+    // Invisible in the other two worlds: `SimulatedVenue` answers only inside
+    // `observe`, which the engine calls while handling an event it already has.
+    let mut engine = Engine::new(
+        GoesQuiet::new(vec![trade(1, "100.00")], 4),
+        SpeaksLater::default(),
+        AllowAll,
+        Recorder::default(),
+        CASH,
+    );
+    let stats = engine.run().expect("no source failure");
+
+    assert_eq!(stats.fills, 1, "the fill is booked without a market event");
+    assert!(stats.idle_wakes > 0, "and it took an idle wake to get it");
+    assert_eq!(
+        engine.strategy().executions.len(),
+        1,
+        "the strategy is told, not merely the ledger"
+    );
+    assert_eq!(
+        stats.last_ts,
+        Some(Ts::from_nanos(3_000_000_000)),
+        "booked at the instant the venue acted, not at the last market event"
+    );
+    assert_eq!(stats.clock_clamps, 0, "and nothing had to be clamped");
+}
+
+#[test]
+fn an_idle_wake_before_the_first_event_does_not_date_the_run_from_nineteen_seventy() {
+    // What the early return in `dispatch` actually guards, found by sabotage
+    // rather than by design: removing it reddened nothing, because an empty
+    // report list books nothing and tells nobody. The comment claimed it
+    // prevented noise and it does not.
+    //
+    // What it does prevent is this. The engine's clock starts at zero, and a
+    // live source idles before its first frame as a matter of course -- so
+    // without the return, `first_ts.get_or_insert(self.now)` fires on an idle
+    // wake and the run reports a period beginning at the epoch.
+    let mut engine = Engine::new(
+        IdlesFirst::new(vec![trade(1, "100.00")]),
+        RecordingVenue::default(),
+        AllowAll,
+        Recorder::default(),
+        CASH,
+    );
+    let stats = engine.run().expect("no source failure");
+    assert!(stats.idle_wakes >= 1, "the fixture has to idle first");
+    assert_eq!(
+        stats.first_ts,
+        Some(meta(1).local_recv_ts),
+        "the run began at its first event, not at the epoch"
+    );
+}
+
+#[test]
+fn the_clock_never_runs_backwards_and_says_when_it_was_asked_to() {
+    // Two asynchronous inputs can deliver out of order. Everything downstream
+    // dispatches on this clock, so a report stamped before an event that arrived
+    // first must not drag it back -- a fill would appear to happen before the
+    // order that caused it.
+    let backwards = vec![trade(1, "100.00"), trade_at(2, "100.00", Ts::from_nanos(1))];
+
+    let mut engine = Engine::new(
+        Scripted::new(backwards),
+        RecordingVenue::default(),
+        AllowAll,
+        Recorder::default(),
+        CASH,
+    );
+    let stats = engine.run().expect("run");
+    assert_eq!(stats.clock_clamps, 1, "it was asked to go back, once");
+    assert_eq!(
+        stats.last_ts,
+        Some(meta(1).local_recv_ts),
+        "and did not: the clock held at the later instant"
+    );
+}
+
+#[test]
+fn a_source_that_never_idles_leaves_every_count_at_zero() {
+    // The no-op property, and the reason `next_event_timeout` is defaulted.
+    // `HistoricalSource` uses the default, which can never return `Idle`, so a
+    // backtest's event sequence cannot depend on how fast the disk was. Same
+    // shape as `Costs::NONE` reproducing M3 to the last digit.
+    let mut engine = Engine::new(
+        Scripted::new(vec![snapshot(1), trade(2, "100.75"), trade(3, "100.80")]),
+        RecordingVenue::default(),
+        AllowAll,
+        Recorder::default(),
+        CASH,
+    );
+    let stats = engine.run().expect("run");
+    assert_eq!(stats.idle_wakes, 0, "a file has nothing to wait for");
+    assert_eq!(stats.clock_clamps, 0, "and is monotone by construction");
 }

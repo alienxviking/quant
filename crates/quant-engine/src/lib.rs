@@ -64,7 +64,7 @@ use quant_core::execution::{ClientOrderId, ExecutionEvent, Fill, OrderRequest, R
 use quant_core::fixed::Notional;
 use quant_core::fixed::{Px, Qty};
 use quant_core::instrument::InstrumentId;
-use quant_core::source::{EventSource, SourceError};
+use quant_core::source::{EventSource, SourceError, Wake};
 use quant_core::time::Ts;
 
 pub use journal::{InstrumentKey, Journal, JournalEntry};
@@ -88,6 +88,20 @@ pub struct EngineStats {
     /// First and last event times, for reporting the period actually covered.
     pub first_ts: Option<Ts>,
     pub last_ts: Option<Ts>,
+    /// Times the engine refused to move its clock backwards.
+    ///
+    /// Two asynchronous inputs can deliver out of order — a venue report stamped
+    /// before a market event that reached us first — and the clock must not run
+    /// back, because everything downstream dispatches on it. Counted rather than
+    /// silently clamped: `quant-recorder::segment`'s `backdated_records` arriving
+    /// at the engine for the same reason, since a clamp is evidence about the
+    /// transport and one nobody counts is one nobody notices rising.
+    ///
+    /// **Always zero in a backtest.** `HistoricalSource` is monotone, so a
+    /// non-zero value from a replay means a source broke its own contract.
+    pub clock_clamps: u64,
+    /// Times the engine woke on nothing and went to look for venue reports.
+    pub idle_wakes: u64,
 }
 
 /// The engine's mutable bookkeeping.
@@ -394,21 +408,96 @@ where
     /// A source error stops the run and is returned, rather than being treated
     /// as the end of the stream — see [`EventSource`] for why that distinction
     /// is the difference between a short backtest and a wrong one.
+    /// How long the engine waits on the market before going to look at the
+    /// venue.
+    ///
+    /// Reached only when a source overrides `next_event_timeout`; a historical
+    /// replay never idles, so no backtest number moves. 250 ms is chosen against
+    /// what it costs on each side: a fill learned a quarter-second late is
+    /// nothing to a strategy sampling on a 60-second grid, and four empty polls
+    /// a second is nothing against a market peak of 694 messages a second.
+    const IDLE_TICK: core::time::Duration = core::time::Duration::from_millis(250);
+
     pub fn run(&mut self) -> Result<EngineStats, SourceError> {
-        while let Some(item) = self.source.next_event() {
-            self.step(&item?);
+        while let Some(item) = self.source.next_event_timeout(Self::IDLE_TICK) {
+            match item? {
+                Wake::Event(event) => self.dispatch(Some(&event)),
+                // Nothing from the market -- but the venue may still have
+                // spoken, and before M8.a nothing could ask it. `poll` was
+                // reachable only from inside a market event's handling, so a
+                // fill arriving while the market socket was stalled sat
+                // undelivered until data resumed.
+                Wake::Idle => {
+                    self.ledger.stats.idle_wakes = self.ledger.stats.idle_wakes.saturating_add(1);
+                    self.dispatch(None);
+                }
+            }
         }
         Ok(self.ledger.stats)
     }
 
-    /// Everything that happens because of one event, in the order of the module
+    /// Move the clock forward, never back.
+    ///
+    /// Until M8 the engine had one input and this was an assignment. Two
+    /// asynchronous inputs can deliver out of order -- a venue report stamped
+    /// before a market event that arrived first -- and every dispatch decision
+    /// downstream reads this clock, so letting it run backwards would make a
+    /// fill appear to happen before the order that caused it.
+    ///
+    /// Clamp and count, which is the answer `quant-recorder::segment` gave when
+    /// an NTP step put a record before the open segment's day.
+    fn advance_to(&mut self, ts: Ts) {
+        if ts < self.now {
+            self.ledger.stats.clock_clamps = self.ledger.stats.clock_clamps.saturating_add(1);
+            return;
+        }
+        self.now = ts;
+    }
+
+    /// Steps 1 to 3: the clock, the book, and the venue seeing the event.
+    ///
+    /// Market-only by construction, which is why it is a separate function: a
+    /// wake from the venue has no event to take a timestamp from, no book to
+    /// update and nothing to show the venue that it did not just say itself.
+    fn observe_market(&mut self, event: &MarketEvent) {
+        // 1. The clock. Nothing else advances it.
+        self.advance_to(event.meta().local_recv_ts);
+        self.ledger.stats.events += 1;
+        self.ledger.stats.first_ts.get_or_insert(self.now);
+        self.ledger.stats.last_ts = Some(self.now);
+        if let MarketEvent::Gap(gap) = event {
+            self.ledger.stats.gaps += 1;
+            // Before the book is cleared, which is the next step. The order is
+            // not load-bearing for correctness -- nothing reads the book here --
+            // but it keeps the file's story in the order it happened.
+            if let Some(observer) = self.observer.as_deref_mut() {
+                observer.on_blind(gap.cause, gap.last_good_ts, self.now);
+            }
+        }
+
+        // 2. The book. A gap clears it, so there are no stale prices to read.
+        let index = event.meta().instrument.index();
+        if self.books.len() <= index {
+            self.books.resize_with(index + 1, Book::new);
+        }
+        self.books[index].apply(event);
+
+        // 3. The venue matches orders that were already resting.
+        self.venue.observe(event, &self.books[index], self.now);
+    }
+
+    /// Everything that happens because of one wake, in the order of the module
     /// docs.
-    fn step(&mut self, event: &MarketEvent) {
-        // A macro and not a method, because a method would borrow the whole
-        // engine and the strategy has to be called with the context in hand.
-        // Expanding to explicit field borrows keeps them disjoint, which is the
-        // borrow checker enforcing the thing the design already wanted: the
-        // strategy and the things it may touch are separate parts of the engine.
+    ///
+    /// `None` means the venue spoke and the market did not. Steps 2, 3 and 5 are
+    /// then skipped — there is no book to update, nothing to show the venue, and
+    /// no market event to tell the strategy about. Calling `on_market_event`
+    /// there would hand a strategy an event that did not happen.
+    ///
+    /// One function rather than two, because the step order is the most
+    /// load-bearing thing in this engine and splitting it would put half of it
+    /// somewhere a reader has to go and find.
+    fn dispatch(&mut self, event: Option<&MarketEvent>) {
         macro_rules! ctx {
             () => {
                 Context::new(
@@ -426,32 +515,34 @@ where
             };
         }
 
-        // 1. The clock. Nothing else advances it.
-        self.now = event.meta().local_recv_ts;
-        self.ledger.stats.events += 1;
-        self.ledger.stats.first_ts.get_or_insert(self.now);
-        self.ledger.stats.last_ts = Some(self.now);
-        if let MarketEvent::Gap(gap) = event {
-            self.ledger.stats.gaps += 1;
-            // Before the book is cleared, which is the next step. The order is
-            // not load-bearing for correctness -- nothing reads the book here
-            // -- but it keeps the file's story in the order it happened.
-            if let Some(observer) = self.observer.as_deref_mut() {
-                observer.on_blind(gap.cause, gap.last_good_ts, self.now);
-            }
+        if let Some(event) = event {
+            self.observe_market(event);
         }
 
-        // 2. The book. A gap clears it, so there are no stale prices to read.
-        let index = event.meta().instrument.index();
-        if self.books.len() <= index {
-            self.books.resize_with(index + 1, Book::new);
-        }
-        self.books[index].apply(event);
-
-        // 3. The venue matches orders that were already resting.
-        self.venue.observe(event, &self.books[index], self.now);
         self.scratch.clear();
         self.venue.poll(self.now, &mut self.scratch);
+        if event.is_none() {
+            if self.scratch.is_empty() {
+                // Woke on nothing and the venue had nothing to say, so nothing
+                // below this line has anything to act on.
+                //
+                // It is not only an optimisation, which is what the first
+                // version of this comment claimed and a sabotage disproved: the
+                // engine's clock starts at zero, so an idle wake arriving before
+                // the first market event would set `first_ts` from it and the
+                // run would report a period beginning in 1970. A live source
+                // idles before its first frame as a matter of course.
+                return;
+            }
+            // The clock comes from the reports, because there is no event to
+            // take it from. Taking the latest rather than the first is what lets
+            // a fill be booked at the instant the venue acted.
+            if let Some(latest) = self.scratch.iter().map(ExecutionEvent::ts).max() {
+                self.advance_to(latest);
+            }
+            self.ledger.stats.first_ts.get_or_insert(self.now);
+            self.ledger.stats.last_ts = Some(self.now);
+        }
 
         // 4. Book what happened, then tell the strategy. Booking first means a
         //    strategy reading its own position during `on_execution` sees the
@@ -528,13 +619,17 @@ where
         }
 
         // 5. Only now does the strategy see the market event. An order it
-        //    submits here is not eligible to trade against this event.
-        let mut ctx = ctx!();
-        self.strategy.on_market_event(event, &mut ctx);
-        while let Some(refusal) = self.ledger.deferred.pop() {
-            self.ledger.stats.execution_events += 1;
+        //    submits here is not eligible to trade against this event. Skipped
+        //    entirely when the venue woke us: there is no market event, and
+        //    inventing one would be the lookahead this ordering exists to stop.
+        if let Some(event) = event {
             let mut ctx = ctx!();
-            self.strategy.on_execution(&refusal, &mut ctx);
+            self.strategy.on_market_event(event, &mut ctx);
+            while let Some(refusal) = self.ledger.deferred.pop() {
+                self.ledger.stats.execution_events += 1;
+                let mut ctx = ctx!();
+                self.strategy.on_execution(&refusal, &mut ctx);
+            }
         }
 
         // 6. Ask the strategy what it wrote down, once the event is fully dealt

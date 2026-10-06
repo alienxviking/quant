@@ -344,6 +344,32 @@ verbatim, container version 2 → 3 with a migration note in
 `docs/data-contract.md` §6. Without it, a disagreement between our record and the
 venue's can only be re-litigated from our own interpretation of what it said.
 
+**`LiveVenue` emits one `Filled` per venue trade, not one per order.**
+`SimulatedVenue::take` deliberately collapses a multi-level walk into a single
+fill at the size-weighted average — *"a venue reports an execution, and a
+strategy that had to reassemble three prints into an average price would be
+doing arithmetic the venue already did"*. Binance splits a market order across
+levels into several `myTrades` rows. A `LiveVenue` that aggregated to match the
+simulator would make criterion A fail arithmetically on the first multi-level
+fill, for a reason that is not a disagreement about anything. The venue's rows
+are the unit.
+
+**The fee asset is modelled before the run, and it is cheaper than two
+balances.** §3's criterion A leaves the two-balance question open; this is the
+narrower fix that closes it. `Portfolio::apply_fill` does `cash -= gross + fee`
+with the fee in the quote currency, which M4 named as a simplification; a spot
+venue takes the taker fee in the **received** asset. So `Fill` gains a
+`fee_asset`, `apply_fill` branches on it, and `SimulatedVenue` defaults it to
+`Quote` — which is what makes every existing backtest reproduce to the last
+digit, the `Costs::NONE` no-op property in a third place.
+
+The identity that makes it checkable: after a buy of `q` at `px` with fee `f`,
+our equity at mark `px` is `C₀ − f`, and the venue's two balances marked at the
+same price are `(C₀ − q·px) + (q − f/px)·px = C₀ − f`. **Equity agrees whichever
+asset the fee lands in; cash and position agree only if the asset is modelled.**
+That is why criterion A compares equity as its floor — and why, with
+`fee_asset`, it can compare the balances too.
+
 **`LiveVenue::submit` does not await.** Stamp, format, `try_send`, return. The
 engine loop is synchronous and must not block on a round trip — that is the whole
 of §2's fire-and-forget argument, and the first place it has ever actually

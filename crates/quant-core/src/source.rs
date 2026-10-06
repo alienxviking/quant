@@ -51,4 +51,54 @@ impl std::error::Error for SourceError {}
 pub trait EventSource {
     /// The next event, `None` at the end, `Some(Err(..))` if the source failed.
     fn next_event(&mut self) -> Option<Result<MarketEvent, SourceError>>;
+
+    /// The next event, or [`Wake::Idle`] if `timeout` passes first.
+    ///
+    /// # Why the engine needs a second way to be woken
+    ///
+    /// Until M8 the engine had exactly one input. Market data arrived, and the
+    /// venue's answers were a pure function of it — `SimulatedVenue` produces an
+    /// outcome only inside `observe`, which the engine calls while handling an
+    /// event it already has. So blocking here forever was not merely acceptable,
+    /// it was free.
+    ///
+    /// A live venue speaks on its own schedule. A fill can arrive while the
+    /// market socket is stalled, and Binance closes a stream every 24 hours by
+    /// design against a 120-second idle timeout, so that window opens many times
+    /// in a run. An engine parked in `next_event` cannot book that fill, cannot
+    /// tell the strategy, and cannot move the risk layer's daily tally — which
+    /// is the state in which not knowing is most expensive.
+    ///
+    /// # Why it is defaulted, and what the default guarantees
+    ///
+    /// The default ignores `timeout` and calls [`Self::next_event`], so it can
+    /// **never** return `Idle`. That is not a stub: for a source reading a file
+    /// there is genuinely nothing else to wait for, and a historical replay that
+    /// could idle would make a backtest's event sequence depend on how fast the
+    /// disk was. `HistoricalSource` therefore stays bit-identical through this
+    /// change, which is the no-op property `Costs::NONE` established as the way
+    /// to make a seam change checkable.
+    ///
+    /// Only a source with a second thing to wait for overrides it.
+    fn next_event_timeout(
+        &mut self,
+        timeout: core::time::Duration,
+    ) -> Option<Result<Wake, SourceError>> {
+        let _ = timeout;
+        self.next_event().map(|r| r.map(Wake::Event))
+    }
+}
+
+/// What woke the engine.
+///
+/// Three outcomes rather than two, and the third is the point: *the stream
+/// ended*, *here is an event*, and *nothing arrived, go and look elsewhere*. An
+/// implementation that collapsed `Idle` into `None` would tell the engine the
+/// run was over every time the market went quiet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wake {
+    /// A market event, exactly as `next_event` would have returned it.
+    Event(MarketEvent),
+    /// The timeout passed with nothing to deliver. Not an end, not an error.
+    Idle,
 }

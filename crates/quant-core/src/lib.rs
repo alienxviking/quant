@@ -59,7 +59,7 @@ pub use fixed::{Notional, ParseFixedError, Px, Qty, Rate, SCALE, SCALE_DECIMALS}
 pub use instrument::{
     Exchange, Instrument, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };
-pub use source::{EventSource, SourceError};
+pub use source::{EventSource, SourceError, Wake};
 pub use time::{Clock, ManualClock, SystemClock, Ts, UtcDate};
 
 /// Version of the on-disk / on-wire event contract.
