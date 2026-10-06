@@ -111,10 +111,51 @@ fn main() -> ExitCode {
         Err(e) => outln!("ours      could not read {}: {e}", journal.display()),
     }
 
+    print_decisions(&journal, args.at, args.window_nanos);
     print_window(&market);
     print_health(&args);
     print_provenance(&args, &market);
     ExitCode::SUCCESS
+}
+
+/// What was decided around the instant, and whether we could see.
+///
+/// The block M7 could not write: a decision is not recoverable from raw by any
+/// reader, which is the boundary that milestone established rather than crossed.
+fn print_decisions(journal: &std::path::Path, at: quant_core::time::Ts, span: i64) {
+    let Ok(recovered) = quant_engine::journal::read(journal) else {
+        // Already reported by the `ours` block, which reads the same file.
+        return;
+    };
+    let d = quant_explain::runlog::decisions_at(&recovered.entries, at.as_nanos(), span);
+    match &d.blind {
+        Some((stamp, cause, recovered_since)) if !recovered_since => {
+            outln!(
+                "decided   BLIND since {} ({cause}), with nothing seen since",
+                quant_core::time::Ts::from_nanos(*stamp).to_rfc3339()
+            );
+            outln!(
+                "          Not a quiet hour. The clock is the event stream, so an outage \
+                 writes nothing while it lasts."
+            );
+        }
+        _ => {}
+    }
+    if d.within.is_empty() {
+        outln!("decided   nothing in this window");
+    } else {
+        outln!("decided   {} in this window", d.within.len());
+        for line in d.within.iter().take(5) {
+            outln!("          {line}");
+        }
+        if d.within.len() > 5 {
+            outln!("          and {} more", d.within.len() - 5);
+        }
+    }
+    if !d.notes.is_empty() {
+        let summary: Vec<String> = d.notes.iter().map(|(k, n)| format!("{n} {k}")).collect();
+        outln!("strategy  {}", summary.join(", "));
+    }
 }
 
 /// P2, as a command: every checkpoint against the entries it describes.

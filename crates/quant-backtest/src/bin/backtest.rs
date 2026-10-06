@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! backtest [DATA_ROOT] [--symbol SYM] [--cash N] [--fast N] [--slow N]
-//!          [--interval-secs N] [--qty N] [--equity-csv PATH]
+//!          [--interval-secs N] [--qty N] [--equity-csv PATH] [--journal PATH]
 //!          [--realistic | --fee-rate R --latency-ms N --adverse P]
 //!          [--max-order N] [--max-position N] [--max-daily-loss N] [--max-orders N]
 //! backtest data/acceptance --symbol BTCUSDT              # free and instant
@@ -35,11 +35,15 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
+use quant_backtest::record::{write, JournalWriter};
 use quant_backtest::{EquityCurve, MaCrossover, Recorded};
 use quant_core::fixed::{Notional, Qty};
 use quant_core::fixed::{Px, Rate};
 use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
+use quant_core::time::Ts;
+use quant_engine::journal::{Journal, JournalEntry};
 use quant_engine::{Engine, EngineStats, Limits, Portfolio, RiskEngine};
 use quant_normalize::{discover_days, HistoricalSource};
 use quant_sim::{Costs, FeeSchedule, Latency, SimStats, SimulatedVenue};
@@ -57,6 +61,7 @@ struct Args {
     interval_secs: i64,
     qty: Qty,
     equity_csv: Option<PathBuf>,
+    journal: Option<PathBuf>,
     costs: Costs,
     limits: Limits,
 }
@@ -77,6 +82,7 @@ impl Default for Args {
             // position is most of the account.
             qty: "0.001".parse().expect("a valid quantity"),
             equity_csv: None,
+            journal: None,
             // Free and instant unless asked otherwise. See the module docs.
             costs: Costs::NONE,
             // Permits everything, so a bare run is byte-identical to the one
@@ -140,6 +146,14 @@ fn main() -> ExitCode {
         args.interval_secs * NANOS_PER_SEC,
     );
 
+    let journal = match open_journal(&args) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let mut engine = Engine::new(
         source,
         // The venue enforces its own rules, as a venue does. Without this a
@@ -154,6 +168,17 @@ fn main() -> ExitCode {
         strategy,
         args.cash,
     );
+    if let Some(journal) = journal.as_ref() {
+        if let Err(e) = start_journal(journal, &args) {
+            eprintln!("could not write the journal: {e}");
+            return ExitCode::FAILURE;
+        }
+        engine = engine.observing_fills(Box::new(JournalWriter::new(
+            Arc::clone(journal),
+            args.symbol.clone(),
+            0,
+        )));
+    }
     let stats = match engine.run() {
         Ok(stats) => stats,
         Err(e) => {
@@ -162,7 +187,18 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(journal) = journal.as_ref() {
+        if let Err(e) = close_journal(journal, stats.last_ts, engine.portfolio()) {
+            eprintln!("could not close the journal: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     report(&args, &days, stats, &engine);
+
+    if let Some(path) = &args.journal {
+        println!("journal   written to {}", path.display());
+    }
 
     if let Some(path) = &args.equity_csv {
         if let Err(e) = write_csv(path, engine.strategy().curve()) {
@@ -176,6 +212,46 @@ fn main() -> ExitCode {
 }
 
 type Wiring = Engine<HistoricalSource, SimulatedVenue, RiskEngine, Recorded<MaCrossover>>;
+
+/// Open the run log, if one was asked for.
+///
+/// Written by the *same* `JournalWriter` the paper binary uses, which is not
+/// tidiness: `runlog diff` compares a live journal against a replayed one, so
+/// two writers would mean the diff measures the writers as much as the runs. One
+/// writer cannot disagree with itself.
+fn open_journal(args: &Args) -> Result<Option<Arc<Mutex<Journal>>>, String> {
+    let Some(path) = args.journal.as_ref() else {
+        return Ok(None);
+    };
+    Journal::open(path)
+        .map(|j| Some(Arc::new(Mutex::new(j))))
+        .map_err(|e| format!("could not open {}: {e}", path.display()))
+}
+
+/// The opening mark, which is what dates the journal's own beginning.
+fn start_journal(journal: &Arc<Mutex<Journal>>, args: &Args) -> std::io::Result<()> {
+    write(
+        journal,
+        &JournalEntry::Started {
+            at: Ts::from_nanos(0),
+            cash: args.cash,
+            schema: quant_engine::journal::SCHEMA,
+        },
+    )
+}
+
+/// The two marks the paper binary also ends on, for the same reasons: without a
+/// final checkpoint there is nothing for a recompute to be compared against, and
+/// without `Stopped` a clean end cannot be told from a crash.
+fn close_journal(
+    journal: &Arc<Mutex<Journal>>,
+    last_ts: Option<Ts>,
+    portfolio: &Portfolio,
+) -> std::io::Result<()> {
+    let at = last_ts.unwrap_or(Ts::from_nanos(0));
+    write(journal, &JournalEntry::checkpoint(at, portfolio))?;
+    write(journal, &JournalEntry::Stopped { at })
+}
 
 fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, engine: &Wiring) {
     let curve = engine.strategy().curve();
@@ -365,7 +441,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-h" | "--help" => {
                 println!(
                     "usage: backtest [DATA_ROOT] [--symbol SYM] [--cash N] [--fast N] \
-                     [--slow N] [--interval-secs N] [--qty N] [--equity-csv PATH] \
+                     [--slow N] [--interval-secs N] [--qty N] [--equity-csv PATH] [--journal PATH] \
                      [--realistic] [--fee-rate R] [--latency-ms N] [--adverse P]\n\
                      \x20               [--max-order N] [--max-position N] \
                      [--max-daily-loss N] [--max-orders N]"
@@ -383,6 +459,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                     .map_err(|e| format!("--interval-secs: {e}"))?;
             }
             "--equity-csv" => args.equity_csv = Some(PathBuf::from(value()?)),
+            "--journal" => args.journal = Some(PathBuf::from(value()?)),
             // A preset rather than three flags, because the three belong
             // together: quoting a fee-only result as "realistic" would be
             // exactly the kind of half-costed number M4 exists to prevent.

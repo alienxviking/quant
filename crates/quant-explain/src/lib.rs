@@ -43,6 +43,7 @@ use quant_recorder::{catalog, SessionFiles};
 pub mod checkpoints;
 pub mod health;
 pub mod ours;
+pub mod runlog;
 
 #[cfg(test)]
 mod tests;

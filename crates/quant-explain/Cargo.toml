@@ -28,6 +28,8 @@ quant-recorder = { workspace = true }
 quant-normalize = { workspace = true }
 quant-book = { workspace = true }
 quant-engine = { workspace = true }
+# Notes are opaque JSON by design -- see `Strategy::take_notes`.
+serde_json = "1"
 
 [lints]
 workspace = true
