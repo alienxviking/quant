@@ -233,7 +233,7 @@ a convention here rather than an afterthought.
 | d | Risk's own clock, blindness, and the tee made reachable | `Tripped` at the instant, `Blind`, `secondary_dropped` |
 | e | The strategy's own words | `take_notes`, pulled not pushed |
 | f | `runlog check`, `runlog diff`, and the sabotages | the three criteria — **met**, §7 |
-| g | The debt with a scheduled repayment | emitter to `.json()`, delete `health.rs` |
+| g | The debt with a scheduled repayment | **done** — one shared type, not two formats |
 
 Slice (a) is load-bearing out of proportion to its size: making `journal::replay`
 an exhaustive `match` with no `_` arm means a future variant **cannot silently

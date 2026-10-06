@@ -17,6 +17,11 @@ license.workspace = true
 [dependencies]
 quant-core = { workspace = true }
 quant-storage = { workspace = true }
+# One metrics line is a value both the emitter and `quant-explain` hold, rather
+# than a format they each guess at -- see `metrics::MetricsLine`.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
 
 [lints]
 workspace = true

@@ -1861,38 +1861,44 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   other, so a disagreement means one of them is wrong — and for the whole of
   M5 only one of them existed.
 
-- **`quant-explain::health` parses prose, and that is debt with a scheduled
-  repayment.** An emitter and parser that must agree forever through a format
-  neither owns, with no test that they agree, is the pattern this project
-  refuses — accepted only because switching the emitter to `.json()` changes the
-  running binary. **Switch the emitter and delete `health.rs` in the same commit
-  as the run log**, and write the emitter↔parser test there: it cannot be written
-  now, because pinning the emitter means running it and the emitter is frozen.
+- **The prose-parsing debt is repaid (M7.5.g), and the repayment was not the
+  obvious one.** `quant-explain::health` matched the literal `"metrics
+  symbol="` and pulled `key=value` pairs out of whatever `tracing`'s `fmt`
+  layer rendered — an emitter and a parser that had to agree forever through a
+  format neither owned, with no test that they did. M7 accepted it and wrote
+  down the repayment date, because the only fix changed the running binary and
+  the fortnight was pinned.
 
-  Two of that debt's interest payments came due on 2026-09-20 and are paid. The
-  module claimed "an unrecognised line is reported as unparseable rather than
-  skipped, so the day the format changes is the day this says so" — **half true**.
-  A line that *looked like* a metrics line and would not parse was loud, but a
-  line was only examined if it contained `metrics symbol=`, and that literal is as
-  much part of the borrowed format as the field names. Switch the emitter and
-  every line stops matching at once, whereupon the old code fell through to
-  `NotCovered`, whose message says the process may not have been running — blaming
-  a healthy run for a stale parser. `NoHealth::FormatUnrecognised` now separates
-  the two, and says in as many words that it is not a statement about the run.
+  **Switching to `.json()` is not the fix; it only moves the coupling.** Two
+  lists of field names in two crates still have to match, with nothing to
+  notice when they stop. The fix is that there is now **one type**:
+  `quant-recorder::MetricsLine` is serialized by the emitter and deserialized
+  by the reader, so adding a field changes one struct and both sides at once.
 
-  And `clock_skew` was **a sample count reported as milliseconds**.
-  `quant-recorder::metrics` increments it once per message whose venue timestamp
-  is ahead of ours and records no duration anywhere; `explain` called it
-  `clock_skew_ms` and warned above 1000 "ms", citing Binance's tolerance for a
-  *signed-request offset* against a *count*. So a thousand ordinary samples
-  produced a clock alarm in units nothing had measured. Now `clock_skew_samples`,
-  printed against `latency_samples` so it reads as a proportion. The millisecond
-  offset it was mistaken for is a different measurement entirely and lives in
-  `preflight.sh` and the recorder's startup check. **A tool whose whole purpose is
-  answering "what was it doing at 03:14" must not invent the units of its own
-  answer** — this is the same class of defect as the verifier crying wolf on good
-  data, and it was found the same way: by reading what the code does rather than
-  what its docs say.
+  The emitter moved onto that type too, out of `quant-binance`. That was not
+  tidiness: nothing may depend on `quant-explain` and `quant-explain` may not
+  depend on `quant-binance`, so while the emitter sat there the test pinning
+  the two **could not be expressed at all**. Both sides already depend on
+  `quant-recorder`. M7 recorded the test as owed and blamed the freeze; the
+  freeze was only half of it.
+
+  That test now runs the real emitter through a real JSON subscriber and reads
+  its bytes back through the real reader. It is what catches the one coupling
+  that could not be collapsed — `tracing`'s field syntax needs a literal
+  identifier, so the emitter writes `metrics = %json` while the reader looks up
+  `MetricsLine::FIELD`, and renaming either reddens exactly that test.
+
+- **Two of my own tests were not testing what I thought, and sabotage found
+  both.** A fixture whose fields were mostly **zero** could not tell a
+  serialized field from a dropped one: `#[serde(skip)]` on a `u64` writes
+  nothing and reads back `0`, so the round-trip succeeded either way. Marking
+  `dropped` as skipped reddened nothing until every value in the fixture became
+  distinct and non-zero. And `MetricsLine::from_report` — the join between the
+  counters and the thing written down — had **no test at all**, so wiring a
+  field to the wrong source reddened nothing in the workspace. Both are covered
+  now. *A fixture of zeros proves far less than it looks like it does*, which is
+  the M2.e lesson wearing yet another costume.
+
 - Minor: CI annotates `Node.js 20 is deprecated` for `actions/checkout@v4` on both
   jobs. Harmless; fixed by bumping to `@v5` whenever CI is next touched.
 

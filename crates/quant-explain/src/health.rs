@@ -1,114 +1,62 @@
 //! How the process itself was doing, for the minute containing an instant.
 //!
-//! # This parses a format we do not own, and that is named debt
+//! # The debt M7 scheduled, and what actually repaid it
 //!
-//! The recorder emits its metrics through `tracing`'s default `fmt` layer, so
-//! the only durable record of queue depth, drop counts and venue latency is a
-//! *prose* log line. Nothing else has them: they are properties of one process
-//! at one instant and appear nowhere in the capture, so unlike everything else
-//! `explain` reports, they cannot be re-derived. If the log is deleted they are
-//! gone.
+//! The recorder's metrics are the one thing `explain` reports that cannot be
+//! re-derived. Queue depth, drop counts and venue latency are properties of one
+//! process at one instant; they appear nowhere in the capture, so if the log is
+//! deleted they are gone. They therefore have to be read back out of a log.
 //!
-//! An emitter and a parser that must agree forever, coupled through a format
-//! neither owns, with no test that they agree, is the pattern this project
-//! refuses. It is accepted here for one reason: the alternative — switching the
-//! emitter to `.json()` — would change the running binary, and the fortnight is
-//! pinned. **The replacement is scheduled rather than hoped for:** switch the
-//! emitter and delete this module in the same commit as the run log.
+//! Until M7.5.g that meant **parsing prose**: matching the literal
+//! `"metrics symbol="` and pulling `key=value` pairs out of whatever `tracing`'s
+//! `fmt` layer happened to render. An emitter and a parser that must agree
+//! forever, coupled through a format neither owns, with no test that they agree,
+//! is the pattern this project refuses. M7 accepted it anyway and wrote down the
+//! repayment date, because the only fix changed the running binary and the
+//! fortnight was pinned.
 //!
-//! Until then the parser is strict, and it is strict in **two** places, which
-//! this paragraph originally got wrong. A line that looks like a metrics line
-//! and will not parse is reported as [`NoHealth::Unparseable`] — that part was
-//! always true. But a line is only *looked at* if it contains
-//! [`METRICS_SENTINEL`], and that literal is itself part of the format we do not
-//! own. Change the emitter and every line stops matching, so the old code fell
-//! through to "no metrics line covers this instant" — which reads as *the
-//! process was not running*, and is the exact confabulation this crate exists to
-//! prevent.
+//! **The repayment is not "parse JSON instead of prose".** That moves the
+//! coupling without removing it — two lists of field names that must still match,
+//! in two crates, with nothing to notice when they stop. The fix is that there is
+//! now **one type**: [`quant_recorder::MetricsLine`] is serialized by the emitter
+//! and deserialized here, so adding a field changes one struct and both sides at
+//! once. What remains of the format is `tracing`'s JSON envelope — a `timestamp`
+//! and a `fields` object — and that is pinned by a test which runs the real
+//! emitter through a real subscriber and reads its bytes back through this
+//! reader. That test is the thing M7 said was owed and could not yet be written.
 //!
-//! So a log that holds lines but none this reader recognises is
-//! [`NoHealth::FormatUnrecognised`], separately from a log that holds metrics
-//! lines none of which covers the instant. The day the format changes is the day
-//! that says so.
+//! # Three kinds of absence, which is the other half
 //!
-//! What is still missing is a test that pins the emitter to this parser. It
-//! cannot be written yet: the emitter is in `quant-binance`, which is frozen
-//! while the fortnight runs, and pinning it means running it. That test belongs
-//! in the same commit as the `.json()` switch — named here so it is owed rather
-//! than forgotten.
+//! A query tool's characteristic failure is confabulation, and the most
+//! plausible-looking confabulation here is blaming the run for a stale reader.
+//! So "no log at all", "lines exist but none this reader recognises", and
+//! "metrics lines exist but none covers the instant" stay three separate
+//! answers. The middle one is a statement about *this parser*, and says so.
 //!
-//! # The time bases, which are most of this module's value
+//! # The time bases
 //!
-//! One line mixes three, unmarked:
-//!
-//! - `queue` is **instantaneous** — the depth at the moment the line was written.
-//! - `queue_peak` is **lifetime** — the high-water mark since the process began,
-//!   so a value frozen for six hours still reads like a live number.
-//! - everything else — drops, gaps, and every latency percentile — is a **delta
-//!   over the last 60 seconds**, reset each time the line is emitted.
-//!
-//! Reading `queue_peak=270` beside `queue=0` without knowing which is which is
-//! how an operator concludes the wrong thing at 3am. So every figure is printed
-//! with its base. That labelling costs nothing and is the part of this slice
-//! worth keeping even after the emitter is fixed.
+//! Each figure's base is on [`quant_recorder::MetricsLine`] where the figure is,
+//! rather than restated here. One line mixes instantaneous, lifetime and window
+//! figures, and printing them unmarked is how an operator concludes the wrong
+//! thing at 3am.
 
 use std::path::{Path, PathBuf};
 
 use quant_core::time::Ts;
+use quant_recorder::MetricsLine;
 
-/// The metrics line covering an instant, with each figure's time base.
+/// The metrics line covering an instant.
 #[derive(Debug, Clone)]
 pub struct HealthAt {
     /// The log file the line came from.
     pub log: PathBuf,
     /// When the line was emitted — the end of the window it describes.
     pub emitted_at: Ts,
-    /// Instantaneous: queue depth as the line was written.
-    pub queue: u64,
-    /// Lifetime: the high-water mark since the process started.
-    pub queue_peak: u64,
-    pub queue_capacity: u64,
-    /// Window deltas over the preceding 60 seconds.
-    pub dropped: u64,
-    pub msgs_per_sec: u64,
-    pub latency_p50_ms: i64,
-    pub latency_p99_ms: i64,
-    pub latency_max_ms: i64,
-    /// How many latency samples the window drew the percentiles from. Carried so
-    /// [`Self::clock_skew_samples`] can be read as a proportion rather than as a
-    /// bare number, which is the difference between "one odd message" and "the
-    /// host clock is wrong".
-    pub latency_samples: u64,
-    /// Window delta: **how many messages** arrived stamped ahead of our clock,
-    /// not how far ahead they were.
-    ///
-    /// The emitted field is `clock_skew`, and this reader used to call it
-    /// `clock_skew_ms` and warn when it passed 1000 "ms". It is a counter —
-    /// `quant-recorder::metrics` increments it once per message whose venue
-    /// timestamp is in our future and records no duration at all — so the old
-    /// warning fired after a thousand samples and reported a count in
-    /// milliseconds. A tool whose whole purpose is answering "what was it doing
-    /// at 03:14" must not invent the units of its own answer.
-    ///
-    /// The millisecond offset this was mistaken for is a different measurement
-    /// entirely: `ops/preflight.sh` and the recorder's startup check take it
-    /// round-trip-corrected against `/api/v3/time`, and neither appears on this
-    /// line.
-    pub clock_skew_samples: u64,
-    pub gap_disconnect: u64,
-    pub gap_overflow: u64,
-    pub gap_sequence: u64,
+    /// Exactly what the recorder wrote, as the type it wrote.
+    pub line: MetricsLine,
 }
 
-/// The literal that marks a metrics line, and the one string this reader shares
-/// with an emitter it does not own.
-///
-/// Named rather than inlined because it is the seam: the field *names* can drift
-/// one at a time and produce a loud [`NoHealth::Unparseable`], but this literal
-/// failing to match takes every line out at once and looks like silence.
-pub const METRICS_SENTINEL: &str = "metrics symbol=";
-
-/// Why no health figures could be given.
+/// Why there is nothing to report.
 #[derive(Debug)]
 pub enum NoHealth {
     /// No log file for that symbol under this root.
@@ -183,11 +131,16 @@ pub fn health_at(root: &Path, symbol: &str, at: Ts) -> Result<HealthAt, NoHealth
         last_read = Some(log.clone());
         for line in text.lines() {
             lines_read += 1;
-            if !line.contains(METRICS_SENTINEL) {
+            // Recognition is structural now: a JSON object whose `message`
+            // field is the one the emitter writes. The old test was
+            // `line.contains("metrics symbol=")`, and that literal was itself
+            // part of a format this reader did not own -- change the emitter and
+            // every line stopped matching at once.
+            let Some(envelope) = metrics_envelope(line) else {
                 continue;
-            }
+            };
             candidates += 1;
-            match parse_line(line, &log) {
+            match parse_line(&envelope, line, &log) {
                 Err(why) => {
                     failure.get_or_insert(NoHealth::Unparseable {
                         line: line.to_owned(),
@@ -261,67 +214,95 @@ fn logs_for(root: &Path, symbol: &str) -> Vec<PathBuf> {
 /// not, which is the same stance `quant-binance::sequence` takes with venue
 /// payloads: a new field added upstream must not make an old line unreadable,
 /// but a *missing* one must be loud, because it means the format moved.
-fn parse_line(line: &str, log: &Path) -> Result<HealthAt, String> {
-    let (stamp, rest) = line
-        .split_once("  ")
+/// A metrics event, or `None` if this line is not one.
+///
+/// The whole of the format this reader still has to know: `tracing`'s JSON
+/// envelope is an object with a `timestamp` and a `fields` map, and the emitter
+/// puts the message in `fields.message`. Everything past that point is
+/// [`MetricsLine`]'s own business.
+fn metrics_envelope(line: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let message = value.get("fields")?.get("message")?.as_str()?;
+    (message == MetricsLine::MESSAGE).then_some(value)
+}
+
+/// Read one metrics event into the type the emitter wrote.
+fn parse_line(envelope: &serde_json::Value, line: &str, log: &Path) -> Result<HealthAt, String> {
+    let stamp = envelope
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "no timestamp".to_owned())?;
-    let emitted_at = Ts::parse_rfc3339(stamp.trim())
-        .map_err(|e| format!("the leading timestamp did not parse: {e}"))?;
+    let emitted_at = Ts::parse_rfc3339(stamp)
+        .map_err(|e| format!("the envelope timestamp did not parse: {e}"))?;
 
-    let field = |name: &str| -> Result<&str, String> {
-        rest.split_whitespace()
-            .find_map(|pair| pair.strip_prefix(&format!("{name}=")))
-            .ok_or_else(|| format!("no {name} field"))
-    };
-    let number = |name: &str| -> Result<i64, String> {
-        field(name)?
-            .parse()
-            .map_err(|_| format!("{name} is not a number"))
-    };
-    let count = |name: &str| -> Result<u64, String> {
-        field(name)?
-            .parse()
-            .map_err(|_| format!("{name} is not a count"))
-    };
+    // Carried as a string of its own JSON rather than as loose fields, so the
+    // log renders identically under `fmt` and under `json` and neither a person
+    // grepping it nor this reader has to know which layer produced it.
+    let payload = envelope
+        .get("fields")
+        .and_then(|f| f.get(MetricsLine::FIELD))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("no `{}` field on a metrics event", MetricsLine::FIELD))?;
+    let parsed: MetricsLine = serde_json::from_str(payload)
+        .map_err(|e| format!("the metrics payload did not parse: {e}"))?;
 
+    let _ = line;
     Ok(HealthAt {
         log: log.to_owned(),
         emitted_at,
-        queue: count("queue")?,
-        queue_peak: count("queue_peak")?,
-        queue_capacity: count("queue_capacity")?,
-        dropped: count("dropped")?,
-        msgs_per_sec: count("msgs_per_sec")?,
-        latency_p50_ms: number("latency_p50_ms")?,
-        latency_p99_ms: number("latency_p99_ms")?,
-        latency_max_ms: number("latency_max_ms")?,
-        latency_samples: count("latency_samples")?,
-        clock_skew_samples: count("clock_skew")?,
-        gap_disconnect: count("gap_disconnect")?,
-        gap_overflow: count("gap_overflow")?,
-        gap_sequence: count("gap_sequence")?,
+        line: parsed,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_line, NoHealth};
-    use quant_core::time::Ts;
+    use super::{health_at, metrics_envelope, parse_line, NoHealth};
+    use quant_recorder::MetricsLine;
     use std::path::Path;
 
-    /// A line copied verbatim out of the live fortnight's log, which is the only
-    /// fixture worth having here: the point of this module is to read what the
-    /// recorder actually writes, not what its format is supposed to be.
-    const REAL: &str = "2026-09-19T13:54:52.334285Z  INFO quant_binance::capture: metrics symbol=BTCUSDT msgs_per_sec=42 bytes_per_sec=14067 queue=0 queue_peak=270 queue_capacity=4096 dropped=0 latency_p50_ms=63 latency_p90_ms=81 latency_p99_ms=110 latency_max_ms=153 latency_samples=2524 clock_skew=0 gap_disconnect=0 gap_overflow=0 gap_sequence=0";
+    /// Every field distinct and non-zero, which is load-bearing.
+    ///
+    /// A fixture of zeros cannot tell a field that was written from one that was
+    /// dropped: `#[serde(skip)]` on a `u64` writes nothing and reads back `0`, so
+    /// a round-trip of zeros succeeds either way. Found by sabotage — marking
+    /// `dropped` as skipped reddened nothing until these values became distinct.
+    fn line() -> MetricsLine {
+        MetricsLine {
+            symbol: "BTCUSDT".to_owned(),
+            msgs_per_sec: 42,
+            bytes_per_sec: 14_067,
+            queue_depth: 7,
+            queue_high_water: 270,
+            queue_capacity: 4_096,
+            dropped: 3,
+            latency_p50_micros: 63_000,
+            latency_p90_micros: 81_000,
+            latency_p99_micros: 110_000,
+            latency_max_micros: 153_000,
+            latency_samples: 2_524,
+            clock_skew_samples: 11,
+            gaps: [1, 2, 4, 8],
+        }
+    }
+
+    /// An envelope in the shape `tracing`'s JSON layer writes.
+    fn event(line: &MetricsLine, stamp: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{stamp}","level":"INFO","fields":{{"message":"metrics","metrics":{}}},"target":"quant_binance::capture"}}"#,
+            serde_json::to_string(&serde_json::to_string(line).expect("inner")).expect("outer")
+        )
+    }
 
     #[test]
-    fn a_real_line_from_the_running_fortnight_parses() {
-        let health = parse_line(REAL, Path::new("x.log")).expect("the live format must parse");
-        assert_eq!(health.queue, 0);
-        assert_eq!(health.queue_peak, 270);
-        assert_eq!(health.dropped, 0);
-        assert_eq!(health.latency_p50_ms, 63);
-        assert_eq!(health.msgs_per_sec, 42);
+    fn a_line_round_trips_through_the_type_the_emitter_wrote() {
+        let raw = event(&line(), "2026-09-19T13:54:52.334285Z");
+        let envelope = metrics_envelope(&raw).expect("a metrics event");
+        let health = parse_line(&envelope, &raw, Path::new("x.log")).expect("parses");
+        assert_eq!(
+            health.line,
+            line(),
+            "the whole value, not a field at a time"
+        );
         assert_eq!(
             health.emitted_at.to_rfc3339(),
             "2026-09-19T13:54:52.334285000Z"
@@ -329,123 +310,125 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_extra_field_does_not_make_a_line_unreadable() {
-        // Tolerant of what it does not claim to understand: a field added
-        // upstream must not make every existing log unreadable.
-        let line = format!("{REAL} something_new=1");
-        assert!(parse_line(&line, Path::new("x.log")).is_ok());
+    fn a_field_added_upstream_does_not_make_a_log_unreadable() {
+        // Tolerant of what it does not claim to understand, which is the same
+        // stance `quant-binance::sequence` takes: a new field must not make an
+        // existing log unreadable.
+        let raw = event(&line(), "2026-09-19T13:54:52.334285Z")
+            .replace(r#""level":"INFO""#, r#""level":"INFO","span":{"name":"x"}"#);
+        let envelope = metrics_envelope(&raw).expect("still a metrics event");
+        assert!(parse_line(&envelope, &raw, Path::new("x.log")).is_ok());
     }
 
     #[test]
-    fn a_missing_field_is_loud_rather_than_defaulted() {
-        // And strict about what it does. A zero where a number is missing would
-        // be indistinguishable from a healthy queue, which is the exact figure
-        // an operator checks first.
-        let line = REAL.replace(" dropped=0", "");
-        let why = parse_line(&line, Path::new("x.log")).expect_err("must refuse");
-        assert!(why.contains("dropped"), "{why}");
+    fn a_payload_that_will_not_parse_is_loud_rather_than_defaulted() {
+        // Strict about what it does claim. A zero where a number is missing is
+        // indistinguishable from a healthy queue, which is the first figure an
+        // operator reads.
+        let truncated = serde_json::to_string(r#"{"symbol":"BTCUSDT"}"#).expect("inner");
+        let raw = format!(
+            r#"{{"timestamp":"2026-09-19T13:54:52.334285Z","fields":{{"message":"metrics","metrics":{truncated}}}}}"#
+        );
+        let envelope = metrics_envelope(&raw).expect("a metrics event");
+        let why = parse_line(&envelope, &raw, Path::new("x.log")).expect_err("must refuse");
+        assert!(why.contains("did not parse"), "{why}");
     }
 
     #[test]
     fn clock_skew_reads_as_a_count_of_messages_not_as_milliseconds() {
         // The field is a counter: `quant-recorder::metrics` increments it once
-        // per message whose venue timestamp is ahead of ours and records no
+        // per message whose venue timestamp is ahead of ours, and records no
         // duration anywhere. The old reader called it `clock_skew_ms` and warned
         // above 1000 "ms", so a thousand ordinary samples produced a clock alarm
-        // in units nothing had measured.
-        let line = REAL.replace("clock_skew=0", "clock_skew=1500");
-        let health = parse_line(&line, Path::new("x.log")).expect("parses");
-        assert_eq!(health.clock_skew_samples, 1_500, "a count of messages");
-        assert_eq!(
-            health.latency_samples, 2_524,
-            "carried so the count can be read as a proportion"
-        );
+        // in units nothing had measured. The name now carries the unit.
+        let mut l = line();
+        l.clock_skew_samples = 1_500;
+        let raw = event(&l, "2026-09-19T13:54:52.334285Z");
+        let envelope = metrics_envelope(&raw).expect("a metrics event");
+        let health = parse_line(&envelope, &raw, Path::new("x.log")).expect("parses");
+        assert_eq!(health.line.clock_skew_samples, 1_500, "a count of messages");
         assert!(
-            health.clock_skew_samples < health.latency_samples,
+            health.line.clock_skew_samples < health.line.latency_samples,
             "1500 of 2524 samples is the honest reading; 1500ms is not a reading at all"
         );
     }
 
     #[test]
     fn a_log_this_reader_no_longer_understands_says_so_rather_than_reporting_silence() {
-        // The failure the module header promised was impossible and was not.
-        // Every line is filtered on `METRICS_SENTINEL` before anything looks at
-        // it, and that literal is part of a format this crate does not own -- so
-        // switching the emitter to `.json()` takes every line out at once. The
-        // old code then fell through to `NotCovered`, whose message says the
-        // process may not have been running. That blames a healthy run for a
-        // stale parser.
-        use super::{health_at, METRICS_SENTINEL};
-
+        // Three kinds of absence, and this is the one that blames the reader
+        // instead of the run. "No line covers this instant" says the process was
+        // down; "no line is recognisable" says this parser went stale. Reporting
+        // the second as the first sends whoever is on call to the wrong place.
         let root = std::env::temp_dir().join("quant-explain-format-drift");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("logs")).expect("mkdir");
-        // What a `.json()` emitter would write: real lines, none matching.
-        let json = "{\"timestamp\":\"2026-09-19T13:54:52.334285Z\",\"fields\":{\"message\":\"metrics\",\"symbol\":\"BTCUSDT\",\"queue\":0}}";
-        assert!(
-            !json.contains(METRICS_SENTINEL),
-            "the fixture must not match, or it proves nothing"
-        );
+        // Real JSON events that are not metrics events.
+        let other =
+            r#"{"timestamp":"2026-09-19T13:54:52.334285Z","fields":{"message":"connected"}}"#;
         std::fs::write(
             root.join("logs").join("BTCUSDT-20260919-000000.log"),
-            format!(
-                "{json}
-{json}
-{json}
-"
-            ),
+            format!("{other}\n{other}\n{other}\n"),
         )
         .expect("write");
 
-        let why = health_at(&root, "BTCUSDT", Ts::from_nanos(0)).expect_err("cannot be read");
-        assert!(
-            matches!(why, NoHealth::FormatUnrecognised { lines: 3, .. }),
-            "{why:?}"
-        );
-        let said = why.to_string();
-        assert!(said.contains("not a statement about the run"), "{said}");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_log_with_metrics_lines_that_miss_the_instant_is_still_not_covered() {
-        // The other side of the same boundary, so the new variant cannot quietly
-        // swallow the ordinary case: these lines ARE recognised, they simply all
-        // sit before the instant asked for.
-        use super::health_at;
-
-        let root = std::env::temp_dir().join("quant-explain-not-covered");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("logs")).expect("mkdir");
-        std::fs::write(
-            root.join("logs").join("BTCUSDT-20260919-000000.log"),
-            format!(
-                "{REAL}
-"
-            ),
-        )
-        .expect("write");
-
-        // Far past the line's own timestamp, so nothing covers it.
-        let much_later = Ts::parse_rfc3339("2030-01-01T00:00:00Z").expect("parse");
-        let why = health_at(&root, "BTCUSDT", much_later).expect_err("nothing covers it");
-        assert!(matches!(why, NoHealth::NotCovered), "{why:?}");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn an_unparseable_line_names_the_line_and_the_reason() {
-        // Because the likeliest cause is that the emitter changed, and the
-        // person reading this needs to know that rather than believing the
-        // minute had no metrics.
-        let why = NoHealth::Unparseable {
-            line: "metrics symbol=BTCUSDT queue=nonsense".to_owned(),
-            why: "queue is not a count".to_owned(),
+        let at = quant_core::time::Ts::parse_rfc3339("2026-09-19T13:54:52Z").expect("ts");
+        match health_at(&root, "BTCUSDT", at) {
+            Err(NoHealth::FormatUnrecognised { lines, .. }) => assert_eq!(lines, 3),
+            other => panic!("expected FormatUnrecognised, got {other:?}"),
         }
-        .to_string();
-        assert!(why.contains("emitter"), "{why}");
-        assert!(why.contains("nonsense"), "{why}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// Captures whatever a subscriber writes, so a test can read it back.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_real_emitter_writes_what_this_reader_reads() {
+        // **The test M7 recorded as owed and could not write.** Everything above
+        // feeds this reader an envelope built by hand, which proves only that it
+        // can read a fixture someone wrote to match it. The thing worth pinning
+        // is that the recorder's actual emitter, through an actual JSON
+        // subscriber, produces bytes this actual reader understands.
+        //
+        // It could not be written before for two reasons and only one of them
+        // was the freeze. The other was structural: the emitter sat in
+        // `quant-binance`, nothing may depend on `quant-explain`, and
+        // `quant-explain` may not depend on `quant-binance`. Moving the emitter
+        // onto `MetricsLine` -- which both sides already depend on -- is what
+        // made the pairing expressible.
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer({
+                let sink = sink.clone();
+                move || sink.clone()
+            })
+            .finish();
+
+        let expected = line();
+        tracing::subscriber::with_default(subscriber, || expected.emit());
+
+        let bytes = sink.0.lock().expect("captured").clone();
+        let text = String::from_utf8(bytes).expect("utf-8");
+        let raw = text.lines().next().expect("the emitter wrote a line");
+
+        let envelope =
+            metrics_envelope(raw).expect("the reader must recognise what the emitter writes");
+        let health =
+            parse_line(&envelope, raw, Path::new("x.log")).expect("and must be able to read it");
+        assert_eq!(
+            health.line, expected,
+            "every field, through a real subscriber and back"
+        );
     }
 }

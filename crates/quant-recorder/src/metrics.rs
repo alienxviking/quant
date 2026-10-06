@@ -415,7 +415,7 @@ impl Metrics {
 /// Plain values, so it can be compared against an earlier reading to produce
 /// rates. Not a consistent cross-counter snapshot -- see [`Histogram::summarize`]
 /// -- and it does not need to be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MetricsSample {
     pub messages: u64,
     pub bytes: u64,
@@ -466,6 +466,148 @@ pub struct MetricsReport {
     pub queue_capacity: usize,
     pub latency: LatencySummary,
     pub totals: MetricsSample,
+}
+
+/// One metrics line, as a value both the emitter and the reader hold.
+///
+/// # Why this type exists, and what it repays
+///
+/// The recorder's metrics are the one thing `explain` reports that cannot be
+/// re-derived: queue depth, drop counts and venue latency are properties of one
+/// process at one instant, they appear nowhere in the capture, and if the log is
+/// deleted they are gone. So they have to be read back out of a log — and until
+/// M7.5.g that meant `quant-explain::health` **parsing prose**, matching on the
+/// literal `"metrics symbol="` and pulling `key=value` pairs out of a line
+/// `tracing`'s `fmt` layer happened to render that way.
+///
+/// An emitter and a parser that must agree forever, coupled through a format
+/// neither owns, with no test that they agree, is the pattern this project
+/// refuses. M7 accepted it anyway and wrote down the repayment date, because the
+/// only fix changed the running binary and the fortnight was pinned.
+///
+/// The repayment is not "parse JSON instead of prose". That would move the
+/// coupling without removing it — two lists of field names that must still
+/// match, in two crates, with nothing to notice when they stop. **The fix is
+/// that there is now one type.** The emitter serializes this; the reader
+/// deserializes this; adding a field changes one struct and both sides at once.
+/// What is left of the format is `tracing`'s JSON envelope, which is one
+/// `fields` lookup and is pinned by a test that runs the real emitter.
+///
+/// # The time bases, which are most of this type's value
+///
+/// One line mixes three, and unmarked they are how an operator concludes the
+/// wrong thing at 3am:
+///
+/// - `queue_depth` is **instantaneous** — the depth as the line was written.
+/// - `queue_high_water` is **lifetime** — since the process began, so a value
+///   frozen for six hours still reads like a live number.
+/// - everything else is a **delta over the reporting interval**, reset each time
+///   a line is emitted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MetricsLine {
+    pub symbol: String,
+    pub msgs_per_sec: u64,
+    pub bytes_per_sec: u64,
+    /// Instantaneous.
+    pub queue_depth: u64,
+    /// Lifetime.
+    pub queue_high_water: u64,
+    pub queue_capacity: u64,
+    /// Window delta. The one number that should always be zero.
+    pub dropped: u64,
+    pub latency_p50_micros: u64,
+    pub latency_p90_micros: u64,
+    pub latency_p99_micros: u64,
+    pub latency_max_micros: u64,
+    pub latency_samples: u64,
+    /// **A count of messages**, not a duration.
+    ///
+    /// How many arrived stamped ahead of our clock. The reader called this
+    /// `clock_skew_ms` until 2026-09-20 and warned above 1000 "ms", citing
+    /// Binance's tolerance for a signed-request offset — against a counter.
+    /// A thousand ordinary samples produced a clock alarm in units nothing had
+    /// measured. The name carries the unit now so the mistake cannot be made
+    /// from the field alone.
+    pub clock_skew_samples: u64,
+    pub gaps: [u64; GapCause::ALL.len()],
+}
+
+impl MetricsLine {
+    /// Build a line from a report. The only place the two are joined.
+    #[must_use]
+    pub fn from_report(symbol: &str, report: &MetricsReport) -> Self {
+        let latency = report.latency;
+        Self {
+            symbol: symbol.to_owned(),
+            msgs_per_sec: report.messages_per_sec,
+            bytes_per_sec: report.bytes_per_sec,
+            queue_depth: report.queue_depth as u64,
+            queue_high_water: report.queue_high_water as u64,
+            queue_capacity: report.queue_capacity as u64,
+            dropped: report.dropped,
+            latency_p50_micros: latency.p50_micros,
+            latency_p90_micros: latency.p90_micros,
+            latency_p99_micros: latency.p99_micros,
+            latency_max_micros: latency.max_micros,
+            latency_samples: latency.count,
+            clock_skew_samples: latency.clock_skew,
+            gaps: report.gaps,
+        }
+    }
+
+    /// The tracing field this is carried in, and the whole of the format the
+    /// reader still has to know.
+    pub const FIELD: &'static str = "metrics";
+
+    /// The event message that marks a metrics line.
+    pub const MESSAGE: &'static str = "metrics";
+
+    /// Write this line to the log.
+    ///
+    /// The emitter lives here rather than in the binance adapter so that the
+    /// test which pins it to `quant-explain`'s reader can exist at all: nothing
+    /// may depend on `quant-explain`, and `quant-explain` may not depend on
+    /// `quant-binance`, but both sides already depend on this crate. M7 recorded
+    /// that test as owed and unwritable; the obstacle was where the emitter sat.
+    ///
+    /// The *when* stays in the binary, which already has a runtime — M1.e's
+    /// division, unchanged, and the reason this crate is still async-free.
+    ///
+    /// Serialized by hand into one field rather than spread across `tracing`'s
+    /// field syntax, because that syntax is what made this prose in the first
+    /// place: a field list renders one way under `fmt` and another under `json`,
+    /// and a reader has to know which. A string holding this type's own JSON
+    /// renders identically under both, so the log stays greppable by a person
+    /// *and* readable by a tool without either agreeing about a layer.
+    pub fn emit(&self) {
+        match serde_json::to_string(self) {
+            Ok(json) => tracing::info!(metrics = %json, "{}", Self::MESSAGE),
+            // A metric must never be able to take down a capture -- M1.e's
+            // literal recorded lesson, where a wrapped queue counter killed the
+            // recorder.
+            Err(e) => tracing::warn!(error = %e, "could not serialize the metrics line"),
+        }
+    }
+
+    #[must_use]
+    pub fn gap(&self, cause: GapCause) -> u64 {
+        self.gaps[cause.index()]
+    }
+
+    #[must_use]
+    pub fn latency_p50_ms(&self) -> u64 {
+        self.latency_p50_micros / 1_000
+    }
+
+    #[must_use]
+    pub fn latency_p99_ms(&self) -> u64 {
+        self.latency_p99_micros / 1_000
+    }
+
+    #[must_use]
+    pub fn latency_max_ms(&self) -> u64 {
+        self.latency_max_micros / 1_000
+    }
 }
 
 /// Turns successive samples into rates.
@@ -756,5 +898,53 @@ mod tests {
         assert_eq!(sample.gaps_by_cause[GapCause::Disconnect.index()], 2);
         assert_eq!(sample.gaps_by_cause[GapCause::LocalOverflow.index()], 1);
         assert_eq!(sample.gaps_by_cause[GapCause::SequenceGap.index()], 0);
+    }
+    #[test]
+    fn a_line_carries_the_report_it_was_built_from() {
+        // `from_report` is the join between the counters and the thing written
+        // down, and it had no test: changing `dropped: report.dropped` to
+        // `report.dropped + 1` reddened nothing anywhere in the workspace. Every
+        // field is checked, because the failure mode is one of them being wired
+        // to the wrong source and every other number still looking right.
+        let report = MetricsReport {
+            elapsed: Duration::from_secs(60),
+            messages_per_sec: 42,
+            bytes_per_sec: 14_067,
+            dropped: 3,
+            gaps: [1, 2, 4, 8],
+            queue_depth: 7,
+            queue_high_water: 270,
+            queue_capacity: 4_096,
+            latency: LatencySummary {
+                count: 2_524,
+                p50_micros: 63_000,
+                p90_micros: 81_000,
+                p99_micros: 110_000,
+                max_micros: 153_000,
+                clock_skew: 11,
+            },
+            totals: MetricsSample::default(),
+        };
+        let line = MetricsLine::from_report("BTCUSDT", &report);
+        assert_eq!(line.symbol, "BTCUSDT");
+        assert_eq!(line.msgs_per_sec, 42);
+        assert_eq!(line.bytes_per_sec, 14_067);
+        assert_eq!(line.queue_depth, 7);
+        assert_eq!(line.queue_high_water, 270);
+        assert_eq!(line.queue_capacity, 4_096);
+        assert_eq!(line.dropped, 3);
+        assert_eq!(line.latency_p50_micros, 63_000);
+        assert_eq!(line.latency_p90_micros, 81_000);
+        assert_eq!(line.latency_p99_micros, 110_000);
+        assert_eq!(line.latency_max_micros, 153_000);
+        assert_eq!(line.latency_samples, 2_524);
+        assert_eq!(line.clock_skew_samples, 11);
+        assert_eq!(line.gaps, [1, 2, 4, 8]);
+        // And the millisecond helpers truncate rather than round, which is what
+        // the old flat fields did -- the reader must not start reporting a
+        // different number than four weeks of logs already hold.
+        assert_eq!(line.latency_p50_ms(), 63);
+        assert_eq!(line.latency_p99_ms(), 110);
+        assert_eq!(line.latency_max_ms(), 153);
     }
 }

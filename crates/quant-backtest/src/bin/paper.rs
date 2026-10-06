@@ -92,7 +92,12 @@ struct Args {
 }
 
 fn main() -> ExitCode {
+    // JSON, so the metrics line is a value rather than prose. `explain` reads it
+    // back through `MetricsLine`, and the two sharing a type is what M7.5.g
+    // repaid -- the emitter and the reader previously agreed through a rendering
+    // neither of them owned, with nothing to notice when it changed.
     tracing_subscriber::fmt()
+        .json()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )

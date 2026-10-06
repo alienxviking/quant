@@ -36,7 +36,7 @@ use quant_meta::{
 };
 use quant_recorder::{
     channel, format_session_id, run_writer, CaptureSession, FileStore, Ingress, IngressStats,
-    Metrics, MetricsReporter, ObservedStore, SegmentReport, WriterOutcome,
+    Metrics, MetricsLine, MetricsReporter, ObservedStore, SegmentReport, WriterOutcome,
     DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
 };
 use quant_storage::WriterOptions;
@@ -430,25 +430,11 @@ async fn report_periodically(metrics: Arc<Metrics>, symbol: String) {
         ticker.tick().await;
         let report = reporter.report(METRICS_INTERVAL);
         let latency = report.latency;
-        info!(
-            symbol = %symbol,
-            msgs_per_sec = report.messages_per_sec,
-            bytes_per_sec = report.bytes_per_sec,
-            queue = report.queue_depth,
-            queue_peak = report.queue_high_water,
-            queue_capacity = report.queue_capacity,
-            dropped = report.dropped,
-            latency_p50_ms = latency.p50_micros / 1_000,
-            latency_p90_ms = latency.p90_micros / 1_000,
-            latency_p99_ms = latency.p99_micros / 1_000,
-            latency_max_ms = latency.max_micros / 1_000,
-            latency_samples = latency.count,
-            clock_skew = latency.clock_skew,
-            gap_disconnect = report.gaps[GapCause::Disconnect.index()],
-            gap_overflow = report.gaps[GapCause::LocalOverflow.index()],
-            gap_sequence = report.gaps[GapCause::SequenceGap.index()],
-            "metrics"
-        );
+        // One serialized value rather than eighteen loose fields. `explain` reads
+        // the same `MetricsLine` back, so the two sides share a *type* instead of
+        // a list of names they must each keep in step -- which is the whole of
+        // the debt M7 scheduled for repayment here.
+        MetricsLine::from_report(&symbol, &report).emit();
 
         if latency.clock_skew > 0 {
             // §2: a venue timestamp ahead of ours means the host clock is wrong,
