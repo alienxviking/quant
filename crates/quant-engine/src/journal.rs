@@ -187,6 +187,32 @@ pub enum JournalEntry {
         at: Ts,
         cause: crate::risk::TripCause,
     },
+    /// The market went dark, and for how long we could not see it.
+    ///
+    /// The answer to "why did it not trade between 03:00 and 04:00" is one of
+    /// four things, and three of them are already recorded — a crossing that
+    /// fired, a refusal, a suppression. This is the fourth, and without it a
+    /// quiet hour and a blind hour are the same silence in the file.
+    ///
+    /// `last_good_ts` is the last instant we were confident the stream was
+    /// intact, so `at - last_good_ts` is the width of the blindness. That is a
+    /// **duration, not a message count**, which is a deliberate narrowing of
+    /// what this slice was planned to record: a count would have to be carried
+    /// on `MarketEvent::Gap`, and that type is persisted in the normalized tier,
+    /// so a field added for a log line would change the Parquet schema of the
+    /// whole `gaps/` dataset. The question the operator actually asks is *were
+    /// we blind at 03:30*, and a duration answers it exactly.
+    ///
+    /// A `LocalOverflow` cause here is the engine's own account of records the
+    /// tee dropped on its way in, which is the same fact the capture side
+    /// counts in `TeeSink::secondary_dropped`. Neither is derived from the
+    /// other, so a disagreement means one of them is wrong — and nothing would
+    /// say so if only one existed.
+    Blind {
+        at: Ts,
+        cause: quant_core::event::GapCause,
+        last_good_ts: Ts,
+    },
     /// A session ended cleanly.
     ///
     /// Its absence is how a crash is told from a clean stop — the same
@@ -209,6 +235,7 @@ impl JournalEntry {
             | Self::CancelRequested { at, .. }
             | Self::Cancelled { at, .. }
             | Self::Orphaned { at, .. }
+            | Self::Blind { at, .. }
             | Self::Stopped { at } => *at,
         }
     }
@@ -391,6 +418,8 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             | JournalEntry::Checkpoint { .. }
             // Controls, not money.
             | JournalEntry::Tripped { .. }
+            // Blindness is the absence of input, not a movement of money.
+            | JournalEntry::Blind { .. }
             | JournalEntry::Stopped { .. }
             // Decisions. None of them moves the portfolio: a submission is an
             // intent, a refusal is an intent that stopped at the chokepoint,
@@ -569,6 +598,8 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
             JournalEntry::Started { .. }
             | JournalEntry::Checkpoint { .. }
             | JournalEntry::Tripped { .. }
+            // Consumes no id: nothing was decided, we simply could not see.
+            | JournalEntry::Blind { .. }
             | JournalEntry::Stopped { .. } => None,
         })
         .max()

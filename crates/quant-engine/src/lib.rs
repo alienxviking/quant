@@ -201,6 +201,31 @@ pub trait RunObserver {
     /// An order was withdrawn, with whatever never traded.
     fn on_cancelled(&mut self, _client_order_id: ClientOrderId, _remaining: Qty, _at: Ts) {}
 
+    /// The kill switch was thrown, at the instant it was thrown.
+    ///
+    /// Written here rather than at shutdown, which is where M5 put it and is
+    /// the hole `CLAUDE.md` has carried as *must be fixed before M8* ever
+    /// since. Two things were wrong with the old placement and only one of
+    /// them was ever written down: a hard kill between the trip and the
+    /// shutdown lost the trip entirely, so the supervisor re-armed a switch
+    /// that had fired — but even on a clean exit the entry was stamped with
+    /// the *shutdown* time, so the record of the single most serious thing the
+    /// risk layer can do named the wrong moment, by however long the session
+    /// happened to continue.
+    ///
+    /// This is the write-ahead rule the journal already applies to fills and
+    /// submissions, arriving at the third place that needs it.
+    fn on_tripped(&mut self, _cause: crate::risk::TripCause, _at: Ts) {}
+
+    /// We stopped being able to see the market.
+    ///
+    /// `last_good_ts` is the last instant the stream was known intact, so the
+    /// pair bounds the blindness. The engine has always *counted* gaps in
+    /// `stats.gaps`; this is the first time one is written down with a time
+    /// attached, which is the difference between knowing there were 34 and
+    /// knowing whether we were blind at 03:30.
+    fn on_blind(&mut self, _cause: quant_core::event::GapCause, _last_good_ts: Ts, _at: Ts) {}
+
     /// A fill arrived for an order this engine has no record of.
     ///
     /// The `else` the loop body does not have: `stats.fills` is incremented
@@ -394,8 +419,14 @@ where
         self.ledger.stats.events += 1;
         self.ledger.stats.first_ts.get_or_insert(self.now);
         self.ledger.stats.last_ts = Some(self.now);
-        if matches!(event, MarketEvent::Gap(_)) {
+        if let MarketEvent::Gap(gap) = event {
             self.ledger.stats.gaps += 1;
+            // Before the book is cleared, which is the next step. The order is
+            // not load-bearing for correctness -- nothing reads the book here
+            // -- but it keeps the file's story in the order it happened.
+            if let Some(observer) = self.observer.as_deref_mut() {
+                observer.on_blind(gap.cause, gap.last_good_ts, self.now);
+            }
         }
 
         // 2. The book. A gap clears it, so there are no stale prices to read.

@@ -26,6 +26,24 @@
 //! need to be: a dropped record leaves a hole in `ingest_seq`, and the live
 //! source discovers it the same way `quant-verify` discovers a recorder drop and
 //! the same way `quant-normalize`'s replay does. One mechanism, three places.
+//!
+//! # Why the count is shared rather than returned
+//!
+//! `secondary_dropped` was unreachable for the whole of M5's fortnight — the tee
+//! is built inside the closure `capture::run` takes and is moved into it, so
+//! there was no live reference left to ask. The counter existed, was correct,
+//! and nothing could read it; M5's criterion *assumes* it stayed zero and
+//! nothing in the run said so.
+//!
+//! So the count lives behind an [`Arc<AtomicU64>`] the caller can keep a handle
+//! to, which is M1.e's argument arriving in a second place: the counter is
+//! atomic not because of contention — one thread writes it — but because it must
+//! be *readable* while the thing that owns it is borrowed for the lifetime of
+//! the run. `saturating` arithmetic for the same reason M1.e settled on it: a
+//! metric must never be able to take down a capture.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::record::CaptureRecord;
 use crate::sink::{RecordSink, SinkError};
@@ -35,19 +53,28 @@ use crate::sink::{RecordSink, SinkError};
 pub struct TeeSink<P, S> {
     primary: P,
     secondary: S,
-    secondary_dropped: u64,
+    secondary_dropped: Arc<AtomicU64>,
     secondary_gone: bool,
 }
 
 impl<P: RecordSink, S: RecordSink> TeeSink<P, S> {
     /// `primary` is the sink whose failure is a real failure.
-    pub const fn new(primary: P, secondary: S) -> Self {
+    #[must_use]
+    pub fn new(primary: P, secondary: S) -> Self {
         Self {
             primary,
             secondary,
-            secondary_dropped: 0,
+            secondary_dropped: Arc::new(AtomicU64::new(0)),
             secondary_gone: false,
         }
+    }
+
+    /// Count into a handle the caller keeps, so the drops can be read during a
+    /// run rather than only from inside this type's own tests.
+    #[must_use]
+    pub fn counting_into(mut self, drops: Arc<AtomicU64>) -> Self {
+        self.secondary_dropped = drops;
+        self
     }
 
     /// Records the secondary consumer did not get.
@@ -57,8 +84,17 @@ impl<P: RecordSink, S: RecordSink> TeeSink<P, S> {
     /// engine falling behind *before* the strategy stops trading because its
     /// book keeps being invalidated.
     #[must_use]
-    pub const fn secondary_dropped(&self) -> u64 {
+    pub fn secondary_dropped(&self) -> u64 {
+        self.secondary_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Saturating, because a metric must never be able to take down a capture
+    /// — M1.e's literal recorded lesson, where an unsigned queue depth wrapped
+    /// below zero and killed the recorder.
+    fn count_drop(&mut self) {
+        let seen = self.secondary_dropped.load(Ordering::Relaxed);
         self.secondary_dropped
+            .store(seen.saturating_add(1), Ordering::Relaxed);
     }
 
     /// Whether the secondary consumer has hung up for good.
@@ -93,17 +129,17 @@ impl<P: RecordSink, S: RecordSink> RecordSink for TeeSink<P, S> {
         self.primary.try_send(record)?;
 
         if self.secondary_gone {
-            self.secondary_dropped += 1;
+            self.count_drop();
             return Ok(());
         }
         match self.secondary.try_send(copy) {
             Ok(()) => {}
-            Err(SinkError::Full(_)) => self.secondary_dropped += 1,
+            Err(SinkError::Full(_)) => self.count_drop(),
             Err(SinkError::Disconnected) => {
                 // Latched, so a dead engine costs one failed send rather than
                 // one per message for the rest of a two-week run.
                 self.secondary_gone = true;
-                self.secondary_dropped += 1;
+                self.count_drop();
             }
         }
         Ok(())
@@ -195,5 +231,51 @@ mod tests {
         assert!(tee.secondary_gone());
         assert_eq!(tee.secondary_dropped(), 3);
         assert_eq!(tee.primary().accepted.len(), 3, "recording carries on");
+    }
+    #[test]
+    fn the_drop_count_can_be_read_while_the_tee_is_owned_by_someone_else() {
+        // The actual defect. `secondary_dropped` was correct for the whole of
+        // M5's fortnight and unreachable for all of it: `capture::run` takes a
+        // closure that *builds* the tee, so the tee is moved in and no reference
+        // survives to ask. M5's criterion assumes nothing was dropped and
+        // nothing in the run could say so.
+        //
+        // Reading through a handle the caller kept is the fix, and it is M1.e's
+        // argument in a second place -- atomic not for contention but because
+        // the value must be legible while its owner is borrowed for the length
+        // of the run.
+        let drops = Arc::new(AtomicU64::new(0));
+        let mut tee = TeeSink::new(TestSink::with_capacity(8), TestSink::with_capacity(1))
+            .counting_into(Arc::clone(&drops));
+        // Hand the tee away, exactly as `capture::run` does.
+        let owned = core::cell::RefCell::new(tee);
+        for seq in 1..=4 {
+            owned
+                .borrow_mut()
+                .try_send(record(seq))
+                .expect("the capture always has room");
+        }
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            3,
+            "the caller can see the drops without touching the tee"
+        );
+        tee = owned.into_inner();
+        assert_eq!(
+            tee.secondary_dropped(),
+            drops.load(Ordering::Relaxed),
+            "and both views agree"
+        );
+    }
+
+    #[test]
+    fn a_tee_nobody_asked_about_still_counts_its_own_drops() {
+        // The no-op half: `counting_into` is optional, and a tee built without
+        // it must behave exactly as it did before this slice.
+        let mut tee = TeeSink::new(TestSink::with_capacity(8), TestSink::with_capacity(1));
+        for seq in 1..=4 {
+            tee.try_send(record(seq)).expect("room");
+        }
+        assert_eq!(tee.secondary_dropped(), 3);
     }
 }

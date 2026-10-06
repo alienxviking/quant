@@ -159,7 +159,18 @@ impl<'a> Context<'a> {
             let (bid, ask) = (book.best_bid()?, book.best_ask()?);
             Some(Px::from_raw((bid.px.raw() + ask.px.raw()) / 2))
         });
-        if let Some(refusal) = self.risk.check(&request, mark, self.now) {
+        let refusal = self.risk.check(&request, mark, self.now);
+        // Before the refusal it caused, so the file reads in the order things
+        // happened: the switch was thrown, and then this order was turned away.
+        // Taken on both paths because a layer is free to trip without refusing
+        // the order that tripped it, and an unreported trip is the whole defect
+        // this slice exists to close.
+        if let Some(cause) = self.risk.take_newly_tripped() {
+            if let Some(observer) = self.observer.as_mut() {
+                observer.on_tripped(cause, self.now);
+            }
+        }
+        if let Some(refusal) = refusal {
             // Refused here, so the venue never hears about it at all. That is
             // the chokepoint being a chokepoint.
             if let Some(observer) = self.observer.as_mut() {

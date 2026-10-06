@@ -119,6 +119,21 @@ pub trait RiskLayer {
     fn on_fill(&mut self, instrument: InstrumentId, side: Side, fill: &Fill, at: Ts) {
         let _ = (instrument, side, fill, at);
     }
+
+    /// A trip that has happened and has not yet been reported, taken once.
+    ///
+    /// Take-once rather than a `tripped()` the caller compares against a value
+    /// it saved beforehand: that shape makes "report it exactly once" a
+    /// property of this type instead of something every call site has to get
+    /// right, and there will be a second call site at M8. The engine is what
+    /// writes it down — risk keeps its own tally and has no observer, which is
+    /// the separation that makes a portfolio bug unable to take the limits
+    /// with it.
+    ///
+    /// Defaulted to `None`, so a layer that cannot trip need not say so.
+    fn take_newly_tripped(&mut self) -> Option<TripCause> {
+        None
+    }
 }
 
 /// Allows everything.
@@ -227,6 +242,8 @@ pub struct RiskEngine {
     today: Today,
     positions: Vec<Held>,
     tripped: Option<TripCause>,
+    /// Set when `trip` fires, cleared when the engine has written it down.
+    pending_trip: Option<TripCause>,
     /// Every refusal, by reason, for reporting.
     refusals: u64,
 }
@@ -252,6 +269,7 @@ impl RiskEngine {
             today: Today::default(),
             positions: Vec::new(),
             tripped: None,
+            pending_trip: None,
             refusals: 0,
         }
     }
@@ -264,6 +282,10 @@ impl RiskEngine {
     pub fn recover(limits: Limits, tripped: Option<TripCause>) -> Self {
         Self {
             tripped,
+            // A switch recovered from the file is already on record; reporting
+            // it again would write a second `tripped` line every restart and
+            // make the log claim the limit fired repeatedly.
+            pending_trip: None,
             ..Self::new(limits)
         }
     }
@@ -295,6 +317,14 @@ impl RiskEngine {
     /// one a person should look at, and a switch that resets itself is a switch
     /// that will reset itself at the worst moment.
     pub const fn trip(&mut self, cause: TripCause) {
+        // Guarded so a second trip on an already-thrown switch does not queue a
+        // second line. `check` returns early when tripped, so the live path
+        // cannot reach here twice -- but this is `pub`, and a switch that
+        // reported itself once per call would be worse than one that did not
+        // report at all.
+        if self.tripped.is_none() {
+            self.pending_trip = Some(cause);
+        }
         self.tripped = Some(cause);
     }
 
@@ -348,6 +378,10 @@ impl RiskEngine {
 }
 
 impl RiskLayer for RiskEngine {
+    fn take_newly_tripped(&mut self) -> Option<TripCause> {
+        self.pending_trip.take()
+    }
+
     fn check(&mut self, request: &OrderRequest, mark: Option<Px>, now: Ts) -> Option<Refusal> {
         self.roll(now);
 
@@ -925,5 +959,26 @@ mod tests {
                 .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
         );
+    }
+    #[test]
+    fn tripping_a_switch_that_is_already_thrown_queues_no_second_report() {
+        // The guard inside `trip`, which the engine-level tests do **not**
+        // reach: `check` returns early once tripped, so the live path cannot
+        // call `trip` twice and removing the guard reddens nothing up there. It
+        // is `pub` though, and a switch that queued a report per call would put
+        // a `tripped` line in the file for every manual trip after the first --
+        // a log claiming the limit fired repeatedly when it fired once.
+        //
+        // Found by sabotage rather than by design: the engine test stayed green
+        // with the guard deleted, which is M2.e's lesson arriving again.
+        let mut risk = RiskEngine::new(Limits::default());
+        risk.trip(TripCause::DailyLoss);
+        risk.trip(TripCause::OrderCount);
+        assert_eq!(
+            risk.take_newly_tripped(),
+            Some(TripCause::DailyLoss),
+            "the first cause, because that is the one that stopped trading"
+        );
+        assert_eq!(risk.take_newly_tripped(), None, "and taken exactly once");
     }
 }
