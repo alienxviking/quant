@@ -105,6 +105,8 @@ docs/
                       that way. Written before the engine exists.
   observability.md    why M7 is a reader and not an exporter, and its
                       criteria. Written before the reader exists.
+  run-log.md          what a decision record contains, what it refuses to
+                      be, and the three criteria it is measured against. [M7.5]
   acceptance-run.md   how the 7-day M1 run is conducted and judged
   paper-run.md        how the 2-week M5 paper run is conducted and judged
 ops/
@@ -136,6 +138,7 @@ harness M1 warns about.
 | M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | done |
 | M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | done |
 | M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | done |
+| M7.5 | The run log | A record that detects its own incompleteness, and a diff that refuses rather than passing | done |
 | M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance | |
 
 Milestones have **acceptance criteria, not feature lists**. "Done" means the

@@ -203,11 +203,19 @@ pub enum JournalEntry {
     /// whole `gaps/` dataset. The question the operator actually asks is *were
     /// we blind at 03:30*, and a duration answers it exactly.
     ///
-    /// A `LocalOverflow` cause here is the engine's own account of records the
-    /// tee dropped on its way in, which is the same fact the capture side
-    /// counts in `TeeSink::secondary_dropped`. Neither is derived from the
-    /// other, so a disagreement means one of them is wrong — and nothing would
-    /// say so if only one existed.
+    /// A `LocalOverflow` cause is the engine's own account of records the tee
+    /// dropped on its way in — but **one line per hole, not per record**, which
+    /// the first version of this comment got wrong. `TeeSink` counts each record
+    /// it could not hand over; `LiveSource` compares `ingest_seq` against the
+    /// expected next and emits one gap for the whole discontinuity however wide
+    /// it is. The two are equal only when every hole is one record across.
+    ///
+    /// The pair that *should* agree is `TeeSink::secondary_dropped` against
+    /// `LiveStats::records_missed`, which is the width the live source
+    /// accumulates separately. Neither is derived from the other, so a
+    /// disagreement means one of them is wrong. Counting `blind` lines against
+    /// the tee would instead report a disagreement on every healthy run that
+    /// ever dropped two records at once.
     Blind {
         at: Ts,
         cause: quant_core::event::GapCause,
@@ -528,7 +536,7 @@ pub enum Agreement {
 /// healthy run" -- and it is the same argument, applied to the other end.
 ///
 /// A fresh registry is used for the recompute because only the aggregate money
-/// and fill count are compared, and `a_journal_replays_the_same_through_any_registry`
+/// and fill count are compared, and `an_instrument_is_named_by_exchange_and_symbol_not_by_index`
 /// pins that those do not depend on id assignment.
 #[must_use]
 pub fn agrees(entries: &[JournalEntry]) -> Agreement {

@@ -306,13 +306,13 @@ fn print_ours(
     }
     if let Some(fill) = &ours.last_fill {
         outln!(
-            "          last fill {:?} {} x {} fee {}, {} (fill #{})",
+            "          last fill {:?} {} x {} fee {}, {} (order #{})",
             fill.side,
             fill.px,
             fill.qty,
             fill.fee,
             ago(market.at, fill.at),
-            fill.fill_ordinal
+            fill.client_order_id
         );
     } else {
         outln!("          no fill at or before this instant");

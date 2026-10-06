@@ -208,12 +208,6 @@ fn logs_for(root: &Path, symbol: &str) -> Vec<PathBuf> {
     found
 }
 
-/// Read one metrics line.
-///
-/// Strict about the fields it claims to understand and silent about any it does
-/// not, which is the same stance `quant-binance::sequence` takes with venue
-/// payloads: a new field added upstream must not make an old line unreadable,
-/// but a *missing* one must be loud, because it means the format moved.
 /// A metrics event, or `None` if this line is not one.
 ///
 /// The whole of the format this reader still has to know: `tracing`'s JSON
@@ -227,6 +221,15 @@ fn metrics_envelope(line: &str) -> Option<serde_json::Value> {
 }
 
 /// Read one metrics event into the type the emitter wrote.
+///
+/// Strict about what it claims to understand and silent about what it does not,
+/// which is the same stance `quant-binance::sequence` takes with venue payloads:
+/// a field added upstream must not make an old line unreadable, but a payload
+/// that will not deserialize must be loud, because it means the format moved.
+///
+/// (This paragraph documented `metrics_envelope` for one commit, because M7.5.g
+/// inserted a new item between it and the function it describes. Found by the
+/// post-milestone audit — the same way the two dangling test references were.)
 fn parse_line(envelope: &serde_json::Value, line: &str, log: &Path) -> Result<HealthAt, String> {
     let stamp = envelope
         .get("timestamp")

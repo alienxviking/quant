@@ -55,15 +55,20 @@ pub struct FillAt {
     pub px: Px,
     pub qty: quant_core::fixed::Qty,
     pub fee: Notional,
-    /// The journal's `client_order_id`.
+    /// The engine's own `ClientOrderId` for the order this fill belongs to.
     ///
-    /// **A fill ordinal, not the engine's order id.** `paper.rs` writes
-    /// `ClientOrderId(self.fills)` because `RunObserver::on_fill` is never
-    /// handed the real one, and refused orders consume an id before the risk
-    /// check — so the first refusal desynchronises it permanently. Carried and
-    /// labelled rather than printed as an id: an unlabelled wrong number is M4's
-    /// confidently-wrong-report failure in miniature.
-    pub fill_ordinal: u64,
+    /// It was a *fill ordinal* until M7.5.a, because `RunObserver::on_fill` was
+    /// never handed the real id and `paper.rs` wrote `ClientOrderId(self.fills)`
+    /// instead. The engine now passes `execution.client_order_id()` through, so
+    /// this is the real thing and pasting it into a `jq` filter over the journal
+    /// finds the submission it came from.
+    ///
+    /// The field kept the old name for one commit after the value changed, and
+    /// `explain` kept printing it as `fill #n`. That is worse than either state
+    /// on its own: ids skip wherever an order was refused, so a correct number
+    /// under the wrong label reads as a journal that lost lines. Found by the
+    /// post-M7.5 audit.
+    pub client_order_id: u64,
 }
 
 /// What the engine claimed to believe, written down at the time.
@@ -104,7 +109,7 @@ pub fn ours_at(
         return Ok(out);
     }
 
-    // `Started.at` is hard-coded to zero in `paper.rs`, so a journal cannot date
+    // `Started.at` was hard-coded to zero until M7.5.a, so a journal could not date
     // its own beginning -- see docs/observability.md. The first *fill* is the
     // earliest instant the journal can speak for, and anything before it is
     // reported as such rather than answered with a zero position that looks
@@ -158,7 +163,7 @@ pub fn ours_at(
                     px: *px,
                     qty: *qty,
                     fee: *fee,
-                    fill_ordinal: client_order_id.0,
+                    client_order_id: client_order_id.0,
                 };
                 if *ts <= at {
                     out.last_fill = Some(fill);

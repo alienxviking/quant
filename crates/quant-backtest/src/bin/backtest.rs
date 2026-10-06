@@ -229,11 +229,22 @@ fn open_journal(args: &Args) -> Result<Option<Arc<Mutex<Journal>>>, String> {
 }
 
 /// The opening mark, which is what dates the journal's own beginning.
+///
+/// The wall clock, not a zero -- and this is the *second* time that had to be
+/// said. M7 recorded `Started.at` hard-coded to zero as one of three defects;
+/// M7.5.a fixed it in the paper binary; and M7.5.f reintroduced it here, three
+/// days later, under a doc comment claiming the opposite. Found by the
+/// post-milestone audit.
+///
+/// It is a wall-clock reading rather than an event time because nothing has been
+/// replayed yet: the engine's clock is the event stream and the stream has not
+/// started. That makes this the one timestamp in the file not derived from
+/// market data, which is why `ours.rs` reads it and refuses to *filter* on it.
 fn start_journal(journal: &Arc<Mutex<Journal>>, args: &Args) -> std::io::Result<()> {
     write(
         journal,
         &JournalEntry::Started {
-            at: Ts::from_nanos(0),
+            at: quant_core::time::Clock::now(&quant_core::time::SystemClock),
             cash: args.cash,
             schema: quant_engine::journal::SCHEMA,
         },

@@ -293,8 +293,7 @@ pub struct Engine<S, V, R, K> {
     notes: Vec<crate::strategy::Note>,
     ledger: Ledger,
     portfolio: Portfolio,
-    /// Optional, because a backtest has nothing worth journalling: it can be
-    /// re-run from raw, and a two-week paper session cannot.
+    /// Optional, because a backtest need not journal: it can be re-run from raw, and a two-week paper session cannot.
     observer: Option<Box<dyn RunObserver + Send>>,
 }
 

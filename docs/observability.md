@@ -154,7 +154,7 @@ Until then the parser is strict in one place and silent in another, and the
 sentence that used to stand here named only the first. A line that *looks* like
 a metrics line and will not parse is reported as `NoHealth::Unparseable` rather
 than skipped — that half is built. But a line is only looked at at all if it
-contains the `metrics symbol=` sentinel, and that literal is itself part of the
+contained the `metrics symbol=` sentinel, and that literal was itself part of the
 format we do not own, so the day the emitter changed every line would stop
 matching at once and the reader fell through to `NoHealth::NotCovered` — *"no
 metrics line covers this instant -- the process may not have been running"*.
@@ -364,16 +364,22 @@ between the process starting and its first journalled event: there the honest
 answer is *nothing had happened yet*, where a dated `Started` would say *the
 session was up and flat*. Fix it with the run log.
 
-**Nothing watches the tee during a run.** `TeeSink::secondary_dropped()` exists
-and is called from nowhere outside its own module, so no line of output says
-whether the engine missed records the capture received. This matters because M5's
-exact-agreement criterion silently assumes it was zero.
+**Nothing watched the tee during a run, and half of that is fixed.** When this
+was written `TeeSink::secondary_dropped()` was called from nowhere outside its
+own module, so no line of output said whether the engine missed records the
+capture received — which matters because M5's exact-agreement criterion silently
+assumes it was zero.
 
-It *is* checkable after the fact, and the rehearsals did check it: the paper
-binary prints `events N reached the engine` in its shutdown summary and the
-capture's own summary carries `records=N`, and a dropped record makes the first
-smaller — the engine finds the `ingest_seq` hole itself. So this is a gap in
-*surveillance*, not in recoverability.
+The reason turned out to be structural rather than an oversight: `capture::run`
+takes a closure that *builds* the tee and moves it in, so no reference survived
+to ask. M7.5.d put the count behind an `Arc<AtomicU64>` the caller keeps, and the
+paper binary now prints a `tee` line in its shutdown summary. The engine also
+journals a `blind` entry per hole, so the loss leaves a dated record rather than
+only a number.
+
+What is still true is the *during*: the counter reaches no metrics line and no
+`ops/*.sh`, so an operator watching a live run still cannot see the engine
+falling behind until it ends. A gap in surveillance, not in recoverability.
 
 **This used to end "`explain` reports both numbers in its provenance block", and
 it reports neither.** The `events_read` it does print is a third quantity

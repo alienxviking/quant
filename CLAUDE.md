@@ -4,7 +4,8 @@ Context for any Claude session working in this repo. Read `README.md`,
 `docs/data-contract.md` and `docs/engine-contract.md` too — this file is the
 working agreement; those are the design. The data contract governs data at rest;
 the engine contract governs the seam a strategy sees. `docs/observability.md`
-(M7) and `docs/paper-run.md` (M5) cover their own milestones.
+(M7), `docs/run-log.md` (M7.5) and `docs/paper-run.md` (M5) cover their own
+milestones.
 
 ## What this is
 
@@ -110,15 +111,25 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 ## State
 
-**M0 through M7 are complete.** M5's fortnight ran 2026-09-18 → 2026-10-02 and
+**M0 through M7.5 are complete.** M5's fortnight ran 2026-09-18 → 2026-10-02 and
 **passed**: paper P&L reproduced a backtest over the same window exactly, on both
-symbols, to the satoshi. 416 tests green in debug and release, clippy and fmt
-clean, ~30,700 lines across 12 crates.
+symbols, to the satoshi. 454 tests green in debug and release, clippy and fmt
+clean, ~34,200 lines across 12 crates.
 
-The freeze is over. The next milestone is the run log, which is what unblocks
-deleting `quant-explain::health`'s prose parser and the three defects M7's
-scoping surfaced — all of them `quant-engine`/`quant-backtest` changes that the
-fortnight forbade.
+M7.5, the run log, shipped over seven slices (2026-10-05 → 2026-10-06) and its
+three criteria are measured in `docs/run-log.md` §7. `JournalEntry` now holds
+fourteen variants behind an exhaustive `match` with no `_` arm, so a future
+variant **cannot silently fail to move money** — a compile error rather than a
+paragraph, and it earned that twice during the milestone itself. `runlog check`
+reads a journal and says whether it accounts for every decision it implies;
+`runlog diff` compares a live run against a replay and **refuses** rather than
+agreeing when there is nothing to compare.
+
+Everything the fortnight forbade is now done: `min_notional` is enforced by the
+venue, the risk trip is journalled at the instant, the tee's drop counter is
+readable, the three defects M7's scoping surfaced are closed, and the prose
+parser is gone — replaced not by a JSON parser but by a **type both sides
+share**.
 
 The worktree discipline that made M2.e and M7 buildable *during* a run is worth
 keeping for the next one: `supervise.sh` execs `target/release/paper` on every
@@ -1620,8 +1631,9 @@ it was conducted, kept because the next long run — M8 — repeats most of it.
 
 ### Where things stand
 
-**M0 through M7 are complete.** 416 tests green in debug and release, clippy and
-fmt clean, ~30,700 lines across 12 crates. The next milestone is the run log.
+**M0 through M7.5 are complete.** 454 tests green in debug and release, clippy
+and fmt clean, ~34,200 lines across 12 crates. The next milestone is **M8**,
+live trading with tiny capital.
 
 How it was watched, which worked and is worth repeating:
 
@@ -1770,9 +1782,6 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
 
 ### Still open
 
-- **M5 passed and the freeze is over.** `quant-engine`, `quant-sim` and the
-  strategy are editable again, which is what every item below was waiting for.
-
 - **A supervisor can start a doomed final attempt.** `supervise.sh`'s deadline ran
   46 s past its child's, so when the paper binary exited *because it had finished*
   the supervisor restarted it for a 60-second coda — creating a second session on
@@ -1780,21 +1789,77 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   A child exiting because it completed is not a child dying; only the second
   deserves a restart. Fix before M8.
 
-- **`min_notional` is registered and enforced by nothing.** Nothing in `quant-sim`
-  or `quant-engine` reads it, so the fortnight happily filled 822 ETHUSDT orders
-  at ~$2.58 each — below Binance's spot minimum, which a live venue would have
-  rejected outright. The first symptom at M8 would be order flow that simply does
-  not happen. `tick_size` and `lot_size` are in the same position.
+- **Queue position and market impact remain unmeasured**, as predicted, and the
+  fortnight could not change that: a paper venue uses simulated fills, so our
+  orders were never in the book and nobody in the recording reacted to them.
+  **Only M8 can measure them.**
 
-- **M7.5 (the run log) is through slice f.** `runlog check` reads a journal and
-  reports whether it accounts for every decision it implies; `runlog diff`
-  compares a live run against a replay and **refuses** rather than agreeing when
-  there is nothing to compare or when the live side restarted. `backtest
-  --journal` writes the replay side, through the *same* `JournalWriter` the
-  paper binary uses — a second writer would mean the diff measured the writers
-  as much as the runs. All three criteria are measured in `docs/run-log.md` §7.
-  Slice (g) remains: switch the tracing emitter to `.json()` and delete
-  `quant-explain::health` in one commit.
+- **The strategy question is answered and the answer is no.** A crossover at 209
+  round trips a week cannot survive 10 bps a side. M5 and beyond are about the
+  platform being trustworthy, not about this strategy — and a lower-turnover or
+  maker-side idea is the shape that could work, which is a thing to try *after* the
+  platform can measure it honestly.
+
+- **Four defects the post-M7.5 audit found, all mine and all from the week
+  before.** The audit was six readers checking the docs against the code and
+  then refuting each other, the same shape as the 2026-09-20 one that found the
+  M2.e ordering bug. It is worth running after a milestone, because what it
+  catches is exactly what a milestone's own tests do not.
+
+  `Engine::minting_from` was **built in M7.5.a and called from nowhere**, so a
+  restarted paper session reminted ids from 1 and handed out ids the file
+  already held. `runlog check` would have reported *no hole*, correctly — the
+  ids are not missing, they are ambiguous, which is worse and which nothing
+  downstream can detect. `ids_continue_across_a_restart_rather_than_repeating`
+  had existed since M7.5.a and passed throughout: it tested the arithmetic of
+  `next_order_id`, not that anybody called it. **Fourth time this project has
+  built a thing and not wired it** (M4's cost flags, M6's `FillObserver`,
+  M7.5.e's `Recorded::take_notes`), and the first where a green test sat beside
+  the gap the whole time.
+
+  `backtest --journal` wrote `Started.at = 0` under a doc comment reading *"the
+  opening mark, which is what dates the journal's own beginning"* — M7 recorded
+  that exact defect, M7.5.a fixed it in the paper binary, and M7.5.f
+  reintroduced it three days later in the other one.
+
+  `decisions_at` set "the stream came back" from `Submitted | Filled` only,
+  under a comment saying *"any entry the engine wrote after a gap is proof"*. A
+  run that recovered and then did not trade for an hour kept reporting
+  blindness — turning a quiet hour back into the dark hour that block exists to
+  tell it apart from.
+
+  And the claim that `TeeSink::secondary_dropped` and the engine's `blind` lines
+  were **two independent counts of one fact** was wrong: the tee counts dropped
+  *records*, `LiveSource` emits one gap per *hole*. The pair that should agree is
+  `secondary_dropped` against `LiveStats::records_missed`.
+
+- **A doc comment can drift onto a different item entirely, and the compiler is
+  fine with it.** Two M7.5 insertions landed *inside* existing doc blocks, so
+  "Read one metrics line / strict about the fields it claims to understand" came
+  to document `metrics_envelope`, which reads no fields, and "The thing being
+  tested / both methods take `&mut self`" came to document `Note`, which has no
+  methods. Two more doc comments cited tests by names that do not exist. None of
+  it is visible to `cargo test`. **After inserting an item, check what the
+  comment above it now describes** — the companion to the existing rule about
+  grepping for text that should be gone.
+
+### Closed, and what each one taught
+
+- **M5 passed and the freeze is over.** `quant-engine`, `quant-sim` and the
+  strategy are editable again, which is what every item below was waiting for.
+
+- **`min_notional` is enforced, as of M4.c.** `Filters { tick_size, lot_size,
+  min_notional }` lives in `quant-core` and `SimulatedVenue::enforcing` applies
+  all three at an order's first `observe`. Re-running the fortnight with them on
+  leaves BTCUSDT byte-identical and takes ETHUSDT from 822 fills to **zero** —
+  the proof that half that run measured orders which could not have existed.
+
+- **M7.5 (the run log) is complete**, over seven slices. `runlog check` reads a
+  journal and reports whether it accounts for every decision it implies;
+  `runlog diff` compares a live run against a replay and **refuses** rather than
+  agreeing when there is nothing to compare or when the live side restarted.
+  `backtest --journal` writes the replay side through the *same* `JournalWriter`
+  the paper binary uses. All three criteria are measured in `docs/run-log.md` §7.
 
 - **A check that excludes the discriminating field is vacuous, and this one
   nearly shipped.** `runlog diff` first compared decisions *without* their
@@ -1807,12 +1872,6 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   check, ask what input would make it fail* — and the first where the answer was
   "almost nothing would".
 
-- **The run log was the next milestone**, and it started.
-  Orders that never filled, risk refusals, cancels and strategy state are
-  recorded nowhere and are **not recoverable by any reader** — M7 established
-  that boundary rather than crossing it, and building the reader first made
-  concrete what those entries have to contain. It also unblocks three things
-  below that are all waiting on the same unfreeze.
 - **A hard kill between a risk trip and shutdown used to lose the trip. Fixed
   in M7.5.d**, and it was two defects wearing one coat. The known half: the
   switch was journalled at shutdown, so a kill in between lost it and the
@@ -1823,10 +1882,7 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   fires from inside the seam at the instant the limit binds — the write-ahead
   rule the journal already applied to fills and submissions, arriving at the
   third place that needed it.
-- **Queue position and market impact remain unmeasured**, as predicted, and the
-  fortnight could not change that: a paper venue uses simulated fills, so our
-  orders were never in the book and nobody in the recording reacted to them.
-  **Only M8 can measure them.**
+
 - **A decorator that forgets to forward a new trait method is silent, and
   M7.5.e found one.** `Recorded<S>` wraps the strategy to sample equity, and
   when `Strategy::take_notes` was added it inherited the trait's default —
@@ -1838,11 +1894,6 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   **Adding a method to a trait with decorators means checking every decorator**
   — the compiler will not, because that is what a default is for.
 
-- **The strategy question is answered and the answer is no.** A crossover at 209
-  round trips a week cannot survive 10 bps a side. M5 and beyond are about the
-  platform being trustworthy, not about this strategy — and a lower-turnover or
-  maker-side idea is the shape that could work, which is a thing to try *after* the
-  platform can measure it honestly.
 - **Three defects M7's scoping surfaced — all three now closed.** The journal's
   `client_order_id` was a *fill ordinal* rather than the engine's id, and
   `Started.at` was hard-coded to zero; both fell to M7.5.a. The third was the

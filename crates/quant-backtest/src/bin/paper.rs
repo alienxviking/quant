@@ -217,6 +217,14 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // reporting "cash 0 from 0" on a session configured with a hundred.
     if !recovered.entries.is_empty() {
         engine = engine.resuming(resumed);
+        // And the id counter, which `resuming` does *not* carry: `Ledger::mint`
+        // starts at 1 with the process, so a restart would hand out ids the file
+        // already holds. `runlog check` reads density from 1 and would see no
+        // hole, because there is none -- the ids are not missing, they are
+        // ambiguous, which is worse. Built in M7.5.a as `minting_from` and
+        // called from nowhere until the post-milestone audit found it: the
+        // fourth time this project has built a thing and not wired it.
+        engine = engine.minting_from(journal::next_order_id(&recovered.entries));
     }
 
     // The engine blocks on its channel, so it gets a thread of its own -- the

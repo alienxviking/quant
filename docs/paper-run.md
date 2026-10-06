@@ -233,10 +233,12 @@ writes AppleDouble stubs that the verifier reports as strays).
 **The logs are evidence, not convenience.** Criterion 2 silently *assumes* the
 tee delivered every record to both consumers, and the only thing that can
 confirm it is a pair of numbers that live nowhere but those files. `TeeSink`
-does count its own drops, but `TeeSink::secondary_dropped()` is called from
-nothing except its own unit tests, so that counter never reaches an artifact and
-never reaches a log line — it is one of the three defects M7's scoping surfaced
-and it is not fixed inside the freeze. What *does* reach a file is the paper
+does count its own drops, and when this run was conducted
+`TeeSink::secondary_dropped()` was called from nothing but its own unit tests, so
+that counter reached no artifact at all — one of the three defects M7's scoping
+surfaced, and not fixable inside the freeze. M7.5.d fixed it: the paper binary
+now prints a `tee` line at shutdown and the engine journals a `blind` entry per
+hole. For *this* run, though, what reached a file is the paper
 binary's shutdown summary on stdout (`events N reached the engine`) and the
 capture's own closing line through tracing (`records=N`), and `supervise.sh`
 sends both streams of every attempt to `~/paper/logs/$SYMBOL-$STAMP.log`. Leave

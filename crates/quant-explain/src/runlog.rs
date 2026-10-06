@@ -46,6 +46,14 @@ pub enum Finding {
     },
     /// A claim went backwards, which no running total may do.
     ClaimWentBackwards { kind: String, from: u64, to: u64 },
+    /// Two decisions claim the same id.
+    ///
+    /// A journal written before `minting_from` was wired: a restarted session
+    /// reminted from 1, so the file holds two different orders under one id. The
+    /// hole check cannot see it — nothing is *missing* — which is precisely why
+    /// it needs saying separately. A checker that assumed its own fix had always
+    /// been in place would read such a file as COMPLETE.
+    DuplicateDecision { client_order_id: u64, times: usize },
 }
 
 impl core::fmt::Display for Finding {
@@ -67,6 +75,14 @@ impl core::fmt::Display for Finding {
             Self::ClaimWentBackwards { kind, from, to } => {
                 write!(f, "a running total for '{kind}' fell from {from} to {to}")
             }
+            Self::DuplicateDecision {
+                client_order_id,
+                times,
+            } => write!(
+                f,
+                "client_order_id {client_order_id} names {times} different decisions, \
+                 so the ids in this file are ambiguous rather than dense"
+            ),
         }
     }
 }
@@ -114,6 +130,29 @@ pub fn check(entries: &[JournalEntry]) -> Report {
     }
     report.decisions = seen.len();
     seen.sort_unstable();
+    // Before the dedup, because the dedup is what would hide this.
+    let mut run = 1_usize;
+    for i in 1..seen.len() {
+        if seen[i] == seen[i - 1] {
+            run += 1;
+        } else {
+            if run > 1 {
+                report.findings.push(Finding::DuplicateDecision {
+                    client_order_id: seen[i - 1],
+                    times: run,
+                });
+            }
+            run = 1;
+        }
+    }
+    if run > 1 {
+        if let Some(&last) = seen.last() {
+            report.findings.push(Finding::DuplicateDecision {
+                client_order_id: last,
+                times: run,
+            });
+        }
+    }
     seen.dedup();
     if let Some(&highest) = seen.last() {
         let present: std::collections::BTreeSet<u64> = seen.iter().copied().collect();
@@ -375,9 +414,30 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
                 blind = Some((stamp, format!("{cause:?}")));
                 seen_since = false;
             }
-            // Any entry the engine wrote after a gap is proof the stream came
-            // back: the clock only advances on an event.
-            JournalEntry::Submitted { .. } | JournalEntry::Filled { .. } if blind.is_some() => {
+            // A restart is a new session; the previous session's blindness is
+            // not this one's state.
+            JournalEntry::Started { .. } => {
+                blind = None;
+                seen_since = false;
+            }
+            // `Stopped` proves nothing. It is written unconditionally at
+            // shutdown and stamped with `stats.last_ts` — which, for a session
+            // that ended while blind, *is* the gap event. Counting it would make
+            // every run that died in an outage report the stream as seen again,
+            // which is the one case where saying so is most wrong.
+            JournalEntry::Stopped { .. } => {}
+            // Any *other* entry the engine wrote is proof the stream came back,
+            // because the engine's clock only advances on an event -- so a line
+            // stamped after the gap was written while handling a later one.
+            //
+            // This listed `Submitted | Filled` until the post-milestone audit,
+            // which is narrower than the sentence above it in a way that
+            // mattered: a run that recovers and then simply does not trade for
+            // an hour kept reporting "with nothing seen since", turning a quiet
+            // hour back into the dark hour this block exists to tell it apart
+            // from. The comment stated the right rule and the match arm
+            // implemented a different one.
+            _ if blind.is_some() => {
                 seen_since = true;
             }
             _ => {}
@@ -613,5 +673,95 @@ mod tests {
         let d = decisions_at(&entries, 10_000, 1_000);
         let (_, _, recovered) = d.blind.expect("the gap is still on record");
         assert!(recovered, "a later entry proves the clock advanced again");
+    }
+    #[test]
+    fn a_quiet_hour_after_a_gap_is_not_reported_as_a_dark_one() {
+        // The audit's finding. `seen_since` was set only by `Submitted` and
+        // `Filled`, so a run that recovered and then did not trade kept
+        // reporting "with nothing seen since" -- turning a quiet hour back into
+        // the dark hour this whole block exists to distinguish it from. Any
+        // entry proves the clock advanced, because the clock is the event
+        // stream.
+        let entries = vec![
+            JournalEntry::Blind {
+                at: Ts::from_nanos(200),
+                cause: quant_core::event::GapCause::Disconnect,
+                last_good_ts: Ts::from_nanos(190),
+            },
+            // Recovery, evidenced by something that is neither a fill nor an
+            // order: the strategy's hourly claim.
+            JournalEntry::Note {
+                at: Ts::from_nanos(300),
+                kind: "claim".to_owned(),
+                detail: serde_json::json!({ "tally": {} }),
+            },
+        ];
+        let d = decisions_at(&entries, 10_000, 1_000);
+        let (_, _, recovered) = d.blind.expect("the gap is still on record");
+        assert!(
+            recovered,
+            "a claim after the gap proves the stream came back"
+        );
+    }
+
+    #[test]
+    fn a_restart_does_not_inherit_the_previous_session_s_blindness() {
+        // A `Started` after a gap is a new session, and the old session's
+        // darkness is not this one's state. Without this the first query of
+        // every restarted run reports an outage that ended before it began.
+        let entries = vec![
+            JournalEntry::Blind {
+                at: Ts::from_nanos(200),
+                cause: quant_core::event::GapCause::Disconnect,
+                last_good_ts: Ts::from_nanos(190),
+            },
+            JournalEntry::Started {
+                at: Ts::from_nanos(300),
+                cash: quant_core::Notional::from_raw(0),
+                schema: quant_engine::journal::SCHEMA,
+            },
+        ];
+        let d = decisions_at(&entries, 10_000, 1_000);
+        assert!(d.blind.is_none(), "a new session starts sighted");
+    }
+    #[test]
+    fn a_session_that_ends_while_blind_does_not_claim_the_stream_came_back() {
+        // `Stopped` is written unconditionally at shutdown and stamped with the
+        // engine's last event time -- which during a terminal outage is the gap
+        // itself. Counting it as proof would make every run that died in an
+        // outage report the market as visible again, which is exactly the case
+        // where that claim is most misleading.
+        let entries = vec![
+            JournalEntry::Blind {
+                at: Ts::from_nanos(200),
+                cause: quant_core::event::GapCause::Disconnect,
+                last_good_ts: Ts::from_nanos(190),
+            },
+            JournalEntry::Stopped {
+                at: Ts::from_nanos(200),
+            },
+        ];
+        let d = decisions_at(&entries, 10_000, 1_000);
+        let (_, _, recovered) = d.blind.expect("the outage is still the answer");
+        assert!(!recovered, "shutting down is not seeing the market again");
+    }
+
+    #[test]
+    fn two_decisions_under_one_id_are_named_rather_than_deduplicated() {
+        // What the hole check structurally cannot see: nothing is missing, so
+        // density holds and the file reads COMPLETE. A journal written before
+        // `minting_from` was wired has exactly this shape -- a restarted session
+        // reminted from 1 -- and a checker that assumed its own fix had always
+        // been in place would vouch for it.
+        let entries = vec![submitted(1, 10), submitted(2, 20), submitted(1, 30)];
+        let report = check(&entries);
+        assert_eq!(
+            report.findings,
+            vec![Finding::DuplicateDecision {
+                client_order_id: 1,
+                times: 2
+            }]
+        );
+        assert!(!report.is_complete());
     }
 }

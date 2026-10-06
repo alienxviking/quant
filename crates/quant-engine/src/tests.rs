@@ -845,3 +845,37 @@ fn notes_cannot_reveal_which_venue_the_strategy_was_wired_to() {
         "the diary is the same whichever venue it was wired to"
     );
 }
+
+#[test]
+fn an_engine_told_where_to_start_does_not_remint_ids_from_one() {
+    // `minting_from` existed from M7.5.a and was called from nowhere until the
+    // post-milestone audit. A unit test on `journal::next_order_id` would not
+    // have caught that -- it tests the number, not that anyone uses it -- so
+    // this tests the seam the binary actually goes through.
+    //
+    // What it guards: a restarted session whose ids began at 1 again would hand
+    // out ids the journal already holds. `runlog check` reads density from 1 and
+    // would report no hole, because there is none. The ids are not missing, they
+    // are ambiguous, which nothing downstream can detect.
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00")]),
+        RecordingVenue::default(),
+        AllowAll,
+        Recorder::default(),
+        CASH,
+    )
+    .minting_from(825);
+    engine.run().expect("run");
+
+    let first = engine
+        .venue()
+        .received
+        .first()
+        .expect("the strategy submits on the first event")
+        .0;
+    assert_eq!(
+        first,
+        ClientOrderId(825),
+        "an engine resumed at 825 must not hand out 1"
+    );
+}
