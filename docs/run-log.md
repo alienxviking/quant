@@ -232,7 +232,7 @@ a convention here rather than an afterthought.
 | c | Refusals, and which of the six limits bound | `Refusal { reason, bound }`, coalescing |
 | d | Risk's own clock, blindness, and the tee made reachable | `Tripped` at the instant, `Blind`, `secondary_dropped` |
 | e | The strategy's own words | `take_notes`, pulled not pushed |
-| f | `runlog check`, `runlog diff`, and the sabotages | the three criteria |
+| f | `runlog check`, `runlog diff`, and the sabotages | the three criteria — **met**, §7 |
 | g | The debt with a scheduled repayment | emitter to `.json()`, delete `health.rs` |
 
 Slice (a) is load-bearing out of proportion to its size: making `journal::replay`
@@ -300,3 +300,71 @@ demonstrated as one-liners against the finished fortnight — the questions get
 answered before the milestone is called done — and that slice (f) teaches
 `explain --at` to print the decisions around an instant, so the reader that
 established this boundary becomes the first consumer of the thing that crosses it.
+
+
+---
+
+## 7. The criteria, measured
+
+Against the finished fortnight, replayed through `backtest --journal` so there is
+a run log over the real window at all. The live journals predate this milestone
+and hold only fills and checkpoints, which is why the replay side is the one
+measured — and why `runlog diff` against a live journal is a thing to run at M8
+rather than now.
+
+**P1 — the record detects its own incompleteness.** `runlog check` on
+BTCUSDT: 3,845 lines, 824 decisions, 337 claims, **exit 0**, every id dense from
+1 to 824. Removing the `submitted` line for id 400 names it exactly —
+*"client_order_id 400 was minted and never written down"*, exit 1.
+
+Its honest limit, demonstrated rather than asserted: deleting a `note` leaves
+**no hole**, because a note consumes no id. The claim fold is what catches it —
+*"the strategy claimed 1 more 'entry' notes between two claims; the file holds
+0"*. Two layers, and the second is weaker on purpose: both sides of that fold
+are written by the same strategy, so it catches a dropped line and not a wrong
+belief.
+
+**P2 — the questions, as one-liners.**
+
+```bash
+# why did it not trade between 20:00 and 21:00 on 2026-09-29?
+explain ~/paper --at 2026-09-29T23:00:00Z --symbol BTCUSDT --window 1h
+#   decided   BLIND since 2026-09-29T18:35:01Z (Disconnect), with nothing seen since
+
+# which of the six limits bound, and when?
+jq -r 'select(.type=="refused") | "\(.at)  \(.bound)  by \(.by)"' run.jsonl
+#   1789744915755174000  order_notional  by risk   (5,768 of them under --max-order 50)
+
+# how many crossings produced no order, and why?
+jq -r 'select(.type=="note" and .kind=="no_op") | .detail.why' run.jsonl | sort | uniq -c
+#   412 crossed down while already flat          (ETHUSDT)
+```
+
+The first question is the one that needed more than `jq`, and finding out why is
+the useful part. The engine's clock *is* the event stream, so a twelve-hour
+outage writes nothing while it lasts — the `blind` line sits at the moment the
+stream stopped, eleven hours before the hour being asked about. A window query
+finds silence, and silence reads as *quiet*. So `explain --at` carries the last
+blindness forward from outside the window and reports whether anything has been
+seen since. Same shape as `market_at`'s day rule: ask narrowly, widen only when
+the narrow answer is the uninformative one.
+
+**P3 — the diff localises, and refuses rather than passing vacuously.** Two
+identical runs: `AGREE: 824 decisions`, exit 0. A genuinely different system
+(`--fast 12`): the first differing decision with both sides, exit 1. Nothing to
+compare: exit **2**. A live side holding two `started` entries: exit **2**, with
+the reason — a restart forfeits the exact match before any comparison begins.
+
+**The diff's first version was vacuous and the fortnight proved it.** It compared
+decisions without their timestamps, reasoning that a reader should not assume
+what M5's criterion proves. But the ids are dense from 1 and a long/flat
+crossover alternates buy and sell at one size, so every line read `submitted #n
+Buy 0.001` — run against two genuinely different strategies it compared 786
+decisions and found **every one equal**, reporting only that one side had more.
+The assumption being avoided was the thing worth testing: the tee gives both
+paths identical `local_recv_ts`, so a decision and its replay disagreeing about
+*when* is exactly the divergence this tool exists to find. Excluding the field
+discarded the only evidence.
+
+All six checks ship with the sabotage that reddens them, and each sabotage
+reddens its own tests and nothing else.

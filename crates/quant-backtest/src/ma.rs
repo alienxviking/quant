@@ -97,6 +97,8 @@ pub struct MaCrossover {
     last_pair: Option<(Px, Px)>,
     /// Next instant a `claim` is due, on an hourly grid of event time.
     next_claim_at: Option<Ts>,
+    /// Notes written so far, by kind — the running total a `claim` states.
+    tally: std::collections::BTreeMap<&'static str, u64>,
 }
 
 /// How often the strategy states its own running totals.
@@ -123,6 +125,7 @@ impl MaCrossover {
             notes: Vec::new(),
             last_pair: None,
             next_claim_at: None,
+            tally: std::collections::BTreeMap::new(),
         }
     }
 
@@ -136,6 +139,9 @@ impl MaCrossover {
             Some((f, s)) => (Some(f.to_string()), Some(s.to_string())),
             None => (None, None),
         };
+        // Counted here rather than at each call site, so a new note kind cannot
+        // be added without entering the tally a claim is checked against.
+        *self.tally.entry(kind).or_insert(0) += 1;
         self.notes.push(Note::new(
             kind,
             serde_json::json!({ "why": why, "fast": fast, "slow": slow }),
@@ -144,18 +150,26 @@ impl MaCrossover {
 
     /// State the running totals, so a dropped note between two claims shows up
     /// as a fold that does not reconcile.
+    ///
+    /// `tally` is keyed **by note kind**, which is what makes the check generic:
+    /// `runlog check` folds the notes between two claims by their own `kind`
+    /// field and compares against the difference between the two tallies,
+    /// knowing nothing about crossovers, averages or positions. A claim stating
+    /// `entries` and `no_ops` would have forced the checker to learn this
+    /// strategy's vocabulary, and the next strategy's after it.
+    ///
+    /// The rest is for a person reading the file. `samples` and `crossings` have
+    /// no per-note record and so cannot be folded — stated anyway, because the
+    /// claim is also the only place the indicator's own progress is written
+    /// down.
     fn claim(&mut self) {
         let s = self.stats;
         self.notes.push(Note::new(
             "claim",
             serde_json::json!({
+                "tally": self.tally,
                 "samples": s.samples,
                 "crossings": s.crossings,
-                "entries": s.entries,
-                "exits": s.exits,
-                "suppressed": s.suppressed,
-                "no_ops": s.no_ops,
-                "blind_intervals": s.blind_intervals,
             }),
         ));
     }

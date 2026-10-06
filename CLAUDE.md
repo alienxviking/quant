@@ -1786,7 +1786,28 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   rejected outright. The first symptom at M8 would be order flow that simply does
   not happen. `tick_size` and `lot_size` are in the same position.
 
-- **The run log is the next milestone**, and it can start now.
+- **M7.5 (the run log) is through slice f.** `runlog check` reads a journal and
+  reports whether it accounts for every decision it implies; `runlog diff`
+  compares a live run against a replay and **refuses** rather than agreeing when
+  there is nothing to compare or when the live side restarted. `backtest
+  --journal` writes the replay side, through the *same* `JournalWriter` the
+  paper binary uses — a second writer would mean the diff measured the writers
+  as much as the runs. All three criteria are measured in `docs/run-log.md` §7.
+  Slice (g) remains: switch the tracing emitter to `.json()` and delete
+  `quant-explain::health` in one commit.
+
+- **A check that excludes the discriminating field is vacuous, and this one
+  nearly shipped.** `runlog diff` first compared decisions *without* their
+  timestamps, on the reasoning that a reader should not assume what M5's
+  criterion proves. But ids are dense from 1 and a long/flat crossover
+  alternates buy and sell at one size, so every line read `submitted #n Buy
+  0.001`: run against two genuinely different strategies it compared 786
+  decisions and found **every one equal**. The assumption being avoided was the
+  thing worth testing. Fourth sighting of M5.c's lesson — *before trusting a
+  check, ask what input would make it fail* — and the first where the answer was
+  "almost nothing would".
+
+- **The run log was the next milestone**, and it started.
   Orders that never filled, risk refusals, cancels and strategy state are
   recorded nowhere and are **not recoverable by any reader** — M7 established
   that boundary rather than crossing it, and building the reader first made
