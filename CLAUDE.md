@@ -1436,10 +1436,10 @@ underneath a running supervisor can make its loop jump mid-execution. Merging to
   That reasoning was right for the wrong reason: the restart came from the
   harness, not from a crash.
 
-  Worth fixing before the next long run: a supervisor whose deadline is 46 s
-  ahead of its child's will always start a doomed final attempt. The child
-  exiting *because it finished* is not the same as the child dying, and only the
-  second deserves a restart.
+  Fixed in M8.a. A supervisor whose deadline outran its child's would always
+  start a doomed final attempt: the child exiting *because it finished* is not
+  the child dying, and only the second deserves a restart. A clean exit now
+  always ends supervision, and `ops/test-supervise.sh` pins it.
 
 - **A bug in M2.e, found and fixed while the run was in flight** (PR #27, not by
   me — worth reading before trusting anything else in that slice). `place`
@@ -1782,12 +1782,32 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
 
 ### Still open
 
-- **A supervisor can start a doomed final attempt.** `supervise.sh`'s deadline ran
-  46 s past its child's, so when the paper binary exited *because it had finished*
-  the supervisor restarted it for a 60-second coda — creating a second session on
-  the last day. Harmless here only because M2.e had landed three days earlier.
-  A child exiting because it completed is not a child dying; only the second
-  deserves a restart. Fix before M8.
+- **A supervisor could start a doomed final attempt. Fixed (M8.a), and `ops/`
+  has tests now.** `supervise.sh` broke its restart loop only on a clean exit
+  within **30s** of the deadline; M5's paper binary finished and exited with
+  **46s** left, so the supervisor started attempt 2 for a 60-second coda and
+  created a second session on the last day for both symbols. Without M2.e —
+  merged three days earlier for unrelated reasons — the fortnight would have
+  been unjudgeable.
+
+  The fix is not a wider window. `stop-run.sh` stops supervisors *before* it
+  signals anything, so a clean exit arriving in that loop is **never** a human
+  stopping the run; it is the child saying it did what it was asked. So a clean
+  exit now always ends supervision. An unexpectedly early one is made loud
+  instead of papered over by a respawn — stopping leaves a short capture, which
+  is visible, where restarting leaves a spurious extra session, which is subtle.
+  "Early" is measured against the duration the supervisor *requested*, not
+  against a window of wall clock, so it does not depend on how a rounding and a
+  deadline happen to line up. And paper mode will not begin an attempt shorter
+  than the whole minute its binary works in.
+
+  `ops/test-supervise.sh` runs the loop against a fake child in about twenty
+  seconds. Its first fixture used a 20s deadline and **passed on the broken
+  code**, because a clean exit that close falls inside the old 30s window — the
+  real coda had 46s. Moved outside it, the old behaviour produces four attempts
+  where one is correct. M2.e's lesson arriving in a shell script: a fixture that
+  fixes one side of the boundary under test proves much less than it looks like
+  it does.
 
 - **Queue position and market impact remain unmeasured**, as predicted, and the
   fortnight could not change that: a paper venue uses simulated fills, so our

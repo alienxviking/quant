@@ -114,6 +114,8 @@ ops/
   start-run.sh      start a run: supervisors + verify loop. `--paper` runs
                     M5's fortnight instead of a bare recorder
   supervise.sh      keep one symbol running to its deadline, restarting it
+                    only if it *died* -- a clean exit is the run finishing
+  test-supervise.sh exercise that restart rule against a fake child, in ~20s
   verify-loop.sh    verify during the capture rather than after it
   status.sh         "how is it going" in one command
   stop-run.sh       stop it in a way that still seals the files
