@@ -213,6 +213,30 @@ pub enum JournalEntry {
         cause: quant_core::event::GapCause,
         last_good_ts: Ts,
     },
+    /// The strategy's own account of something it decided.
+    ///
+    /// The column this milestone exists for, and the weakest one in the file.
+    /// Everything else here is written by the engine about facts it witnessed —
+    /// a fill it booked, an order it sent, a limit that bound. A note is the
+    /// strategy talking about itself, and `detail` is opaque, so nothing can
+    /// contradict it the way folding the fills contradicts a bad `Checkpoint`.
+    /// A strategy that writes nothing leaves a file that looks complete.
+    ///
+    /// The narrowing, not a fix: a strategy may periodically emit a note whose
+    /// `kind` is `claim`, holding its own running totals. The notes between two
+    /// claims must fold to the difference between them, so a **dropped** line is
+    /// detectable. Both sides of that fold are written by the same strategy, so
+    /// it catches a lost note and not a wrong belief. Conceded in
+    /// `docs/run-log.md` §6 rather than answered.
+    ///
+    /// Carries no `fee`, no `cash`, no `realized` and no `fills` — the three
+    /// defences that keep a decision line from being folded as money by someone
+    /// with the wrong filter. `Checkpoint` stays the only claim about money.
+    Note {
+        at: Ts,
+        kind: String,
+        detail: serde_json::Value,
+    },
     /// A session ended cleanly.
     ///
     /// Its absence is how a crash is told from a clean stop — the same
@@ -236,6 +260,7 @@ impl JournalEntry {
             | Self::Cancelled { at, .. }
             | Self::Orphaned { at, .. }
             | Self::Blind { at, .. }
+            | Self::Note { at, .. }
             | Self::Stopped { at } => *at,
         }
     }
@@ -420,6 +445,9 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             | JournalEntry::Tripped { .. }
             // Blindness is the absence of input, not a movement of money.
             | JournalEntry::Blind { .. }
+            // The strategy talking about itself. Deliberately carries nothing a
+            // money fold keys on, so it cannot be mistaken for one.
+            | JournalEntry::Note { .. }
             | JournalEntry::Stopped { .. }
             // Decisions. None of them moves the portfolio: a submission is an
             // intent, a refusal is an intent that stopped at the chokepoint,
@@ -600,6 +628,9 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
             | JournalEntry::Tripped { .. }
             // Consumes no id: nothing was decided, we simply could not see.
             | JournalEntry::Blind { .. }
+            // Consumes no id either: a note describes a decision, and the
+            // decision that minted an id is recorded by the engine beside it.
+            | JournalEntry::Note { .. }
             | JournalEntry::Stopped { .. } => None,
         })
         .max()

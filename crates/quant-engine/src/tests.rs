@@ -566,6 +566,7 @@ fn client_order_ids_are_unique_even_across_refusals() {
 struct Witness {
     tripped: Vec<(crate::risk::TripCause, Ts)>,
     blind: Vec<(GapCause, Ts, Ts)>,
+    notes: Vec<(&'static str, Ts)>,
 }
 
 impl crate::RunObserver for std::sync::Arc<std::sync::Mutex<Witness>> {
@@ -578,6 +579,10 @@ impl crate::RunObserver for std::sync::Arc<std::sync::Mutex<Witness>> {
             .expect("witness")
             .blind
             .push((cause, last_good_ts, at));
+    }
+
+    fn on_note(&mut self, note: &crate::strategy::Note, at: Ts) {
+        self.lock().expect("witness").notes.push((note.kind, at));
     }
 }
 
@@ -725,4 +730,118 @@ fn a_run_that_never_goes_blind_says_nothing_about_blindness() {
     );
     assert_eq!(seen.blind, Vec::new());
     assert_eq!(seen.tripped, Vec::new(), "and no limit bound either");
+}
+
+/// Writes one note per event, naming the event it saw.
+#[derive(Debug, Default)]
+struct Diarist {
+    pending: Vec<crate::strategy::Note>,
+}
+
+impl Strategy for Diarist {
+    fn on_market_event(&mut self, event: &MarketEvent, _ctx: &mut Context<'_>) {
+        self.pending.push(crate::strategy::Note::new(
+            "saw",
+            serde_json::json!({ "seq": event.meta().ingest_seq }),
+        ));
+    }
+
+    fn take_notes(&mut self, out: &mut Vec<crate::strategy::Note>) {
+        out.append(&mut self.pending);
+    }
+}
+
+#[test]
+fn a_note_is_taken_in_the_same_event_the_strategy_wrote_it() {
+    // The pull happens last in the step, after `on_market_event`, which is
+    // where a strategy does its deciding. Taken between steps 4 and 5 it would
+    // collect each note one event late and every timestamp in the strategy's
+    // column would be wrong by one event -- a file that disagrees with the
+    // engine's own entries about when the same instant was.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00"), trade(2, "100.00")]),
+        RecordingVenue::default(),
+        AllowAll,
+        Diarist::default(),
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    engine.run().expect("run");
+
+    let notes = std::mem::take(&mut seen.lock().expect("witness").notes);
+    assert_eq!(
+        notes,
+        vec![
+            ("saw", meta(1).local_recv_ts),
+            ("saw", meta(2).local_recv_ts)
+        ],
+        "each note carries the instant of the event that produced it"
+    );
+}
+
+#[test]
+fn a_strategy_that_keeps_no_diary_is_not_made_to_say_so() {
+    // The defaulted method, and the no-op property: `Recorder` implements
+    // nothing, and the run must produce no notes rather than empty ones.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00"), trade(2, "100.00")]),
+        RecordingVenue::default(),
+        AllowAll,
+        Recorder::default(),
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    engine.run().expect("run");
+    assert_eq!(seen.lock().expect("witness").notes, Vec::new());
+}
+
+#[test]
+fn notes_cannot_reveal_which_venue_the_strategy_was_wired_to() {
+    // The §7 criterion, re-run with a record attached. `take_notes` is a new
+    // path out of a strategy, and the thing to prove is that it did not become
+    // a path *in*: the same strategy value against a venue that fills
+    // everything and one that fills nothing must write the same diary.
+    //
+    // It is not a restatement of the existing wiring test. That one compares
+    // strategy state, which a note is derived from; this compares what actually
+    // reached the observer, which is what ends up in the file.
+    fn notes_against<V: ExecutionVenue>(venue: V) -> Vec<(&'static str, Ts)> {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+        let mut engine = Engine::new(
+            Scripted::new(vec![snapshot(1), trade(2, "100.75"), trade(3, "100.80")]),
+            venue,
+            AllowAll,
+            Diarist::default(),
+            CASH,
+        )
+        .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+        engine.run().expect("run");
+        let out = std::mem::take(&mut seen.lock().expect("witness").notes);
+        out
+    }
+
+    #[derive(Debug, Default)]
+    struct FillsNothing;
+    impl ExecutionVenue for FillsNothing {
+        fn submit(&mut self, _id: ClientOrderId, _r: &OrderRequest, _now: Ts) {}
+        fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
+        fn poll(&mut self, _now: Ts, _out: &mut Vec<ExecutionEvent>) {}
+    }
+
+    let filling = notes_against(RecordingVenue::default());
+    // Non-empty first. Comparing two empty diaries is a test that passes
+    // whatever the engine does -- it stayed green with the pull deleted
+    // outright, which is M5.c's vacuous identity in a new costume.
+    assert_eq!(
+        filling.len(),
+        3,
+        "one note per event, or there is nothing being compared"
+    );
+    assert_eq!(
+        filling,
+        notes_against(FillsNothing),
+        "the diary is the same whichever venue it was wired to"
+    );
 }

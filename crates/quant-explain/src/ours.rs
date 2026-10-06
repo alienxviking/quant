@@ -212,6 +212,7 @@ const fn entry_ts(entry: &JournalEntry) -> Option<Ts> {
         | JournalEntry::Cancelled { at, .. }
         | JournalEntry::Orphaned { at, .. }
         | JournalEntry::Blind { at, .. }
+        | JournalEntry::Note { at, .. }
         | JournalEntry::Stopped { at } => Some(*at),
     }
 }

@@ -30,7 +30,7 @@ use quant_core::execution::{ClientOrderId, ExecutionEvent, OrderKind, OrderReque
 use quant_core::fixed::{Px, Qty};
 use quant_core::instrument::InstrumentId;
 use quant_core::time::Ts;
-use quant_engine::{Context, Strategy};
+use quant_engine::{Context, Note, Strategy};
 
 /// How the crossover is configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +62,19 @@ pub struct MaStats {
     pub suppressed: u64,
     /// Intervals with no mid to sample, because the book was dark.
     pub blind_intervals: u64,
+    /// Crossings that were legitimately nothing to do: crossed up while already
+    /// long, or down while already flat.
+    ///
+    /// The `else` this strategy never had. `crossings` was documented as the
+    /// number of signals and silently was not the number of decisions --
+    /// `entries + exits + suppressed` fell short of it by however many of these
+    /// occurred, and nothing counted the difference. M5's ETHUSDT leg: 828
+    /// crossings, 822 submitted, 4 suppressed, and **two** that went nowhere and
+    /// were recorded by nothing at all.
+    ///
+    /// Now counted, which makes `crossings` an identity rather than an
+    /// approximation -- see `every_crossing_is_accounted_for`.
+    pub no_ops: u64,
 }
 
 /// Long when the fast average is above the slow one, flat otherwise.
@@ -76,7 +89,22 @@ pub struct MaCrossover {
     /// The order we are waiting on, if any.
     working: Option<ClientOrderId>,
     stats: MaStats,
+    /// Written here, taken by the engine at the end of the event. The strategy
+    /// never hands these anywhere itself -- see `Strategy::take_notes`.
+    notes: Vec<Note>,
+    /// The averages behind the most recent decision, so a note can say *why*
+    /// rather than only *what*.
+    last_pair: Option<(Px, Px)>,
+    /// Next instant a `claim` is due, on an hourly grid of event time.
+    next_claim_at: Option<Ts>,
 }
+
+/// How often the strategy states its own running totals.
+///
+/// Hourly: 336 lines over a fortnight against ~3,500 of everything else, which
+/// is cheap enough not to think about, and fine enough that a dropped note is
+/// localised to an hour rather than to a run.
+const CLAIM_INTERVAL_NANOS: i64 = 3_600 * 1_000_000_000;
 
 impl MaCrossover {
     #[must_use]
@@ -92,7 +120,44 @@ impl MaCrossover {
             last_side: None,
             working: None,
             stats: MaStats::default(),
+            notes: Vec::new(),
+            last_pair: None,
+            next_claim_at: None,
         }
+    }
+
+    /// Write something down, for the engine to collect.
+    ///
+    /// Money goes in as its decimal string, never as a number: invariant 1 says
+    /// prices do not travel through `f64`, and `serde_json` would turn an
+    /// integer price into exactly that on the way back in.
+    fn note(&mut self, kind: &'static str, why: &'static str) {
+        let (fast, slow) = match self.last_pair {
+            Some((f, s)) => (Some(f.to_string()), Some(s.to_string())),
+            None => (None, None),
+        };
+        self.notes.push(Note::new(
+            kind,
+            serde_json::json!({ "why": why, "fast": fast, "slow": slow }),
+        ));
+    }
+
+    /// State the running totals, so a dropped note between two claims shows up
+    /// as a fold that does not reconcile.
+    fn claim(&mut self) {
+        let s = self.stats;
+        self.notes.push(Note::new(
+            "claim",
+            serde_json::json!({
+                "samples": s.samples,
+                "crossings": s.crossings,
+                "entries": s.entries,
+                "exits": s.exits,
+                "suppressed": s.suppressed,
+                "no_ops": s.no_ops,
+                "blind_intervals": s.blind_intervals,
+            }),
+        ));
     }
 
     #[must_use]
@@ -151,6 +216,15 @@ impl Strategy for MaCrossover {
         }
 
         let now = ctx.now();
+        // Before the sampling gate, so a claim is still made across a quiet
+        // stretch -- an hour with no samples is exactly an hour whose silence
+        // someone will want accounted for.
+        let claim_due = self.next_claim_at.unwrap_or(now);
+        if now >= claim_due {
+            self.next_claim_at = Some(Ts::from_nanos(claim_due.as_nanos() + CLAIM_INTERVAL_NANOS));
+            self.claim();
+        }
+
         let due = self.next_sample_at.unwrap_or(now);
         if now < due {
             return;
@@ -164,6 +238,7 @@ impl Strategy for MaCrossover {
             // anchored yet. The indicator does not advance, which is how "do not
             // trade across a gap" holds without a rule about gaps.
             self.stats.blind_intervals += 1;
+            self.note("no_mid", "the book had no prices to sample");
             return;
         };
 
@@ -179,6 +254,7 @@ impl Strategy for MaCrossover {
         ) else {
             return;
         };
+        self.last_pair = Some((fast, slow));
         let above = fast > slow;
         let crossed = self.last_side.is_some_and(|was| was != above);
         self.last_side = Some(above);
@@ -192,6 +268,7 @@ impl Strategy for MaCrossover {
         // cost of fire-and-forget submission, charged in every world.
         if self.working.is_some() {
             self.stats.suppressed += 1;
+            self.note("suppressed", "an order was already working");
             return;
         }
 
@@ -199,9 +276,26 @@ impl Strategy for MaCrossover {
         if above && position.is_flat() {
             self.stats.entries += 1;
             self.working = Some(ctx.submit(self.order(Side::Buy)));
+            self.note("entry", "crossed up while flat");
         } else if !above && !position.is_flat() {
             self.stats.exits += 1;
             self.working = Some(ctx.submit(self.order(Side::Sell)));
+            self.note("exit", "crossed down while long");
+        } else {
+            // The arm that did not exist. Both cases are legitimate -- the
+            // signal agrees with the position we already hold -- but "nothing
+            // happened because there was nothing to do" and "nothing happened
+            // because something is broken" are the same silence in a file, and
+            // the operator at 3am is asking which.
+            self.stats.no_ops += 1;
+            self.note(
+                "no_op",
+                if above {
+                    "crossed up while already long"
+                } else {
+                    "crossed down while already flat"
+                },
+            );
         }
     }
 
@@ -209,5 +303,9 @@ impl Strategy for MaCrossover {
         if self.working == Some(event.client_order_id()) && event.is_terminal() {
             self.working = None;
         }
+    }
+
+    fn take_notes(&mut self, out: &mut Vec<Note>) {
+        out.append(&mut self.notes);
     }
 }

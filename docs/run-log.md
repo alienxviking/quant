@@ -186,12 +186,27 @@ the real run:
 - which of the six risk limits bound, and when?
 - how many crossings produced no order, and why?
 
-That third one has a known answer the current system cannot give. ETHUSDT:
-**828 crossings, 4 suppressed, 822 submitted — two crossings produced neither an
-order nor a suppression**, because the `if`/`else if` in `MaCrossover` has no
-`else`. Legitimate no-ops (crossed up while already long; crossed down while
-already flat), counted by nothing, findable today only by subtracting three
-counters of which two are unrecorded.
+That third one had a known answer the system could not give, and M7.5.e gave it.
+ETHUSDT signalled **828 crossings, 4 suppressed, 822 submitted — two produced
+neither an order nor a suppression**, because the `if`/`else if` in `MaCrossover`
+had no `else`. Legitimate no-ops (crossed up while already long; crossed down
+while already flat), counted by nothing.
+
+The arm exists now, and `crossings` is an identity rather than an approximation:
+`entries + exits + suppressed + no_ops == crossings`, asserted and printed.
+Measured on the finished fortnight it holds at 828 and 824.
+
+Two things that fixing it turned up. Every fixture in `quant-backtest`'s tests
+**rose before it fell**, so none of them could reach the arm — the indicator's
+first side was always *below* and its first crossing always upward, which is an
+entry. Reaching a no-op needs the side established as above at the first sample
+where both averages exist, which is never itself a crossing. That is why five
+milestones passed without the gap showing.
+
+And with venue filters enforced (M4.c), ETHUSDT's 828 crossings resolve to **413
+entries, 0 exits, 3 suppressed and 412 nothing-to-do** — the strategy signalling
+exits it can never take, because it never gets a position to exit. The
+`min_notional` defect arriving in a second, independent place.
 
 ### P3 — the diff localises, and refuses rather than passing vacuously
 

@@ -160,6 +160,17 @@ impl RunObserver for JournalWriter {
         self.record(&JournalEntry::Tripped { at, cause }, "a kill switch trip");
     }
 
+    fn on_note(&mut self, note: &quant_engine::Note, at: Ts) {
+        self.record(
+            &JournalEntry::Note {
+                at,
+                kind: note.kind.to_owned(),
+                detail: note.detail.clone(),
+            },
+            "a strategy note",
+        );
+    }
+
     fn on_blind(&mut self, cause: quant_core::event::GapCause, last_good_ts: Ts, at: Ts) {
         self.record(
             &JournalEntry::Blind {

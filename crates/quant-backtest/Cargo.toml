@@ -23,6 +23,8 @@ quant-sim = { workspace = true }
 # comparable.
 quant-binance = { workspace = true }
 quant-recorder = { workspace = true }
+# The strategy's notes are opaque JSON by design -- see `Strategy::take_notes`.
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

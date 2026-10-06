@@ -801,3 +801,93 @@ fn a_binding_order_limit_stops_the_crossover_before_the_venue() {
     assert_eq!(loose.stats().refused, 0);
     assert!(loose.portfolio().fills() > 0);
 }
+
+/// Rising from the very first sample, then falling.
+///
+/// The fixture that produces a crossing with nothing to do, and getting it right
+/// took a failed attempt worth recording. `up_then_down` opens flat at 100, so
+/// the first side the indicator takes is *below* and its first crossing is
+/// upward — an entry. A no-op needs the opposite: the side established as
+/// **above** at the first sample where both averages exist (which is never
+/// itself a crossing, since there is no previous side to differ from), and then
+/// a fall. That crossing is downward while flat, which is a real signal and
+/// legitimately nothing to do.
+///
+/// That `up_then_down` cannot reach the arm is exactly why the arm was missing
+/// for five milestones: every fixture in this file rose before it fell.
+fn rise_then_fall() -> Vec<Step> {
+    let mut steps = Vec::new();
+    for mid in [100, 102, 105, 109, 114] {
+        steps.push(Step::Book(mid));
+    }
+    for mid in [112, 107, 101, 95, 89] {
+        steps.push(Step::Book(mid));
+    }
+    steps
+}
+
+#[test]
+fn every_crossing_is_an_entry_an_exit_a_suppression_or_nothing_to_do() {
+    // `crossings` was documented as the number of signals and silently was not
+    // the number of *decisions*: the `if`/`else if` had no `else`, so a crossing
+    // up while already long, or down while already flat, went nowhere and was
+    // counted by nothing. M5's ETHUSDT leg signalled 828, submitted 822 and
+    // suppressed 4 -- and the two that made up the difference had never been
+    // seen by any counter in the system.
+    //
+    // This assertion is what the missing arm makes possible, and it is worth
+    // more than the counter it increments.
+    for steps in [up_then_down(), rise_then_fall()] {
+        let engine = run(&steps);
+        let ma = engine.strategy().inner().stats();
+        assert!(ma.crossings > 0, "the fixture has to cross: {ma:?}");
+        assert_eq!(
+            ma.entries + ma.exits + ma.suppressed + ma.no_ops,
+            ma.crossings,
+            "four outcomes, and they are exhaustive: {ma:?}"
+        );
+    }
+}
+
+#[test]
+fn a_crossing_with_nothing_to_do_is_recorded_as_such() {
+    // Crossing down while flat is a real signal and a legitimate no-op. Before
+    // this slice it produced no order, no suppression and no counter -- the same
+    // silence in the file as an hour in which nothing happened at all.
+    let engine = run(&rise_then_fall());
+    let ma = engine.strategy().inner().stats();
+    assert!(
+        ma.no_ops >= 1,
+        "a down-cross while flat has nothing to do, and says so: {ma:?}"
+    );
+}
+
+#[test]
+fn a_wrapped_strategy_still_gets_its_notes_out() {
+    // `Recorded<S>` is a decorator, and a decorator that forgets to forward a
+    // trait method inherits the default -- which for `take_notes` is silence.
+    // Every note `MaCrossover` wrote would have been swallowed here, in both
+    // binaries, with nothing raised anywhere and a journal that merely looked
+    // like a quiet strategy.
+    //
+    // Found by writing this test rather than before it. The same shape as M6's
+    // `FillObserver`, which was never called at all, and whose durability
+    // therefore did not exist.
+    #[derive(Debug, Default)]
+    struct Talks;
+    impl quant_engine::Strategy for Talks {
+        fn on_market_event(&mut self, _e: &MarketEvent, _c: &mut quant_engine::Context<'_>) {}
+        fn take_notes(&mut self, out: &mut Vec<quant_engine::Note>) {
+            out.push(quant_engine::Note::new("hello", serde_json::Value::Null));
+        }
+    }
+
+    let mut wrapped = Recorded::new(Talks, instrument(), SECOND);
+    let mut notes = Vec::new();
+    quant_engine::Strategy::take_notes(&mut wrapped, &mut notes);
+    assert_eq!(
+        notes.iter().map(|n| n.kind).collect::<Vec<_>>(),
+        vec!["hello"],
+        "the wrapper has to pass the diary through"
+    );
+}

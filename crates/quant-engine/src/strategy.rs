@@ -227,6 +227,33 @@ impl<'a> Context<'a> {
 /// outstanding orders, its indicators, its position. That is the cost of
 /// fire-and-forget submission, and it is charged identically in all three
 /// worlds.
+/// Something the strategy decided, in its own words.
+///
+/// The payload is **opaque to everything above it**. The engine stamps the time
+/// and copies the bytes; it has no opinion about what a crossing is, which is
+/// the same stance `Recorded<S>` takes about what a report is. That opacity is
+/// also this column's permanent weakness, conceded in `docs/run-log.md` §6: a
+/// `Checkpoint` can be contradicted by folding the fills, and nothing can
+/// contradict a note. A strategy that writes nothing produces a record that
+/// looks complete.
+///
+/// `kind` is `&'static str` rather than `String` on purpose. A strategy's note
+/// kinds are a fixed vocabulary decided when it is written, and a type that
+/// cannot hold a formatted value cannot grow unbounded cardinality in a file an
+/// operator has to grep at 3am.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    pub kind: &'static str,
+    pub detail: serde_json::Value,
+}
+
+impl Note {
+    #[must_use]
+    pub const fn new(kind: &'static str, detail: serde_json::Value) -> Self {
+        Self { kind, detail }
+    }
+}
+
 pub trait Strategy {
     /// The market did something.
     ///
@@ -241,5 +268,28 @@ pub trait Strategy {
     /// making it implement an empty method would teach nobody anything.
     fn on_execution(&mut self, event: &ExecutionEvent, ctx: &mut Context<'_>) {
         let _ = (event, ctx);
+    }
+
+    /// Hand over whatever the strategy decided to write down, and forget it.
+    ///
+    /// **Pulled, not pushed**, and that is the whole of this method's design.
+    /// The obvious alternative is `ctx.note(..)`, which would give `Context` a
+    /// channel to the outside world — and `Context` is the entire surface a
+    /// strategy has, kept deliberately free of anything that could reveal which
+    /// of the three wirings it got. A strategy that could write out could also
+    /// be written to. Pulling keeps the seam one-directional: the engine asks,
+    /// and a strategy that has nothing to say costs an empty `Vec`.
+    ///
+    /// It is also `Recorded<S>`'s argument arriving where it was going. The
+    /// engine has no business knowing what a report is; here it does not know
+    /// what a note means either, only when it was taken.
+    ///
+    /// Shaped after [`crate::ExecutionVenue::poll`]: drain into the caller's
+    /// buffer rather than returning a fresh `Vec`, so the per-event path does
+    /// not allocate for the overwhelmingly common case of nothing to say.
+    ///
+    /// Defaulted to nothing, so a strategy that keeps no diary need not say so.
+    fn take_notes(&mut self, out: &mut Vec<Note>) {
+        let _ = out;
     }
 }
