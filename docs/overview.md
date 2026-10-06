@@ -530,7 +530,7 @@ venue is **reported as unchecked**, which is the part that matters.
 One structured line per minute per symbol:
 
 ```
-metrics symbol=BTCUSDT msgs_per_sec=42 bytes_per_sec=14067
+metrics symbol=BTCUSDT msgs_per_sec=42 bytes_per_sec=14067   <- the pre-M7.5.g format
         queue=0 queue_peak=270 queue_capacity=4096 dropped=0
         latency_p50_ms=63 latency_p90_ms=81 latency_p99_ms=110
         latency_max_ms=153 latency_samples=2524 clock_skew=0

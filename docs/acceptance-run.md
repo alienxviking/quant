@@ -190,6 +190,13 @@ loop does not cry wolf every six hours. **Only errors fail the run.**
 One line per minute per symbol:
 
 ```text
+{"timestamp":"…","level":"INFO","fields":{"message":"metrics","metrics":"{…}"}}
+
+Since M7.5.g the line is JSON holding one serialized `quant-recorder::MetricsLine`,
+not the `key=value` prose below. The shape here is kept because this document
+describes a run that was conducted against the old emitter, and its logs still
+read this way:
+
 metrics symbol=BTCUSDT msgs_per_sec=37 bytes_per_sec=13070
         queue=0 queue_peak=18 queue_capacity=4096 dropped=0
         latency_p50_ms=41 latency_p90_ms=88 latency_p99_ms=140 latency_max_ms=212

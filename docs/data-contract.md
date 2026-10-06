@@ -347,25 +347,25 @@ explained after the fact.
 
 One structured log line per minute, plus a whole-run summary at shutdown:
 
-```text
-metrics symbol=BTCUSDT msgs_per_sec=37 bytes_per_sec=13070
-        queue=0 queue_peak=18 queue_capacity=4096 dropped=0
-        latency_p50_ms=41 latency_p90_ms=88 latency_p99_ms=140 latency_max_ms=612
-        latency_samples=2276 clock_skew=0
-        gap_disconnect=0 gap_overflow=0 gap_sequence=0
+```json
+{"timestamp":"2026-10-06T14:45:12.528794Z","level":"INFO",
+ "fields":{"message":"metrics",
+           "metrics":"{\"symbol\":\"BTCUSDT\",\"msgs_per_sec\":47,…}"},
+ "target":"quant_binance::capture"}
 ```
 
-The three `gap_*` counters went missing from this sample in an editing pass, so
-the criterion above asked for a gap count by cause and the document then printed
-a line without one. They are back, because the **field set** is the contractual
-part of this line: `quant-binance::capture` emits exactly these keys,
-`docs/acceptance-run.md` prints the same line, and M7's reader looks them up by
-name. The *numbers* are one minute's worth and illustrative, which is worth
-saying plainly: this copy and the one in `docs/acceptance-run.md` disagree about
-`latency_max_ms` (612 against 212), and nothing in this repository can say which
-minute either was taken from. A real line, copied verbatim out of the running
-fortnight's log, is pinned by `a_real_line_from_the_running_fortnight_parses` in
-`quant-explain`; that is the copy to hold an emitter against.
+**This was a prose line until M7.5.g and the field set was the contractual
+part**, which made an emitter and a reader agree forever through a rendering
+neither owned. It is now one serialized value: `quant-recorder::MetricsLine`,
+written by `MetricsLine::emit` and read back by `quant-explain::health` through
+the same type. The contractual part is therefore the **type**, not a list of
+keys — adding a field changes one struct and both sides at once.
+
+What is left of the format is `tracing`'s JSON envelope: a `timestamp`, and a
+`fields` map holding `message` and the serialized line. That much is pinned by
+`the_real_emitter_writes_what_this_reader_reads`, which runs the real emitter
+through a real subscriber and reads its bytes back with the real reader — the
+test M7 recorded as owed and could not then express.
 
 Rates are deltas between two readings, not totals, because a total that has
 stopped growing looks exactly like one that never grew. Latency percentiles come
@@ -396,7 +396,7 @@ above a one-second offset — the venue's own tolerance for a signed request. A
 negative latency is counted separately as `clock_skew` and never folded into the
 histogram, per §2.
 
-`clock_skew` on the line is that **count of samples**, not an offset in
+`clock_skew_samples` on the line is that **count of samples**, not an offset in
 milliseconds. It sits among fields that all end in `_ms`, which makes the
 misreading close to inviting — and M7's reader took the invitation:
 `quant-explain::health` parsed the count into a field it called `clock_skew_ms`
@@ -640,9 +640,10 @@ file at a real path.
 section is easy to read as "a restart inside a day is handled", and for this
 contract it is: the day normalizes, every event is there, and a replay across the
 boundary sees them in the venue's own order. The *process* is a separate
-question, and not this document's to answer. `JournalEntry` records fills,
-checkpoints, a risk trip and a stop, but nothing of the strategy, and
-`Engine::resuming` replaces only the portfolio — so a restarted paper process
+question, and not this document's to answer. `JournalEntry` records fills, checkpoints, a risk
+trip, a stop, the order lifecycle and the strategy's own notes (fourteen
+variants as of M7.5) — but still nothing from which in-memory strategy state
+could be rebuilt, and `Engine::resuming` still replaces only the portfolio — so a restarted paper process
 comes back with the right cash and position and with empty indicator windows, a
 zeroed equity sampler and a zeroed daily risk tally, while the backtest it is
 compared against runs all three continuously across the same instant. That

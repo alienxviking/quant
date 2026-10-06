@@ -28,13 +28,24 @@
 //! Queue depth genuinely is cross-thread: the producer increments it on the async
 //! side and the writer thread decrements it. That one has to be shared.
 //!
-//! # Why there is no exporter here
+//! # Why the only exporter here is a log line
 //!
 //! [`Metrics::sample`] gives a consistent-enough snapshot and [`MetricsReporter`]
-//! turns two samples into rates. What happens to that -- a log line, Prometheus,
-//! OpenTelemetry -- is a separate decision, and it belongs to M7 where the rest of
-//! the observability story lives. Wiring an exporter now would fix that choice
-//! before there is anything to observe with it.
+//! turns two samples into rates. What happens to that was deliberately left open
+//! at M1.e, because wiring an exporter before there was anything to observe would
+//! have fixed the choice too early.
+//!
+//! M7 made the choice and argued the alternatives down: no Prometheus, no `OTel`,
+//! no `/metrics`. A time-series store would be a fourth copy of numbers derived
+//! from artifacts already kept, with no way to notice when it disagreed, and it
+//! would put a listening socket in a process built `panic = "abort"` whose own
+//! history includes a metric that killed the recorder.
+//!
+//! So the export is [`MetricsLine::emit`], one `tracing` line, and it lives in
+//! this module as of M7.5.g — not in the venue adapter that calls it, because the
+//! test pinning it to `quant-explain`'s reader could not otherwise be expressed.
+//! The *when* still belongs to the caller, which is what keeps this module free
+//! of anything async.
 //!
 //! Nothing in this module is async or spawns anything, which is what keeps
 //! `quant-recorder` free of a runtime; see the crate docs. The caller decides when

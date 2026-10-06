@@ -73,7 +73,8 @@ pub struct MaStats {
     /// were recorded by nothing at all.
     ///
     /// Now counted, which makes `crossings` an identity rather than an
-    /// approximation -- see `every_crossing_is_accounted_for`.
+    /// approximation -- see
+    /// `every_crossing_is_an_entry_an_exit_a_suppression_or_nothing_to_do`.
     pub no_ops: u64,
 }
 
@@ -131,9 +132,18 @@ impl MaCrossover {
 
     /// Write something down, for the engine to collect.
     ///
-    /// Money goes in as its decimal string, never as a number: invariant 1 says
-    /// prices do not travel through `f64`, and `serde_json` would turn an
-    /// integer price into exactly that on the way back in.
+    /// Money goes in as its decimal string, never as a raw integer.
+    ///
+    /// Not because `serde_json` would lose it — it stores integers as `u64`/`i64`
+    /// and reaches for `f64` only when a token has a fraction or exponent, so a
+    /// scaled price would in fact round-trip exactly. The first version of this
+    /// comment claimed otherwise and was wrong.
+    ///
+    /// The real reason is invariant 1's other half: a bare integer makes every
+    /// reader responsible for knowing the `1e8` convention out of band, and the
+    /// first one that reads it as a double loses precision silently. That is the
+    /// same argument that put `DECIMAL(18,8)` rather than `INT64` in the Parquet
+    /// tier at M2.d — the scale travels with the value.
     fn note(&mut self, kind: &'static str, why: &'static str) {
         let (fast, slow) = match self.last_pair {
             Some((f, s)) => (Some(f.to_string()), Some(s.to_string())),

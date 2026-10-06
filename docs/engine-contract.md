@@ -367,10 +367,18 @@ recordings were concurrent and there is no ordering of them that is the truth.
 The half that is not closed is **state**, and it is the half that decides the
 criterion.
 
-`JournalEntry` records a start, fills, checkpoints, a kill-switch trip and a
-stop (`crates/quant-engine/src/journal.rs`). There is no entry for what the
-*strategy* held, and `Engine::resuming` (`crates/quant-engine/src/lib.rs`)
-replaces the **portfolio** and nothing else. So a restarted paper process comes
+`JournalEntry` had five variants when this was written — a start, fills,
+checkpoints, a kill-switch trip and a stop. M7.5 took it to fourteen, adding the
+order lifecycle (`Submitted`, `Refused`, `Accepted`, `Rejected`,
+`CancelRequested`, `Cancelled`, `Orphaned`), blindness (`Blind`) and the
+strategy's own notes (`Note`) — behind an exhaustive `match` with no `_` arm, so
+a fifteenth cannot silently fail to move money.
+
+What has **not** changed is the sentence this paragraph exists for: there is
+still no entry from which in-memory strategy state could be rebuilt, and
+`Engine::resuming` (`crates/quant-engine/src/lib.rs`) still replaces the
+**portfolio** and nothing else. A `Note` is a record of a decision, not a
+checkpoint to resume from — `docs/run-log.md` §2 refuses that in writing. So a restarted paper process comes
 back up with the right cash and the right position — which is exactly what
 criterion 4 asks for, and it is worth having — and with **empty `MaCrossover`
 windows, a zeroed equity sampler and a zeroed daily risk tally**.

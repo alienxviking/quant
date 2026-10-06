@@ -221,12 +221,6 @@ impl<'a> Context<'a> {
     }
 }
 
-/// The thing being tested.
-///
-/// Both methods take `&mut self`, so a strategy holds its own state — its
-/// outstanding orders, its indicators, its position. That is the cost of
-/// fire-and-forget submission, and it is charged identically in all three
-/// worlds.
 /// Something the strategy decided, in its own words.
 ///
 /// The payload is **opaque to everything above it**. The engine stamps the time
@@ -254,6 +248,13 @@ impl Note {
     }
 }
 
+/// The thing being tested.
+///
+/// Every method takes `&mut self`, so a strategy holds its own state — its
+/// outstanding orders, its indicators, its position, and since M7.5 whatever it
+/// has written down and not yet handed over. That is the cost of
+/// fire-and-forget submission, and it is charged identically in all three
+/// worlds.
 pub trait Strategy {
     /// The market did something.
     ///

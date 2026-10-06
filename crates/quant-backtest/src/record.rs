@@ -46,8 +46,11 @@ use tracing::error;
 /// strategy that trades less than five times between passes still leaves nothing
 /// new to check, and a hard kill before the fifth fill loses the lot. A
 /// time-based checkpoint would close it and needs a periodic hook the engine
-/// does not have — `RunObserver` fires only on fills and `Engine::run` blocks —
-/// which is a change to the seam and not a thing to slip in before a fortnight.
+/// still does not have. `RunObserver` has eleven methods as of M7.5 and fires on
+/// nine things besides fills, but every one of them is driven by an *event* —
+/// there is no tick, and `Engine::run` blocks — so a quiet stretch produces no
+/// callback to checkpoint from. That is a change to the seam, not a thing to
+/// slip in before a run.
 pub const CHECKPOINT_EVERY: u64 = 5;
 
 /// Writes fills down before the strategy is told about them.

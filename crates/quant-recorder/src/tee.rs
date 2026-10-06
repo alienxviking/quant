@@ -79,10 +79,15 @@ impl<P: RecordSink, S: RecordSink> TeeSink<P, S> {
 
     /// Records the secondary consumer did not get.
     ///
-    /// Each one is a hole in the secondary's view of `ingest_seq`, which is what
-    /// the live source turns into a gap. Reported so an operator can see the
-    /// engine falling behind *before* the strategy stops trading because its
-    /// book keeps being invalidated.
+    /// Counted **per record**, not per hole: the live source turns a run of
+    /// consecutive missing sequence numbers into one gap, so this is the width
+    /// and `LiveStats::records_missed` is the figure it should equal.
+    ///
+    /// Read at shutdown today, which is honest but late — the paper binary
+    /// prints it once the capture has returned. Reading it on the metrics tick
+    /// would let an operator see the engine falling behind *during* a run, and
+    /// is the obvious next step; it is not done, so this doc no longer claims
+    /// it.
     #[must_use]
     pub fn secondary_dropped(&self) -> u64 {
         self.secondary_dropped.load(Ordering::Relaxed)
