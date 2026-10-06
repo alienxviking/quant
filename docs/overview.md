@@ -253,7 +253,7 @@ use whatever tool fits, with no schema registration.
 | M5 | Paper trading | 2 weeks live; paper P&L matches a backtest over the same window | **done** |
 | M6 | Risk engine + kill switch | Limits provably veto a misbehaving strategy, under test | **done** |
 | M7 | Observability | "What was it doing at 03:14 last Tuesday?" answered in a minute | **done** |
-| M8 | Live, tiny capital | Live fills reconcile to the paper model within tolerance | |
+| M8 | Live, tiny capital | Our record and the venue's agree exactly; the model predicts the right kind of outcome for every order; its price error is inside a bound registered beforehand | |
 
 Milestones have **acceptance criteria, not feature lists**. "Done" means the
 criterion passes. Each is sized at roughly a week at 10–15 hours.
@@ -963,8 +963,10 @@ was never in the recorded book, and nobody in the recording reacted to it. No am
 cleverness recovers that from a capture — and the conclusion drawn from that at the end
 of M4, that M5 was therefore the instrument, was **wrong**. A paper venue fills against
 the same reconstructed book, so our orders are still not in it and nobody is still
-reacting to them. Only M8 puts an order somewhere other participants can see, so only
-M8 can measure these.
+reacting to them. A live venue is the only thing that puts an order somewhere other
+participants can see — though M8 as scoped sends market orders at the minimum, which
+never rest; see `docs/live-run.md` §2 — so measuring these needs a resting, passive
+strategy at a size that matters, which is a later milestone than M8.
 
 ### M5 — Paper trading *(the run is in flight)*
 
@@ -1052,7 +1054,9 @@ has never been run is not a harness.
 
 **What this run cannot measure:** queue position and market impact. A paper venue
 uses simulated fills, so our orders are still not in the book and nobody is still
-reacting to them. Only M8 can measure those.
+reacting to them. Only a milestone with **resting** orders at a size that
+matters can measure those — which M8 as scoped is not; it validates the adapter
+with market orders at the venue minimum. See `docs/live-run.md` §2.
 
 ### M6 — Risk engine + kill switch *(complete)*
 
@@ -1154,10 +1158,16 @@ finding it previously meant grepping 1388 log lines and knowing which ones to co
 
 ### M8 — Live, tiny capital
 
-**Criterion:** live fills reconcile to the paper model within tolerance.
+**Criterion:** three of them, because the inherited one-liner did two incompatible
+jobs. Our record and the venue's record describe the same events and must agree
+**exactly**; the model must predict the right *kind* of outcome for every order; and
+its price error must sit inside a bound registered **before** the run. Plus a lifecycle
+checklist where an unreached state is a failure, not a pass. `docs/live-run.md` §3.
 
-Note what this criterion is *not*. It is not "makes money". It is a measurement of whether
-the simulation was honest. See §11.
+Note what these are *not*. Not "makes money" — the strategy loses, and that is why it
+is the right instrument for testing an adapter. Not a measurement of queue position or
+market impact either: M8 sends market orders at the venue minimum, which never rest and
+move nothing. See §11, and `docs/live-run.md` §2.
 
 ---
 

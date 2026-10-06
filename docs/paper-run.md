@@ -507,12 +507,19 @@ and not wired.
 **Queue position and market impact.** A paper venue uses simulated fills, so our
 orders were never in the book and nobody in the recording reacted to them.
 Finishing the fortnight changed nothing about that, exactly as this section said
-it would not: both remain unmeasured, and only M8 — real orders, real money — can
-measure them.
+it would not: both remain unmeasured.
 
-An earlier draft of the engine contract claimed otherwise. The correction is
-recorded there rather than quietly fixed, because the wrong version made this run
-look like it settled something it cannot.
+**Nor does M8 measure them, which is a correction to what this section used to
+say.** It read "only M8 — real orders, real money — can measure them". Real
+orders are necessary and not sufficient: M8 as scoped sends market orders at the
+venue minimum, which never rest and move nothing. Microstructure needs a passive
+strategy and real size. See `docs/live-run.md` §2.
+
+An earlier draft of the engine contract claimed paper trading could settle this.
+That correction is recorded there rather than quietly fixed, because the wrong
+version made this run look like it settled something it cannot — and the same
+reasoning is why this paragraph names its own correction instead of absorbing
+it.
 
 ---
 

@@ -4,8 +4,8 @@ Context for any Claude session working in this repo. Read `README.md`,
 `docs/data-contract.md` and `docs/engine-contract.md` too — this file is the
 working agreement; those are the design. The data contract governs data at rest;
 the engine contract governs the seam a strategy sees. `docs/observability.md`
-(M7), `docs/run-log.md` (M7.5) and `docs/paper-run.md` (M5) cover their own
-milestones.
+(M7), `docs/run-log.md` (M7.5), `docs/paper-run.md` (M5) and `docs/live-run.md`
+(M8, written before the code) cover their own milestones.
 
 ## What this is
 
@@ -1156,7 +1156,10 @@ underneath a running supervisor can make its loop jump mid-execution. Merging to
   And at the end of M4 I said M5 was the instrument for measuring queue position
   and market impact. **Wrong**: a paper venue uses simulated fills, so our orders
   are still not in the book and nobody is still reacting to them. Both remain
-  unmeasured after M5, and **only M8 can measure them.**
+  unmeasured after M5. **M8 as scoped does not measure them either** —
+  `MaCrossover` sends market orders exclusively and an order that never rests has
+  no queue position; M8 measures the venue *adapter*. Measuring microstructure
+  needs a resting, passive strategy and real size. See `docs/live-run.md` §2.
 
 - **There is no `PaperVenue`, and that is a finding.** The architecture diagram
   lists three venues; the middle one does not need to exist. A paper venue fills
@@ -1812,7 +1815,10 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
 - **Queue position and market impact remain unmeasured**, as predicted, and the
   fortnight could not change that: a paper venue uses simulated fills, so our
   orders were never in the book and nobody in the recording reacted to them.
-  **Only M8 can measure them.**
+  **And M8 as scoped does not measure them either**: it validates the venue
+  adapter with market orders at minimum size, which have no queue position and no
+  impact. Microstructure needs a resting, passive strategy — a later milestone.
+  See `docs/live-run.md` §2.
 
 - **The strategy question is answered and the answer is no.** A crossover at 209
   round trips a week cannot survive 10 bps a side. M5 and beyond are about the

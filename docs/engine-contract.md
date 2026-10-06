@@ -276,10 +276,17 @@ edit, grep for the thing that should now be gone.
 
 A paper venue's fills are *simulated*. Our orders are still not in the book and
 nobody is still reacting to them, so a fortnight of paper trading measures
-neither of these two — it is the same recorded book, arriving live. Both are why
-**M8 exists**: real orders resting in the real book are the only instrument that
-can measure them. §9's *What paper trading cannot measure* carries the full
-correction and what M5 is worth instead.
+neither of these two — it is the same recorded book, arriving live. §9's *What
+paper trading cannot measure* carries the full correction and what M5 is worth
+instead.
+
+**And this used to end "both are why M8 exists".** That is a second correction to
+the same two sentences, made while scoping M8 in `docs/live-run.md` §2. Real
+orders *resting* in the real book are indeed the only instrument that can measure
+these — but M8 as scoped sends `OrderKind::Market` exclusively at the venue
+minimum, and an order that never rests has no queue position while $5 moves
+nothing. M8 measures the **adapter**. Microstructure needs a passive strategy and
+real size, and is a later milestone that does not yet have a number.
 
 ---
 
@@ -482,8 +489,11 @@ changes what M5 is worth.
 
 A paper venue uses *simulated* fills. Our orders are still not in the book, and
 nobody is still reacting to them. The two things M4 could not model remain
-unmodelled and unmeasured after M5, and **only M8 — real orders, real money —
-can measure them.** What M5 proves is that the engine runs continuously against
+unmodelled and unmeasured after M5. **Real orders and real money are necessary
+and not sufficient**: M8 as scoped sends market orders at the venue minimum,
+which never rest and move nothing, so it measures the adapter rather than the
+microstructure — see `docs/live-run.md` §2. What M5 proves is that the engine
+runs continuously against
 a live socket, that the architectural claim holds (one binary, two wirings), and
 that live and replay agree.
 
