@@ -31,5 +31,12 @@ quant-engine = { workspace = true }
 # Notes are opaque JSON by design -- see `Strategy::take_notes`.
 serde_json = "1"
 
+[dev-dependencies]
+# For the one test M7 recorded as owed: run the real emitter through a real
+# JSON subscriber and read its bytes back with this crate's reader, so the two
+# are pinned to each other rather than to a fixture someone wrote by hand.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+
 [lints]
 workspace = true

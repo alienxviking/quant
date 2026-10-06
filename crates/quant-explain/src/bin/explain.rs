@@ -379,40 +379,41 @@ fn print_health(args: &Args) {
     match quant_explain::health_at(&args.root, &args.symbol, args.at) {
         Err(why) => outln!("health    {why}"),
         Ok(health) => {
+            let m = &health.line;
             outln!(
                 "health    queue {} now, {} at its worst since start, of {} capacity",
-                health.queue,
-                health.queue_peak,
-                health.queue_capacity
+                m.queue_depth,
+                m.queue_high_water,
+                m.queue_capacity
             );
             outln!(
                 "          in the 60s to {}: {} msg/s, {} dropped, latency p50 {}ms p99 {}ms max {}ms",
                 health.emitted_at.to_rfc3339(),
-                health.msgs_per_sec,
-                health.dropped,
-                health.latency_p50_ms,
-                health.latency_p99_ms,
-                health.latency_max_ms
+                m.msgs_per_sec,
+                m.dropped,
+                m.latency_p50_ms(),
+                m.latency_p99_ms(),
+                m.latency_max_ms()
             );
-            let gaps = health.gap_disconnect + health.gap_overflow + health.gap_sequence;
+            let gaps: u64 = m.gaps.iter().sum();
             if gaps > 0 {
                 outln!(
                     "          and {} gaps that minute ({} disconnect, {} overflow, {} sequence)",
                     gaps,
-                    health.gap_disconnect,
-                    health.gap_overflow,
-                    health.gap_sequence
+                    m.gap(quant_core::event::GapCause::Disconnect),
+                    m.gap(quant_core::event::GapCause::LocalOverflow),
+                    m.gap(quant_core::event::GapCause::SequenceGap)
                 );
             }
-            if health.clock_skew_samples > 0 {
+            if m.clock_skew_samples > 0 {
                 // A count, not a duration. This line used to read
                 // "clock skew {}ms -- past Binance's own tolerance", which
                 // reported the number of affected messages as an offset in
                 // milliseconds and fired at a thousand of them.
                 outln!(
                     "          {} of {} latency samples that minute were stamped ahead of our clock",
-                    health.clock_skew_samples,
-                    health.latency_samples
+                    m.clock_skew_samples,
+                    m.latency_samples
                 );
             }
         }

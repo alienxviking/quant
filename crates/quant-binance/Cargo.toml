@@ -67,7 +67,7 @@ serde = { workspace = true }
 serde_json = "1"
 
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Session identity. A v4 UUID rather than something derived from the clock,
 # because it becomes a primary key in the metadata database at M1.c and two
