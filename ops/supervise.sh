@@ -91,9 +91,22 @@ note() {
 
 note "supervising $symbol in $mode mode until $(date -u -r "$end_epoch" +%Y-%m-%dT%H:%M:%SZ) into $root"
 
+# The smallest attempt worth starting. The paper binary's unit is whole minutes,
+# so an attempt begun with less than one left cannot finish inside the deadline
+# and can only overshoot it -- the second half of the coda defect above, fixed at
+# the source rather than caught afterwards. The recorder takes seconds, so a few
+# of those are still a usable attempt.
+case "$mode" in
+    paper) min_attempt=60;;
+    *)     min_attempt=5;;
+esac
+
 while [ "$(date +%s)" -lt "$end_epoch" ]; do
     remaining=$(( end_epoch - $(date +%s) ))
-    [ "$remaining" -le 5 ] && break
+    if [ "$remaining" -le "$min_attempt" ]; then
+        note "${remaining}s left, less than the ${min_attempt}s an attempt needs -- stopping"
+        break
+    fi
 
     attempt=$(( attempt + 1 ))
     stamp="$(date -u +%Y%m%d-%H%M%S)"
@@ -111,8 +124,10 @@ while [ "$(date +%s)" -lt "$end_epoch" ]; do
         # rounded *up*: rounding down would leave the last partial minute
         # unsupervised, and a restart loop with nothing left to do spins.
         minutes=$(( (remaining + 59) / 60 ))
+        asked_for=$(( minutes * 60 ))
         "$exe" --symbol "$symbol" "$root" --minutes "$minutes" "${extra[@]}" >"$out" 2>&1
     else
+        asked_for="$remaining"
         "$exe" "$symbol" "$root" "$remaining" >"$out" 2>&1
     fi
     code=$?
@@ -120,13 +135,40 @@ while [ "$(date +%s)" -lt "$end_epoch" ]; do
 
     if [ "$code" -eq 0 ]; then
         note "attempt $attempt exited cleanly after ${ran_for}s"
-        # A clean exit within 30s of the deadline means the duration limit was
-        # reached -- the run finishing, not failing. An earlier clean exit falls
-        # through and respawns, exactly as the Windows supervisor does: the only
-        # deliberate early clean exit is a SIGINT from stop-run.sh, and that path
-        # kills this supervisor *first*, so a clean exit reaching this branch is
-        # one we should recover from, not stop on.
-        [ "$(date +%s)" -ge $(( end_epoch - 30 )) ] && break
+        # A clean exit is the end of the run, whenever it happens.
+        #
+        # This used to break only within 30s of the deadline and respawn
+        # otherwise, reasoning that the one deliberate early clean exit is a
+        # SIGINT from stop-run.sh and that path kills this supervisor first --
+        # so a clean exit reaching here must be one to recover from. The
+        # reasoning was wrong in a way the M5 fortnight demonstrated on its last
+        # day: the paper binary finished its 20,160 minutes and exited at
+        # 14:46:06 with **46s** left on the supervisor's clock, 46 > 30, so the
+        # supervisor started attempt 2 for a 60-second coda. That created a
+        # second session on the final day for both symbols, and without M2.e --
+        # merged three days earlier, for unrelated reasons -- the entire
+        # fortnight would have been unjudgeable.
+        #
+        # The premise is still true and is exactly why the conclusion flips:
+        # because stop-run.sh kills supervisors before signalling anything, a
+        # clean exit arriving *here* is never a human stopping the run. It is
+        # the child saying it did what it was asked. A child exiting because it
+        # finished is not a child dying, and only the second deserves a restart.
+        #
+        # An unexpectedly early clean exit is therefore made loud rather than
+        # papered over by a respawn. Stopping leaves a short capture, which is
+        # visible; restarting leaves a spurious extra session, which is subtle
+        # and nearly cost a fortnight.
+        # "Early" is measured against what we asked for, not against a window
+        # of wall clock. The supervisor told the child how long to run, so the
+        # child running materially less than that is the thing worth saying --
+        # and it is a comparison that does not depend on how a rounding or a
+        # deadline happens to line up, which is what the 30-second window got
+        # wrong.
+        if [ "$ran_for" -lt $(( asked_for * 9 / 10 )) ]; then
+            note "UNEXPECTED: clean exit after ${ran_for}s of ${asked_for}s asked -- not restarting; see $(basename "$out")"
+        fi
+        break
     else
         note "attempt $attempt exited $code after ${ran_for}s -- see $(basename "$out")"
     fi
@@ -134,7 +176,7 @@ while [ "$(date +%s)" -lt "$end_epoch" ]; do
     [ "$ran_for" -ge "$healthy_run" ] && backoff=2
 
     remaining=$(( end_epoch - $(date +%s) ))
-    [ "$remaining" -le 5 ] && break
+    [ "$remaining" -le "$min_attempt" ] && break
 
     sleep_for=$(( backoff < remaining ? backoff : remaining ))
     note "restarting in ${sleep_for}s"
