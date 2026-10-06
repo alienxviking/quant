@@ -1806,6 +1806,17 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   fortnight could not change that: a paper venue uses simulated fills, so our
   orders were never in the book and nobody in the recording reacted to them.
   **Only M8 can measure them.**
+- **A decorator that forgets to forward a new trait method is silent, and
+  M7.5.e found one.** `Recorded<S>` wraps the strategy to sample equity, and
+  when `Strategy::take_notes` was added it inherited the trait's default —
+  which is to say nothing. Every note `MaCrossover` wrote would have been
+  swallowed in the wrapper, in **both** binaries, with no error anywhere and a
+  journal that merely looked like a quiet strategy. Third time this project has
+  hit the shape (M4's cost flags, M6's `FillObserver`), and the first time the
+  mechanism was a defaulted trait method rather than a patch that missed.
+  **Adding a method to a trait with decorators means checking every decorator**
+  — the compiler will not, because that is what a default is for.
+
 - **The strategy question is answered and the answer is no.** A crossover at 209
   round trips a week cannot survive 10 bps a side. M5 and beyond are about the
   platform being trustworthy, not about this strategy — and a lower-turnover or

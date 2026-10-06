@@ -159,4 +159,19 @@ impl<S: Strategy> Strategy for Recorded<S> {
     fn on_execution(&mut self, event: &ExecutionEvent, ctx: &mut Context<'_>) {
         self.inner.on_execution(event, ctx);
     }
+
+    /// Forwarded, and the reason this needs saying is that forgetting it is
+    /// silent. A decorator that does not pass a method through inherits the
+    /// trait's default, and the default for `take_notes` is to say nothing —
+    /// so every note `MaCrossover` wrote would be dropped here, in both
+    /// binaries, with no error anywhere and a journal that merely looked like
+    /// the strategy had been quiet.
+    ///
+    /// That is the same shape as M6's `FillObserver`, which was never called
+    /// and whose durability therefore did not exist. `a_wrapped_strategy_still
+    /// _gets_its_notes_out` is the regression test, and it was written after
+    /// this was found rather than before.
+    fn take_notes(&mut self, out: &mut Vec<quant_engine::Note>) {
+        self.inner.take_notes(out);
+    }
 }

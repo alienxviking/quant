@@ -70,7 +70,7 @@ use quant_core::time::Ts;
 pub use journal::{InstrumentKey, Journal, JournalEntry};
 pub use portfolio::{Portfolio, Position};
 pub use risk::{AllowAll, Bound, Limits, Refusal, RiskEngine, RiskLayer, TripCause};
-pub use strategy::{Context, Strategy};
+pub use strategy::{Context, Note, Strategy};
 pub use venue::ExecutionVenue;
 
 /// What a run did.
@@ -226,6 +226,15 @@ pub trait RunObserver {
     /// knowing whether we were blind at 03:30.
     fn on_blind(&mut self, _cause: quant_core::event::GapCause, _last_good_ts: Ts, _at: Ts) {}
 
+    /// The strategy wrote something down.
+    ///
+    /// `at` is the engine's clock, not the strategy's: the strategy accumulates
+    /// notes during its own callbacks and the engine takes them at the end of
+    /// the same event, so the two instants are identical by construction — and
+    /// stamping here rather than there means a strategy cannot date its own
+    /// entries, which is invariant 4 holding at one more seam.
+    fn on_note(&mut self, _note: &crate::strategy::Note, _at: Ts) {}
+
     /// A fill arrived for an order this engine has no record of.
     ///
     /// The `else` the loop body does not have: `stats.fills` is incremented
@@ -279,6 +288,9 @@ pub struct Engine<S, V, R, K> {
     books: Vec<Book>,
     now: Ts,
     scratch: Vec<ExecutionEvent>,
+    /// Reused across events so the common case -- a strategy with nothing to
+    /// say -- allocates nothing. Same reason `scratch` exists.
+    notes: Vec<crate::strategy::Note>,
     ledger: Ledger,
     portfolio: Portfolio,
     /// Optional, because a backtest has nothing worth journalling: it can be
@@ -325,6 +337,7 @@ where
             books: Vec::new(),
             now: Ts::from_nanos(0),
             scratch: Vec::new(),
+            notes: Vec::new(),
             ledger: Ledger::default(),
             portfolio: Portfolio::new(starting_cash),
             observer: None,
@@ -523,6 +536,19 @@ where
             self.ledger.stats.execution_events += 1;
             let mut ctx = ctx!();
             self.strategy.on_execution(&refusal, &mut ctx);
+        }
+
+        // 6. Ask the strategy what it wrote down, once the event is fully dealt
+        //    with. Last on purpose: a note taken between steps 4 and 5 would
+        //    miss everything `on_market_event` decided, which is where a
+        //    crossover strategy does all of its deciding. Taken even when the
+        //    strategy is silent, because `take_notes` is how it says so.
+        self.notes.clear();
+        self.strategy.take_notes(&mut self.notes);
+        if let Some(observer) = self.observer.as_deref_mut() {
+            for note in &self.notes {
+                observer.on_note(note, self.now);
+            }
         }
     }
 

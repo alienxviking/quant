@@ -220,6 +220,18 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
         "signals   {} samples, {} crossings, {} blind intervals",
         ma.samples, ma.crossings, ma.blind_intervals
     );
+    // The identity that was silently not one until M7.5.e: every crossing is a
+    // decision, and before the `else` existed the four outcomes did not add up
+    // to the signal count. Printed so a reader can check it rather than take it
+    // on trust.
+    println!(
+        "          {} entries + {} exits + {} suppressed + {} nothing-to-do = {}",
+        ma.entries,
+        ma.exits,
+        ma.suppressed,
+        ma.no_ops,
+        ma.entries + ma.exits + ma.suppressed + ma.no_ops
+    );
     println!(
         "orders    {} submitted, {} refused, {} suppressed while one was working",
         stats.submitted, stats.refused, ma.suppressed

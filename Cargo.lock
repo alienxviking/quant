@@ -1058,6 +1058,7 @@ dependencies = [
  "quant-normalize",
  "quant-recorder",
  "quant-sim",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
