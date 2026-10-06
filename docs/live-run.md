@@ -306,11 +306,18 @@ about again.
 | | Slice | Content |
 |---|---|---|
 | a | The engine can receive what a venue says | wake on either input; `step_reports`; forward-only clock |
-| b | Credentials, signing, and refusing to run without them | HMAC, key handling, `preflight` |
+| b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check` |
 | c | `LiveVenue`: submit, cancel, and the user-data stream | the translator |
 | d | The indeterminate window | `InDoubt`, `openOrders` recovery |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
+
+Slice (b) is runnable today with no money at risk: `venue-check` makes one
+signed `GET /api/v3/account`, which exercises the key, the secret, the signature,
+the header and the clock in a single round trip and places nothing. A wrong
+secret comes back HTTP 401, which is the venue's auth layer answering — proof the
+request was well formed enough to be judged on its credentials rather than its
+shape.
 
 Slice (a) is first and is not negotiable: it is a seam change, every slice after
 it depends on the guarantee, and it is the one thing that can be built and tested

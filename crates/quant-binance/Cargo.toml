@@ -37,6 +37,11 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
 #
 # `ring` rather than `aws-lc-rs` because aws-lc-rs needs cmake and nasm on
 # Windows and this has to build on a stock developer machine.
+# Already in the graph via rustls' `ring` backend, so signing adds no new build
+# surface -- which is the whole reason this crate chose `ring` over `aws-lc-rs`
+# in the first place. `hmac` + `sha2` would be two more crates to do what is
+# already linked. See `credentials.rs`.
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",

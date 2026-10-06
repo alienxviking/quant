@@ -18,7 +18,7 @@
 # whether the run would produce data that cannot be trusted (blocker) or data
 # that is fine but less useful (advisory).
 #
-# Usage: preflight.sh [--root DIR] [--days N] [--symbols "BTCUSDT ETHUSDT"]
+# Usage: preflight.sh [--root DIR] [--days N] [--symbols "BTCUSDT ETHUSDT"] [--live]
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,11 +27,13 @@ repo="$(cd "$here/.." && pwd)"
 root=""
 days=7
 symbols="BTCUSDT ETHUSDT"
+live=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --root)    root="$2"; shift 2;;
         --days)    days="$2"; shift 2;;
         --symbols) symbols="$2"; shift 2;;
+        --live)    live=1; shift;;
         *) echo "unknown argument: $1" >&2; exit 2;;
     esac
 done
@@ -316,6 +318,29 @@ elif [ -n "${sleep_ac:-}" ]; then
     report 'sleep' advisory "system sleeps after ${sleep_ac}min on AC -- caffeinate holds it awake with the lid open on mains; a closed lid still sleeps"
 else
     report 'sleep' advisory 'could not read the sleep setting -- keep the lid open on mains'
+fi
+
+# --- live mode: credentials, before anything irreversible ----------------------
+# Only when asked. A recorder and a paper run need no credentials at all, and a
+# preflight that demanded them would block the two things that have been run for
+# months over a key they do not use.
+#
+# This checks only that the variables are *present*. Proving they work needs a
+# signed round trip, which is `venue-check` -- a separate binary because it talks
+# to the venue, and this script is meant to be runnable with no network on a
+# machine that is about to record.
+if [ "${live:-0}" = 1 ]; then
+    for var in BINANCE_API_KEY BINANCE_API_SECRET; do
+        value="$(eval "printf '%s' \"\${$var:-}\"")"
+        if [ -z "$value" ]; then
+            report 'credentials' blocker "$var is not set -- live trading cannot start without it"
+        else
+            # The name, never any part of the value.
+            report 'credentials' ok "$var is set"
+        fi
+    done
+    report 'credentials' advisory \
+        'presence is not proof -- run `cargo run -p quant-binance --bin venue-check` to make one signed request'
 fi
 
 echo ""
