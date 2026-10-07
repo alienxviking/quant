@@ -167,6 +167,7 @@ impl RunObserver for JournalWriter {
                 qty: fill.qty,
                 fee: fill.fee,
                 is_maker: fill.is_maker,
+                fee_asset: quant_core::execution::FeeAsset::Quote,
             },
             "a fill",
         );

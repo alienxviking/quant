@@ -548,6 +548,7 @@ mod tests {
             qty: qty.parse().expect("qty"),
             fee: amount(fee),
             is_maker: false,
+            fee_asset: quant_core::execution::FeeAsset::Quote,
         }
     }
 
@@ -862,6 +863,7 @@ mod tests {
                 qty: "1".parse().expect("qty"),
                 fee: Notional::ZERO,
                 is_maker: false,
+                fee_asset: quant_core::execution::FeeAsset::Quote,
             },
             NOW,
         );
@@ -883,6 +885,7 @@ mod tests {
                 qty: "1".parse().expect("qty"),
                 fee: amount("5"),
                 is_maker: false,
+                fee_asset: quant_core::execution::FeeAsset::Quote,
             },
             NOW,
         );

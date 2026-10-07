@@ -70,7 +70,7 @@ pub mod costs;
 use quant_book::Book;
 use quant_core::event::{MarketEvent, Side};
 use quant_core::execution::{
-    ClientOrderId, ExecutionEvent, Fill, OrderRequest, RejectReason, TimeInForce,
+    ClientOrderId, ExecutionEvent, FeeAsset, Fill, OrderRequest, RejectReason, TimeInForce,
 };
 use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::{FilterBreach, Filters, InstrumentId};
@@ -416,6 +416,10 @@ impl SimulatedVenue {
                     qty: taken,
                     fee,
                     is_maker,
+                    // The simulator charges in the quote currency, which is M4's
+                    // named simplification and what every result in this
+                    // repository was computed with. Live is where it differs.
+                    fee_asset: FeeAsset::Quote,
                 },
                 remaining,
                 ts: now,
@@ -465,6 +469,7 @@ impl SimulatedVenue {
                     qty: taken,
                     fee,
                     is_maker: true,
+                    fee_asset: quant_core::execution::FeeAsset::Quote,
                 },
                 remaining: Qty::from_raw(0),
                 ts: now,
