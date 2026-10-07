@@ -6,6 +6,8 @@ working agreement; those are the design. The data contract governs data at rest;
 the engine contract governs the seam a strategy sees. `docs/observability.md`
 (M7), `docs/run-log.md` (M7.5), `docs/paper-run.md` (M5) and `docs/live-run.md`
 (M8, written before the code) cover their own milestones.
+`docs/machine-move.md` covers getting the artifacts between machines, which is
+not a milestone and has its own way of going wrong.
 
 ## What this is
 
@@ -1356,7 +1358,8 @@ underneath a running supervisor can make its loop jump mid-execution. Merging to
   `docs/observability.md` disagree about them.** That file records worst 4951 ms
   and 18 of 18; `docs/overview.md` sides with it on the latency and gives no
   checkpoint count. Neither is checkable from this repository — the journals and
-  capture are on the Mac — and the likeliest explanation is benign: they were
+  capture live beside it rather than in it, wherever the artifacts currently are
+  (`docs/machine-move.md`) — and the likeliest explanation is benign: they were
   measured hours apart on a run that was still accumulating checkpoints, so 18
   and 24 were each true when taken and neither was stamped. **Neither number was
   picked over the other**, because guessing between two measurements is exactly
@@ -1811,6 +1814,20 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   where one is correct. M2.e's lesson arriving in a shell script: a fixture that
   fixes one side of the boundary under test proves much less than it looks like
   it does.
+
+- **`ops/*.ps1` is record-only, and that becomes load-bearing if the run host
+  moves.** The paper and live modes exist in the bash half alone, which was the
+  right call when it was made — *an untested paper mode there would be exactly
+  the harness-never-run M1 warns about* — but it means a long M8 run on Windows
+  needs WSL or a rehearsed port. WSL is the cheaper answer and the one with
+  evidence behind it; the thing to check there is sleep, since `caffeinate` has
+  no equivalent and a 72-hour run needs the host awake.
+
+- **Whichever machine runs M8 must pass `venue-check` before anything is
+  planned around it.** M8.b made a host more than 1000 ms from the venue unable
+  to trade, where M1 only warned — and M1 declined to start its acceptance run
+  on the Windows box partly over a stopped `w32time` and a ~2 s offset. Cheap to
+  find out now, expensive on the afternoon of the run.
 
 - **Queue position and market impact remain unmeasured**, as predicted, and the
   fortnight could not change that: a paper venue uses simulated fills, so our

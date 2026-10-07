@@ -285,6 +285,14 @@ on — the 2026-08 run recorded on an Apple Silicon Mac and was carried back to 
 Windows laptop. The method (USB drive, or a cloud service like Google Drive) does
 not matter; getting the *same bytes* to the other side, provably, does.
 
+> **Moving a whole machine rather than retrieving one capture?** See
+> `docs/machine-move.md`. It inherits this procedure and adds the two things a
+> migration needs that a retrieval does not: what to leave behind (the entire
+> normalized tier, which is a function of raw and should be rebuilt rather than
+> copied), and the rule that nothing is deleted from the source until the
+> destination has passed `quant-verify` — not until a checksum matched, which is
+> a weaker claim.
+
 **1. Stop cleanly first, then package as one file.** Only package after the
 recorders have stopped and their trailers are sealed (a duration-limit exit or
 `stop-run` both do this). One tarball is easier to move and verify than a deep
