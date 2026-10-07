@@ -312,6 +312,25 @@ about again.
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
 
+### Where it runs, which is not yet settled
+
+M5 ran on the MacBook Air, and `ops/`'s bash half is the only harness with a
+paper or live mode — the `.ps1` half is **record-only**, deliberately, because
+*"an untested paper mode there would be exactly the harness-never-run M1 warns
+about"*. So an M8 run on the Windows box needs WSL, where the bash harness runs
+unmodified, or a PowerShell port that is then rehearsed. The second is a slice of
+work in its own right and must not be written the night before a run.
+
+The clock constrains the choice more than the harness does. Slice (b) made a
+host more than 1000 ms from the venue **unable to trade at all**, where M1 had
+only warned about it — and M1 declined to start its acceptance run on the Windows
+box partly because `w32time` was stopped and it sat ~2 s ahead of Binance.
+Whatever machine runs M8 has to pass `venue-check` first, and that is a cheaper
+thing to find out now than on the afternoon of the run.
+
+`docs/machine-move.md` covers moving the artifacts between the two, and why the
+3.2 GB normalized tier is rebuilt rather than copied.
+
 Slice (b) is runnable today with no money at risk: `venue-check` makes one
 signed `GET /api/v3/account`, which exercises the key, the secret, the signature,
 the header and the clock in a single round trip and places nothing. A wrong

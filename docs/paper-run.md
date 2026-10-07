@@ -227,7 +227,7 @@ trailerless — indistinguishable from a crash.
 ## Judging it
 
 Bring the capture, the journals **and the whole of `~/paper/logs/`** back
-(`COPYFILE_DISABLE=1 tar ...`, per `docs/acceptance-run.md` — macOS otherwise
+(`COPYFILE_DISABLE=1 tar ...`, per `docs/machine-move.md` — macOS otherwise
 writes AppleDouble stubs that the verifier reports as strays).
 
 **The logs are evidence, not convenience.** Criterion 2 silently *assumes* the
@@ -242,8 +242,9 @@ hole. For *this* run, though, what reached a file is the paper
 binary's shutdown summary on stdout (`events N reached the engine`) and the
 capture's own closing line through tracing (`records=N`), and `supervise.sh`
 sends both streams of every attempt to `~/paper/logs/$SYMBOL-$STAMP.log`. Leave
-the logs on the Mac and that check does not become harder, it becomes
-impossible.
+the logs on the run host and that check does not become harder, it becomes
+impossible — which is why `logs/` is on the move-it side of the table in
+`docs/machine-move.md` §1 while the whole normalized tier is not.
 
 ```bash
 git checkout m5-run-start          # the comparison runs at the run's commit

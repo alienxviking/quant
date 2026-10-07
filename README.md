@@ -110,6 +110,9 @@ docs/
   live-run.md         why M8 is the engine gaining a second asynchronous
                       input, and what reconciling against a counterparty
                       can and cannot prove. Written before the code. [M8]
+  machine-move.md     getting the artifacts between machines: what moves,
+                      what is rebuilt instead, and what a third party in
+                      the middle changes
   acceptance-run.md   how the 7-day M1 run is conducted and judged
   paper-run.md        how the 2-week M5 paper run is conducted and judged
 ops/
