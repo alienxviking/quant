@@ -113,10 +113,15 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 ## State
 
-**M0 through M7.5 are complete.** M5's fortnight ran 2026-09-18 → 2026-10-02 and
-**passed**: paper P&L reproduced a backtest over the same window exactly, on both
-symbols, to the satoshi. 454 tests green in debug and release, clippy and fmt
-clean, ~34,200 lines across 12 crates.
+**M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
+2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
+same window exactly, on both symbols, to the satoshi. 476 tests green in debug
+and release, clippy and fmt clean, ~35,700 lines across 12 crates.
+
+> **The work moved off the MacBook Air to the HP Omen on 2026-10-08.** Read
+> *"Picking up on the Omen"* at the bottom of this file before anything else —
+> the artifacts travelled separately from the repository and the first job is
+> proving they arrived.
 
 M7.5, the run log, shipped over seven slices (2026-10-05 → 2026-10-06) and its
 three criteria are measured in `docs/run-log.md` §7. `JournalEntry` now holds
@@ -2086,3 +2091,104 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   since CI runs `stable`. Raise it when a dependency we want requires it. Bumping
   it also un-blocks `clippy::incompatible_msrv`, which had been rejecting std APIs
   stabilised years ago (`Option::is_none_or`, 1.82).
+
+---
+
+## Picking up on the Omen
+
+Written on the Mac on 2026-10-08, as the last thing done there. The repository
+came over `git`; the artifacts did not, and the first job is proving they did.
+
+### 1. The data, and the rule about deleting
+
+M5's fortnight was packaged as a single tar and moved through Google Drive:
+
+| | |
+|---|---|
+| archive | `quant-m5-fortnight.tar`, 4,894,435,328 bytes |
+| sha256 | `1ffdc54688d700b62a05d0bc5e4f9a143cf5191077b8ece08c2afe0fb5001e25` |
+| holds | `raw/` (32 capture files), `logs/` (180), both journals, `run.json` |
+| left behind | the 3.2 GB normalized tier — rebuild it, do not ask for it |
+
+**The Mac still holds the source.** It stays there until `quant-verify` exits 0
+on the extracted tree here — not until the checksum matches, which is a weaker
+claim. `docs/machine-move.md` §2 is the argument; §5 is the sequence, and it ends
+with the check that is worth more than the other three:
+
+```
+backtest <root> --symbol BTCUSDT --realistic --cash 100 --qty 0.001 \
+    --fast 10 --slow 30 --interval-secs 60 --max-order 200 --max-position 200 \
+    --max-daily-loss 20 --max-orders 200
+```
+
+**824 fills, cash 31.64743842.** M5's published result, and the no-op property
+every money-path change since has been checked against. Reproducing it on
+different hardware, a different OS and a different CPU architecture says the data
+survived *and* the platform is deterministic across all three. Only after that is
+anything safe to delete on the Mac.
+
+### 2. Two things this machine needs that the Mac did not
+
+**The clock, and it is now blocking rather than cosmetic.** M1 declined to start
+its acceptance run here partly because `w32time` was stopped and the host sat ~2 s
+ahead of Binance — tolerable then, because a wrong clock costs a capture only a
+latency metric. M8.b made a host more than 1000 ms out **unable to trade at all**,
+since a signed request outside `recvWindow` is refused. Check it before planning
+anything around this machine:
+
+```
+w32tm /query /status ; w32tm /resync
+cargo run --release -p quant-binance --bin venue-check    # needs the API keys
+```
+
+`venue-check` places no order. It makes one signed `GET /api/v3/account` and
+prints the round-trip-corrected offset, which is the quantity that matters —
+measuring `now - serverTime` naively folds one-way latency into the offset and
+would block a run over a clock that is fine.
+
+**`ops/*.ps1` is record-only.** The paper and live modes exist in the bash half
+alone, deliberately. A long M8 run here needs WSL — where the bash harness runs
+unmodified and is the proven path — or a PowerShell port that is then rehearsed,
+which is a slice of work and must not be written the night before a run. In WSL,
+check sleep: `caffeinate` has no equivalent and a 72-hour run needs the host
+awake.
+
+### 3. Where M8 is
+
+`docs/live-run.md` is the scoping, written before any of the code. Slices (a) and
+(b) are done and (c) is part done:
+
+- **(a) done.** The engine can be woken by the venue as well as the market.
+  `EventSource::next_event_timeout` returns a three-way `Wake`, defaulted so a
+  historical replay can never idle and no backtest number moved. The clock is
+  forward-only and counts its clamps.
+- **(b) done.** `Credentials` (redacting `Debug`, environment only, signature
+  pinned against RFC 4231), `TradeClient`, and `venue-check`. Verified against
+  the real API: a wrong secret comes back HTTP 401, which is the venue's auth
+  layer answering and therefore proof the request was well formed.
+- **(c) part done.** `FeeAsset` shipped — a spot venue takes its fee in the
+  asset you received, and modelling it turned out to need one field rather than
+  the two balances M4 predicted. **What remains is the translator**:
+  `executionReport` → `ExecutionEvent`, the `q-<run>-<id>` prefix with its three
+  inbound outcomes (not ours / ours and known / ours and unknown → orphan), and
+  the detail that a cancel's `c` field carries the *cancel request's* id while
+  `C` carries the original. Pure logic — no network, no credentials, no data.
+
+One thing the `FeeAsset` work turned up that the translator has to settle:
+Binance's `N` is a commission **asset code**, and with the BNB discount enabled
+it is neither the base nor the quote. `FeeAsset` has two variants on purpose, so
+the translator must refuse an unrecognised asset **loudly** rather than coerce
+it, and the run procedure has to turn the discount off.
+
+### 4. Things that are easy to get wrong here specifically
+
+- cargo may be missing from a shell opened before Rust was installed:
+  `$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"`.
+- Smart App Control was disabled on 2026-07-29 and cannot be re-enabled without
+  a reinstall, so the `os error 4551` build failures should not recur.
+- `zstd-sys` compiles C and `ring` assembles per-architecture. Both built here
+  through M4, so the toolchain is proven — but a fresh machine image is not.
+- PowerShell 5.1 traps are catalogued in the M1 notes above and cost real time:
+  `$PSScriptRoot` is empty while `param()` defaults bind, redirecting a native
+  command's stderr wraps every line in an `ErrorRecord`, and `-ArgumentList`
+  quotes nothing.
