@@ -57,12 +57,14 @@
 
 pub mod capture;
 pub mod connection;
+pub mod credentials;
 pub mod decode;
 pub mod live;
 pub mod parse;
 pub mod rest;
 pub mod sequence;
 pub mod stream;
+pub mod trade;
 
 /// Install the TLS backend, if the process has not already chosen one.
 ///

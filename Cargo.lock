@@ -1075,6 +1075,7 @@ dependencies = [
  "quant-recorder",
  "quant-storage",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
