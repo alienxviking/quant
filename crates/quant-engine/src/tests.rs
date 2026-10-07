@@ -174,6 +174,7 @@ impl ExecutionVenue for RecordingVenue {
                     qty: "1".parse().expect("qty"),
                     fee: Notional::from_raw(0),
                     is_maker: false,
+                    fee_asset: quant_core::execution::FeeAsset::Quote,
                 },
                 remaining: "0".parse().expect("qty"),
                 ts: now,
@@ -990,6 +991,7 @@ impl ExecutionVenue for SpeaksLater {
                 qty: "1".parse().expect("qty"),
                 fee: Notional::from_raw(0),
                 is_maker: false,
+                fee_asset: quant_core::execution::FeeAsset::Quote,
             },
             remaining: "0".parse().expect("qty"),
             // Stamped by the venue, *later* than any market event in the

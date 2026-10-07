@@ -27,7 +27,7 @@
 //! produce.
 
 use quant_core::event::Side;
-use quant_core::execution::Fill;
+use quant_core::execution::{FeeAsset, Fill};
 use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::InstrumentId;
 
@@ -166,12 +166,31 @@ impl Portfolio {
             self.positions.resize(index + 1, Position::default());
         }
 
-        let signed = Qty::from_raw(fill.qty.raw() * side.sign());
+        let mut signed = Qty::from_raw(fill.qty.raw() * side.sign());
         let gross = notional(fill.px, signed);
+        // A fee taken in the base asset leaves the *position* smaller, not the
+        // cash lower -- a spot venue hands you what you bought minus its cut.
+        // Both still reduce equity by the same amount, which is why M4's
+        // quote-only simplification was invisible for four milestones and why
+        // `a_base_asset_fee_costs_the_same_equity_in_a_different_place` is the
+        // test that pins it.
+        let cash_fee = match fill.fee_asset {
+            FeeAsset::Quote => fill.fee,
+            FeeAsset::Base => {
+                // `fee` is denominated in the base asset here, so it is a
+                // quantity rather than money. Subtract it from what arrived.
+                signed = Qty::from_raw(signed.raw() - fill.fee.raw() * side.sign());
+                Notional::from_raw(0)
+            }
+        };
         // Buying spends cash, selling raises it; `gross` already carries the
         // sign, so this is one line for both directions rather than a branch
         // that can be written backwards.
-        self.cash = Notional::from_raw(self.cash.raw() - gross.raw() - fill.fee.raw());
+        self.cash = Notional::from_raw(self.cash.raw() - gross.raw() - cash_fee.raw());
+        // Always the full fee, in both cases: `fees` is what the venue took, and
+        // M4 made it separately visible so "profitable before costs and not
+        // after" is read off the output rather than inferred. A base-asset fee
+        // that vanished from this total would make the fee counter understate.
         self.fees = Notional::from_raw(self.fees.raw() + fill.fee.raw());
         self.fills += 1;
 
@@ -274,6 +293,7 @@ mod tests {
             qty: qty.parse().expect("qty"),
             fee: fee.parse().expect("fee"),
             is_maker: false,
+            fee_asset: quant_core::execution::FeeAsset::Quote,
         }
     }
 
@@ -451,5 +471,89 @@ mod tests {
 
         assert_eq!(whole.position(i), split.position(i));
         assert_eq!(whole.cash(), split.cash());
+    }
+    #[test]
+    fn a_base_asset_fee_costs_the_same_equity_in_a_different_place() {
+        // The identity that makes M8's criterion A checkable, and the reason the
+        // field exists at all. Binance takes the taker fee in the asset you
+        // *received*: on a buy that is the base, so the position arrives a
+        // fraction smaller rather than the cash a fraction lower.
+        //
+        // Equity agrees either way -- which is why M4's quote-only
+        // simplification went unnoticed for four milestones, and why criterion A
+        // compares equity as its floor. Cash and position agree only if the
+        // asset is modelled, which is what lets A compare the venue's two
+        // balances instead.
+        let instrument = instrument();
+        let px: Px = "100".parse().expect("px");
+        let qty: Qty = "2".parse().expect("qty");
+        let fee_quote = Notional::from_raw(10 * quant_core::SCALE / 100); // 0.10 quote
+                                                                          // The same value expressed in base at this price: 0.10 / 100 = 0.001.
+        let fee_base = Notional::from_raw(fee_quote.raw() * quant_core::SCALE / px.raw());
+
+        let mut in_quote = Portfolio::new(Notional::from_raw(1_000 * quant_core::SCALE));
+        in_quote.apply_fill(
+            instrument,
+            Side::Buy,
+            &Fill {
+                px,
+                qty,
+                fee: fee_quote,
+                is_maker: false,
+                fee_asset: FeeAsset::Quote,
+            },
+        );
+
+        let mut in_base = Portfolio::new(Notional::from_raw(1_000 * quant_core::SCALE));
+        in_base.apply_fill(
+            instrument,
+            Side::Buy,
+            &Fill {
+                px,
+                qty,
+                fee: fee_base,
+                is_maker: false,
+                fee_asset: FeeAsset::Base,
+            },
+        );
+
+        assert_ne!(
+            in_quote.cash(),
+            in_base.cash(),
+            "a base fee leaves the cash alone"
+        );
+        assert_ne!(
+            in_quote.position(instrument).qty,
+            in_base.position(instrument).qty,
+            "and takes it out of the position instead"
+        );
+        assert_eq!(
+            in_quote.equity(instrument, Some(px)),
+            in_base.equity(instrument, Some(px)),
+            "but the equity is the same, which is why this went unnoticed"
+        );
+    }
+
+    #[test]
+    fn a_fee_counts_as_a_fee_whichever_asset_it_was_taken_in() {
+        // M4 made `fees` separately visible so "profitable before costs and not
+        // after" is read off the output rather than inferred. A base-asset fee
+        // that vanished from this total would make the counter understate by
+        // exactly the amount that matters.
+        let instrument = instrument();
+        let fee = Notional::from_raw(quant_core::SCALE / 1_000);
+        let mut p = Portfolio::new(Notional::from_raw(1_000 * quant_core::SCALE));
+        p.apply_fill(
+            instrument,
+            Side::Buy,
+            &Fill {
+                px: "100".parse().expect("px"),
+                qty: "1".parse().expect("qty"),
+                fee,
+                is_maker: false,
+                fee_asset: FeeAsset::Base,
+            },
+        );
+        assert_eq!(p.fees(), fee, "the venue took it, so it is counted");
     }
 }

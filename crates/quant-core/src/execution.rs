@@ -188,6 +188,37 @@ pub struct Fill {
     /// Recorded rather than derived because it decides the fee tier on every
     /// venue that has one, and by M4 it must not be a guess.
     pub is_maker: bool,
+    /// Which asset the fee was taken in.
+    ///
+    /// M4 charged every fee in the quote currency and named that a
+    /// simplification: *"a spot venue takes its fee in the base, leaving the
+    /// position a fraction smaller rather than the cash a fraction lower"*. M8
+    /// is where that bill arrives, because the venue reports the asset and our
+    /// record must agree with the venue's to the satoshi.
+    ///
+    /// Defaults to [`FeeAsset::Quote`] so every result computed before this
+    /// field existed reproduces exactly — the `Costs::NONE` no-op property in a
+    /// third place, and what makes a change to the money path checkable rather
+    /// than hoped for.
+    #[serde(default)]
+    pub fee_asset: FeeAsset,
+}
+
+/// Which side of the pair a fee was taken from.
+///
+/// Two variants and not a string: the set is closed by what a spot venue can do,
+/// and an open type here would let a venue's asset code reach the portfolio,
+/// where nothing could act on it anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeAsset {
+    /// USDT for BTCUSDT. What every simulated fill charges, and M4's
+    /// simplification.
+    #[default]
+    Quote,
+    /// BTC for BTCUSDT. What Binance takes on a buy: the position arrives a
+    /// fraction smaller rather than the cash a fraction lower.
+    Base,
 }
 
 /// What happened to an order we sent.
@@ -345,6 +376,7 @@ mod tests {
                 qty: "1".parse().expect("qty"),
                 fee: Notional::from_raw(0),
                 is_maker: false,
+                fee_asset: FeeAsset::Quote,
             },
             remaining: "1".parse().expect("qty"),
             ts,
@@ -420,6 +452,7 @@ mod tests {
             qty: "1".parse().expect("qty"),
             fee: "-0.0001".parse().expect("a rebate"),
             is_maker: true,
+            fee_asset: FeeAsset::Quote,
         };
         assert!(fill.fee.raw() < 0);
     }
@@ -435,6 +468,7 @@ mod tests {
                 qty: "0.00040000".parse().expect("qty"),
                 fee: "0.03".parse().expect("fee"),
                 is_maker: false,
+                fee_asset: FeeAsset::Quote,
             },
             remaining: "0".parse().expect("qty"),
             ts: Ts::from_nanos(1_787_315_652_514_000_001),

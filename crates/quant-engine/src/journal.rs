@@ -94,6 +94,11 @@ pub enum JournalEntry {
         qty: Qty,
         fee: Notional,
         is_maker: bool,
+        /// Which asset the venue took its fee in. Absent from journals written
+        /// before M8.c, where it reads back as `Quote` — M4's simplification,
+        /// which is what those runs actually did.
+        #[serde(default)]
+        fee_asset: quant_core::execution::FeeAsset,
     },
     /// What the *engine* believed at this moment.
     ///
@@ -440,6 +445,7 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
                         qty: *qty,
                         fee: *fee,
                         is_maker: *is_maker,
+                fee_asset: quant_core::execution::FeeAsset::Quote,
                     },
                 );
             }
@@ -706,6 +712,7 @@ mod tests {
             qty: qty.parse().expect("qty"),
             fee: fee.parse().expect("fee"),
             is_maker: false,
+            fee_asset: quant_core::execution::FeeAsset::Quote,
         }
     }
 
@@ -801,6 +808,7 @@ mod tests {
                 qty: "0.001".parse().expect("qty"),
                 fee: amount("0.0766"),
                 is_maker: false,
+                fee_asset: quant_core::execution::FeeAsset::Quote,
             },
         );
         direct.apply_fill(
@@ -811,6 +819,7 @@ mod tests {
                 qty: "0.001".parse().expect("qty"),
                 fee: amount("0.0767"),
                 is_maker: false,
+                fee_asset: quant_core::execution::FeeAsset::Quote,
             },
         );
 
@@ -1163,6 +1172,7 @@ mod m75a_tests {
             qty: "0.001".parse().expect("qty"),
             fee: "0.0001".parse().expect("fee"),
             is_maker: false,
+            fee_asset: quant_core::execution::FeeAsset::Quote,
         }
     }
 }
