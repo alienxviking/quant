@@ -59,9 +59,9 @@ on purpose at the moment of moving.
 
 ```bash
 cd ~
-COPYFILE_DISABLE=1 tar czf ~/quant-m5-fortnight.tar.gz \
+COPYFILE_DISABLE=1 tar cf ~/quant-m5-fortnight.tar \
     paper/raw paper/logs paper/paper-BTCUSDT.jsonl paper/paper-ETHUSDT.jsonl paper/run.json
-shasum -a 256 ~/quant-m5-fortnight.tar.gz | tee ~/quant-m5-fortnight.tar.gz.sha256
+shasum -a 256 ~/quant-m5-fortnight.tar | tee ~/quant-m5-fortnight.tar.sha256
 ```
 
 `COPYFILE_DISABLE=1` is not decoration. macOS `tar` archives extended attributes
@@ -78,21 +78,52 @@ If a tree already has them:
 find ~/paper -name '._*' -type f -delete
 ```
 
-`czf` rather than `cf` — the payload is already zstd so gzip buys little on the
-capture itself, but the logs are 14 MB of text and compress by about ten to one,
-and one file is one thing to checksum.
+**`cf`, not `czf`, and the first draft of this document had it the other way
+round.** The reasoning given was that the logs are 14 MB of text compressing
+about ten to one — which is true, measured at 13× — but it mattered less than it
+sounded. Measured on the real capture: gzip saves ~14 MB out of 4.6 GB (0.3%) and
+costs about 85 seconds of CPU grinding over 4.5 GB of data that is *already zstd*
+and gains nothing from a second pass. Plain `tar` is simpler, faster, and the same
+size to upload.
+
+Compress the payload once, at the tier that owns it. That is what the raw
+container already does.
+
+**Write the sidecar with a bare filename.** `shasum` echoes whatever path it was
+given, and `/Users/you/...` means nothing on the machine that has to check it.
+Run it from the containing directory so the sidecar reads
+`<hash>  quant-m5-fortnight.tar`.
 
 **Watch the disk.** This Mac has ~11 GB free against a 4.5 GB source, so the
 archive fits but not comfortably. If it does not, pipe straight to the
 destination instead of staging a file:
 
 ```bash
-COPYFILE_DISABLE=1 tar czf - paper/raw paper/logs paper/*.jsonl paper/run.json \
-  | ssh you@omen 'cat > quant-m5-fortnight.tar.gz'
+COPYFILE_DISABLE=1 tar cf - paper/raw paper/logs paper/*.jsonl paper/run.json \
+  | ssh you@omen 'cat > quant-m5-fortnight.tar'
 ```
 
 That loses the convenient local checksum, so take one on each side of the pipe
 instead (`tee >(shasum -a 256 …)`).
+
+---
+
+### What this produced, 2026-10-07
+
+Kept as a baseline for the next move, and because a procedure nobody has run is
+not a procedure:
+
+| | |
+|---|---|
+| archive | 4.56 GB, built in 28 s |
+| sha256 | `1ffdc54688d700b62a05d0bc5e4f9a143cf5191077b8ece08c2afe0fb5001e25` |
+| entries | 282 — 32 capture files, 180 logs, 2 journals, `run.json` |
+| AppleDouble | 0 |
+| source verified first | `quant-verify` exit 0, 97,937,822 frames, `missing 0` |
+
+Verifying the **source** before packaging is the step that makes a later failure
+attributable: if the far side disagrees, the question is about the move rather
+than about the capture.
 
 ---
 
@@ -106,17 +137,17 @@ for all of that.
 
 So the checksum is not optional here, and it is the reason the sidecar exists:
 
-1. Upload **both** `quant-m5-fortnight.tar.gz` and its `.sha256`.
+1. Upload **both** `quant-m5-fortnight.tar` and its `.sha256`.
 2. Upload them as *files*, not into a folder Drive might "optimise". Do not let
    Drive unpack the archive.
 3. On the Omen, download both and compare before extracting anything.
 
 ```powershell
 # PowerShell 5.1+ has a hasher and tar built in (Windows 10+)
-Get-FileHash quant-m5-fortnight.tar.gz -Algorithm SHA256
-Get-Content quant-m5-fortnight.tar.gz.sha256     # compare by eye, or:
-(Get-FileHash quant-m5-fortnight.tar.gz -Algorithm SHA256).Hash.ToLower() -eq `
-    ((Get-Content quant-m5-fortnight.tar.gz.sha256) -split '\s+')[0]
+Get-FileHash quant-m5-fortnight.tar -Algorithm SHA256
+Get-Content quant-m5-fortnight.tar.sha256     # compare by eye, or:
+(Get-FileHash quant-m5-fortnight.tar -Algorithm SHA256).Hash.ToLower() -eq `
+    ((Get-Content quant-m5-fortnight.tar.sha256) -split '\s+')[0]
 ```
 
 A `False` there means download it again. It does not mean investigate — a
@@ -128,7 +159,7 @@ exists because of §2.
 ## 5. Extract and verify
 
 ```powershell
-tar xzf quant-m5-fortnight.tar.gz          # restores paper/raw, paper/logs, the journals
+tar xf quant-m5-fortnight.tar          # restores paper/raw, paper/logs, the journals
 ```
 
 Then the three checks, in order of how much they prove:
