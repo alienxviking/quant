@@ -174,14 +174,15 @@ impl Portfolio {
         // quote-only simplification was invisible for four milestones and why
         // `a_base_asset_fee_costs_the_same_equity_in_a_different_place` is the
         // test that pins it.
+        //
+        // The base fee comes *out of* holdings on either side, so it is
+        // subtracted without the side's sign: a buyer receives `qty - fee`, a
+        // seller parts with `qty + fee`. This used to multiply by the sign,
+        // which is right for a buy and on a sell handed the fee back.
+        signed = Qty::from_raw(signed.raw() - fill.fee_in_base().raw());
         let cash_fee = match fill.fee_asset {
             FeeAsset::Quote => fill.fee,
-            FeeAsset::Base => {
-                // `fee` is denominated in the base asset here, so it is a
-                // quantity rather than money. Subtract it from what arrived.
-                signed = Qty::from_raw(signed.raw() - fill.fee.raw() * side.sign());
-                Notional::from_raw(0)
-            }
+            FeeAsset::Base => Notional::from_raw(0),
         };
         // Buying spends cash, selling raises it; `gross` already carries the
         // sign, so this is one line for both directions rather than a branch
@@ -191,7 +192,9 @@ impl Portfolio {
         // M4 made it separately visible so "profitable before costs and not
         // after" is read off the output rather than inferred. A base-asset fee
         // that vanished from this total would make the fee counter understate.
-        self.fees = Notional::from_raw(self.fees.raw() + fill.fee.raw());
+        // In quote terms: a base fee is a quantity, and its raw value added to
+        // a money total understates it by a factor of the price.
+        self.fees = Notional::from_raw(self.fees.raw() + fill.fee_in_quote().raw());
         self.fills += 1;
 
         let position = self.positions[index];
@@ -540,8 +543,13 @@ mod tests {
         // after" is read off the output rather than inferred. A base-asset fee
         // that vanished from this total would make the counter understate by
         // exactly the amount that matters.
+        //
+        // And it is counted as *money*. A base-asset fee is a quantity of the
+        // base -- 0.001 BTC, not 0.001 USDT -- so adding its raw value to a
+        // quote-currency total understates it by a factor of the price. This
+        // test used to assert `fees == 0.001` at a price of 100, which pinned
+        // exactly that: the right answer is 0.1.
         let instrument = instrument();
-        let fee = Notional::from_raw(quant_core::SCALE / 1_000);
         let mut p = Portfolio::new(Notional::from_raw(1_000 * quant_core::SCALE));
         p.apply_fill(
             instrument,
@@ -549,11 +557,100 @@ mod tests {
             &Fill {
                 px: "100".parse().expect("px"),
                 qty: "1".parse().expect("qty"),
-                fee,
+                fee: "0.001".parse().expect("fee in base units"),
                 is_maker: false,
                 fee_asset: FeeAsset::Base,
             },
         );
-        assert_eq!(p.fees(), fee, "the venue took it, so it is counted");
+        assert_eq!(
+            p.fees(),
+            "0.1".parse::<Notional>().expect("fee"),
+            "0.001 of the base at 100 is 0.1 of the quote"
+        );
+    }
+
+    #[test]
+    fn a_base_fee_on_a_sell_comes_out_of_the_position_too() {
+        // A fee is taken *from* holdings, so on a sell the position falls by the
+        // quantity sold plus the fee. The first version multiplied the fee by
+        // the side's sign, which is right for a buy and on a sell handed the
+        // fee back. Binance charges a seller in the quote, so this cannot
+        // happen there today -- but the type allows it, and the venue that
+        // does it should not have to discover this.
+        let instrument = instrument();
+        let mut p = Portfolio::new(Notional::from_raw(1_000 * quant_core::SCALE));
+        p.apply_fill(
+            instrument,
+            Side::Buy,
+            &Fill {
+                px: "100".parse().expect("px"),
+                qty: "2".parse().expect("qty"),
+                fee: Notional::ZERO,
+                is_maker: false,
+                fee_asset: FeeAsset::Quote,
+            },
+        );
+        p.apply_fill(
+            instrument,
+            Side::Sell,
+            &Fill {
+                px: "100".parse().expect("px"),
+                qty: "1".parse().expect("qty"),
+                fee: "0.01".parse().expect("fee in base units"),
+                is_maker: false,
+                fee_asset: FeeAsset::Base,
+            },
+        );
+        assert_eq!(
+            p.position(instrument).qty,
+            "0.99".parse().expect("qty"),
+            "2 held, 1 sold, 0.01 taken: 0.99 left"
+        );
+    }
+
+    #[test]
+    fn a_round_trip_with_a_base_fee_balances_to_the_satoshi() {
+        // The identity `reconcile` prints: cash moved = realized - fees. It held
+        // for every fill this project had ever produced because every fill was
+        // charged in the quote. A base fee is the first that is not, and with
+        // the fee counted in base units the identity breaks by almost the whole
+        // fee. Buy 1 at 100 paying 0.001 of the base; sell the 0.999 that
+        // arrived at 110 paying 0.1 of the quote.
+        let instrument = instrument();
+        let start = Notional::from_raw(1_000 * quant_core::SCALE);
+        let mut p = Portfolio::new(start);
+        p.apply_fill(
+            instrument,
+            Side::Buy,
+            &Fill {
+                px: "100".parse().expect("px"),
+                qty: "1".parse().expect("qty"),
+                fee: "0.001".parse().expect("fee"),
+                is_maker: false,
+                fee_asset: FeeAsset::Base,
+            },
+        );
+        assert_eq!(p.position(instrument).qty, "0.999".parse().expect("qty"));
+        p.apply_fill(
+            instrument,
+            Side::Sell,
+            &Fill {
+                px: "110".parse().expect("px"),
+                qty: "0.999".parse().expect("qty"),
+                fee: "0.1".parse().expect("fee"),
+                is_maker: false,
+                fee_asset: FeeAsset::Quote,
+            },
+        );
+        assert!(p.position(instrument).qty.is_zero(), "flat");
+        let moved = Notional::from_raw(p.cash().raw() - start.raw());
+        assert_eq!(moved, "9.79".parse().expect("cash moved"));
+        assert_eq!(p.realized(), "9.99".parse().expect("realized"));
+        assert_eq!(p.fees(), "0.2".parse().expect("fees"));
+        assert_eq!(
+            moved.raw(),
+            p.realized().raw() - p.fees().raw(),
+            "cash moved = realized - fees, with a base fee in the trip"
+        );
     }
 }

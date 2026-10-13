@@ -452,7 +452,11 @@ impl RiskLayer for RiskEngine {
         }
         let held = self.positions[index];
         let before = held.qty.raw();
-        let delta = fill.qty.raw() * side.sign();
+        // A base-asset fee comes out of the position, as it does in the
+        // portfolio. Risk keeps its own tally, but about the same holdings: if
+        // the two disagreed on what arrived, a limit would bind on a position
+        // that does not exist.
+        let delta = fill.qty.raw() * side.sign() - fill.fee_in_base().raw();
         let after = before + delta;
 
         // Realized on whatever this fill closed, at the running average. Simpler
@@ -474,7 +478,9 @@ impl RiskLayer for RiskEngine {
         // the daily budget. A limit that ignored them would be reached late by
         // exactly the amount a high-turnover strategy pays -- which M4 showed is
         // most of the damage.
-        self.today.realized = Notional::from_raw(self.today.realized.raw() - fill.fee.raw());
+        // Valued in the quote whichever asset it was taken in.
+        self.today.realized =
+            Notional::from_raw(self.today.realized.raw() - fill.fee_in_quote().raw());
 
         self.positions[index] = if after == 0 {
             Held::default()
@@ -699,6 +705,69 @@ mod tests {
             risk.check(&order(Side::Buy, "1"), MARK, NOW)
                 .map(|r| r.reason),
             Some(RejectReason::RiskLimit)
+        );
+    }
+
+    #[test]
+    fn a_base_asset_fee_counts_against_the_budget_at_its_quote_value() {
+        // A spot venue takes a buyer's fee in the asset bought. 0.02 of the base
+        // at 100 is 2 of the quote, which is over a budget of 1 -- but counted
+        // in base units it is 0.02 and the limit never notices. The daily loss
+        // limit would be reached late by a factor of the price, on the first
+        // run where fees are real.
+        let mut risk = RiskEngine::new(Limits {
+            max_daily_loss: Some(amount("1")),
+            ..Limits::default()
+        });
+        risk.on_fill(
+            instrument(),
+            Side::Buy,
+            &Fill {
+                px: price("100"),
+                qty: "1".parse().expect("qty"),
+                fee: "0.02".parse().expect("fee in base units"),
+                is_maker: false,
+                fee_asset: quant_core::execution::FeeAsset::Base,
+            },
+            NOW,
+        );
+        assert_eq!(risk.realized_today(), amount("-2"));
+        assert_eq!(
+            risk.check(&order(Side::Buy, "1"), MARK, NOW)
+                .map(|r| r.reason),
+            Some(RejectReason::RiskLimit)
+        );
+    }
+
+    #[test]
+    fn a_base_asset_fee_shrinks_the_position_risk_believes_in() {
+        // Risk keeps its own tally on purpose, so it has to agree with the
+        // portfolio about what arrived. Buy 1 paying 0.001 of the base and 0.999
+        // arrives; sell 0.999 and the position is flat. A tally that ignored the
+        // fee would still think 0.001 was held, and with a position limit of
+        // exactly one unit at the mark of 100 it would refuse the next
+        // full-size buy as 1.001 units, 100.1 of notional.
+        let mut risk = RiskEngine::new(Limits {
+            max_position_notional: Some(amount("100")),
+            ..Limits::default()
+        });
+        risk.on_fill(
+            instrument(),
+            Side::Buy,
+            &Fill {
+                px: price("100"),
+                qty: "1".parse().expect("qty"),
+                fee: "0.001".parse().expect("fee"),
+                is_maker: false,
+                fee_asset: quant_core::execution::FeeAsset::Base,
+            },
+            NOW,
+        );
+        risk.on_fill(instrument(), Side::Sell, &fill("100", "0.999", "0"), NOW);
+        assert_eq!(
+            risk.check(&order(Side::Buy, "1"), MARK, NOW),
+            None,
+            "flat, so a full-size buy fits the limit again"
         );
     }
 

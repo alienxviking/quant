@@ -167,7 +167,7 @@ impl RunObserver for JournalWriter {
                 qty: fill.qty,
                 fee: fill.fee,
                 is_maker: fill.is_maker,
-                fee_asset: quant_core::execution::FeeAsset::Quote,
+                fee_asset: fill.fee_asset,
             },
             "a fill",
         );
@@ -281,6 +281,7 @@ impl RunObserver for JournalWriter {
                 px: fill.px,
                 qty: fill.qty,
                 fee: fill.fee,
+                fee_asset: fill.fee_asset,
             },
             "an orphaned fill",
         );
@@ -297,4 +298,74 @@ pub fn write(journal: &Arc<Mutex<Journal>>, entry: &JournalEntry) -> std::io::Re
         .lock()
         .map_err(|_| std::io::Error::other("the journal lock is poisoned"))?
         .append(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quant_core::execution::FeeAsset;
+    use quant_core::fixed::Notional;
+    use quant_engine::portfolio::Portfolio;
+
+    /// A journal in a fresh temp file, unique to the calling test.
+    fn journal(name: &str) -> (std::path::PathBuf, Arc<Mutex<Journal>>) {
+        let dir = std::env::temp_dir().join(format!("quant-record-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("journal.jsonl");
+        let journal = Journal::open(&path).expect("open journal");
+        (path, Arc::new(Mutex::new(journal)))
+    }
+
+    fn base_fee_fill() -> Fill {
+        Fill {
+            px: "100".parse().expect("px"),
+            qty: "1".parse().expect("qty"),
+            fee: "0.001".parse().expect("fee in base units"),
+            is_maker: false,
+            fee_asset: FeeAsset::Base,
+        }
+    }
+
+    #[test]
+    fn a_fill_is_journalled_with_the_asset_its_fee_was_taken_in() {
+        // The writer used to stamp every fill `FeeAsset::Quote`, whatever the
+        // fill said. Harmless while every fill was simulated, because the
+        // simulator only charges in the quote; the first live fill with a base
+        // fee would have been written down as a quote fee, replayed as one, and
+        // `reconcile` would then disagree with the engine's own checkpoint over
+        // a value our writer invented.
+        let (path, journal) = journal("filled");
+        let mut writer = JournalWriter::new(journal, "BTCUSDT".to_owned(), 0);
+        let portfolio = Portfolio::new(Notional::from_raw(1_000 * quant_core::SCALE));
+        writer.on_fill(
+            ClientOrderId(1),
+            InstrumentId::from_index(0),
+            Side::Buy,
+            &base_fee_fill(),
+            Ts::from_nanos(1),
+            &portfolio,
+        );
+        let entries = quant_engine::journal::read(&path).expect("read").entries;
+        let asset = entries.iter().find_map(|e| match e {
+            JournalEntry::Filled { fee_asset, .. } => Some(*fee_asset),
+            _ => None,
+        });
+        assert_eq!(asset, Some(FeeAsset::Base));
+    }
+
+    #[test]
+    fn an_orphaned_fill_records_its_fee_asset_too() {
+        // An orphan is the one fill a person has to investigate by hand, against
+        // the venue's own record. Its fee is half a fact without the asset.
+        let (path, journal) = journal("orphaned");
+        let mut writer = JournalWriter::new(journal, "BTCUSDT".to_owned(), 0);
+        writer.on_orphaned(ClientOrderId(7), &base_fee_fill(), Ts::from_nanos(1));
+        let entries = quant_engine::journal::read(&path).expect("read").entries;
+        let asset = entries.iter().find_map(|e| match e {
+            JournalEntry::Orphaned { fee_asset, .. } => Some(*fee_asset),
+            _ => None,
+        });
+        assert_eq!(asset, Some(FeeAsset::Base));
+    }
 }
