@@ -181,6 +181,12 @@ pub enum JournalEntry {
         px: Px,
         qty: Qty,
         fee: Notional,
+        /// Which asset `fee` is in. An orphan is investigated by hand against
+        /// the venue's record, and a fee without its asset is half a fact.
+        /// Absent from journals written before M8.c, where it reads back as
+        /// `Quote`, which is what every fill before then was.
+        #[serde(default)]
+        fee_asset: quant_core::execution::FeeAsset,
     },
     /// The kill switch was thrown.
     ///
