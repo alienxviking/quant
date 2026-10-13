@@ -204,6 +204,45 @@ pub struct Fill {
     pub fee_asset: FeeAsset,
 }
 
+impl Fill {
+    /// The fee as money, in the quote currency, whichever asset it was taken in.
+    ///
+    /// For [`FeeAsset::Base`] the `fee` field holds a *quantity of the base*,
+    /// so it is valued at this fill's own price. Every total of fees, and every
+    /// limit that counts them, must go through this rather than reading `fee`
+    /// directly: adding a base quantity to a quote total understates it by a
+    /// factor of the price, and nothing fails when you do it. One method here,
+    /// so the portfolio and the risk layer cannot each convert it slightly
+    /// differently.
+    ///
+    /// # Panics
+    ///
+    /// If the product overflows `Notional`, which needs a fee worth more than
+    /// about 92 billion of the quote.
+    #[must_use]
+    pub fn fee_in_quote(&self) -> crate::fixed::Notional {
+        match self.fee_asset {
+            FeeAsset::Quote => self.fee,
+            FeeAsset::Base => self
+                .px
+                .notional(Qty::from_raw(self.fee.raw()))
+                .expect("a fee small enough to be taken is small enough to value"),
+        }
+    }
+
+    /// The part of the fee taken out of the base asset, as a quantity.
+    ///
+    /// Zero for a quote fee. What a buyer receives is `qty` less this, and a
+    /// seller parts with `qty` plus it.
+    #[must_use]
+    pub const fn fee_in_base(&self) -> Qty {
+        match self.fee_asset {
+            FeeAsset::Quote => Qty::from_raw(0),
+            FeeAsset::Base => Qty::from_raw(self.fee.raw()),
+        }
+    }
+}
+
 /// Which side of the pair a fee was taken from.
 ///
 /// Two variants and not a string: the set is closed by what a spot venue can do,
