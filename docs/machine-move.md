@@ -229,10 +229,11 @@ cargo run --release -p quant-binance --bin venue-check    # needs the API keys
 `venue-check` prints the round-trip-corrected offset against the venue's own
 clock, which is the quantity that actually matters — measuring `now - serverTime`
 naively folds one-way latency into the offset and would block a run over a clock
-that is fine (seen live at M1: −1445 ms naive against +450 ms corrected). That
-example is `ops/preflight.sh`'s, which corrects correctly. `venue-check`'s own
-correction had the wrong sign, putting it off by a full round trip, until
-`m8b-venue-check-offset`.
+that is fine (seen live at M1: −1445 ms naive against −450 ms corrected, both as
+host minus venue; `ops/preflight.sh` prints the second as +450, venue minus
+host). That example is `preflight.sh`'s, whose midpoint arithmetic is right.
+`venue-check`'s own correction had the wrong sign, putting it off by a full round
+trip, until `m8b-venue-check-offset`.
 
 **The ops harness, and this is the real gap.** `ops/*.ps1` is **record-only**.
 The paper mode exists in the bash half alone, deliberately: *"an untested paper

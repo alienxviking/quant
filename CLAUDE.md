@@ -1206,7 +1206,11 @@ underneath a running supervisor can make its loop jump mid-execution. Merging to
   to a second kind of irreplaceable data. JSON Lines against this project's grain,
   because a journal is hundreds of lines a week rather than millions a day — so
   density buys nothing and `jq` at 3am buys a lot; only the **last** line may be
-  torn, since nothing writes into the middle of an append-only file.
+  torn, since nothing writes into the middle of an append-only file. One
+  exception since `m8c-journal-recovery`: a line torn by a crash and then
+  followed by a restart's `Started` is tolerated too, and listed, never dropped
+  silently. Only truncation and garbage qualify; a complete line the reader
+  cannot understand is still an error.
   `(exchange, symbol)` and never an id, pinned by a test that replays one journal
   through two registries with different id assignments. Fills are journalled
   **before** the strategy is told, so a crash cannot erase a fill it acted on.
@@ -1244,7 +1248,9 @@ underneath a running supervisor can make its loop jump mid-execution. Merging to
   hold — the latter lets everything through up to the one that mattered. Exposure is
   absolute so a short counts, and **reducing an oversized position is always
   allowed**: a risk layer that trapped a position it thought too large would be the
-  most dangerous thing here.
+  most dangerous thing here. (That held only for an order that brought exposure
+  back within the limit in one go, until `m8c-risk-reduce`. Now a purely reducing
+  order is exempt from the position limit. Every other check still binds it.)
 
   **Fees count against the daily loss budget**, or the limit is reached late by
   exactly the amount M4 showed is most of the damage. Loss and order-count limits
@@ -1535,9 +1541,13 @@ reasoning in its header. Three macOS choices were not arbitrary:
 - **The clock check is round-trip corrected.** The PowerShell preflight measured
   `now - serverTime`, which folds one-way latency to the venue into the offset. From
   a hostel connection that latency was hundreds of ms and would have *blocked a run
-  over a clock that was fine* (seen live: −1445 ms naive vs +450 ms corrected).
-  `preflight.sh`/`fix-clock.sh` use the NTP midpoint estimate and confirm sync
-  read-only with `sntp` — no sudo, and the same quantity `clock_skew` reflects.
+  over a clock that was fine* (seen live: −1445 ms naive against −450 ms
+  corrected, both as host minus venue; `preflight.sh` prints the second as +450
+  because its convention is venue minus host). `preflight.sh`/`fix-clock.sh` use
+  the NTP midpoint estimate and confirm sync read-only with `sntp`, no sudo. This
+  used to add "and the same quantity `clock_skew` reflects", which is false:
+  `clock_skew` counts messages whose venue timestamp was ahead of our receive
+  stamp, and is not an offset at all.
 
 `zstd-sys` compiles C, so Xcode Command Line Tools were required
 (`xcode-select --install`); everything else on `aarch64-apple-darwin` built clean
@@ -1710,7 +1720,8 @@ gives the fortnight two independent samples.
   `stop-run.sh` already sends SIGINT.
 - **The clock check is round-trip corrected.** Measuring `now - serverTime`
   naively folds one-way latency into the offset and would block a run over a clock
-  that is fine (seen live: −1445 ms naive vs +450 ms corrected).
+  that is fine (seen live: −1445 ms naive against −450 ms corrected, both as host
+  minus venue).
 - **`caffeinate -dimsu -w $$`** is held for each supervisor's lifetime, so the Mac
   stays awake across every reconnect. A reboot still ends the run, deliberately.
 - **`COPYFILE_DISABLE=1 tar ...`** when bringing data back, or macOS writes
@@ -2175,6 +2186,13 @@ anything around this machine:
 w32tm /query /status ; w32tm /resync
 cargo run --release -p quant-binance --bin venue-check    # needs the API keys
 ```
+
+**Measured on 2026-10-15: this host is about 2.1 s ahead of Binance**, the
+tightest of six midpoint readings against the public `/api/v3/time` giving
++2110 ms, with `w32time` **stopped and set to manual**. That is M1's condition
+again, and it would refuse every order. The fix needs an Administrator
+PowerShell: `Set-Service w32time -StartupType Automatic`, `Start-Service
+w32time`, `w32tm /resync /force`. Then measure again before trusting it.
 
 `venue-check` places no order. It makes one signed `GET /api/v3/account` and
 prints the round-trip-corrected offset, which is the quantity that matters —

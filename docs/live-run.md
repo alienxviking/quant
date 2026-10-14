@@ -40,14 +40,15 @@ the order formats — is mechanical. These three are the milestone.
 
 ### The defect this scoping found, before any code was written
 
-`Engine::run` blocks on `source.next_event()`
-(`crates/quant-engine/src/lib.rs`), and `venue.poll()` is called in exactly one
-place: inside `step`. So **execution reports are drained only when a market event
-arrives**, and `LiveSource::next_event` calls `recv()` with no timeout.
+As written before slice (a): `Engine::run` blocked on `source.next_event()`
+(`crates/quant-engine/src/lib.rs`), and `venue.poll()` was called in exactly one
+place, inside `step` (since replaced by `Engine::dispatch`). So **execution
+reports were drained only when a market event arrived**, and
+`LiveSource::next_event` called `recv()` with no timeout.
 
-In two of the three worlds this is invisible, which is why it has survived five
+In two of the three worlds this is invisible, which is why it survived five
 milestones. `SimulatedVenue` produces outcomes only in response to `observe`,
-which happens inside `step` anyway — the coupling is real and costs nothing.
+which happened inside `step` anyway — the coupling is real and costs nothing.
 
 In the third world it is wrong. A live fill arrives from the venue's user-data
 stream on its own schedule, and while no market event arrives the engine thread
@@ -108,7 +109,18 @@ in the quote asset, which is every backtest and all of M5, the position is
 exactly zero or `qty`, so the change must be a no-op: `m8c-exit-sizing` is
 accepted only if M5's 824 fills and cash 31.64743842 reproduce exactly. Both
 sides of every M8 comparison run the same code, so the strategy still cannot be
-the reason live differs from the model.
+the reason live differs from the model, but the venue model can be.
+`SimulatedVenue` charges every fee in the quote asset, so the model's exits sell
+`qty` where live sells one lot less, and criteria B and C cannot pair exits
+honestly until the simulator can take a buy's fee in the base asset (§4).
+
+One consequence for sizing. With the fee taken in the base asset the exit is a
+lot smaller than the entry, so a `qty` within about a lot of the venue's
+minimum notional produces an exit the venue refuses on every down-cross, and a
+strategy still holding a lot never trades again. The size must clear the
+minimum notional by more than one lot plus the expected adverse move. M5's
+0.001 BTC clears it about fifteen times over, and the live binary refuses a size
+that does not.
 
 **Not a measurement of queue position or market impact, and four documents
 currently say otherwise.** `docs/engine-contract.md` §8, `docs/overview.md`,
@@ -401,7 +413,13 @@ feature.
 4. **What a live run writes down.** The run tag on `Started`; venue order and
    trade ids; entries for an orphan from another run, someone else's trade, losing
    and regaining the account stream, a refused cancel, and a rejection's code;
-   journal schema 3, with `read` refusing a schema it does not know.
+   journal schema 3, with `read` refusing a schema it does not know. Three reader
+   debts come due here too. The market's return after a gap must be recorded
+   explicitly, because once a live venue speaks on idle wakes a fill after a
+   `blind` line no longer proves the market came back, which is what `explain`
+   assumes. An `orphaned` line must be loud in `runlog check`, which today never
+   reads it. And lines torn before a restart must show where an operator looks,
+   not only in `reconcile`'s full report.
 5. **A frame kind for the account stream.** Container version 3, and the account
    stream under its own data root (§5), where `quant-verify` runs its container
    checks and not the update-id chain. Accepted when a v3 build reads every v1 and
@@ -418,15 +436,19 @@ feature.
    (§5). Behind it, `impl ExecutionVenue`. Accepted by a permutation test over
    every interleaving of the REST reply and the stream's reports.
 8. **The `live` binary and a rehearsal.** Paper's session extracted so any venue
-   can run it; a startup that records first and trades last; a live mode in
-   `ops/` enforcing one symbol. Accepted when a run on Spot Testnet (§5) reaches
+   can run it; a startup that records first and trades last; a refusal of any
+   size whose floored exit would fall below the minimum notional at the current
+   mark (§2); a live mode in `ops/` enforcing one symbol. Accepted when a run on Spot Testnet (§5) reaches
    criterion D's states 1, 2, 4 and 6, `reconcile` agrees, `quant-verify` is clean
    on both data roots, and replaying the recorded account frames through the
    translator reproduces every venue-produced journal entry.
 
 Outside slice (c): resolving an in-doubt order by lookup is slice (d), criteria
 A, B and C as a binary are slice (e), and the run with criteria D and E is slice
-(f).
+(f). Slice (e) needs one model change first: `SimulatedVenue` taking a buy's fee
+in the base asset when configured to (§2). It is off by default, so every
+backtest and M5 still reproduce; the model replay for criteria B and C runs with
+it on, or every exit it predicts is a lot bigger than the one live sends.
 
 ### Where it runs, which is not yet settled
 

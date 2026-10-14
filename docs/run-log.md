@@ -267,7 +267,7 @@ wire. At M8 an order at a live venue we never wrote down is an orphan position.
 **The volume boundary is a policy, and policies drift.** Everything here is
 affordable because decisions arrive at ~0.003/s against a market peak of 694
 msg/s. The design holds while decisions stay below roughly **250/s sustained**.
-Past that an fsync inside `step` stalls the engine thread, the tee drops the
+Past that an fsync inside `Engine::dispatch` stalls the engine thread, the tee drops the
 engine's copy, and the record of a session damages the session — M1's literal
 recorded lesson, *a metric must never be able to take down a capture*. The
 consolation is that the failure reports itself: `LiveSource` finds the
