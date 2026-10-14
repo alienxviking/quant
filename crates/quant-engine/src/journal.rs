@@ -64,7 +64,9 @@ use crate::RefusedBy;
 use quant_core::event::Side;
 use quant_core::execution::{ClientOrderId, Fill, RejectReason};
 use quant_core::fixed::{Notional, Px, Qty};
-use quant_core::instrument::{Exchange, InstrumentDef, InstrumentId, InstrumentRegistry};
+use quant_core::instrument::{
+    Exchange, Instrument, InstrumentDef, InstrumentId, InstrumentRegistry,
+};
 use quant_core::time::Ts;
 
 use crate::portfolio::Portfolio;
@@ -768,6 +770,9 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
 #[derive(Debug)]
 pub struct Resumption {
     /// The session's instrument, under the definition the caller gave.
+    ///
+    /// Checked rather than assumed: [`resume`] fails before it hands back an
+    /// id the registry holds under any other definition.
     pub instrument: InstrumentId,
     /// The capital the session began with, as [`resume`] decides it.
     pub starting_cash: Notional,
@@ -798,6 +803,15 @@ pub struct Resumption {
 /// that way would lose its asset names as well, and the user-data translator
 /// refuses an instrument without them.
 ///
+/// **And it checks what registering kept**, because ordering can only beat the
+/// placeholders `resume` itself would cause. The same idempotence means a
+/// registry that already held the instrument before `resume` was called hands
+/// back whatever it held — a placeholder from an earlier replay, or a
+/// definition from somewhere else — and the one given is dropped just as
+/// silently. Nothing but a comparison can see that, so `resume` compares every
+/// field and fails, naming each one that differs, rather than return an id
+/// that names rules the caller never gave.
+///
 /// It lives here rather than in `paper` because a live session must resume the
 /// same way, and beside [`replay`] and `resolve` because the placeholders it
 /// has to beat are registered here: the rule and the hazard it orders against
@@ -808,23 +822,131 @@ pub struct Resumption {
 /// capital a session began with and a restart must not reset it. A journal
 /// that holds entries and no `Started` at all, which nothing in this workspace
 /// writes, resumes from zero, as `paper` always did.
-#[must_use]
+///
+/// # Errors
+///
+/// [`DefinitionConflict`] when `registry` already held the instrument under a
+/// different definition. Nothing is replayed, and the registry is left as it
+/// was.
 pub fn resume(
     entries: &[JournalEntry],
     registry: &mut InstrumentRegistry,
     instrument: InstrumentDef,
     cash: Notional,
-) -> Resumption {
+) -> Result<Resumption, DefinitionConflict> {
+    // Kept, because registering consumes the definition and what the registry
+    // made of it is the thing to check.
+    let given = instrument.clone();
     // Before anything in the journal can register a placeholder for it.
     let instrument = registry.register(instrument);
+    let fields = conflicts(registry.expect(instrument), &given);
+    if !fields.is_empty() {
+        return Err(DefinitionConflict {
+            exchange: given.exchange,
+            symbol: given.symbol,
+            fields,
+        });
+    }
     let portfolio = (!entries.is_empty()).then(|| replay(entries, registry));
-    Resumption {
+    Ok(Resumption {
         instrument,
         starting_cash: portfolio.as_ref().map_or(cash, Portfolio::starting_cash),
         portfolio,
         tripped: last_trip(entries),
         next_order_id: next_order_id(entries),
+    })
+}
+
+/// The registry already held a session's instrument under a different
+/// definition from the one [`resume`] was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionConflict {
+    pub exchange: Exchange,
+    pub symbol: String,
+    /// Every field that differs, in [`InstrumentDef`]'s order. Never empty.
+    pub fields: Vec<FieldConflict>,
+}
+
+/// One field two definitions of an instrument disagree about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldConflict {
+    /// The field's name in [`InstrumentDef`].
+    pub field: &'static str,
+    /// What the registry held, as a person would read it.
+    pub registered: String,
+    /// What the caller gave.
+    pub given: String,
+}
+
+impl std::fmt::Display for DefinitionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} is already registered under a different definition from the one \
+             this session was given, so resuming would trade under rules nobody gave it:",
+            self.exchange, self.symbol
+        )?;
+        for (i, conflict) in self.fields.iter().enumerate() {
+            write!(
+                f,
+                "{}{} is {} where {} was given",
+                if i == 0 { " " } else { "; " },
+                conflict.field,
+                conflict.registered,
+                conflict.given
+            )?;
+        }
+        Ok(())
     }
+}
+
+impl std::error::Error for DefinitionConflict {}
+
+/// Every field on which what the registry holds differs from what was given.
+fn conflicts(registered: &Instrument, given: &InstrumentDef) -> Vec<FieldConflict> {
+    // Every field named, and no `..` -- the rule `replay`'s `Filled` arm learned
+    // from `fee_asset`. A field added to `InstrumentDef` does not build here
+    // until somebody has decided whether disagreeing about it matters.
+    let InstrumentDef {
+        exchange,
+        symbol,
+        base,
+        quote,
+        kind,
+        tick_size,
+        lot_size,
+        min_notional,
+    } = given;
+    let mut out = Vec::new();
+    // One field, compared by value and rendered only when the two differ. The
+    // name is the field's own identifier, so the two cannot drift apart.
+    macro_rules! compare {
+        ($field:ident, $show:expr) => {
+            if registered.$field != *$field {
+                out.push(FieldConflict {
+                    field: stringify!($field),
+                    registered: $show(&registered.$field),
+                    given: $show($field),
+                });
+            }
+        };
+    }
+    // Quoted, so an empty asset name reads as `""` rather than as nothing; and
+    // a kind by its variant's name.
+    let quoted = |text: &String| format!("{text:?}");
+    let named = |kind| format!("{kind:?}");
+    // The key registration is idempotent on, so these two cannot differ today.
+    // Compared anyway: the claim is about every field, and a registry keyed
+    // some other way tomorrow should not make it quietly narrower.
+    compare!(exchange, ToString::to_string);
+    compare!(symbol, quoted);
+    compare!(base, quoted);
+    compare!(quote, quoted);
+    compare!(kind, named);
+    compare!(tick_size, ToString::to_string);
+    compare!(lot_size, ToString::to_string);
+    compare!(min_notional, ToString::to_string);
+    out
 }
 
 /// The trip state a previous session left behind.
@@ -1240,7 +1362,8 @@ mod tests {
         // -- and the real definition was dropped without a word.
         let real = btcusdt();
         let mut registry = InstrumentRegistry::new();
-        let resumed = resume(&session(), &mut registry, real.clone(), amount("100"));
+        let resumed = resume(&session(), &mut registry, real.clone(), amount("100"))
+            .expect("a fresh registry holds nothing to conflict with");
         assert!(
             resumed.portfolio.is_some(),
             "the journal holds fills, so this is a resume"
@@ -1260,7 +1383,7 @@ mod tests {
         // `Engine::resuming` replaces the portfolio outright -- the rehearsal
         // that reported "cash 0 from 0" on a session configured with a hundred.
         let mut registry = InstrumentRegistry::new();
-        let resumed = resume(&[], &mut registry, btcusdt(), amount("100"));
+        let resumed = resume(&[], &mut registry, btcusdt(), amount("100")).expect("resumes");
         assert!(resumed.portfolio.is_none(), "nothing to resume");
         assert_eq!(resumed.starting_cash, amount("100"));
         assert_eq!(resumed.next_order_id, 1);
@@ -1279,7 +1402,7 @@ mod tests {
             schema: SCHEMA,
         });
         let mut registry = InstrumentRegistry::new();
-        let resumed = resume(&restarted, &mut registry, btcusdt(), amount("50"));
+        let resumed = resume(&restarted, &mut registry, btcusdt(), amount("50")).expect("resumes");
         assert_eq!(resumed.starting_cash, amount("100"));
         assert_eq!(
             resumed.next_order_id, 3,
@@ -1303,8 +1426,60 @@ mod tests {
             schema: SCHEMA,
         });
         let mut registry = InstrumentRegistry::new();
-        let resumed = resume(&entries, &mut registry, btcusdt(), amount("100"));
+        let resumed = resume(&entries, &mut registry, btcusdt(), amount("100")).expect("resumes");
         assert_eq!(resumed.tripped, Some(crate::risk::TripCause::DailyLoss));
+    }
+
+    #[test]
+    fn resuming_onto_a_placeholder_already_registered_fails_naming_each_difference() {
+        // Registration is idempotent on (exchange, symbol), so a registry that
+        // already holds the symbol hands back what it holds and drops the
+        // definition given -- and `replay` registers a placeholder for every
+        // instrument it meets. Resuming onto one would hand back an id under
+        // the smallest tick and lot and no minimum notional while
+        // `Resumption::instrument` claimed the caller's definition.
+        let mut registry = InstrumentRegistry::new();
+        let placeholder = resolve(&mut registry, &key());
+
+        let conflict = resume(&session(), &mut registry, btcusdt(), amount("100"))
+            .expect_err("a placeholder is not the definition the caller gave");
+
+        assert_eq!(conflict.exchange, Exchange::Binance);
+        assert_eq!(conflict.symbol, "BTCUSDT");
+        let fields: Vec<&str> = conflict.fields.iter().map(|c| c.field).collect();
+        assert_eq!(
+            fields,
+            ["base", "quote", "tick_size", "lot_size", "min_notional"],
+            "every rule the placeholder lacks, and nothing the two share"
+        );
+        let text = conflict.to_string();
+        assert!(text.contains("binance BTCUSDT"), "{text}");
+        assert!(
+            text.contains(r#"base is "" where "BTC" was given"#),
+            "{text}"
+        );
+        assert!(
+            text.contains("min_notional is 0 where 5 was given"),
+            "{text}"
+        );
+        assert_eq!(
+            registry.expect(placeholder).min_notional,
+            Notional::ZERO,
+            "the registry is left as it was"
+        );
+    }
+
+    #[test]
+    fn resuming_onto_the_same_definition_already_registered_is_not_a_conflict() {
+        // The other side of that boundary. A caller that registered the real
+        // definition before resuming -- a live session that read the venue's
+        // rules first -- is resuming onto exactly what it gave.
+        let mut registry = InstrumentRegistry::new();
+        let registered = registry.register(btcusdt());
+        let resumed = resume(&session(), &mut registry, btcusdt(), amount("100"))
+            .expect("the same definition twice is not a conflict");
+        assert_eq!(resumed.instrument, registered);
+        assert!(resumed.portfolio.is_some(), "and the journal still replays");
     }
 
     #[test]

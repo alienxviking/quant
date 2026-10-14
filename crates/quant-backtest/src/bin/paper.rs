@@ -139,7 +139,8 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // position it does not know about. `resume` registers the instrument's own
     // definition before it replays a line: this used to replay first, so after
     // a restart with fills the journal's placeholder rules won and the session
-    // traded under none.
+    // traded under none. It fails if the registry already held other rules for
+    // the symbol, which a fresh registry cannot.
     let recovered = journal::read(&journal_path)?;
     let mut registry = InstrumentRegistry::new();
     let resumed = journal::resume(
@@ -147,7 +148,7 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         &mut registry,
         definition(&args.symbol),
         args.cash,
-    );
+    )?;
     let instrument = resumed.instrument;
     let starting = resumed.starting_cash;
 
