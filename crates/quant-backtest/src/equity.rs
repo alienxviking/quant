@@ -105,7 +105,13 @@ pub struct Recorded<S> {
 }
 
 impl<S: Strategy> Recorded<S> {
-    /// Sample every `interval` nanoseconds of event time.
+    /// Sample every `interval` nanoseconds of engine time, read from
+    /// `ctx.now()` at each market event.
+    ///
+    /// In a backtest and in paper that is the market event stream's own time.
+    /// Live it need not be: a venue report stamped later than the event in
+    /// hand carries the clock up to the report before the strategy sees the
+    /// event, and the sample is stamped with the clock, not with the event.
     #[must_use]
     pub fn new(inner: S, instrument: InstrumentId, interval: i64) -> Self {
         Self {

@@ -63,11 +63,14 @@ pub trait EventSource {
     /// it was free.
     ///
     /// A live venue speaks on its own schedule. A fill can arrive while the
-    /// market socket is stalled, and Binance closes a stream every 24 hours by
-    /// design against a 120-second idle timeout, so that window opens many times
-    /// in a run. An engine parked in `next_event` cannot book that fill, cannot
-    /// tell the strategy, and cannot move the risk layer's daily tally — which
-    /// is the state in which not knowing is most expensive.
+    /// market socket is silent: Binance cuts every stream at 24 hours by
+    /// design, and a socket that stays open but stops delivering is given up on
+    /// only when the connection's 120-second idle timeout expires — so the
+    /// market can say nothing for two minutes before a reconnect even begins,
+    /// with an order working across it. An engine parked in `next_event`
+    /// cannot book that fill, cannot tell the strategy, and cannot move the
+    /// risk layer's daily tally — which is the state in which not knowing is
+    /// most expensive.
     ///
     /// # Why it is defaulted, and what the default guarantees
     ///
@@ -79,7 +82,10 @@ pub trait EventSource {
     /// change, which is the no-op property `Costs::NONE` established as the way
     /// to make a seam change checkable.
     ///
-    /// Only a source with a second thing to wait for overrides it.
+    /// Overriding it is for the engine's sake, not the source's. `LiveSource`
+    /// waits on one channel and nothing else, but its `next_event` blocks for
+    /// as long as the market is quiet, and the engine has a second thing to
+    /// wait for — the venue — that it cannot hear while parked there.
     fn next_event_timeout(
         &mut self,
         timeout: core::time::Duration,

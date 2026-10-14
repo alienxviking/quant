@@ -486,7 +486,11 @@ struct Quiet {
     /// Flipped on every call, so idle wakes and events alternate, starting
     /// with an idle wake -- a socket that is up before its first frame.
     idle_next: bool,
-    /// Idle wakes still to give once the script has run out.
+    /// How many more times to find the script empty and idle rather than end.
+    ///
+    /// Not the number of idle wakes after the last event: the flip carries on
+    /// regardless, so each of these is preceded by an idle wake of its own and
+    /// one more comes before the end -- `2 * trailing + 1` in all.
     trailing: usize,
 }
 

@@ -17,11 +17,12 @@
 //! This module used to argue that blocking was right, and while the engine had
 //! one input it was. M8 gives it a second. A live venue's reports arrive on
 //! their own socket, on their own schedule, and an engine parked on this channel
-//! while the market socket is stalled -- which Binance's own 24-hour stream
-//! rotation makes routine -- cannot book a fill, cannot tell the strategy, and
-//! cannot move the risk layer's tally. M8.a taught the engine to stop waiting,
-//! but this source never let it: the trait's default calls `next_event`, so it
-//! can never idle, and until this override the default is what the engine got.
+//! while the market socket is silent -- cut by Binance's 24-hour limit on a
+//! stream, or stalled until the connection's 120-second idle timeout gives up
+//! on it -- cannot book a fill, cannot tell the strategy, and cannot move the
+//! risk layer's tally. M8.a taught the engine to stop waiting, but this source
+//! never let it: the trait's default calls `next_event`, so it can never idle,
+//! and until this override the default is what the engine got.
 //!
 //! What the old argument protected still holds, because an idle wake is not a
 //! timer the strategy can see. The engine clock *is* the input stream, so a

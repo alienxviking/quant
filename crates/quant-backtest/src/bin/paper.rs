@@ -230,9 +230,12 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         engine = engine.minting_from(journal::next_order_id(&recovered.entries));
     }
 
-    // The engine blocks on its channel, so it gets a thread of its own -- the
-    // same reasoning that gives the capture writer one. It ends when the capture
-    // drops the sender, which is how a clean shutdown reaches it.
+    // The engine spends the whole run waiting on its channel. Since M8 the waits
+    // are bounded, so that it can look at the venue while the market is quiet,
+    // but each one still holds the thread it runs on -- so it gets a thread of
+    // its own, the same reasoning that gives the capture writer one. It ends
+    // when the capture drops the sender, which is how a clean shutdown reaches
+    // it.
     let engine_thread = std::thread::Builder::new()
         .name(format!("paper-engine-{}", args.symbol))
         .spawn(move || {
