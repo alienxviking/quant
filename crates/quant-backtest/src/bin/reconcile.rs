@@ -93,12 +93,18 @@ fn describe_journal(path: &Path, recovered: &Recovered) {
         }
     );
     println!("marks     {checkpoints} checkpoints");
+    // Said as a shape rather than a cause. `read` tolerates a line that is not
+    // valid JSON, which is what a hard kill mid-write leaves and also what a
+    // power loss that left NUL bytes leaves, and the file cannot say which.
     if recovered.torn_tail {
-        println!("tail      the last line was torn and discarded: a hard kill mid-write");
+        println!(
+            "tail      the last line is not valid JSON and was discarded: the shape an \
+             interrupted write leaves"
+        );
     }
-    // Each one is an entry lost to a hard kill, and the restart after it. Said
-    // with the line numbers so a person can go and look at what was being
-    // written, which the file still holds.
+    // Each one is an entry an interrupted write lost, and the restart after it.
+    // Said with the line numbers so a person can go and look at what is there,
+    // which the file still holds.
     if !recovered.torn_before_restart.is_empty() {
         let lines: Vec<String> = recovered
             .torn_before_restart
@@ -106,7 +112,8 @@ fn describe_journal(path: &Path, recovered: &Recovered) {
             .map(ToString::to_string)
             .collect();
         println!(
-            "torn      {} {}: a hard kill mid-write, then a restart wrote past it",
+            "torn      {} {}: not valid JSON, the shape an interrupted write leaves, then \
+             a restart wrote past it",
             if lines.len() == 1 { "line" } else { "lines" },
             lines.join(", ")
         );

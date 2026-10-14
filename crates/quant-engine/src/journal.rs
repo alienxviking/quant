@@ -30,10 +30,12 @@
 //!
 //! # A torn line, and the restart after it
 //!
-//! A process killed mid-`append` leaves a partial last line. The supervisor
-//! then restarts it, and the restart appends — so a torn line does not stay
-//! the last line for long. Two rules keep that safe, and both keep every byte
-//! and the file append-only:
+//! A write that is cut short leaves a last line that is not valid JSON. A
+//! process killed mid-`append` leaves the start of an entry; a power loss can
+//! leave a run of NUL bytes instead, where the file's new length reached the
+//! disk before its data did. The supervisor then restarts the process, and the
+//! restart appends — so a torn line does not stay the last line for long. Two
+//! rules keep that safe, and both keep every byte and the file append-only:
 //!
 //! - **Opening terminates the fragment.** [`Journal::open`] writes a newline
 //!   first when the file does not end in one, so the next entry starts on its
@@ -42,12 +44,24 @@
 //!   damage — so a journal that had survived a hard kill was made unreadable
 //!   by the restart that followed it: to `reconcile`, to `explain`, and to the
 //!   next restart, which is when it is needed most.
-//! - **Reading tolerates exactly that shape and counts it.** A bad line may be
-//!   the last line, or it may be followed by a `Started` entry, which is the
-//!   first thing every session writes. Either is an interrupted write and is
-//!   reported in [`Recovered`]; a bad line followed by anything else is damage
-//!   and an error, because nothing else writes into the middle of an
-//!   append-only file.
+//! - **Reading tolerates exactly that shape and counts it.** A line that is not
+//!   valid JSON may be the last line, or it may be followed by a `Started`
+//!   entry, which is the first thing every session writes. Either is reported
+//!   in [`Recovered`] as the shape an interrupted write leaves; which
+//!   interruption left it, the file cannot say. A bad line followed by anything
+//!   else is damage and an error, because nothing else writes into the middle
+//!   of an append-only file.
+//!
+//! "Not valid JSON" is the whole of that tolerance, and `read` asks
+//! `serde_json` rather than guessing: JSON cut short is its `Eof`, and bytes
+//! that are not JSON at all — NULs, or a fragment with NULs after it — are its
+//! `Syntax`. A line that is valid JSON and still not an entry is its `Data`: an
+//! entry type a newer build wrote, or a field this build requires that the
+//! writer left out. No interrupted write produces that, so it is an error
+//! wherever it is, the last line and the line before a `Started` included.
+//! Tolerated at the end, it would be discarded under a torn line's name, and
+//! the restart after it would leave it in the middle of the file for every
+//! later reader to refuse.
 //!
 //! # Why the instrument is `(exchange, symbol)`
 //!
@@ -59,6 +73,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+use serde_json::error::Category;
 
 use crate::RefusedBy;
 use quant_core::event::Side;
@@ -341,7 +357,7 @@ impl Journal {
     /// Open for appending, creating it if absent.
     ///
     /// A file that does not end in a newline gets one before anything else is
-    /// written. That is the mark of a process killed mid-`append`, and writing
+    /// written. That is the mark of a write that was cut short, and writing
     /// straight after the fragment would glue the next entry onto it: one
     /// unreadable line in the middle of the file, where `read` cannot tell an
     /// interrupted write from damage. Terminated, the fragment keeps every one
@@ -410,25 +426,29 @@ fn ends_mid_line(file: &mut File) -> std::io::Result<bool> {
 #[derive(Debug, Default, Clone)]
 pub struct Recovered {
     pub entries: Vec<JournalEntry>,
-    /// A final line that was not valid JSON.
+    /// A final line that was not valid JSON: cut short, or not JSON at all.
     ///
-    /// Reported rather than treated as an error: a process killed mid-`write`
-    /// leaves a partial last line, and that is a *torn tail* — the same
-    /// distinction `quant-storage` draws between an interrupted write and
-    /// corruption.
+    /// Reported rather than treated as an error, because that is the shape an
+    /// interrupted write leaves — a process killed mid-`append` leaves the start
+    /// of an entry, and a power loss can leave NUL bytes — and that is a *torn
+    /// tail*: the same distinction `quant-storage` draws between an interrupted
+    /// write and corruption. A final line that is valid JSON and not an entry
+    /// is not torn, and `read` refuses it.
     pub torn_tail: bool,
-    /// Lines a crash tore and a restart then wrote past, numbered from 1.
+    /// Lines that were not valid JSON and that a restart then wrote past,
+    /// numbered from 1.
     ///
     /// A torn tail stops being the tail as soon as the supervisor restarts the
     /// process: [`Journal::open`] terminates the fragment and the restart
-    /// appends its `Started` on the next line. So a bad line can sit in the
-    /// middle of the file in exactly one honest way, immediately before a
-    /// `Started`, and these are those lines. Listed rather than counted
+    /// appends its `Started` on the next line. So a line that is not valid JSON
+    /// can sit in the middle of the file in exactly one honest way, immediately
+    /// before a `Started`, and these are those lines. Listed rather than counted
     /// silently, so a person can find each one; the entry that was being
-    /// written when the process died is lost, and this is where it was.
+    /// written when the write was cut short is lost, and this is where it was.
     ///
     /// A bad line followed by anything else is damage and `read` refuses it,
-    /// because nothing else writes into the middle of an append-only file.
+    /// because nothing else writes into the middle of an append-only file. So
+    /// is a line that is valid JSON and not an entry, wherever it is.
     pub torn_before_restart: Vec<usize>,
 }
 
@@ -437,9 +457,12 @@ pub struct Recovered {
 /// A missing file is an empty journal, not an error: the first run of a session
 /// has not written one yet.
 ///
-/// A line that is not an entry is tolerated in two places only, both of them
-/// an interrupted write: as the last line, and immediately before a `Started`
-/// entry. Anywhere else it is an error. See the module docs.
+/// A line that is not valid JSON — cut short, or not JSON at all — is tolerated
+/// in two places only, the two an interrupted write can leave one in: as the
+/// last line, and immediately before a `Started` entry. Anywhere else it is an
+/// error. A line that *is* valid JSON and still not an entry is an error
+/// wherever it is, those two places included, because no interrupted write
+/// produces one. See the module docs.
 pub fn read(path: &Path) -> std::io::Result<Recovered> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -465,6 +488,28 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
             }
             Err(e) => e,
         };
+        // Which kind of failure, before where it is. Exhaustive, so every
+        // category is a decision here rather than a default.
+        match e.classify() {
+            // The two shapes an interrupted write leaves: JSON cut short, and
+            // bytes that are not JSON at all -- a run of NULs where the file's
+            // length reached the disk before its data, alone or after a
+            // fragment. Whether one is tolerated depends on where it is.
+            Category::Eof | Category::Syntax => {}
+            // Valid JSON that is not an entry: a type a newer build wrote, or a
+            // field this build requires that the writer left out. No
+            // interrupted write produces that, so it is not torn wherever it
+            // is, and calling it torn would discard a whole entry under a false
+            // name. `Io` cannot come out of `from_str`, and is refused with it
+            // rather than given a tolerance nothing has argued for.
+            Category::Data | Category::Io => {
+                return Err(std::io::Error::other(format!(
+                    "journal line {number} is not an entry this build can read, and not the \
+                     shape an interrupted write leaves either, so it is not torn -- an entry \
+                     from a newer build, or damage: {e}"
+                )))
+            }
+        }
         match parsed.peek() {
             // The write the crash interrupted, not yet written past.
             None => out.torn_tail = true,
@@ -1317,6 +1362,95 @@ mod tests {
 
         let err = read(&scratch.path).expect_err("damage must be loud");
         assert!(err.to_string().contains("only the last line may be torn"));
+    }
+
+    /// The restart that follows a torn write: what `paper` does on coming
+    /// back up, which is to open the journal and write its `Started`.
+    fn restart(path: &Path) -> JournalEntry {
+        let started = JournalEntry::Started {
+            at: Ts::from_nanos(10),
+            cash: amount("100"),
+            schema: SCHEMA,
+        };
+        write_all(path, std::slice::from_ref(&started));
+        started
+    }
+
+    /// A whole line a newer build might write: valid JSON, and an entry type
+    /// this build has never heard of.
+    const FROM_A_NEWER_BUILD: &str = "{\"type\":\"venue_trade\",\"at\":5}\n";
+
+    #[test]
+    fn a_run_of_nul_bytes_reads_as_an_interrupted_write_before_and_after_a_restart() {
+        // The other shape a lost write can read back as. A power loss can put
+        // the file's new length on the disk before its data, and the bytes that
+        // never arrived read back as NULs -- not JSON at all, where a hard
+        // kill leaves JSON cut short. Both are the shape an interrupted write
+        // leaves, and both must survive the restart that follows.
+        let scratch = Scratch::new("nul-run");
+        write_all(&scratch.path, &session());
+        let mut bytes = std::fs::read(&scratch.path).expect("read");
+        bytes.extend_from_slice(&[0_u8; 64]);
+        std::fs::write(&scratch.path, &bytes).expect("write");
+
+        let recovered = read(&scratch.path).expect("a run of NULs at the end is a torn tail");
+        assert!(recovered.torn_tail);
+        assert_eq!(
+            recovered.entries,
+            session(),
+            "everything before it survives"
+        );
+
+        let started = restart(&scratch.path);
+        let recovered = read(&scratch.path).expect("and a restart written past it is not damage");
+        let mut expected = session();
+        expected.push(started);
+        assert_eq!(recovered.entries, expected);
+        assert_eq!(
+            recovered.torn_before_restart,
+            vec![5],
+            "listed where it is, like a line cut short"
+        );
+        assert!(!recovered.torn_tail);
+    }
+
+    #[test]
+    fn a_whole_line_this_build_cannot_read_before_a_restart_is_an_error_naming_it() {
+        // Valid JSON that fails only on what it says -- here an entry type a
+        // newer build wrote. No interrupted write produces that: cut short is
+        // not valid JSON, and neither are NULs. Tolerated because a `Started`
+        // happened to follow it, it was reported as a torn write and the entry
+        // was discarded under that name.
+        let scratch = Scratch::new("unknown-type-then-restarted");
+        write_all(&scratch.path, &session());
+        let mut text = std::fs::read_to_string(&scratch.path).expect("read");
+        text.push_str(FROM_A_NEWER_BUILD);
+        std::fs::write(&scratch.path, text).expect("write");
+        restart(&scratch.path);
+
+        let err = read(&scratch.path).expect_err("an entry this build cannot read is not torn");
+        let message = err.to_string();
+        assert!(message.contains("journal line 5 "), "{message}");
+        assert!(message.contains("venue_trade"), "{message}");
+    }
+
+    #[test]
+    fn a_whole_line_this_build_cannot_read_at_the_end_is_an_error_not_a_torn_tail() {
+        // The same line as the last one. Discarded here as a torn tail, it would
+        // be written past by the restart that read it -- leaving the line the
+        // test above refuses in the middle of the file, and a journal that
+        // every reader after the restart refuses: `reconcile`, `explain`, the
+        // session's own closing check, and the next restart.
+        let scratch = Scratch::new("unknown-type-at-the-end");
+        write_all(&scratch.path, &session());
+        let mut text = std::fs::read_to_string(&scratch.path).expect("read");
+        text.push_str(FROM_A_NEWER_BUILD);
+        std::fs::write(&scratch.path, text).expect("write");
+
+        let err = read(&scratch.path).expect_err("a whole line is not a torn tail");
+        let message = err.to_string();
+        assert!(message.contains("journal line 5 "), "{message}");
+        assert!(message.contains("venue_trade"), "{message}");
     }
 
     #[test]

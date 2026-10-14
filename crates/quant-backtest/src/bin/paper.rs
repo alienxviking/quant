@@ -305,7 +305,8 @@ fn print_banner(
             .map(ToString::to_string)
             .collect();
         println!(
-            "          torn by an earlier hard kill and written past by a restart: {} {}",
+            "          not valid JSON, the shape an interrupted write leaves, and written \
+             past by a restart: {} {}",
             if lines.len() == 1 { "line" } else { "lines" },
             lines.join(", ")
         );
