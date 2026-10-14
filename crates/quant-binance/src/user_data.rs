@@ -38,9 +38,9 @@
 //!   earlier run's order 5 and this run's order 5 are different orders, and
 //!   booking one as the other is the worst outcome available here.
 //!
-//! The line between the last three is drawn lopsided on purpose. An id with our
-//! prefix that does not parse is an orphan, never "not ours": an orphan is put in
-//! front of a person, while "not ours" is set aside. Wrong in the first direction
+//! The line between an orphan and "not ours" is drawn lopsided on purpose. An id
+//! with our prefix that does not parse is an orphan, never "not ours": an orphan
+//! is put in front of a person, while "not ours" is set aside. Wrong in the first direction
 //! costs an investigation. Wrong in the second leaves a live order of ours that
 //! nothing is watching.
 //!
