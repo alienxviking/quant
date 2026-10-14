@@ -9,10 +9,9 @@
 //!
 //! # Why risk keeps its own tally
 //!
-//! [`RiskEngine`] tracks position, notional traded and realized P&L itself,
-//! rather than reading [`Portfolio`](crate::Portfolio). That is deliberate
-//! duplication — the one kind this project accepts — and the reason is what a
-//! risk layer is *for*.
+//! [`RiskEngine`] tracks position and realized P&L itself, rather than reading
+//! [`Portfolio`](crate::Portfolio). That is deliberate duplication — the one
+//! kind this project accepts — and the reason is what a risk layer is *for*.
 //!
 //! A limit computed from the portfolio can only be as correct as the portfolio.
 //! If the accounting has a bug, the limits go wrong in the same direction and
@@ -25,11 +24,14 @@
 //! journal and the engine each claim a P&L. Each time the value is not the second
 //! number but that a disagreement becomes visible.
 //!
-//! The tally is deliberately *simpler* than the portfolio's: signed position,
-//! gross notional, and realized P&L on a first-in basis at the position's running
-//! average. Not because average cost is wrong, but because a risk limit needs to
-//! be obviously right rather than exactly right, and forty lines that can be read
-//! in one sitting is worth more here than agreement to the satoshi.
+//! The tally is deliberately *simpler* than the portfolio's: per instrument, a
+//! signed position and its running average price, and for the day, the P&L
+//! realized against that average, net of fees. The method is the portfolio's,
+//! average cost; what is left out is everything a limit does not read — cash,
+//! equity, any P&L from before today. Not because the portfolio is wrong to keep
+//! them, but because a risk limit needs to be obviously right rather than exactly
+//! right, and forty lines that can be read in one sitting is worth more here than
+//! agreement to the satoshi.
 //!
 //! # Why a tripped kill switch has to survive a restart
 //!
@@ -107,7 +109,7 @@ pub trait RiskLayer {
     /// cannot price, and guessing would make the limit widest exactly when the
     /// market is least understood.
     ///
-    /// Takes `&mut self` because a real limit is stateful — notional traded
+    /// Takes `&mut self` because a real limit is stateful — orders and losses
     /// today, open position, a tripped switch — and a checker that could not
     /// remember could only enforce per-order limits, which are the least useful
     /// kind.
@@ -256,7 +258,9 @@ pub struct RiskEngine {
     tripped: Option<TripCause>,
     /// Set when `trip` fires, cleared when the engine has written it down.
     pending_trip: Option<TripCause>,
-    /// Every refusal, by reason, for reporting.
+    /// How many orders were refused, in total, for reporting. One count across
+    /// every [`Bound`], not one per reason: which limit bound is carried by
+    /// each [`Refusal`], and reaches the record from there.
     refusals: u64,
 }
 
