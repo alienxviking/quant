@@ -229,18 +229,24 @@ cargo run --release -p quant-binance --bin venue-check    # needs the API keys
 `venue-check` prints the round-trip-corrected offset against the venue's own
 clock, which is the quantity that actually matters — measuring `now - serverTime`
 naively folds one-way latency into the offset and would block a run over a clock
-that is fine (seen live at M1: −1445 ms naive against +450 ms corrected).
+that is fine (seen live at M1: −1445 ms naive against +450 ms corrected). That
+example is `ops/preflight.sh`'s, which corrects correctly. `venue-check`'s own
+correction had the wrong sign, putting it off by a full round trip, until
+`m8b-venue-check-offset`.
 
 **The ops harness, and this is the real gap.** `ops/*.ps1` is **record-only**.
-The paper and live modes exist in the bash half alone, deliberately: *"an untested
-paper mode there would be exactly the harness-never-run M1 warns about"*. So a
-long M8 run on the Omen needs either WSL — where the bash harness runs unmodified
-and is the proven path — or a PowerShell port that is then rehearsed, which is a
-slice of work in its own right and must not be written the night before a run.
+The paper mode exists in the bash half alone, deliberately: *"an untested paper
+mode there would be exactly the harness-never-run M1 warns about"*. There is no
+live mode in either half yet; slice (c)'s last pull request adds one. This said
+the bash harness runs under WSL unmodified. It does not, because it has only ever
+run on macOS and uses BSD `date -u -r`, `caffeinate` and BSD `stat -f`. So an M8
+run on the Omen needs a WSL port or a PowerShell port, rehearsed either way, and
+that is a slice of work in its own right that must not be written the night
+before a run.
 
-WSL is the cheaper answer and the one with evidence behind it. The thing to check
-there is sleep: a 72-hour run needs the host awake, and `caffeinate` has no WSL
-equivalent — that is Windows power settings, not a script.
+Whichever port, the host has to stay awake for the run. M8 plans an afternoon,
+not 72 hours (`docs/live-run.md` §2), and `caffeinate` has no Windows equivalent:
+that is Windows power settings, not a script.
 
 ---
 
