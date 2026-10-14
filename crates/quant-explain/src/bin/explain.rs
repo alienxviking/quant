@@ -48,8 +48,10 @@ macro_rules! outln {
     }};
 }
 
+use quant_core::execution::FeeAsset;
 use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
 use quant_core::time::Ts;
+use quant_explain::ours::FillAt;
 use quant_explain::{market_at, ours_at, MarketAt, OurState};
 
 fn main() -> ExitCode {
@@ -318,7 +320,7 @@ fn print_ours(
             fill.side,
             fill.px,
             fill.qty,
-            fill.fee,
+            fee(fill),
             ago(market.at, fill.at),
             fill.client_order_id
         );
@@ -336,12 +338,6 @@ fn print_ours(
     }
 }
 
-/// The operational picture for the containing minute, with time bases.
-///
-/// The labels are the point. One line mixes instantaneous, lifetime and
-/// 60-second-window figures with nothing marking which is which, and
-/// `queue_peak=270` beside `queue=0` is how an operator concludes the wrong
-/// thing at 3am.
 /// What happened across the span, when one was asked for.
 fn print_window(market: &MarketAt) {
     let Some(window) = &market.window else {
@@ -383,6 +379,12 @@ fn span(nanos: i64) -> String {
     }
 }
 
+/// The operational picture for the containing minute, with time bases.
+///
+/// The labels are the point. One line mixes instantaneous, lifetime and
+/// 60-second-window figures with nothing marking which is which, and
+/// `queue_peak=270` beside `queue=0` is how an operator concludes the wrong
+/// thing at 3am.
 fn print_health(args: &Args) {
     match quant_explain::health_at(&args.root, &args.symbol, args.at) {
         Err(why) => outln!("health    {why}"),
@@ -441,6 +443,19 @@ fn print_provenance(args: &Args, market: &MarketAt) {
         market.events_read
     );
     let _ = args;
+}
+
+/// A fill's fee with the asset it was taken in.
+///
+/// Never the number alone. A base-asset fee is a quantity of the base, so
+/// `fee 0.000001` reads as a millionth of the quote when it was a millionth of
+/// a bitcoin -- understated by a factor of the price, in the one line someone
+/// reads to find out what a trade cost.
+fn fee(fill: &FillAt) -> String {
+    match fill.fee_asset {
+        FeeAsset::Quote => format!("{} in the quote", fill.fee),
+        FeeAsset::Base => format!("{} in the base", fill.fee),
+    }
 }
 
 /// How long before the instant something happened, in words.

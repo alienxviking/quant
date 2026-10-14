@@ -476,7 +476,8 @@ Unchanged from §2, and worth restating now that the reader exists:
   of the block, while `print_health`, which they describe, carries no doc
   comment at all. A search-and-replace whose tail survived, in code rather than
   in prose. Harmless to run and misleading to read, which is the whole objection
-  to it.
+  to it. **Fixed 2026-10-15**: the paragraph sits on `print_health` and
+  `print_window` keeps its own one line.
 
 The honest structural caveat, restated because it has not changed: `explain`'s
 market answers are what the *replay* says the book was, not what the *engine*

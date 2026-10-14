@@ -62,12 +62,10 @@ use quant_backtest::{MaConfig, MaCrossover, Recorded};
 use quant_binance::capture::{self, CaptureConfig};
 use quant_binance::LiveSource;
 use quant_core::fixed::{Notional, Qty};
-use quant_core::instrument::{
-    Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
-};
+use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
 use quant_core::time::Ts;
 use quant_engine::journal::{self, Agreement};
-use quant_engine::{Engine, Journal, JournalEntry, Limits, RiskEngine, TripCause};
+use quant_engine::{Engine, Journal, JournalEntry, Limits, RiskEngine};
 use quant_sim::{Costs, SimulatedVenue};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -141,27 +139,23 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     // Recover before anything else. A restart on day nine has to come back up
     // holding what it held, or the strategy's first act is to trade against a
-    // position it does not know about.
+    // position it does not know about. `resume` registers the instrument's own
+    // definition before it replays a line: this used to replay first, so after
+    // a restart with fills the journal's placeholder rules won and the session
+    // traded under none. It fails if the registry already held other rules for
+    // the symbol, which a fresh registry cannot.
     let recovered = journal::read(&journal_path)?;
     let mut registry = InstrumentRegistry::new();
-    let resumed = journal::replay(&recovered.entries, &mut registry);
-    let instrument = register(&mut registry, &args.symbol);
-    let tripped = last_trip(&recovered.entries);
+    let resumed = journal::resume(
+        &recovered.entries,
+        &mut registry,
+        definition(&args.symbol),
+        args.cash,
+    )?;
+    let instrument = resumed.instrument;
+    let starting = resumed.starting_cash;
 
-    let starting = if recovered.entries.is_empty() {
-        args.cash
-    } else {
-        resumed.starting_cash()
-    };
-
-    print_banner(
-        args,
-        &journal_path,
-        &recovered,
-        &resumed,
-        instrument,
-        tripped,
-    );
+    print_banner(args, &journal_path, &recovered, &resumed);
 
     let journal = Arc::new(Mutex::new(Journal::open(&journal_path)?));
     write(
@@ -209,17 +203,18 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
             instrument,
             registry.get(instrument).expect("just registered").filters(),
         ),
-        RiskEngine::recover(args.limits, tripped),
+        RiskEngine::recover(args.limits, resumed.tripped),
         strategy,
         starting,
     )
     .observing_fills(observer);
-    // Only when there is something to resume. `resuming` replaces the portfolio
+    // Only when there is something to resume, which `resume` says with `None`
+    // rather than an empty recompute. `resuming` replaces the portfolio
     // outright, so calling it with a fresh journal's empty recompute would
     // silently reset starting capital to zero -- which a rehearsal caught,
     // reporting "cash 0 from 0" on a session configured with a hundred.
-    if !recovered.entries.is_empty() {
-        engine = engine.resuming(resumed);
+    if let Some(portfolio) = resumed.portfolio {
+        engine = engine.resuming(portfolio);
         // And the id counter, which `resuming` does *not* carry: `Ledger::mint`
         // starts at 1 with the process, so a restart would hand out ids the file
         // already holds. `runlog check` reads density from 1 and would see no
@@ -227,7 +222,7 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         // ambiguous, which is worse. Built in M7.5.a as `minting_from` and
         // called from nowhere until the post-milestone audit found it: the
         // fourth time this project has built a thing and not wired it.
-        engine = engine.minting_from(journal::next_order_id(&recovered.entries));
+        engine = engine.minting_from(resumed.next_order_id);
     }
 
     // The engine spends the whole run waiting on its channel. Since M8 the waits
@@ -286,14 +281,11 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
 }
 
 /// Everything the run is about to do, before it does any of it.
-#[allow(clippy::too_many_arguments, reason = "a banner names what it names")]
 fn print_banner(
     args: &Args,
     journal_path: &std::path::Path,
     recovered: &journal::Recovered,
-    resumed: &quant_engine::Portfolio,
-    instrument: InstrumentId,
-    tripped: Option<TripCause>,
+    resumed: &journal::Resumption,
 ) {
     println!("root      {}", args.root.display());
     println!("symbol    {} on {}", args.symbol, Exchange::Binance);
@@ -312,17 +304,29 @@ fn print_banner(
             ""
         }
     );
-    if recovered.entries.is_empty() {
-        println!("resuming  no: a fresh session");
-    } else {
+    if !recovered.torn_before_restart.is_empty() {
+        let lines: Vec<String> = recovered
+            .torn_before_restart
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         println!(
-            "resuming  position {}, cash {}, {} fills already booked",
-            resumed.position(instrument).qty,
-            resumed.cash(),
-            resumed.fills()
+            "          not valid JSON, the shape an interrupted write leaves, and written \
+             past by a restart: {} {}",
+            if lines.len() == 1 { "line" } else { "lines" },
+            lines.join(", ")
         );
     }
-    if let Some(cause) = tripped {
+    match &resumed.portfolio {
+        None => println!("resuming  no: a fresh session"),
+        Some(portfolio) => println!(
+            "resuming  position {}, cash {}, {} fills already booked",
+            portfolio.position(resumed.instrument).qty,
+            portfolio.cash(),
+            portfolio.fills()
+        ),
+    }
+    if let Some(cause) = resumed.tripped {
         // Loud, because it means this process will refuse every order until a
         // person clears it. A run that silently did nothing for a fortnight is
         // the worst possible outcome here.
@@ -399,21 +403,12 @@ where
     Ok(())
 }
 
-/// The trip state a previous session left behind.
+/// Fills already on record, so the writer's checkpoint cadence carries on
+/// across a restart rather than counting from zero again.
 ///
-/// A kill switch that forgets is not a kill switch: the supervisor exists to
-/// restart a dead process, so a switch held only in memory would be re-armed by
-/// the machinery meant to keep things running.
-fn last_trip(entries: &[JournalEntry]) -> Option<TripCause> {
-    entries.iter().rev().find_map(|e| match e {
-        JournalEntry::Tripped { cause, .. } => Some(*cause),
-        // Deliberately *not* cleared by a later `Started`: a restart is exactly
-        // the moment a forgotten switch would be re-armed.
-        _ => None,
-    })
-}
-
-/// Fills already on record, so a restart's client order ids do not collide.
+/// It once kept client order ids from colliding, when the journal's id was a
+/// fill ordinal. The engine's own ids replaced that at M7.5.a; what is left is
+/// `JournalWriter` checkpointing every `CHECKPOINT_EVERY` fills of the session.
 fn recovered_fills(entries: &[JournalEntry]) -> u64 {
     entries
         .iter()
@@ -421,8 +416,16 @@ fn recovered_fills(entries: &[JournalEntry]) -> u64 {
         .count() as u64
 }
 
-fn register(registry: &mut InstrumentRegistry, symbol: &str) -> InstrumentId {
-    registry.register(InstrumentDef {
+/// The instrument this session trades, with the rules its venue enforces.
+///
+/// The same definition `backtest` registers, which is part of what lets the two
+/// be compared. Handed to `journal::resume` rather than registered here because
+/// the order is the point: registered after a replay of fills, it was silently
+/// ignored. The asset names stay empty because nothing in a paper session reads
+/// them. The user-data translator does, and refuses an instrument without both,
+/// so a live session cannot take its definition from here.
+fn definition(symbol: &str) -> InstrumentDef {
+    InstrumentDef {
         exchange: Exchange::Binance,
         symbol: symbol.to_owned(),
         base: String::new(),
@@ -431,7 +434,7 @@ fn register(registry: &mut InstrumentRegistry, symbol: &str) -> InstrumentId {
         tick_size: "0.01".parse().expect("a valid literal"),
         lot_size: "0.00001".parse().expect("a valid literal"),
         min_notional: "5".parse().expect("a valid literal"),
-    })
+    }
 }
 
 fn parse_args() -> Result<Option<Args>, String> {

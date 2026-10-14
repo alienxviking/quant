@@ -25,8 +25,43 @@
 //! millions of records a day and its density decides whether a week fits on a
 //! laptop; a journal is a few hundred lines a week. What matters instead is that
 //! it can be read at three in the morning by a person, and by `jq`, and appended
-//! to safely after a crash — and a torn last line is trivially detectable and
+//! to safely after a crash — and a torn line is trivially detectable and
 //! discardable, whereas a torn binary frame needed a whole container format.
+//!
+//! # A torn line, and the restart after it
+//!
+//! A write that is cut short leaves a last line that is not valid JSON. A
+//! process killed mid-`append` leaves the start of an entry; a power loss can
+//! leave a run of NUL bytes instead, where the file's new length reached the
+//! disk before its data did. The supervisor then restarts the process, and the
+//! restart appends — so a torn line does not stay the last line for long. Two
+//! rules keep that safe, and both keep every byte and the file append-only:
+//!
+//! - **Opening terminates the fragment.** [`Journal::open`] writes a newline
+//!   first when the file does not end in one, so the next entry starts on its
+//!   own line instead of being glued onto the fragment. Glued, the two became
+//!   one unreadable line in the middle of the file, which `read` refused as
+//!   damage — so a journal that had survived a hard kill was made unreadable
+//!   by the restart that followed it: to `reconcile`, to `explain`, and to the
+//!   next restart, which is when it is needed most.
+//! - **Reading tolerates exactly that shape and counts it.** A line that is not
+//!   valid JSON may be the last line, or it may be followed by a `Started`
+//!   entry, which is the first thing every session writes. Either is reported
+//!   in [`Recovered`] as the shape an interrupted write leaves; which
+//!   interruption left it, the file cannot say. A bad line followed by anything
+//!   else is damage and an error, because nothing else writes into the middle
+//!   of an append-only file.
+//!
+//! "Not valid JSON" is the whole of that tolerance, and `read` asks
+//! `serde_json` rather than guessing: JSON cut short is its `Eof`, and bytes
+//! that are not JSON at all — NULs, or a fragment with NULs after it — are its
+//! `Syntax`. A line that is valid JSON and still not an entry is its `Data`: an
+//! entry type a newer build wrote, or a field this build requires that the
+//! writer left out. No interrupted write produces that, so it is an error
+//! wherever it is, the last line and the line before a `Started` included.
+//! Tolerated at the end, it would be discarded under a torn line's name, and
+//! the restart after it would leave it in the middle of the file for every
+//! later reader to refuse.
 //!
 //! # Why the instrument is `(exchange, symbol)`
 //!
@@ -36,14 +71,18 @@
 //! changed. Identity is reattached on replay.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+use serde_json::error::Category;
 
 use crate::RefusedBy;
 use quant_core::event::Side;
 use quant_core::execution::{ClientOrderId, Fill, RejectReason};
 use quant_core::fixed::{Notional, Px, Qty};
-use quant_core::instrument::{Exchange, InstrumentId, InstrumentRegistry};
+use quant_core::instrument::{
+    Exchange, Instrument, InstrumentDef, InstrumentId, InstrumentRegistry,
+};
 use quant_core::time::Ts;
 
 use crate::portfolio::Portfolio;
@@ -66,6 +105,10 @@ pub enum JournalEntry {
     /// authority on starting capital, and later ones mark restarts — so the
     /// number a report quotes is the capital the whole session began with, not
     /// whatever it happened to have when it last came up.
+    ///
+    /// And written *first*, before anything else a run appends. [`read`] relies
+    /// on that to tell a line a crash tore and a restart wrote past from damage
+    /// in the middle of the file.
     Started {
         at: Ts,
         cash: Notional,
@@ -312,8 +355,27 @@ pub struct Journal {
 
 impl Journal {
     /// Open for appending, creating it if absent.
+    ///
+    /// A file that does not end in a newline gets one before anything else is
+    /// written. That is the mark of a write that was cut short, and writing
+    /// straight after the fragment would glue the next entry onto it: one
+    /// unreadable line in the middle of the file, where `read` cannot tell an
+    /// interrupted write from damage. Terminated, the fragment keeps every one
+    /// of its bytes, the file stays append-only, and the next entry — a
+    /// restart's `Started` — begins on its own line, which is the shape `read`
+    /// accepts and counts.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        if ends_mid_line(&mut file)? {
+            // Not synced here: the first `append` syncs the file, and a crash
+            // before it leaves a torn tail either way, which `read` tolerates
+            // and the next `open` terminates again.
+            file.write_all(b"\n")?;
+        }
         Ok(Self {
             path: path.to_owned(),
             out: BufWriter::new(file),
@@ -348,24 +410,59 @@ impl Journal {
     }
 }
 
+/// Whether a file has bytes after its last newline: a line was being written
+/// when the writer stopped.
+fn ends_mid_line(file: &mut File) -> std::io::Result<bool> {
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
 /// What reading a journal back found.
 #[derive(Debug, Default, Clone)]
 pub struct Recovered {
     pub entries: Vec<JournalEntry>,
-    /// A final line that was not valid JSON.
+    /// A final line that was not valid JSON: cut short, or not JSON at all.
     ///
-    /// Reported rather than treated as an error: a process killed mid-`write`
-    /// leaves a partial last line, and that is a *torn tail* — the same
-    /// distinction `quant-storage` draws between an interrupted write and
-    /// corruption. Only the last line may be torn; a bad line anywhere else is
-    /// an error, because nothing writes into the middle of an append-only file.
+    /// Reported rather than treated as an error, because that is the shape an
+    /// interrupted write leaves — a process killed mid-`append` leaves the start
+    /// of an entry, and a power loss can leave NUL bytes — and that is a *torn
+    /// tail*: the same distinction `quant-storage` draws between an interrupted
+    /// write and corruption. A final line that is valid JSON and not an entry
+    /// is not torn, and `read` refuses it.
     pub torn_tail: bool,
+    /// Lines that were not valid JSON and that a restart then wrote past,
+    /// numbered from 1.
+    ///
+    /// A torn tail stops being the tail as soon as the supervisor restarts the
+    /// process: [`Journal::open`] terminates the fragment and the restart
+    /// appends its `Started` on the next line. So a line that is not valid JSON
+    /// can sit in the middle of the file in exactly one honest way, immediately
+    /// before a `Started`, and these are those lines. Listed rather than counted
+    /// silently, so a person can find each one; the entry that was being
+    /// written when the write was cut short is lost, and this is where it was.
+    ///
+    /// A bad line followed by anything else is damage and `read` refuses it,
+    /// because nothing else writes into the middle of an append-only file. So
+    /// is a line that is valid JSON and not an entry, wherever it is.
+    pub torn_before_restart: Vec<usize>,
 }
 
 /// Read a journal back.
 ///
 /// A missing file is an empty journal, not an error: the first run of a session
 /// has not written one yet.
+///
+/// A line that is not valid JSON — cut short, or not JSON at all — is tolerated
+/// in two places only, the two an interrupted write can leave one in: as the
+/// last line, and immediately before a `Started` entry. Anywhere else it is an
+/// error. A line that *is* valid JSON and still not an entry is an error
+/// wherever it is, those two places included, because no interrupted write
+/// produces one. See the module docs.
 pub fn read(path: &Path) -> std::io::Result<Recovered> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -373,19 +470,63 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
         Err(e) => return Err(e),
     };
     let mut out = Recovered::default();
-    let lines: Vec<String> = BufReader::new(file).lines().collect::<Result<_, _>>()?;
-    let last = lines.len().saturating_sub(1);
-    for (i, line) in lines.iter().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<JournalEntry>(line) {
-            Ok(entry) => out.entries.push(entry),
-            Err(_) if i == last => out.torn_tail = true,
-            Err(e) => {
+    // Bytes, not `String`s. A write cut through a multi-byte character leaves a
+    // line that is not UTF-8, and reading text would refuse the whole file over
+    // it before the rule below could judge that one line. `from_slice` reports
+    // invalid UTF-8 as a syntax error, which is what such a line is. A lossy
+    // decode would be worse: a whole line with one damaged byte would parse,
+    // with the damage quietly replaced.
+    let lines: Vec<Vec<u8>> = BufReader::new(file)
+        .split(b'\n')
+        .collect::<Result<_, _>>()?;
+    // Numbered from 1, as an editor numbers them. Blank lines are dropped first
+    // because they were never entries, so "the line after a torn one" is the
+    // next line that says anything.
+    let mut parsed = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !line.iter().all(u8::is_ascii_whitespace))
+        .map(|(i, line)| (i + 1, serde_json::from_slice::<JournalEntry>(line)))
+        .peekable();
+    while let Some((number, line)) = parsed.next() {
+        let e = match line {
+            Ok(entry) => {
+                out.entries.push(entry);
+                continue;
+            }
+            Err(e) => e,
+        };
+        // Which kind of failure, before where it is. Exhaustive, so every
+        // category is a decision here rather than a default.
+        match e.classify() {
+            // The two shapes an interrupted write leaves: JSON cut short, and
+            // bytes that are not JSON at all -- a run of NULs where the file's
+            // length reached the disk before its data, alone or after a
+            // fragment. Whether one is tolerated depends on where it is.
+            Category::Eof | Category::Syntax => {}
+            // Valid JSON that is not an entry: a type a newer build wrote, or a
+            // field this build requires that the writer left out. No
+            // interrupted write produces that, so it is not torn wherever it
+            // is, and calling it torn would discard a whole entry under a false
+            // name. `Io` cannot come out of `from_str`, and is refused with it
+            // rather than given a tolerance nothing has argued for.
+            Category::Data | Category::Io => {
                 return Err(std::io::Error::other(format!(
-                    "journal line {} is not readable, and only the last line may be torn: {e}",
-                    i + 1
+                    "journal line {number} is not an entry this build can read, and not the \
+                     shape an interrupted write leaves either, so it is not torn -- an entry \
+                     from a newer build, or damage: {e}"
+                )))
+            }
+        }
+        match parsed.peek() {
+            // The write the crash interrupted, not yet written past.
+            None => out.torn_tail = true,
+            // The same, and the restart that followed it.
+            Some((_, Ok(JournalEntry::Started { .. }))) => out.torn_before_restart.push(number),
+            Some(_) => {
+                return Err(std::io::Error::other(format!(
+                    "journal line {number} is not readable, and only the last line may be torn, \
+                     or a line a restart's `started` entry follows: {e}"
                 )))
             }
         }
@@ -404,6 +545,12 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
 /// Instruments are re-registered from `(exchange, symbol)`, so the ids this
 /// produces are this process's ids and not the ones the journal was written
 /// under — which is precisely why the pair is what gets persisted.
+///
+/// An instrument `registry` does not already hold is registered with
+/// placeholder rules, because a journal records what we traded and not the
+/// venue's filters. A caller that will trade the instrument afterwards must
+/// register its real definition *before* replaying — which is what [`resume`]
+/// is for.
 #[must_use]
 pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Portfolio {
     let starting = entries
@@ -433,14 +580,24 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
         // this would have no reason not to fold it.
         #[allow(clippy::match_same_arms)]
         match entry {
+            // Every field named, and no `..` -- the exhaustive match above,
+            // applied one level down. `fee_asset` is what a `..` cost: the
+            // writer has recorded it since PR #50, this arm elided it and
+            // folded every fee as quote, and nothing complained, because a
+            // pattern with `..` compiles whatever the entry grows. Named, the
+            // next field is a compile error here until somebody has decided
+            // whether it moves money.
             JournalEntry::Filled {
+                // When it happened and which order it was are not money.
+                at: _,
+                client_order_id: _,
                 instrument,
                 side,
                 px,
                 qty,
                 fee,
                 is_maker,
-                ..
+                fee_asset,
             } => {
                 let id = resolve(registry, instrument);
                 portfolio.apply_fill(
@@ -451,7 +608,7 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
                         qty: *qty,
                         fee: *fee,
                         is_maker: *is_maker,
-                fee_asset: quant_core::execution::FeeAsset::Quote,
+                        fee_asset: *fee_asset,
                     },
                 );
             }
@@ -485,8 +642,17 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             // recompute disagree with a `Checkpoint` that is faithfully
             // reporting what the engine believed. The disagreement would then
             // read as an accounting bug rather than as what it is: a fill we
-            // cannot account for. It is recorded so a human can see it, and
-            // `runlog check` is where it becomes loud.
+            // cannot account for. It is recorded so a human can see it.
+            //
+            // Nothing that reads the journal back says so yet. The one thing
+            // that says it out loud is the error `JournalWriter` logs as it
+            // writes the line. `reconcile` agrees, because neither the
+            // checkpoint nor this fold counts it, and `runlog check` never
+            // reads an `Orphaned` line, so an orphan alone never changes its
+            // verdict. An orphaned line must be loud in `runlog check`, and
+            // making it so is owed to slice (c)'s pull request for what a live
+            // run writes down (`docs/live-run.md` §4) -- the one that gives an
+            // orphan from another run its entry.
             JournalEntry::Orphaned { .. } => {}
         }
     }
@@ -657,15 +823,219 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
         .map_or(1, |highest| highest + 1)
 }
 
+/// Everything a restarted session takes from its journal.
+///
+/// One value, so that a session is resumed or not as a whole. The capital, the
+/// position, the kill switch and the id counter each have their own way of
+/// going wrong across a restart, and each of those ways has been found in this
+/// codebase at least once.
+#[derive(Debug)]
+pub struct Resumption {
+    /// The session's instrument, under the definition the caller gave.
+    ///
+    /// Checked rather than assumed: [`resume`] fails before it hands back an
+    /// id the registry holds under any other definition.
+    pub instrument: InstrumentId,
+    /// The capital the session began with, as [`resume`] decides it.
+    pub starting_cash: Notional,
+    /// What the journal replays to, or `None` when it holds nothing to resume.
+    ///
+    /// `None` rather than an empty recompute, because `Engine::resuming`
+    /// replaces the portfolio outright and an empty recompute has no capital: a
+    /// rehearsal once reported "cash 0 from 0" on a session configured with a
+    /// hundred. A value that is not there cannot be passed by mistake.
+    pub portfolio: Option<Portfolio>,
+    /// The kill switch a previous session threw, which a restart must not
+    /// re-arm.
+    pub tripped: Option<crate::risk::TripCause>,
+    /// The next client order id to mint, for `Engine::minting_from`.
+    pub next_order_id: u64,
+}
+
+/// Resume a session from its journal, onto its instrument's real definition.
+///
+/// **It registers first and replays second, and the order is the point.**
+/// Registration is idempotent on `(exchange, symbol)`, and [`replay`] registers
+/// every instrument it meets with placeholder rules -- the smallest tick and
+/// lot, no minimum notional, no asset names. Replay first and the placeholders
+/// are what the registry keeps; the real definition registered afterwards is
+/// silently ignored. `paper` did exactly that, so a session restarted after any
+/// fill ran under no venue rules at all, and its simulated venue would have
+/// filled the sub-minimum orders M4.c made it refuse. A live session resumed
+/// that way would lose its asset names as well, and the user-data translator
+/// refuses an instrument without them.
+///
+/// **And it checks what registering kept**, because ordering can only beat the
+/// placeholders `resume` itself would cause. The same idempotence means a
+/// registry that already held the instrument before `resume` was called hands
+/// back whatever it held — a placeholder from an earlier replay, or a
+/// definition from somewhere else — and the one given is dropped just as
+/// silently. Nothing but a comparison can see that, so `resume` compares every
+/// field and fails, naming each one that differs, rather than return an id
+/// that names rules the caller never gave.
+///
+/// It lives here rather than in `paper` because a live session must resume the
+/// same way, and beside [`replay`] and `resolve` because the placeholders it
+/// has to beat are registered here: the rule and the hazard it orders against
+/// are read together or not at all.
+///
+/// `cash` is what a fresh session starts with. Once the journal holds anything
+/// it is ignored, because the first `Started` entry is the authority on the
+/// capital a session began with and a restart must not reset it. A journal
+/// that holds entries and no `Started` at all, which nothing in this workspace
+/// writes, resumes from zero, as `paper` always did.
+///
+/// # Errors
+///
+/// [`DefinitionConflict`] when `registry` already held the instrument under a
+/// different definition. Nothing is replayed, and the registry is left as it
+/// was.
+pub fn resume(
+    entries: &[JournalEntry],
+    registry: &mut InstrumentRegistry,
+    instrument: InstrumentDef,
+    cash: Notional,
+) -> Result<Resumption, DefinitionConflict> {
+    // Kept, because registering consumes the definition and what the registry
+    // made of it is the thing to check.
+    let given = instrument.clone();
+    // Before anything in the journal can register a placeholder for it.
+    let instrument = registry.register(instrument);
+    let fields = conflicts(registry.expect(instrument), &given);
+    if !fields.is_empty() {
+        return Err(DefinitionConflict {
+            exchange: given.exchange,
+            symbol: given.symbol,
+            fields,
+        });
+    }
+    let portfolio = (!entries.is_empty()).then(|| replay(entries, registry));
+    Ok(Resumption {
+        instrument,
+        starting_cash: portfolio.as_ref().map_or(cash, Portfolio::starting_cash),
+        portfolio,
+        tripped: last_trip(entries),
+        next_order_id: next_order_id(entries),
+    })
+}
+
+/// The registry already held a session's instrument under a different
+/// definition from the one [`resume`] was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionConflict {
+    pub exchange: Exchange,
+    pub symbol: String,
+    /// Every field that differs, in [`InstrumentDef`]'s order. Never empty.
+    pub fields: Vec<FieldConflict>,
+}
+
+/// One field two definitions of an instrument disagree about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldConflict {
+    /// The field's name in [`InstrumentDef`].
+    pub field: &'static str,
+    /// What the registry held, as a person would read it.
+    pub registered: String,
+    /// What the caller gave.
+    pub given: String,
+}
+
+impl std::fmt::Display for DefinitionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} is already registered under a different definition from the one \
+             this session was given, so resuming would trade under rules nobody gave it:",
+            self.exchange, self.symbol
+        )?;
+        for (i, conflict) in self.fields.iter().enumerate() {
+            write!(
+                f,
+                "{}{} is {} where {} was given",
+                if i == 0 { " " } else { "; " },
+                conflict.field,
+                conflict.registered,
+                conflict.given
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DefinitionConflict {}
+
+/// Every field on which what the registry holds differs from what was given.
+fn conflicts(registered: &Instrument, given: &InstrumentDef) -> Vec<FieldConflict> {
+    // Every field named, and no `..` -- the rule `replay`'s `Filled` arm learned
+    // from `fee_asset`. A field added to `InstrumentDef` does not build here
+    // until somebody has decided whether disagreeing about it matters.
+    let InstrumentDef {
+        exchange,
+        symbol,
+        base,
+        quote,
+        kind,
+        tick_size,
+        lot_size,
+        min_notional,
+    } = given;
+    let mut out = Vec::new();
+    // One field, compared by value and rendered only when the two differ. The
+    // name is the field's own identifier, so the two cannot drift apart.
+    macro_rules! compare {
+        ($field:ident, $show:expr) => {
+            if registered.$field != *$field {
+                out.push(FieldConflict {
+                    field: stringify!($field),
+                    registered: $show(&registered.$field),
+                    given: $show($field),
+                });
+            }
+        };
+    }
+    // Quoted, so an empty asset name reads as `""` rather than as nothing; and
+    // a kind by its variant's name.
+    let quoted = |text: &String| format!("{text:?}");
+    let named = |kind| format!("{kind:?}");
+    // The key registration is idempotent on, so these two cannot differ today.
+    // Compared anyway: the claim is about every field, and a registry keyed
+    // some other way tomorrow should not make it quietly narrower.
+    compare!(exchange, ToString::to_string);
+    compare!(symbol, quoted);
+    compare!(base, quoted);
+    compare!(quote, quoted);
+    compare!(kind, named);
+    compare!(tick_size, ToString::to_string);
+    compare!(lot_size, ToString::to_string);
+    compare!(min_notional, ToString::to_string);
+    out
+}
+
+/// The trip state a previous session left behind.
+///
+/// A kill switch that forgets is not a kill switch: the supervisor exists to
+/// restart a dead process, so a switch held only in memory would be re-armed by
+/// the machinery meant to keep things running.
+fn last_trip(entries: &[JournalEntry]) -> Option<crate::risk::TripCause> {
+    entries.iter().rev().find_map(|e| match e {
+        JournalEntry::Tripped { cause, .. } => Some(*cause),
+        // Deliberately *not* cleared by a later `Started`: a restart is exactly
+        // the moment a forgotten switch would be re-armed.
+        _ => None,
+    })
+}
+
 /// Find or register an instrument by its persisted identity.
 fn resolve(registry: &mut InstrumentRegistry, key: &InstrumentKey) -> InstrumentId {
-    use quant_core::instrument::{InstrumentDef, InstrumentKind};
+    use quant_core::instrument::InstrumentKind;
     registry.register(InstrumentDef {
         exchange: key.exchange,
         symbol: key.symbol.clone(),
         // A journal records what we traded, not the venue's filters. Registering
         // is idempotent on `(exchange, symbol)`, so an instrument already known
-        // to this process keeps the definition it was registered with.
+        // to this process keeps the definition it was registered with -- which
+        // is why `resume` registers the real definition before it replays, and
+        // why these placeholders win if anything does it the other way round.
         base: String::new(),
         quote: String::new(),
         kind: InstrumentKind::Spot,
@@ -836,6 +1206,62 @@ mod tests {
     }
 
     #[test]
+    fn a_fee_taken_in_the_base_replays_as_the_engine_booked_it() {
+        // Binance takes a buyer's fee in what was bought, so the position
+        // arrives a fraction smaller and the cash does not pay the fee at all.
+        // `JournalWriter` has written the asset down since PR #50; replay threw
+        // it away and folded every fee as quote, which left the recompute's
+        // cash short by the fee and its position long by it -- and `agrees`
+        // then reported the engine's own, correct checkpoint as a disagreement.
+        // A restart resumes from this fold, so the strategy would have come
+        // back up holding a position it did not have.
+        let buy = Fill {
+            px: "76650".parse().expect("px"),
+            qty: "0.001".parse().expect("qty"),
+            // Ten basis points of what was bought, in BTC.
+            fee: "0.000001".parse().expect("a fee in base units"),
+            is_maker: false,
+            fee_asset: quant_core::execution::FeeAsset::Base,
+        };
+        let mut registry = InstrumentRegistry::new();
+        let id = resolve(&mut registry, &key());
+        let mut live = Portfolio::new(amount("100"));
+        live.apply_fill(id, Side::Buy, &buy);
+
+        let entries = vec![
+            JournalEntry::Started {
+                at: Ts::from_nanos(0),
+                cash: amount("100"),
+                schema: SCHEMA,
+            },
+            JournalEntry::Filled {
+                at: Ts::from_nanos(1),
+                client_order_id: ClientOrderId(1),
+                instrument: key(),
+                side: Side::Buy,
+                px: buy.px,
+                qty: buy.qty,
+                fee: buy.fee,
+                is_maker: buy.is_maker,
+                fee_asset: buy.fee_asset,
+            },
+            // What the engine writes down after booking that fill.
+            JournalEntry::checkpoint(Ts::from_nanos(2), &live),
+        ];
+
+        let replayed = replay(&entries, &mut registry);
+        assert_eq!(replayed.cash(), live.cash(), "the fee is not paid in cash");
+        assert_eq!(
+            replayed.position(id),
+            live.position(id),
+            "it comes out of the position instead"
+        );
+        assert_eq!(replayed.fees(), live.fees(), "and still counts as money");
+        assert_eq!(replayed, live, "exactly the portfolio the engine held");
+        assert_eq!(agrees(&entries), Agreement::Agrees);
+    }
+
+    #[test]
     fn a_round_trip_through_the_journal_ends_flat_and_pays_its_fees() {
         // The arithmetic, checked end to end: bought and sold one unit 50 apart,
         // so 0.05 of gross gain against 0.1533 of fees.
@@ -868,10 +1294,121 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_after_a_torn_write_keeps_every_line_and_counts_the_torn_one() {
+        // A hard kill mid-write leaves a partial last line, and the supervisor
+        // restarts the process. The restart used to append straight after the
+        // fragment, gluing its own `started` onto it: a bad line in the middle,
+        // which `read` refuses as damage. From then on the journal was
+        // unreadable -- to `reconcile`, and to the next restart, which is when
+        // it is needed most.
+        let scratch = Scratch::new("torn-then-restarted");
+        write_all(&scratch.path, &session());
+        let mut bytes = std::fs::read(&scratch.path).expect("read");
+        bytes.extend_from_slice(b"{\"type\":\"fil");
+        std::fs::write(&scratch.path, &bytes).expect("write");
+
+        // What a restart does: open for append, write its `Started`, carry on.
+        let restarted = JournalEntry::Started {
+            at: Ts::from_nanos(10),
+            cash: amount("100"),
+            schema: SCHEMA,
+        };
+        let after = filled(11, Side::Buy, "76800", "0.001", "0.0768");
+        write_all(&scratch.path, &[restarted.clone(), after.clone()]);
+
+        let recovered = read(&scratch.path).expect("a torn line a restart followed is not damage");
+        let mut expected = session();
+        expected.push(restarted);
+        expected.push(after);
+        assert_eq!(
+            recovered.entries, expected,
+            "every whole entry survives, both starts included"
+        );
+        assert_eq!(
+            recovered.torn_before_restart,
+            vec![5],
+            "the torn line is reported where it is, not skipped in silence"
+        );
+        assert!(!recovered.torn_tail, "the tail itself is whole");
+
+        // Every byte kept: the fragment is still there, terminated rather than
+        // overwritten or removed.
+        let text = std::fs::read_to_string(&scratch.path).expect("read");
+        assert!(text.contains("{\"type\":\"fil\n"), "{text}");
+    }
+
+    #[test]
+    fn a_write_cut_through_a_multibyte_character_is_torn_like_any_other() {
+        // A note's detail is free text, so an entry can hold a character UTF-8
+        // spells in more than one byte, and a crash can cut the write between
+        // them. The line is then not UTF-8 at all. Read as text, that refused
+        // the whole journal before the torn-line rule could judge the line.
+        let scratch = Scratch::new("torn-mid-character");
+        write_all(&scratch.path, &session());
+        let note = JournalEntry::Note {
+            at: Ts::from_nanos(9),
+            kind: "claim".to_owned(),
+            detail: serde_json::json!({ "why": "prix moyen à 76 800" }),
+        };
+        let mut line = serde_json::to_vec(&note).expect("serialize");
+        // `à` is 0xC3 0xA0; keep the first byte and lose the second.
+        let cut = line
+            .iter()
+            .position(|&b| b == 0xC3)
+            .expect("a two-byte character")
+            + 1;
+        line.truncate(cut);
+        let mut bytes = std::fs::read(&scratch.path).expect("read");
+        bytes.extend_from_slice(&line);
+        std::fs::write(&scratch.path, &bytes).expect("write");
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "the fixture must not be valid UTF-8, or it tests nothing new"
+        );
+
+        let recovered = read(&scratch.path).expect("a write cut mid-character is a torn tail");
+        assert!(recovered.torn_tail);
+        assert_eq!(recovered.entries, session());
+
+        // And once a restart has written past it.
+        let restarted = JournalEntry::Started {
+            at: Ts::from_nanos(10),
+            cash: amount("100"),
+            schema: SCHEMA,
+        };
+        write_all(&scratch.path, std::slice::from_ref(&restarted));
+        let recovered = read(&scratch.path).expect("a restart after it is not damage");
+        assert_eq!(recovered.torn_before_restart, vec![5]);
+        assert!(!recovered.torn_tail);
+        let mut expected = session();
+        expected.push(restarted);
+        assert_eq!(recovered.entries, expected);
+    }
+
+    #[test]
+    fn opening_a_journal_that_ends_cleanly_adds_nothing_to_it() {
+        // The newline `open` writes is for a torn fragment and nothing else.
+        // Written every time, each restart would leave a blank line behind:
+        // harmless to `read`, and noise in the one file a person reads by hand.
+        let whole = Scratch::new("reopened-whole");
+        write_all(&whole.path, &session());
+        let before = std::fs::read(&whole.path).expect("read");
+        drop(Journal::open(&whole.path).expect("open"));
+        assert_eq!(std::fs::read(&whole.path).expect("read"), before);
+
+        // Nor does a journal that does not exist yet start with one.
+        let fresh = Scratch::new("reopened-fresh");
+        drop(Journal::open(&fresh.path).expect("open"));
+        assert_eq!(std::fs::read(&fresh.path).expect("read"), Vec::<u8>::new());
+    }
+
+    #[test]
     fn a_bad_line_in_the_middle_is_an_error() {
-        // Nothing writes into the middle of an append-only file, so this is
-        // damage rather than an interrupted write -- and silently skipping it
-        // would drop a fill and quietly change the position.
+        // A torn line ends up in the middle only when a restart wrote past it,
+        // and a restart always begins with `started`. Anything else in the
+        // middle of an append-only file is damage rather than an interrupted
+        // write -- and silently skipping it would drop a fill and quietly
+        // change the position.
         let scratch = Scratch::new("corrupt-middle");
         write_all(&scratch.path, &session());
         let mut text = std::fs::read_to_string(&scratch.path).expect("read");
@@ -881,6 +1418,95 @@ mod tests {
 
         let err = read(&scratch.path).expect_err("damage must be loud");
         assert!(err.to_string().contains("only the last line may be torn"));
+    }
+
+    /// The restart that follows a torn write: what `paper` does on coming
+    /// back up, which is to open the journal and write its `Started`.
+    fn restart(path: &Path) -> JournalEntry {
+        let started = JournalEntry::Started {
+            at: Ts::from_nanos(10),
+            cash: amount("100"),
+            schema: SCHEMA,
+        };
+        write_all(path, std::slice::from_ref(&started));
+        started
+    }
+
+    /// A whole line a newer build might write: valid JSON, and an entry type
+    /// this build has never heard of.
+    const FROM_A_NEWER_BUILD: &str = "{\"type\":\"venue_trade\",\"at\":5}\n";
+
+    #[test]
+    fn a_run_of_nul_bytes_reads_as_an_interrupted_write_before_and_after_a_restart() {
+        // The other shape a lost write can read back as. A power loss can put
+        // the file's new length on the disk before its data, and the bytes that
+        // never arrived read back as NULs -- not JSON at all, where a hard
+        // kill leaves JSON cut short. Both are the shape an interrupted write
+        // leaves, and both must survive the restart that follows.
+        let scratch = Scratch::new("nul-run");
+        write_all(&scratch.path, &session());
+        let mut bytes = std::fs::read(&scratch.path).expect("read");
+        bytes.extend_from_slice(&[0_u8; 64]);
+        std::fs::write(&scratch.path, &bytes).expect("write");
+
+        let recovered = read(&scratch.path).expect("a run of NULs at the end is a torn tail");
+        assert!(recovered.torn_tail);
+        assert_eq!(
+            recovered.entries,
+            session(),
+            "everything before it survives"
+        );
+
+        let started = restart(&scratch.path);
+        let recovered = read(&scratch.path).expect("and a restart written past it is not damage");
+        let mut expected = session();
+        expected.push(started);
+        assert_eq!(recovered.entries, expected);
+        assert_eq!(
+            recovered.torn_before_restart,
+            vec![5],
+            "listed where it is, like a line cut short"
+        );
+        assert!(!recovered.torn_tail);
+    }
+
+    #[test]
+    fn a_whole_line_this_build_cannot_read_before_a_restart_is_an_error_naming_it() {
+        // Valid JSON that fails only on what it says -- here an entry type a
+        // newer build wrote. No interrupted write produces that: cut short is
+        // not valid JSON, and neither are NULs. Tolerated because a `Started`
+        // happened to follow it, it was reported as a torn write and the entry
+        // was discarded under that name.
+        let scratch = Scratch::new("unknown-type-then-restarted");
+        write_all(&scratch.path, &session());
+        let mut text = std::fs::read_to_string(&scratch.path).expect("read");
+        text.push_str(FROM_A_NEWER_BUILD);
+        std::fs::write(&scratch.path, text).expect("write");
+        restart(&scratch.path);
+
+        let err = read(&scratch.path).expect_err("an entry this build cannot read is not torn");
+        let message = err.to_string();
+        assert!(message.contains("journal line 5 "), "{message}");
+        assert!(message.contains("venue_trade"), "{message}");
+    }
+
+    #[test]
+    fn a_whole_line_this_build_cannot_read_at_the_end_is_an_error_not_a_torn_tail() {
+        // The same line as the last one. Discarded here as a torn tail, it would
+        // be written past by the restart that read it -- leaving the line the
+        // test above refuses in the middle of the file, and a journal that
+        // every reader after the restart refuses: `reconcile`, `explain`, the
+        // session's own closing check, and the next restart.
+        let scratch = Scratch::new("unknown-type-at-the-end");
+        write_all(&scratch.path, &session());
+        let mut text = std::fs::read_to_string(&scratch.path).expect("read");
+        text.push_str(FROM_A_NEWER_BUILD);
+        std::fs::write(&scratch.path, text).expect("write");
+
+        let err = read(&scratch.path).expect_err("a whole line is not a torn tail");
+        let message = err.to_string();
+        assert!(message.contains("journal line 5 "), "{message}");
+        assert!(message.contains("venue_trade"), "{message}");
     }
 
     #[test]
@@ -910,6 +1536,149 @@ mod tests {
         let id_b = resolve(&mut second, &key());
         assert_ne!(id_a, id_b, "the ids really do differ between processes");
         assert_eq!(a.position(id_a), b.position(id_b));
+    }
+
+    /// BTCUSDT as the venue defines it -- which is what a journal cannot say.
+    fn btcusdt() -> InstrumentDef {
+        InstrumentDef {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+            base: "BTC".to_owned(),
+            quote: "USDT".to_owned(),
+            kind: quant_core::instrument::InstrumentKind::Spot,
+            tick_size: "0.01".parse().expect("tick"),
+            lot_size: "0.00001".parse().expect("lot"),
+            min_notional: "5".parse().expect("notional"),
+        }
+    }
+
+    #[test]
+    fn resuming_a_journal_that_holds_fills_keeps_the_real_instrument_definition() {
+        // Registration is idempotent on (exchange, symbol), and replay registers
+        // a placeholder for every instrument it meets. `paper` replayed first
+        // and registered second, so after a restart with fills the placeholder
+        // won -- the smallest tick and lot, no minimum notional, no asset names
+        // -- and the real definition was dropped without a word.
+        let real = btcusdt();
+        let mut registry = InstrumentRegistry::new();
+        let resumed = resume(&session(), &mut registry, real.clone(), amount("100"))
+            .expect("a fresh registry holds nothing to conflict with");
+        assert!(
+            resumed.portfolio.is_some(),
+            "the journal holds fills, so this is a resume"
+        );
+
+        let kept = registry.expect(resumed.instrument);
+        assert_eq!(kept.tick_size, real.tick_size);
+        assert_eq!(kept.lot_size, real.lot_size);
+        assert_eq!(kept.min_notional, real.min_notional);
+        assert_eq!(kept.base, real.base);
+        assert_eq!(kept.quote, real.quote);
+    }
+
+    #[test]
+    fn a_fresh_journal_resumes_nothing_and_starts_with_the_configured_cash() {
+        // An empty journal replays to a portfolio with no capital, and
+        // `Engine::resuming` replaces the portfolio outright -- the rehearsal
+        // that reported "cash 0 from 0" on a session configured with a hundred.
+        let mut registry = InstrumentRegistry::new();
+        let resumed = resume(&[], &mut registry, btcusdt(), amount("100")).expect("resumes");
+        assert!(resumed.portfolio.is_none(), "nothing to resume");
+        assert_eq!(resumed.starting_cash, amount("100"));
+        assert_eq!(resumed.next_order_id, 1);
+        assert_eq!(resumed.tripped, None);
+    }
+
+    #[test]
+    fn a_restart_resumes_from_the_capital_the_session_began_with() {
+        // The first `Started` wins: not the restart's own, and not whatever this
+        // process happened to be configured with. A run that lost money must
+        // not look like it began poorer.
+        let mut restarted = session();
+        restarted.push(JournalEntry::Started {
+            at: Ts::from_nanos(10),
+            cash: amount("64"),
+            schema: SCHEMA,
+        });
+        let mut registry = InstrumentRegistry::new();
+        let resumed = resume(&restarted, &mut registry, btcusdt(), amount("50")).expect("resumes");
+        assert_eq!(resumed.starting_cash, amount("100"));
+        assert_eq!(
+            resumed.next_order_id, 3,
+            "ids carry on from the journal's rather than starting again at 1"
+        );
+    }
+
+    #[test]
+    fn a_kill_switch_thrown_before_a_restart_is_still_thrown_after_it() {
+        // The supervisor restarts a dead process, so a switch held only in
+        // memory would be re-armed by the machinery meant to keep things
+        // running. The restart's own `Started` must not clear it.
+        let mut entries = session();
+        entries.push(JournalEntry::Tripped {
+            at: Ts::from_nanos(4),
+            cause: crate::risk::TripCause::DailyLoss,
+        });
+        entries.push(JournalEntry::Started {
+            at: Ts::from_nanos(5),
+            cash: amount("99"),
+            schema: SCHEMA,
+        });
+        let mut registry = InstrumentRegistry::new();
+        let resumed = resume(&entries, &mut registry, btcusdt(), amount("100")).expect("resumes");
+        assert_eq!(resumed.tripped, Some(crate::risk::TripCause::DailyLoss));
+    }
+
+    #[test]
+    fn resuming_onto_a_placeholder_already_registered_fails_naming_each_difference() {
+        // Registration is idempotent on (exchange, symbol), so a registry that
+        // already holds the symbol hands back what it holds and drops the
+        // definition given -- and `replay` registers a placeholder for every
+        // instrument it meets. Resuming onto one would hand back an id under
+        // the smallest tick and lot and no minimum notional while
+        // `Resumption::instrument` claimed the caller's definition.
+        let mut registry = InstrumentRegistry::new();
+        let placeholder = resolve(&mut registry, &key());
+
+        let conflict = resume(&session(), &mut registry, btcusdt(), amount("100"))
+            .expect_err("a placeholder is not the definition the caller gave");
+
+        assert_eq!(conflict.exchange, Exchange::Binance);
+        assert_eq!(conflict.symbol, "BTCUSDT");
+        let fields: Vec<&str> = conflict.fields.iter().map(|c| c.field).collect();
+        assert_eq!(
+            fields,
+            ["base", "quote", "tick_size", "lot_size", "min_notional"],
+            "every rule the placeholder lacks, and nothing the two share"
+        );
+        let text = conflict.to_string();
+        assert!(text.contains("binance BTCUSDT"), "{text}");
+        assert!(
+            text.contains(r#"base is "" where "BTC" was given"#),
+            "{text}"
+        );
+        assert!(
+            text.contains("min_notional is 0 where 5 was given"),
+            "{text}"
+        );
+        assert_eq!(
+            registry.expect(placeholder).min_notional,
+            Notional::ZERO,
+            "the registry is left as it was"
+        );
+    }
+
+    #[test]
+    fn resuming_onto_the_same_definition_already_registered_is_not_a_conflict() {
+        // The other side of that boundary. A caller that registered the real
+        // definition before resuming -- a live session that read the venue's
+        // rules first -- is resuming onto exactly what it gave.
+        let mut registry = InstrumentRegistry::new();
+        let registered = registry.register(btcusdt());
+        let resumed = resume(&session(), &mut registry, btcusdt(), amount("100"))
+            .expect("the same definition twice is not a conflict");
+        assert_eq!(resumed.instrument, registered);
+        assert!(resumed.portfolio.is_some(), "and the journal still replays");
     }
 
     #[test]

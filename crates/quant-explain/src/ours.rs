@@ -18,6 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
+use quant_core::execution::FeeAsset;
 use quant_core::fixed::{Notional, Px};
 use quant_core::instrument::{InstrumentId, InstrumentRegistry};
 use quant_core::time::Ts;
@@ -54,7 +55,15 @@ pub struct FillAt {
     pub side: quant_core::event::Side,
     pub px: Px,
     pub qty: quant_core::fixed::Qty,
+    /// In whichever asset `fee_asset` names, so the two are one fact.
     pub fee: Notional,
+    /// Which asset the venue took `fee` in.
+    ///
+    /// A base-asset fee is a quantity of the base -- 0.000001 BTC, not 0.000001
+    /// USDT. This was dropped on the way out of the journal, so `explain`
+    /// printed such a fee bare: a millionth of a dollar to anyone reading it,
+    /// understating the cost by a factor of the price.
+    pub fee_asset: FeeAsset,
     /// The engine's own `ClientOrderId` for the order this fill belongs to.
     ///
     /// It was a *fill ordinal* until M7.5.a, because `RunObserver::on_fill` was
@@ -154,6 +163,7 @@ pub fn ours_at(
                 px,
                 qty,
                 fee,
+                fee_asset,
                 client_order_id,
                 ..
             } => {
@@ -163,6 +173,7 @@ pub fn ours_at(
                     px: *px,
                     qty: *qty,
                     fee: *fee,
+                    fee_asset: *fee_asset,
                     client_order_id: client_order_id.0,
                 };
                 if *ts <= at {
@@ -219,5 +230,79 @@ const fn entry_ts(entry: &JournalEntry) -> Option<Ts> {
         | JournalEntry::Blind { at, .. }
         | JournalEntry::Note { at, .. }
         | JournalEntry::Stopped { at } => Some(*at),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ours_at;
+    use quant_core::event::Side;
+    use quant_core::execution::{ClientOrderId, FeeAsset};
+    use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
+    use quant_core::time::Ts;
+    use quant_engine::journal::{InstrumentKey, Journal, JournalEntry, SCHEMA};
+
+    fn filled(at: i64, id: u64, fee: &str, fee_asset: FeeAsset) -> JournalEntry {
+        JournalEntry::Filled {
+            at: Ts::from_nanos(at),
+            client_order_id: ClientOrderId(id),
+            instrument: InstrumentKey {
+                exchange: Exchange::Binance,
+                symbol: "BTCUSDT".to_owned(),
+            },
+            side: Side::Buy,
+            px: "76650".parse().expect("px"),
+            qty: "0.001".parse().expect("qty"),
+            fee: fee.parse().expect("fee"),
+            is_maker: false,
+            fee_asset,
+        }
+    }
+
+    #[test]
+    fn a_fill_is_reported_with_the_asset_its_fee_was_taken_in() {
+        // A base-asset fee is a quantity of the base: 0.000001 BTC, not
+        // 0.000001 USDT. Without the asset, `explain` printed it bare, which
+        // reads as a millionth of a dollar and understates the cost by a
+        // factor of the price. One fill either side of the instant, one in
+        // each asset, so a reader that assumed either one is caught.
+        let path = std::env::temp_dir().join(format!(
+            "quant-explain-ours-fee-asset-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut journal = Journal::open(&path).expect("open");
+        for entry in [
+            JournalEntry::Started {
+                at: Ts::from_nanos(0),
+                cash: "100".parse().expect("cash"),
+                schema: SCHEMA,
+            },
+            filled(1_000, 1, "0.000001", FeeAsset::Base),
+            filled(3_000, 2, "0.07665", FeeAsset::Quote),
+        ] {
+            journal.append(&entry).expect("append");
+        }
+        drop(journal);
+
+        let mut registry = InstrumentRegistry::new();
+        let instrument = registry.register(InstrumentDef {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+            base: "BTC".to_owned(),
+            quote: "USDT".to_owned(),
+            kind: InstrumentKind::Spot,
+            tick_size: "0.01".parse().expect("tick"),
+            lot_size: "0.00001".parse().expect("lot"),
+            min_notional: "5".parse().expect("notional"),
+        });
+        let ours = ours_at(&path, instrument, &mut registry, Ts::from_nanos(2_000));
+        let _ = std::fs::remove_file(&path);
+        let ours = ours.expect("readable");
+
+        let last = ours.last_fill.expect("a fill before the instant");
+        assert_eq!(last.fee_asset, FeeAsset::Base, "taken in what was bought");
+        let next = ours.next_fill.expect("a fill after the instant");
+        assert_eq!(next.fee_asset, FeeAsset::Quote);
     }
 }
