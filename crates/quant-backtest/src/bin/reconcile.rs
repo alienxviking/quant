@@ -96,6 +96,21 @@ fn describe_journal(path: &Path, recovered: &Recovered) {
     if recovered.torn_tail {
         println!("tail      the last line was torn and discarded: a hard kill mid-write");
     }
+    // Each one is an entry lost to a hard kill, and the restart after it. Said
+    // with the line numbers so a person can go and look at what was being
+    // written, which the file still holds.
+    if !recovered.torn_before_restart.is_empty() {
+        let lines: Vec<String> = recovered
+            .torn_before_restart
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        println!(
+            "torn      {} {}: a hard kill mid-write, then a restart wrote past it",
+            if lines.len() == 1 { "line" } else { "lines" },
+            lines.join(", ")
+        );
+    }
 }
 
 fn describe_portfolio(portfolio: &Portfolio, registry: &InstrumentRegistry, recovered: &Recovered) {

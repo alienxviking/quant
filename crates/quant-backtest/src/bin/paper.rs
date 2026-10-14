@@ -297,6 +297,18 @@ fn print_banner(
             ""
         }
     );
+    if !recovered.torn_before_restart.is_empty() {
+        let lines: Vec<String> = recovered
+            .torn_before_restart
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        println!(
+            "          torn by an earlier hard kill and written past by a restart: {} {}",
+            if lines.len() == 1 { "line" } else { "lines" },
+            lines.join(", ")
+        );
+    }
     match &resumed.portfolio {
         None => println!("resuming  no: a fresh session"),
         Some(portfolio) => println!(
