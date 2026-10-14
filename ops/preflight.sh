@@ -155,8 +155,13 @@ fi
 # home connection several thousand km from the venue it can be hundreds of ms and
 # dominate the reading, blocking a run over a clock that is actually fine. This
 # uses the NTP round-trip estimate -- serverTime minus the local midpoint of the
-# request -- which cancels symmetric latency and measures the clock, not the
-# link. It is also exactly the quantity `clock_skew` in the metrics line reflects.
+# request -- which cancels symmetric latency. It does not cancel asymmetric
+# latency, and every reading below opens a fresh connection, so each one carries
+# the TCP and TLS handshake on its outbound leg; keeping the smallest round trip
+# cannot remove a bias every sample shares, and the estimate leans towards "host
+# behind" by about half the setup time. (This used to claim it is the quantity
+# `clock_skew` reflects. It is not: `clock_skew` counts messages whose venue
+# timestamp was ahead of our receive stamp, and is not an offset.)
 clock_out="$(python3 - <<'PY' 2>/dev/null
 import time, json, urllib.request
 best=None
