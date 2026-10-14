@@ -419,7 +419,13 @@ feature.
    `blind` line no longer proves the market came back, which is what `explain`
    assumes. An `orphaned` line must be loud in `runlog check`, which today never
    reads it. And lines torn before a restart must show where an operator looks,
-   not only in `reconcile`'s full report.
+   not only in `reconcile`'s full report. Finally, a restart must bring the risk
+   layer's tally back from the journal. `RiskEngine::recover` restores the kill
+   switch and nothing else. So after a restart an addition to a real position
+   is checked as if from flat, a real exit can be refused as if it opened the
+   opposite position, and the day's loss budget starts fresh. The engine
+   contract's own rule, that an NTP step cannot hand a stopped strategy a fresh
+   budget, already argues against that last one.
 5. **A frame kind for the account stream.** Container version 3, and the account
    stream under its own data root (§5), where `quant-verify` runs its container
    checks and not the update-id chain. Accepted when a v3 build reads every v1 and
