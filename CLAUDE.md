@@ -1820,19 +1820,42 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   fixes one side of the boundary under test proves much less than it looks like
   it does.
 
-- **`ops/*.ps1` is record-only, and that becomes load-bearing if the run host
-  moves.** The paper and live modes exist in the bash half alone, which was the
-  right call when it was made — *an untested paper mode there would be exactly
-  the harness-never-run M1 warns about* — but it means a long M8 run on Windows
-  needs WSL or a rehearsed port. WSL is the cheaper answer and the one with
-  evidence behind it; the thing to check there is sleep, since `caffeinate` has
-  no equivalent and a 72-hour run needs the host awake.
+- **`ops/*.ps1` is record-only, and the bash half has only ever run on macOS.**
+  The paper mode exists in the bash half alone, which was the right call when it
+  was made — *an untested paper mode there would be exactly the
+  harness-never-run M1 warns about*. There is **no live mode in either half
+  yet**: `supervise.sh` accepts only `record` and `paper`. This entry used to say
+  WSL runs the bash half unmodified; it does not, because it uses BSD
+  `date -u -r EPOCH`, `caffeinate` and BSD `stat -f`. So an M8 run on Windows
+  needs either a WSL port or a PowerShell port, rehearsed either way. M8 plans
+  an afternoon, not 72 hours (`docs/live-run.md` §2), but the host still has to
+  stay awake through it.
 
 - **Whichever machine runs M8 must pass `venue-check` before anything is
   planned around it.** M8.b made a host more than 1000 ms from the venue unable
   to trade, where M1 only warned — and M1 declined to start its acceptance run
   on the Windows box partly over a stopped `w32time` and a ~2 s offset. Cheap to
-  find out now, expensive on the afternoon of the run.
+  find out now, expensive on the afternoon of the run. Until
+  `m8b-venue-check-offset` lands, `venue-check`'s round-trip correction has the
+  wrong sign, so its reading is off by a full round trip.
+
+- **The slice (c) mapping found seven defects in shipped code** (2026-10-14/15:
+  six independent readers, a seventh cross-checking them, and each consequential
+  finding re-read in the source). `LiveSource` never overrode
+  `next_event_timeout`, so slice (a)'s idle wake ran only in tests. Venue reports
+  advanced the clock on idle wakes only, so journal timestamps could run
+  backwards. `journal::replay` re-stamped every fee as `Quote`: PR #50 fixed the
+  writer and missed this, which is mine. A paper restart registered placeholder
+  filters ahead of the real ones, and a torn line followed by a restart made the
+  journal unreadable. Risk refused a partial reduction of an oversized position,
+  against `docs/engine-contract.md` §10, and the test named for that property
+  sold the whole position and so could not see it: the M2.e lesson again, one
+  side of the boundary under test. `venue-check` corrected the clock in the
+  wrong direction. And `MaCrossover` would have sold a fixed quantity against a
+  position the fee had shrunk. Each has its own branch (`docs/live-run.md` §4).
+  The general lesson is the audit's, again: **a property asserted in a doc
+  comment, a test name or this file is not a property the code has** until
+  something that can fail says so.
 
 - **Queue position and market impact remain unmeasured**, as predicted, and the
   fortnight could not change that: a paper venue uses simulated fills, so our
@@ -2156,24 +2179,32 @@ cargo run --release -p quant-binance --bin venue-check    # needs the API keys
 `venue-check` places no order. It makes one signed `GET /api/v3/account` and
 prints the round-trip-corrected offset, which is the quantity that matters —
 measuring `now - serverTime` naively folds one-way latency into the offset and
-would block a run over a clock that is fine.
+would block a run over a clock that is fine. **Its correction had the wrong
+sign**, putting the reading off by a full round trip, until
+`m8b-venue-check-offset`. And it is moving to the Ed25519 key the live run will
+use (`docs/live-run.md` §5), so the keys it needs are a new pair, not the HMAC
+ones it was verified with.
 
-**`ops/*.ps1` is record-only.** The paper and live modes exist in the bash half
-alone, deliberately. A long M8 run here needs WSL — where the bash harness runs
-unmodified and is the proven path — or a PowerShell port that is then rehearsed,
-which is a slice of work and must not be written the night before a run. In WSL,
-check sleep: `caffeinate` has no equivalent and a 72-hour run needs the host
-awake.
+**`ops/*.ps1` is record-only, and there is no live mode in either half.** The
+paper mode exists in the bash half alone, deliberately, and the bash half has
+only run on macOS: it uses BSD `date -u -r`, `caffeinate` and BSD `stat -f`, so
+it does not run under WSL unmodified, whatever this said before. An M8 run here
+needs a WSL or PowerShell port, rehearsed, and that is a slice of work that must
+not be written the night before a run. M8 plans an afternoon rather than 72
+hours, and the host still has to stay awake through it.
 
 ### 3. Where M8 is
 
-`docs/live-run.md` is the scoping, written before any of the code. Slices (a) and
-(b) are done and (c) is part done:
+`docs/live-run.md` is the scoping, written before any of the code. Slice (b) is
+done, (a) is done in the engine and not in the source, and (c) is part done:
 
-- **(a) done.** The engine can be woken by the venue as well as the market.
-  `EventSource::next_event_timeout` returns a three-way `Wake`, defaulted so a
-  historical replay can never idle and no backtest number moved. The clock is
-  forward-only and counts its clamps.
+- **(a) done in the engine, missed in the source.** The engine can be woken by
+  the venue as well as the market: `EventSource::next_event_timeout` returns a
+  three-way `Wake`, defaulted so a historical replay can never idle and no
+  backtest number moved. But this said "(a) done" while `LiveSource`, the one
+  source the idle wake exists for, never overrode the method, so in production
+  the engine still blocked in `recv()`. And the clock advanced from venue reports
+  on idle wakes only. Both land in `m8a-live-source-idles`.
 - **(b) done.** `Credentials` (redacting `Debug`, environment only, signature
   pinned against RFC 4231), `TradeClient`, and `venue-check`. Verified against
   the real API: a wrong secret comes back HTTP 401, which is the venue's auth
@@ -2186,7 +2217,11 @@ awake.
   (~80,000x on BTCUSDT); risk did the same to its loss budget and never shrank
   its position by the fee; a sell handed the fee back to the position; and
   `JournalWriter` stamped every fill `Quote`. The conversion now lives once, on
-  `Fill` (`fee_in_quote`, `fee_in_base`).
+  `Fill` (`fee_in_quote`, `fee_in_base`). **PR #50 fixed the writer and not the
+  reader**: `journal::replay` still re-stamped every fee as `Quote`, so a restart
+  after a base-asset fee would have come back with the wrong cash and position.
+  Its commit message even named the failure ("replayed as one"). Fixed in
+  `m8c-journal-recovery`.
 
   **The translator is done**: `quant-binance::user_data`, 27 tests, every one
   seen red under a deliberate break. An `executionReport` is classified before
@@ -2198,14 +2233,23 @@ awake.
   documented example rather than a capture; criterion D's recorded reports have
   to confirm it.
 
-  **What remains in (c) is `LiveVenue` itself**: submitting through
-  `TradeClient` with `newOrderRespType=ACK`, the user-data socket, and
-  dispatching what the translator returns. It inherits three things the
-  translator could not settle. Where the run tag lives, so that a restart reuses
-  it and a lost journal does not. How an orphan from another run is journalled,
-  since `JournalEntry::Orphaned` takes a numeric `ClientOrderId` and an orphan's
-  id is text by design. And recording the user-data socket into the raw tier,
-  which is a new `FrameKind` and container version 2 → 3 (`docs/live-run.md` §5).
+  **What remains in (c) is about ten pull requests**, listed with their
+  acceptance criteria in `docs/live-run.md` §4. Mapping what `LiveVenue` has to
+  fit (2026-10-14/15) found seven defects in shipped code, which go first (see
+  *Still open*), and eighteen design questions. The ones that block code are
+  settled in §5; the rest are settled in the pull request that meets them.
+  Three were the owner's, on 2026-10-15:
+  - **Ed25519 keys for the live run.** Listen keys are gone since 2026-02-20, and
+    `session.logon` is Ed25519-only. An HMAC key's one remaining route is
+    deprecated and doubtful.
+  - **The exit sells what the strategy holds**, rounded down to the lot, and less
+    than a lot counts as flat. It's a no-op wherever fees are paid in USDT.
+  - **Rehearse on Spot Testnet before any real order.**
+
+  The translator's three open questions are settled there too: the run tag
+  lives on `Started`; orphans from other runs get their own journal entry with a
+  text id; and the account stream is recorded under its own data root, with no
+  frame that carries the API key.
 
 **Slice (c) also corrected the design it was built from.** `docs/live-run.md` §5
 called `ClientOrderId` an idempotency key, on the claim that the venue refuses a
