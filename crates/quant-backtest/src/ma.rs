@@ -13,8 +13,12 @@
 //! per interval of **event time** gives a window that means the same thing all
 //! week.
 //!
-//! The clock is `ctx.now()`, which is the last event's `local_recv_ts`. There is
-//! no other clock available, which is the point.
+//! The clock is `ctx.now()`, the engine clock, which only runs forward. With a
+//! simulated venue only market events move it, so it is the last event's
+//! `local_recv_ts`. With a live venue a report can move it too -- one stamped
+//! later than the last market event carries the clock past it -- so in general
+//! it is the engine's clock and not any one event's stamp. There is no other
+//! clock available, which is the point.
 //!
 //! # Why it will not trade across a gap
 //!
