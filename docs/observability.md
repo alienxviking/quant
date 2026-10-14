@@ -423,9 +423,10 @@ printed `clock skew Nms` once it passed a thousand — so a thousand skewed
 messages would have been reported as a second of offset. The emitter's own
 `latency_samples`, which is what makes the count read as a proportion, was not
 parsed at all. The millisecond offset the figure is mistaken for is a different
-measurement entirely: taken round-trip-corrected against `/api/v3/time` by
-`ops/preflight.sh` and the recorder's startup check, and never on the metrics
-line.
+measurement entirely, taken against `/api/v3/time` and never on the metrics
+line: round-trip-corrected by `ops/preflight.sh`, and deliberately uncorrected
+by the recorder's startup check, which reads the venue's clock once and comes
+out short by the outbound leg.
 
 **Fixed 2026-09-20**: the field is `clock_skew_samples`, `latency_samples` is
 parsed, and the two print together. The freeze did not block it, because
