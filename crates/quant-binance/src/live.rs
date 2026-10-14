@@ -405,11 +405,19 @@ mod tests {
         assert_eq!(gap.meta.ingest_seq, 1, "the last one we actually saw");
     }
 
-    /// Short, because every wait in these tests is meant to expire.
+    /// For a call whose wait is meant to expire: short, so the suite is quick.
     const TICK: Duration = Duration::from_millis(50);
 
-    /// Make one call on a thread of its own, so that a source which blocks
-    /// fails the test instead of hanging the suite.
+    /// For a call that already has something to hand over, and so must not
+    /// wait at all. Far past what `bounded` allows, so a source that sat out
+    /// its deadline before delivering fails the test instead of passing slowly
+    /// -- which with `TICK` it would, because a 50 ms wait passes any test
+    /// that does not time it.
+    const LONG: Duration = Duration::from_secs(30);
+
+    /// Make one call on a thread of its own, so that a source which blocks --
+    /// for ever, or for a `LONG` it had no reason to wait -- fails the test
+    /// instead of hanging the suite.
     fn bounded<T: Send + 'static>(
         mut source: LiveSource,
         call: impl FnOnce(&mut LiveSource) -> T + Send + 'static,
@@ -442,13 +450,23 @@ mod tests {
         );
 
         // An idle wake is not an ending: what arrives afterwards still comes
-        // out. Closed before the call, so the record has to outlive its channel.
+        // out, and at once. The channel stays open across this call, so a
+        // source that waited out its deadline before handing the record over
+        // would wait the whole `LONG` and fail rather than pass.
         tx.try_send(venue(1, TRADE)).expect("room");
-        drop(tx);
-        let (woke, source) = bounded(source, |s| s.next_event_timeout(TICK));
+        let (woke, source) = bounded(source, |s| s.next_event_timeout(LONG));
         assert!(
             matches!(&woke, Some(Ok(Wake::Event(MarketEvent::Trade(t)))) if t.meta.ingest_seq == 1),
             "the record sent after the idle wake: {woke:?}"
+        );
+
+        // Closed before the call, so this record has to outlive its channel.
+        tx.try_send(venue(2, TRADE)).expect("room");
+        drop(tx);
+        let (woke, source) = bounded(source, |s| s.next_event_timeout(LONG));
+        assert!(
+            matches!(&woke, Some(Ok(Wake::Event(MarketEvent::Trade(t)))) if t.meta.ingest_seq == 2),
+            "the record sent before the channel closed: {woke:?}"
         );
 
         let (woke, _source) = bounded(source, |s| s.next_event_timeout(TICK));
@@ -465,12 +483,23 @@ mod tests {
         // the channel: waiting first would hold it behind a record that may be
         // minutes away, and on a quiet market report an idle wake while a trade
         // sat undelivered.
+        //
+        // Timed, or it proves none of that: a source that held the trade until
+        // its deadline passed would still hand everything over in this order.
+        // So every call with something left to deliver gets a `LONG` and has to
+        // answer inside `bounded`'s limit, and only the last, with nothing
+        // left, is meant to wait.
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
         tx.try_send(venue(1, TRADE)).expect("room");
         tx.try_send(venue(5, TRADE)).expect("room");
         let mut source = LiveSource::new(rx, instrument());
 
-        let woke: Vec<_> = (0..4).map(|_| source.next_event_timeout(TICK)).collect();
+        let mut woke = Vec::new();
+        for timeout in [LONG, LONG, LONG, TICK] {
+            let (answer, back) = bounded(source, move |s| s.next_event_timeout(timeout));
+            woke.push(answer);
+            source = back;
+        }
         assert!(
             matches!(&woke[0], Some(Ok(Wake::Event(MarketEvent::Trade(t)))) if t.meta.ingest_seq == 1),
             "{woke:?}"
