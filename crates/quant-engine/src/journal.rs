@@ -43,7 +43,7 @@ use crate::RefusedBy;
 use quant_core::event::Side;
 use quant_core::execution::{ClientOrderId, Fill, RejectReason};
 use quant_core::fixed::{Notional, Px, Qty};
-use quant_core::instrument::{Exchange, InstrumentId, InstrumentRegistry};
+use quant_core::instrument::{Exchange, InstrumentDef, InstrumentId, InstrumentRegistry};
 use quant_core::time::Ts;
 
 use crate::portfolio::Portfolio;
@@ -404,6 +404,12 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
 /// Instruments are re-registered from `(exchange, symbol)`, so the ids this
 /// produces are this process's ids and not the ones the journal was written
 /// under — which is precisely why the pair is what gets persisted.
+///
+/// An instrument `registry` does not already hold is registered with
+/// placeholder rules, because a journal records what we traded and not the
+/// venue's filters. A caller that will trade the instrument afterwards must
+/// register its real definition *before* replaying — which is what [`resume`]
+/// is for.
 #[must_use]
 pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Portfolio {
     let starting = entries
@@ -667,15 +673,97 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
         .map_or(1, |highest| highest + 1)
 }
 
+/// Everything a restarted session takes from its journal.
+///
+/// One value, so that a session is resumed or not as a whole. The capital, the
+/// position, the kill switch and the id counter each have their own way of
+/// going wrong across a restart, and each of them already has once.
+#[derive(Debug)]
+pub struct Resumption {
+    /// The session's instrument, under the definition the caller gave.
+    pub instrument: InstrumentId,
+    /// The capital the session began with: the first `Started` entry's, or the
+    /// configured cash when the journal is empty.
+    pub starting_cash: Notional,
+    /// What the journal replays to, or `None` when it holds nothing to resume.
+    ///
+    /// `None` rather than an empty recompute, because `Engine::resuming`
+    /// replaces the portfolio outright and an empty recompute has no capital: a
+    /// rehearsal once reported "cash 0 from 0" on a session configured with a
+    /// hundred. A value that is not there cannot be passed by mistake.
+    pub portfolio: Option<Portfolio>,
+    /// The kill switch a previous session threw, which a restart must not
+    /// re-arm.
+    pub tripped: Option<crate::risk::TripCause>,
+    /// The next client order id to mint, for `Engine::minting_from`.
+    pub next_order_id: u64,
+}
+
+/// Resume a session from its journal, onto its instrument's real definition.
+///
+/// **It registers first and replays second, and the order is the point.**
+/// Registration is idempotent on `(exchange, symbol)`, and [`replay`] registers
+/// every instrument it meets with placeholder rules -- the smallest tick and
+/// lot, no minimum notional, no asset names. Replay first and the placeholders
+/// are what the registry keeps; the real definition registered afterwards is
+/// silently ignored. `paper` did exactly that, so a session restarted after any
+/// fill ran under no venue rules at all, and its simulated venue would have
+/// filled the sub-minimum orders M4.c made it refuse. A live session resumed
+/// that way would lose its asset names as well, and the user-data translator
+/// refuses an instrument without them.
+///
+/// It lives here rather than in `paper` because a live session must resume the
+/// same way, and beside [`replay`] and `resolve` because the placeholders it
+/// has to beat are registered here: the rule and the hazard it orders against
+/// are read together or not at all.
+///
+/// `cash` is what a fresh session starts with. Once the journal holds anything
+/// it is ignored, because the first `Started` entry is the authority on the
+/// capital a session began with and a restart must not reset it.
+#[must_use]
+pub fn resume(
+    entries: &[JournalEntry],
+    registry: &mut InstrumentRegistry,
+    instrument: InstrumentDef,
+    cash: Notional,
+) -> Resumption {
+    // Before anything in the journal can register a placeholder for it.
+    let instrument = registry.register(instrument);
+    let portfolio = (!entries.is_empty()).then(|| replay(entries, registry));
+    Resumption {
+        instrument,
+        starting_cash: portfolio.as_ref().map_or(cash, Portfolio::starting_cash),
+        portfolio,
+        tripped: last_trip(entries),
+        next_order_id: next_order_id(entries),
+    }
+}
+
+/// The trip state a previous session left behind.
+///
+/// A kill switch that forgets is not a kill switch: the supervisor exists to
+/// restart a dead process, so a switch held only in memory would be re-armed by
+/// the machinery meant to keep things running.
+fn last_trip(entries: &[JournalEntry]) -> Option<crate::risk::TripCause> {
+    entries.iter().rev().find_map(|e| match e {
+        JournalEntry::Tripped { cause, .. } => Some(*cause),
+        // Deliberately *not* cleared by a later `Started`: a restart is exactly
+        // the moment a forgotten switch would be re-armed.
+        _ => None,
+    })
+}
+
 /// Find or register an instrument by its persisted identity.
 fn resolve(registry: &mut InstrumentRegistry, key: &InstrumentKey) -> InstrumentId {
-    use quant_core::instrument::{InstrumentDef, InstrumentKind};
+    use quant_core::instrument::InstrumentKind;
     registry.register(InstrumentDef {
         exchange: key.exchange,
         symbol: key.symbol.clone(),
         // A journal records what we traded, not the venue's filters. Registering
         // is idempotent on `(exchange, symbol)`, so an instrument already known
-        // to this process keeps the definition it was registered with.
+        // to this process keeps the definition it was registered with -- which
+        // is why `resume` registers the real definition before it replays, and
+        // why these placeholders win if anything does it the other way round.
         base: String::new(),
         quote: String::new(),
         kind: InstrumentKind::Spot,
@@ -976,6 +1064,96 @@ mod tests {
         let id_b = resolve(&mut second, &key());
         assert_ne!(id_a, id_b, "the ids really do differ between processes");
         assert_eq!(a.position(id_a), b.position(id_b));
+    }
+
+    /// BTCUSDT as the venue defines it -- which is what a journal cannot say.
+    fn btcusdt() -> InstrumentDef {
+        InstrumentDef {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+            base: "BTC".to_owned(),
+            quote: "USDT".to_owned(),
+            kind: quant_core::instrument::InstrumentKind::Spot,
+            tick_size: "0.01".parse().expect("tick"),
+            lot_size: "0.00001".parse().expect("lot"),
+            min_notional: "5".parse().expect("notional"),
+        }
+    }
+
+    #[test]
+    fn resuming_a_journal_that_holds_fills_keeps_the_real_instrument_definition() {
+        // Registration is idempotent on (exchange, symbol), and replay registers
+        // a placeholder for every instrument it meets. `paper` replayed first
+        // and registered second, so after a restart with fills the placeholder
+        // won -- the smallest tick and lot, no minimum notional, no asset names
+        // -- and the real definition was dropped without a word.
+        let real = btcusdt();
+        let mut registry = InstrumentRegistry::new();
+        let resumed = resume(&session(), &mut registry, real.clone(), amount("100"));
+        assert!(
+            resumed.portfolio.is_some(),
+            "the journal holds fills, so this is a resume"
+        );
+
+        let kept = registry.expect(resumed.instrument);
+        assert_eq!(kept.tick_size, real.tick_size);
+        assert_eq!(kept.lot_size, real.lot_size);
+        assert_eq!(kept.min_notional, real.min_notional);
+        assert_eq!(kept.base, real.base);
+        assert_eq!(kept.quote, real.quote);
+    }
+
+    #[test]
+    fn a_fresh_journal_resumes_nothing_and_starts_with_the_configured_cash() {
+        // An empty journal replays to a portfolio with no capital, and
+        // `Engine::resuming` replaces the portfolio outright -- the rehearsal
+        // that reported "cash 0 from 0" on a session configured with a hundred.
+        let mut registry = InstrumentRegistry::new();
+        let resumed = resume(&[], &mut registry, btcusdt(), amount("100"));
+        assert!(resumed.portfolio.is_none(), "nothing to resume");
+        assert_eq!(resumed.starting_cash, amount("100"));
+        assert_eq!(resumed.next_order_id, 1);
+        assert_eq!(resumed.tripped, None);
+    }
+
+    #[test]
+    fn a_restart_resumes_from_the_capital_the_session_began_with() {
+        // The first `Started` wins: not the restart's own, and not whatever this
+        // process happened to be configured with. A run that lost money must
+        // not look like it began poorer.
+        let mut restarted = session();
+        restarted.push(JournalEntry::Started {
+            at: Ts::from_nanos(10),
+            cash: amount("64"),
+            schema: SCHEMA,
+        });
+        let mut registry = InstrumentRegistry::new();
+        let resumed = resume(&restarted, &mut registry, btcusdt(), amount("50"));
+        assert_eq!(resumed.starting_cash, amount("100"));
+        assert_eq!(
+            resumed.next_order_id, 3,
+            "ids carry on from the journal's rather than starting again at 1"
+        );
+    }
+
+    #[test]
+    fn a_kill_switch_thrown_before_a_restart_is_still_thrown_after_it() {
+        // The supervisor restarts a dead process, so a switch held only in
+        // memory would be re-armed by the machinery meant to keep things
+        // running. The restart's own `Started` must not clear it.
+        let mut entries = session();
+        entries.push(JournalEntry::Tripped {
+            at: Ts::from_nanos(4),
+            cause: crate::risk::TripCause::DailyLoss,
+        });
+        entries.push(JournalEntry::Started {
+            at: Ts::from_nanos(5),
+            cash: amount("99"),
+            schema: SCHEMA,
+        });
+        let mut registry = InstrumentRegistry::new();
+        let resumed = resume(&entries, &mut registry, btcusdt(), amount("100"));
+        assert_eq!(resumed.tripped, Some(crate::risk::TripCause::DailyLoss));
     }
 
     #[test]
