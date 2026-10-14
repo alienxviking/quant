@@ -297,12 +297,13 @@ impl Instrument {
     }
 
     /// Round a quantity toward zero to a valid lot.
+    ///
+    /// [`Qty::round_to_lot`] with this instrument's lot, rather than a second
+    /// copy of the arithmetic: a strategy that holds only the lot rounds with
+    /// that, and the two must never disagree about what a whole lot is.
     #[must_use]
     pub fn round_qty(&self, qty: Qty) -> Qty {
-        if self.lot_size.is_zero() {
-            return qty;
-        }
-        Qty::from_raw(qty.raw() - qty.raw() % self.lot_size.raw())
+        qty.round_to_lot(self.lot_size)
     }
 
     /// Whether the venue would accept this order's size and price.

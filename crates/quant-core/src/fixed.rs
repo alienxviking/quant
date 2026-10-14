@@ -422,6 +422,9 @@ impl Qty {
     /// smaller short rather than the larger.
     ///
     /// A `lot` of zero means the venue has no lot rule, and leaves `self` alone.
+    ///
+    /// [`Instrument::round_qty`](crate::instrument::Instrument::round_qty) is
+    /// this with the instrument's own lot.
     #[must_use]
     pub const fn round_to_lot(self, lot: Self) -> Self {
         if lot.is_zero() {
