@@ -35,8 +35,8 @@ three things M8 must supply and nothing else can:
    indeterminate, and a crash in that window leaves money in a state no previous
    milestone could reach.
 
-Everything else people associate with "going live" — the HMAC, the API keys, the
-order formats — is mechanical. These three are the milestone.
+Everything else people associate with "going live" — the signing, the API keys,
+the order formats — is mechanical. These three are the milestone.
 
 ### The defect this scoping found, before any code was written
 
@@ -69,6 +69,16 @@ document first: the defect is invisible from the backtest and the paper run, and
 visible in ten minutes of reading once the question is "what does a live venue
 need".
 
+**Slice (a) fixed the engine's half and missed the source's.** The engine learned
+to wake on `next_event_timeout` returning `Wake::Idle`, and the trait's default
+can never return `Idle`, on purpose, so that a historical replay stays
+bit-identical. Only a source with a second thing to wait for overrides it, and
+`LiveSource`, the one source with exactly that, never did: its `next_event` still
+blocked in `recv()` under a comment saying so on purpose. The idle path ran in
+tests, whose test sources override the method, and never in production. Found by
+slice (c)'s mapping, not by a test, and fixed in `m8a-live-source-idles` together
+with the other half of the forward-only clock (§5).
+
 ---
 
 ## 2. What it is not
@@ -84,6 +94,21 @@ every surprise it produces is the adapter's.
 rule. The strategy is a known quantity and that is its entire value here — if
 behaviour differs from the paper run, the strategy is the one thing that cannot
 be the reason.
+
+**One exception, decided on 2026-10-15 before anything ran live: the exit sells
+what the strategy holds.** A spot venue takes a buy's fee in the asset bought, so
+after buying `qty` the position is `qty` minus the fee. `MaCrossover` exited by
+selling a fixed `qty` and counted only an exact zero as flat, so live it would
+never be flat again, and every later down-cross would sell `qty` again: refused
+for want of balance or, with other BTC in the account, selling coins it never
+bought. The exit now sells the position rounded down to the lot, and less than a
+lot counts as flat. That is a correction rather than the kind of sizing rule this
+paragraph forbids, and the paragraph's reason survives it. Wherever fees are paid
+in the quote asset, which is every backtest and all of M5, the position is
+exactly zero or `qty`, so the change must be a no-op: `m8c-exit-sizing` is
+accepted only if M5's 824 fills and cash 31.64743842 reproduce exactly. Both
+sides of every M8 comparison run the same code, so the strategy still cannot be
+the reason live differs from the model.
 
 **Not a measurement of queue position or market impact, and four documents
 currently say otherwise.** `docs/engine-contract.md` §8, `docs/overview.md`,
@@ -111,7 +136,10 @@ independent because two `SimulatedVenue`s are. Two live processes share one
 exchange balance while holding two private `Portfolio`s and two daily-loss
 budgets, neither of which can see the other's fills — so each would permit its
 full budget against a balance the other is also spending. One symbol, one
-process, one account, enforced in `ops/start-run.sh` rather than left to care.
+process, one account, to be enforced by a live mode of `ops/start-run.sh` rather
+than left to care. That mode does not exist yet: `supervise.sh` accepts only
+`record` and `paper`, and `start-run.sh` defaults to two symbols. Slice (c)'s last
+pull request adds it, tested the way `ops/test-supervise.sh` tests the supervisor.
 
 **Not a second way to fold our own records — but `runlog diff` as it stands
 cannot be the criterion, and saying otherwise would have made M8 vacuous.**
@@ -322,21 +350,96 @@ Engine"*.
 
 | | Slice | Content |
 |---|---|---|
-| a | The engine can receive what a venue says | wake on either input; `step_reports`; forward-only clock |
-| b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check` |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`); `LiveVenue` remains |
+| a | The engine can receive what a venue says | wake on either input (`next_event_timeout`), forward-only clock. Engine side **done**; `LiveSource`'s half was missed (§1) and lands in `m8a-live-source-idles` |
+| b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c) (§5) |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`); the rest is the pull requests below |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
+
+### Slice (c), as pull requests
+
+Mapping what `LiveVenue` has to fit turned one item into about ten pull requests.
+Six independent readers covered the engine seam, the journal, the live
+transport, the raw tier, Binance's documentation (at commit `0556f1a`) and this
+document, a seventh cross-checked them, and every consequential finding was then
+re-read in the source by hand. Each pull request is a branch of small green
+commits whose acceptance criterion can fail, with every new test seen red before
+it was trusted.
+
+**First, the defects the mapping found in shipped code.** None of them waits for a
+feature.
+
+| branch | what it fixes |
+|---|---|
+| `m8a-live-source-idles` | `LiveSource` never overrode `next_event_timeout`, so the idle wake never ran in production (§1); and venue reports advanced the clock on idle wakes only (§5) |
+| `m8c-journal-recovery` | `journal::replay` re-stamped every fee as `Quote`, which PR #50 fixed in the writer and missed here; a restart registered placeholder filters ahead of the real ones; a torn line followed by a restart made the journal unreadable |
+| `m8c-risk-reduce` | a partial reduction of an oversized position was refused, against `docs/engine-contract.md` §10, and the test named for the property sold the whole position, so it could not see the gap |
+| `m8c-exit-sizing` | the exit sold a fixed quantity against a position the fee had shrunk (§2) |
+| `m8b-venue-check-offset` | `venue-check` subtracted half the round trip where the midpoint estimate adds it, so the clock gate was off by a full round trip |
+
+**Then slice (c) proper, in dependency order.**
+
+1. **Credentials and requests.** Ed25519 keys (§5); signed `POST` and `DELETE`
+   that keep the response body; an encoder from `OrderRequest` that never sends
+   `timeInForce` on a market order and always sends `newOrderRespType=ACK` and the
+   run-tagged `newClientOrderId`; and a classifier sorting every response into
+   *placed*, *refused* (with its code and message) or *unknown*. Any 5xx, `-1007`
+   and `-1006` are unknown, never refused. Accepted when Binance's documented
+   signature examples reproduce and a table test maps every documented code to
+   its class.
+2. **The instrument comes from the venue.** `exchangeInfo` parsed into an
+   `InstrumentDef`, naming the venue rules our `Filters` do not model
+   (`MARKET_LOT_SIZE`, `applyMinToMarket`, `maxNotional`). Accepted when the
+   documented response parses exactly and a missing asset is an error naming the
+   field rather than an empty string.
+3. **The engine seam a live venue needs.** A readiness check consulted before an
+   order is journalled (§5), venue detail delivered to the observer and never to
+   the strategy (§5), and a final drain at shutdown. Accepted when the simulator
+   reproduces every existing test and M5's money check, and a strategy's view of
+   a lifecycle is identical whichever venue produced it.
+4. **What a live run writes down.** The run tag on `Started`; venue order and
+   trade ids; entries for an orphan from another run, someone else's trade, losing
+   and regaining the account stream, a refused cancel, and a rejection's code;
+   journal schema 3, with `read` refusing a schema it does not know.
+5. **A frame kind for the account stream.** Container version 3, and the account
+   stream under its own data root (§5), where `quant-verify` runs its container
+   checks and not the update-id chain. Accepted when a v3 build reads every v1 and
+   v2 file on disk and `quant-verify` still exits 0 on `data/paper` and
+   `data/acceptance`.
+6. **Listening to the account.** `session.logon`, then `userDataStream.subscribe`,
+   over the WebSocket API; resubscribing on every reconnect and on
+   `serverShutdown`; every recordable frame written to raw before it is
+   translated. Accepted against a local WebSocket server: recorded bytes equal sent
+   bytes, and a dropped connection produces a `Gap`, a reconnect and a second
+   subscribe.
+7. **`LiveVenue`.** A state machine merging REST outcomes with stream reports: one
+   terminal event per order, fills deduplicated by trade id, the in-doubt state
+   (§5). Behind it, `impl ExecutionVenue`. Accepted by a permutation test over
+   every interleaving of the REST reply and the stream's reports.
+8. **The `live` binary and a rehearsal.** Paper's session extracted so any venue
+   can run it; a startup that records first and trades last; a live mode in
+   `ops/` enforcing one symbol. Accepted when a run on Spot Testnet (§5) reaches
+   criterion D's states 1, 2, 4 and 6, `reconcile` agrees, `quant-verify` is clean
+   on both data roots, and replaying the recorded account frames through the
+   translator reproduces every venue-produced journal entry.
+
+Outside slice (c): resolving an in-doubt order by lookup is slice (d), criteria
+A, B and C as a binary are slice (e), and the run with criteria D and E is slice
+(f).
 
 ### Where it runs, which is not yet settled
 
 M5 ran on the MacBook Air, and `ops/`'s bash half is the only harness with a
 paper or live mode — the `.ps1` half is **record-only**, deliberately, because
 *"an untested paper mode there would be exactly the harness-never-run M1 warns
-about"*. So an M8 run on the Windows box needs WSL, where the bash harness runs
-unmodified, or a PowerShell port that is then rehearsed. The second is a slice of
-work in its own right and must not be written the night before a run.
+about"*. So an M8 run on the Windows box needs WSL or a PowerShell port that is
+then rehearsed, and this used to say the bash harness runs under WSL unmodified.
+It does not: it has only ever run on macOS, and it uses BSD `date -u -r EPOCH`
+(`start-run.sh`, `supervise.sh`, `verify-loop.sh`), `caffeinate` (`supervise.sh`)
+and BSD `stat -f` (`status.sh`), none of which behaves the same under GNU. Either
+route is a slice of work in its own right and must not be written the night
+before a run.
 
 The clock constrains the choice more than the harness does. Slice (b) made a
 host more than 1000 ms from the venue **unable to trade at all**, where M1 had
@@ -353,7 +456,9 @@ signed `GET /api/v3/account`, which exercises the key, the secret, the signature
 the header and the clock in a single round trip and places nothing. A wrong
 secret comes back HTTP 401, which is the venue's auth layer answering — proof the
 request was well formed enough to be judged on its credentials rather than its
-shape.
+shape. Two caveats: until `m8b-venue-check-offset` lands its clock reading is off
+by a round trip, and the credentials pull request moves it to the Ed25519 key
+(§5).
 
 Slice (a) is first and is not negotiable: it is a seam change, every slice after
 it depends on the guarantee, and it is the one thing that can be built and tested
@@ -431,9 +536,11 @@ That is why criterion A compares equity as its floor — and why, with
 **`LiveVenue::submit` does not await.** Stamp, format, `try_send`, return. The
 engine loop is synchronous and must not block on a round trip — that is the whole
 of §2's fire-and-forget argument, and the first place it has ever actually
-mattered. A full outbound channel is **our** failure and gets its own
-`RejectReason`, distinct from a venue rejection, on the same argument that made
-`RefusedBy` distinguish the seam from the risk layer.
+mattered. A full outbound channel is **our** failure, distinct from a venue
+rejection, on the same argument that made `RefusedBy` distinguish the seam from
+the risk layer. This said it "gets its own `RejectReason`", but that argument
+points at `RefusedBy`, not at a reason inside `Rejected`, and slice (c) followed it
+there: the adapter refuses *before* the order is journalled (below).
 
 **Venue-sourced filters block submission, not recording.** Criterion B will
 probably fail first on a hard-coded `tick_size` or `min_notional`, so the live
@@ -452,6 +559,13 @@ no-op property that made `Costs::NONE` checkable. Mirrors
 `quant-recorder::segment`'s never-roll-backwards rule and its `backdated_records`
 counter.
 
+Half of this shipped with slice (a). The clock advanced from venue reports on
+idle wakes only, so on a market wake a later report was journalled at its own
+time while the strategy's clock stayed earlier, and the journal's timestamps
+could run backwards. `runlog`'s `decisions_at` stops at the first entry stamped
+after the instant it is asked about, so one entry out of order hides every entry
+behind it. The market-wake half lands in `m8a-live-source-idles`.
+
 **The kill switch must stop a live run, and stopping is not flattening.** M6
 decided that a tripped switch refuses everything including the order that would
 close a position, and named the trade-off: closing out becomes manual. That was
@@ -459,6 +573,100 @@ cheap in paper. It is a real decision with real money and it is **not** reversed
 here — a switch that trades after tripping is not a switch — but the run
 procedure must state plainly that a trip leaves a position open and a human
 closes it.
+
+### Decided in slice (c)
+
+Settled while mapping what `LiveVenue` must fit, on the evidence of the code and
+of Binance's documentation at commit `0556f1a`. The key type and the rehearsal
+were the owner's calls, as was §2's exit rule; the rest follow from the
+arguments given.
+
+**The account stream is `session.logon` then `userDataStream.subscribe`, signed
+with an Ed25519 key.** The route this project had assumed is gone: the changelog
+for 2026-01-21 lists `POST /api/v3/userDataStream` among endpoints that *"will no
+longer be available starting from 2026-02-20,07:00 UTC"*. Session authentication
+is Ed25519 only (*"Only _Ed25519_ keys are supported for this feature"*), and
+`userDataStream.subscribe` *"requires an authenticated WebSocket connection using
+Ed25519 keys"*. An HMAC key has one route left,
+`userDataStream.subscribe.signature`, which the changelog says *"can work with any
+API Key type"* while the method's own example signature is base64, and Binance's
+key-type page says *"HMAC keys are deprecated."* So the live path signs with Ed25519, which `ring`, already linked
+for TLS, provides. The key pair is generated locally and only its public half is
+registered with Binance. Orders stay on REST, per *one authority per fact*: one
+WebSocket carrying both would let a single disconnect blind the stream and leave
+every in-flight order's outcome unknown at the same instant.
+
+**Losing the account stream is ours to notice; the venue does not announce it.**
+`eventStreamTerminated` is sent when a listen token expires, when a logon
+subscription is ended by `session.logout`, and when we unsubscribe, and we cause
+none of those involuntarily. A lost subscription shows up as transport instead:
+the socket closing, the idle timeout firing, a `serverShutdown` event, a
+resubscribe that fails. A subscription belongs to one connection and nothing is
+replayed after a reconnect, so every reconnect resubscribes, and an order working
+across the blind stretch is in doubt (below) until slice (d)'s lookup settles it.
+The venue's pings every 20 seconds prove the socket, not the subscription;
+`session.status` reports whether we still hold one.
+
+**The adapter refuses before an order is journalled, not after.** By the time
+`ExecutionVenue::submit` runs, `on_submitted` has written the order down and the
+engine's ledger holds it, so the only way back would be a `Rejected` through
+`poll`, recorded as *"the venue declined an order it had been told about"*, which
+is false for an order that never left. So every refusal that starts in the
+adapter (no venue filters, a full outbound queue, the account stream down, an
+order in doubt, a failed clock check, a failed journal append) is a readiness
+check the engine consults in `Context::submit`, after the seam check and before
+the risk layer. It is refused through `RefusedBy` like the other two kinds of
+refusal, journalled as a refusal, and consumes none of the risk layer's daily
+count. The check cannot race: the engine thread is the outbound queue's only
+producer, so room can only grow between the check and the send.
+`SimulatedVenue` takes the default, always ready, and does not change.
+
+**An unknown outcome is not a rejection.** Until slice (d) exists, a submission
+whose outcome is unknown (a 5xx, `-1007`, `-1006`, a timeout after the request was
+sent) produces no event at all. The order stays working, the venue marks itself
+in doubt, and readiness refuses every new order until the stream mentions that
+order or slice (d)'s lookup settles it. `Rejected` would be the convenient lie: a
+rejection is terminal and removes the order from the engine's ledger, so the real
+fill arriving a second later would be booked as an orphan and never reach the
+portfolio. Loud and stuck is the safe failure, and recording carries on
+throughout. The client's own timeout sits above the venue's ten seconds, so the
+venue's `-1007` arrives first when it can.
+
+**Venue facts reach the journal and never the strategy.** Criterion A needs the
+venue's order and trade ids, orphans from other runs, other people's trades on
+our symbol, a lost stream, a refused cancel and a rejection's code written down.
+None of them may reach a strategy, because a strategy that can tell which venue
+it is wired to is a bug. One already does: `ExecutionEvent::Accepted` carries a
+venue order id that the translator fills and `SimulatedVenue` deliberately leaves
+empty. The seam pull request delivers venue detail beside each event, to the
+observer only, so that a strategy's view of every lifecycle is identical
+whichever venue produced it, which closes that leak too.
+
+**The account stream is recorded under its own data root.** Interleaved into the
+market capture, an account gap would become a market `Gap` and clear the order
+book over a socket that has nothing to do with it, and account frames would
+compete for the market's channel. A session under `raw/` would be handed to every
+market reader. A second root, `<run-root>/account/`, reuses `Ingress`, `TeeSink`,
+`CaptureSession`, `FileStore` and `quant-verify` unchanged, so day rolling,
+trailers and holes as evidence come for free, and no market tool ever sees the
+files. **No frame carrying key material is recorded**, because raw is kept
+forever. Every outbound request is out; so are the responses to `session.logon`
+and `session.status`, which echo the API key in their `result`. Those are our
+session's bookkeeping rather than facts about the account. Everything else
+inbound (events, `serverShutdown`, subscription responses) is recorded verbatim.
+
+**The run tag lives on `Started`.** Minted only when the journal is empty, and
+read from the *first* `Started` thereafter, the rule starting cash already
+follows. An older build reading the journal ignores an unknown field, where it
+would fail on an unknown entry type, and a sidecar file is the second file
+`docs/run-log.md` refuses. A live run that finds a non-empty journal without a
+tag refuses to trade and records anyway.
+
+**Rehearse on Spot Testnet before any real order.** Every protocol path
+(logon, subscribe, place, cancel, reject, reconnect) can be exercised at
+`wss://ws-api.testnet.binance.vision/ws-api/v3` with no money at risk, and with
+its own key pair. Its market is not the real one, so it cannot stand in for
+criteria A, C or D; it is where adapter bugs are supposed to surface first.
 
 ---
 
