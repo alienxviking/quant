@@ -80,6 +80,27 @@ impl ClockSample {
     pub const fn offset_ms(&self) -> i64 {
         midpoint_offset_ms(self.sent_at, self.server_time, self.received_at)
     }
+
+    /// Of several readings, the one to believe: the smallest round trip.
+    ///
+    /// The standard NTP choice, for the reason [`midpoint_offset_ms`] gives:
+    /// whatever the split between the legs, a reading is wrong by at most half
+    /// its round trip, so the smallest round trip is the tightest bound on
+    /// offer.
+    ///
+    /// A negative round trip is never chosen. It means the host clock stepped
+    /// backwards while the request was in flight -- the very clock being
+    /// measured -- and "smallest wins" alone would rank it above every honest
+    /// reading. Of equal round trips, the earliest. `None` when no reading
+    /// qualifies.
+    #[must_use]
+    pub fn tightest(readings: &[Self]) -> Option<Self> {
+        readings
+            .iter()
+            .filter(|r| r.round_trip_ms() >= 0)
+            .min_by_key(|r| r.round_trip_ms())
+            .copied()
+    }
 }
 
 /// How far the host clock is from the venue's, in milliseconds, from one
@@ -109,7 +130,8 @@ impl ClockSample {
 /// leg of `d1` and a return of `d2` the estimate is off by `(d2 - d1) / 2`, which
 /// can never exceed half the round trip. So half the round trip bounds the
 /// error, give or take a millisecond of rounding, and of several readings the
-/// one with the smallest round trip is the one to believe.
+/// one with the smallest round trip is the one to believe: that is
+/// [`ClockSample::tightest`].
 #[must_use]
 pub const fn midpoint_offset_ms(sent_at: i64, server_time: i64, received_at: i64) -> i64 {
     let reading = ClockSample {
@@ -371,6 +393,49 @@ mod tests {
                 assert_eq!(r.round_trip_ms(), 2 * d, "{r:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_reading_with_the_smallest_round_trip_is_the_one_believed() {
+        // One clock, 250 ms ahead, read five times over legs of different length
+        // and symmetry, so each reading tells a different story. The first
+        // carries a handshake on its outbound leg, as a cold first request does,
+        // and is the furthest from the truth. The tightest is neither first nor
+        // last, so a rule that took either -- or the largest round trip --
+        // believes a different reading and fails.
+        let theta = 250;
+        let readings = [
+            reading(1_700_000_000_000, theta, 400, 100), // round trip 500, reads 100
+            reading(1_700_000_001_000, theta, 150, 30),  // 180, reads 190
+            reading(1_700_000_002_000, theta, 20, 20),   // 40, reads 250
+            reading(1_700_000_003_000, theta, 60, 30),   // 90, reads 235
+            reading(1_700_000_004_000, theta, 35, 25),   // 60, reads 245
+        ];
+        let believed = ClockSample::tightest(&readings).expect("five to choose from");
+        assert_eq!(believed, readings[2]);
+        assert_eq!(believed.round_trip_ms(), 40);
+        assert_eq!(believed.offset_ms(), theta);
+    }
+
+    #[test]
+    fn a_reading_whose_round_trip_ran_backwards_is_never_believed() {
+        // The host clock stepped back while the request was in flight. Smallest
+        // wins on its own would rank this above every honest reading.
+        let honest = reading(1_700_000_000_000, 250, 30, 30);
+        let stepped = ClockSample {
+            received_at: honest.sent_at - 1_000,
+            ..honest
+        };
+        assert!(stepped.round_trip_ms() < 0, "{stepped:?}");
+        assert_eq!(ClockSample::tightest(&[stepped, honest]), Some(honest));
+        assert_eq!(ClockSample::tightest(&[stepped]), None);
+        assert_eq!(ClockSample::tightest(&[]), None);
+
+        // And the boundary from the other side: a round trip inside one
+        // millisecond is quick, not impossible, and is believed.
+        let instant = reading(1_700_000_000_000, 250, 0, 0);
+        assert_eq!(instant.round_trip_ms(), 0);
+        assert_eq!(ClockSample::tightest(&[honest, instant]), Some(instant));
     }
 
     #[test]
