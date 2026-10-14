@@ -387,16 +387,34 @@ pub struct Decisions {
 ///
 /// # Why blindness is looked for *outside* the window
 ///
-/// The engine's clock is the event stream, so an outage produces no entries at
-/// all while it lasts — the `blind` line sits at the moment the stream stopped,
-/// which for M5's twelve-hour outage is eleven hours before the hour someone
-/// asks about. A window query finds nothing and an operator reads nothing as
-/// "quiet". The answer to *why did it not trade between 03:00 and 04:00* lives
-/// before 03:00, so the last blindness at or before the instant is carried
-/// forward and the search for the recovery that ends it runs to the instant.
+/// Against a simulated venue the engine's clock is the event stream, so an
+/// outage produces no entries at all while it lasts — the `blind` line sits at
+/// the moment the stream stopped, which for M5's twelve-hour outage is eleven
+/// hours before the hour someone asks about. A window query finds nothing and
+/// an operator reads nothing as "quiet". The answer to *why did it not trade
+/// between 03:00 and 04:00* lives before 03:00, so the last blindness at or
+/// before the instant is carried forward and the search for the recovery that
+/// ends it runs to the instant.
 ///
 /// Same shape as `market_at`'s day rule: ask the narrow question first, widen
 /// only when the narrow answer is the uninformative one.
+///
+/// # What "seen since" rests on, and where it stops holding
+///
+/// The recovery is inferred, not read: an entry the engine wrote after the
+/// `blind` line is taken to mean the market came back. That inference holds
+/// only while venue reports cannot arrive without a market event. That is
+/// true of `SimulatedVenue`, which reports only from inside `observe`, so it
+/// holds for every journal written so far — backtest and paper.
+///
+/// It stops being true with a live venue. Since M8.a the engine wakes on a
+/// quiet market to hear the venue, and a fill delivered during an outage is
+/// journalled at its own later time, with whatever the strategy decides on
+/// hearing of it — all after the `blind` line, while the market is still dark.
+/// By this rule that outage would read as over. Nothing in the file tells
+/// those entries apart, so the fix belongs to the writer: slice (c)'s
+/// live-journal pull request owes an explicit record of the market's return,
+/// and this function should read that rather than infer it.
 #[must_use]
 pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
     let from = at.saturating_sub(span);
@@ -422,13 +440,17 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
             }
             // `Stopped` proves nothing. It is written unconditionally at
             // shutdown and stamped with `stats.last_ts` — which, for a session
-            // that ended while blind, *is* the gap event. Counting it would make
-            // every run that died in an outage report the stream as seen again,
-            // which is the one case where saying so is most wrong.
+            // that ended while blind, *is* the gap event or, live, a venue
+            // report delivered after it. Neither is the market. Counting it
+            // would make every run that died in an outage report the stream as
+            // seen again, which is the one case where saying so is most wrong.
             JournalEntry::Stopped { .. } => {}
-            // Any *other* entry the engine wrote is proof the stream came back,
-            // because the engine's clock only advances on an event -- so a line
-            // stamped after the gap was written while handling a later one.
+            // Any *other* entry the engine wrote is taken as proof the stream
+            // came back. Against a simulated venue the engine's clock only
+            // advances on a market event, so a line stamped after the gap was
+            // written while handling a later one. That rests on venue reports
+            // never arriving without a market event, which a live venue breaks
+            // -- see the doc comment above for what slice (c) owes.
             //
             // This listed `Submitted | Filled` until the post-milestone audit,
             // which is narrower than the sentence above it in a way that
@@ -637,11 +659,12 @@ mod tests {
 
     #[test]
     fn blindness_is_carried_forward_from_before_the_window() {
-        // The twelve-hour outage, in miniature. The engine's clock is the event
-        // stream, so an outage writes nothing while it lasts and the `blind`
-        // line sits at the moment the stream stopped -- hours before the hour
-        // anyone asks about. A window query alone finds silence and an operator
-        // reads silence as quiet.
+        // The twelve-hour outage, in miniature, as a paper journal records it.
+        // Against a simulated venue the engine's clock is the event stream, so
+        // an outage writes nothing while it lasts and the `blind` line sits at
+        // the moment the stream stopped -- hours before the hour anyone asks
+        // about. A window query alone finds silence and an operator reads
+        // silence as quiet.
         let entries = vec![
             submitted(1, 100),
             JournalEntry::Blind {
@@ -680,8 +703,8 @@ mod tests {
         // `Filled`, so a run that recovered and then did not trade kept
         // reporting "with nothing seen since" -- turning a quiet hour back into
         // the dark hour this whole block exists to distinguish it from. Any
-        // entry proves the clock advanced, because the clock is the event
-        // stream.
+        // later entry proves the clock advanced, and against a simulated venue
+        // only the market advances it.
         let entries = vec![
             JournalEntry::Blind {
                 at: Ts::from_nanos(200),
@@ -727,10 +750,11 @@ mod tests {
     #[test]
     fn a_session_that_ends_while_blind_does_not_claim_the_stream_came_back() {
         // `Stopped` is written unconditionally at shutdown and stamped with the
-        // engine's last event time -- which during a terminal outage is the gap
-        // itself. Counting it as proof would make every run that died in an
-        // outage report the market as visible again, which is exactly the case
-        // where that claim is most misleading.
+        // engine's last clock reading -- which during a terminal outage is the
+        // gap itself or, live, a venue report delivered after it. Neither is
+        // the market. Counting it as proof would make every run that died in
+        // an outage report the market as visible again, which is exactly the
+        // case where that claim is most misleading.
         let entries = vec![
             JournalEntry::Blind {
                 at: Ts::from_nanos(200),
