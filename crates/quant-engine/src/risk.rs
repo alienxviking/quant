@@ -766,6 +766,31 @@ mod tests {
                 .and_then(|r| r.bound),
             Some(Bound::Tripped)
         );
+
+        // The day's loss budget binds a reduction too. It needs an engine of
+        // its own: like the order count it trips the switch, and a thrown
+        // switch answers before any limit is asked, so one engine can show
+        // only one of the two.
+        let mut risk = RiskEngine::new(Limits {
+            max_position_notional: Some(amount("500")),
+            max_daily_loss: Some(amount("10")),
+            ..Limits::default()
+        });
+        risk.on_fill(instrument(), Side::Buy, &fill("100", "10", "0"), NOW);
+        // The market falls to 80 and one unit is sold there: twenty lost
+        // against a budget of ten. The nine left are 720 at that mark, still
+        // over the position limit, so selling two more is a reduction that
+        // limit would let through...
+        risk.on_fill(instrument(), Side::Sell, &fill("80", "1", "0"), NOW);
+        assert_eq!(risk.realized_today(), amount("-20"));
+        assert_eq!(
+            risk.check(&order(Side::Sell, "2"), Some(price("80")), NOW)
+                .and_then(|r| r.bound),
+            Some(Bound::DailyLoss)
+        );
+        // ...but the spent budget refuses it and throws the switch, as it
+        // would for any order.
+        assert_eq!(risk.tripped(), Some(TripCause::DailyLoss));
     }
 
     #[test]
