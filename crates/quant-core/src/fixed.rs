@@ -410,6 +410,27 @@ impl Px {
     }
 }
 
+impl Qty {
+    /// Round toward zero to a whole number of `lot`s.
+    ///
+    /// The largest size a venue with this lot would accept that is no bigger
+    /// than `self`, which is what selling a holding needs: after a fee taken in
+    /// the base asset a position is rarely a whole number of lots, and a venue
+    /// takes only whole ones. Toward zero rather than to nearest, so the result
+    /// is never *more* than was held -- rounding a sell up would sell coins that
+    /// were never bought. A negative quantity rounds toward zero too, to the
+    /// smaller short rather than the larger.
+    ///
+    /// A `lot` of zero means the venue has no lot rule, and leaves `self` alone.
+    #[must_use]
+    pub const fn round_to_lot(self, lot: Self) -> Self {
+        if lot.is_zero() {
+            return self;
+        }
+        Self::from_raw(self.raw() - self.raw() % lot.raw())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +517,27 @@ mod tests {
         let px: Px = "100".parse().unwrap();
         let sell: Qty = "-2.5".parse().unwrap();
         assert_eq!(px.notional(sell).unwrap().to_string(), "-250");
+    }
+
+    #[test]
+    fn a_quantity_rounds_down_to_whole_lots_and_never_up() {
+        let lot: Qty = "0.00001".parse().unwrap();
+        let round = |q: &str| q.parse::<Qty>().unwrap().round_to_lot(lot).to_string();
+        // What a 0.001 buy leaves after a 0.000001 base-asset fee: 99.9 lots,
+        // of which a venue will take 99.
+        assert_eq!(round("0.000999"), "0.00099");
+        // Already whole lots: untouched.
+        assert_eq!(round("0.001"), "0.001");
+        // Less than one lot: nothing a venue would take at all.
+        assert_eq!(round("0.000009"), "0");
+        // A short rounds toward zero too -- the smaller size, not the larger.
+        assert_eq!(round("-0.000019"), "-0.00001");
+    }
+
+    #[test]
+    fn no_lot_leaves_a_quantity_alone() {
+        let q: Qty = "0.000999".parse().unwrap();
+        assert_eq!(q.round_to_lot(Qty::ZERO), q);
     }
 
     #[test]
