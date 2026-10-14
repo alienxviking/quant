@@ -124,7 +124,8 @@ impl ClockSample {
 /// reading is taken to describe the host's instant halfway through the round
 /// trip. *Subtracting* that half instead lands on `theta - 2d`: wrong by the
 /// whole round trip, twice the error the correction exists to remove, and in
-/// the same misleading direction.
+/// the same misleading direction. `venue-check` computed exactly that, and gated
+/// trading on it, until it called this function instead.
 ///
 /// What no arithmetic on one reading can remove is asymmetry. With an outbound
 /// leg of `d1` and a return of `d2` the estimate is off by `(d2 - d1) / 2`, which

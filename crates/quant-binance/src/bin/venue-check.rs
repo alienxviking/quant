@@ -20,9 +20,18 @@ use std::time::Duration;
 
 use quant_binance::credentials::Credentials;
 use quant_binance::rest::SnapshotClient;
-use quant_binance::trade::{TradeClient, MAX_CLOCK_SKEW_MS};
+use quant_binance::trade::{ClockSample, TradeClient, MAX_CLOCK_SKEW_MS};
 
 const BASE: &str = "https://api.binance.com";
+
+/// How many times to read the venue's clock before believing one reading.
+///
+/// Five, as `ops/preflight.sh` takes. The first reading also opens the
+/// connection, so DNS, TCP and TLS all land on its outbound leg -- exactly the
+/// asymmetry a midpoint cannot correct -- and its round trip is the longer for
+/// it, which is what lets [`ClockSample::tightest`] pass it over. The client
+/// pools the connection, so the readings after it normally go out warm.
+const CLOCK_READINGS: usize = 5;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -38,11 +47,20 @@ async fn main() -> ExitCode {
         Credentials::KEY_VAR
     );
 
-    // The same round-trip-corrected measurement the recorder's startup check and
-    // `ops/preflight.sh` use. Measuring `now - serverTime` naively folds one-way
-    // latency into the offset, which on a slow connection blocks a run over a
-    // clock that is fine -- seen live at M1: -1445 ms naive against +450 ms
-    // corrected.
+    // The venue's clock, read the way NTP reads one: the host's clock either
+    // side of `GET /api/v3/time`, the venue's reading taken to describe the
+    // midpoint, and of several readings the one with the smallest round trip
+    // believed. `ClockSample` holds the arithmetic and the reasons for it.
+    //
+    // This is not the recorder's startup check, and the two figures differ by
+    // design. That one -- like `ops/preflight.ps1` and `ops/fix-clock.ps1` --
+    // reads `before - serverTime` once and leaves it uncorrected
+    // (`SnapshotClient::clock_offset_millis` says why), so it comes out short by
+    // the outbound leg: on a slow link, enough to make a clock that is fine look
+    // like one behind the venue. Tolerable in a warning about a metric; not in
+    // the figure that decides whether this host may trade. `ops/preflight.sh`
+    // and `ops/fix-clock.sh` compute the same midpoint as this, with the
+    // opposite sign: positive there means the host is behind.
     let public = match SnapshotClient::new(BASE, Duration::from_secs(10)) {
         Ok(c) => c,
         Err(e) => {
@@ -50,25 +68,54 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let before = millis();
-    let offset = match public.clock_offset_millis(before).await {
-        Ok(offset) => {
-            let after = millis();
-            // Half the round trip is the one-way leg the naive figure wrongly
-            // attributes to the clock.
-            let corrected = offset - (after - before) / 2;
-            println!(
-                "clock        {corrected} ms from the venue (raw {offset} ms, round trip {} ms), \
-                 limit {MAX_CLOCK_SKEW_MS} ms",
-                after - before
-            );
-            corrected
+    let mut readings = Vec::with_capacity(CLOCK_READINGS);
+    let mut failure = None;
+    for _ in 0..CLOCK_READINGS {
+        let sent_at = millis();
+        match public.server_time_millis().await {
+            Ok(server_time) => readings.push(ClockSample {
+                sent_at,
+                server_time,
+                received_at: millis(),
+            }),
+            // Stop at the first failure: a venue that will not answer one
+            // reading is not worth four more timeouts to confirm.
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
         }
-        Err(e) => {
+    }
+    let Some(best) = ClockSample::tightest(&readings) else {
+        if let Some(e) = &failure {
             eprintln!("clock        could not reach the venue: {e}");
-            return ExitCode::FAILURE;
         }
+        if !readings.is_empty() {
+            eprintln!(
+                "clock        every reading's round trip ran backwards: the host clock \
+                 stepped while it was being read"
+            );
+        }
+        return ExitCode::FAILURE;
     };
+    // One binding, printed and gated on, so the two cannot disagree.
+    let offset = best.offset_ms();
+    println!(
+        "clock        {offset} ms from the venue (positive: this host is ahead), limit \
+         {MAX_CLOCK_SKEW_MS} ms"
+    );
+    println!(
+        "             the tightest of {} readings: round trip {} ms, naive {} ms",
+        readings.len(),
+        best.round_trip_ms(),
+        best.naive_offset_ms()
+    );
+    if let Some(e) = &failure {
+        println!(
+            "             reading {} of {CLOCK_READINGS} failed, and no more were taken: {e}",
+            readings.len() + 1
+        );
+    }
 
     let client = match TradeClient::new(BASE, Duration::from_secs(10), credentials) {
         Ok(c) => c,
