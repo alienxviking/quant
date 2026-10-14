@@ -436,15 +436,24 @@ mod tests {
     #[test]
     fn a_reading_whose_round_trip_ran_backwards_is_never_believed() {
         // The host clock stepped back while the request was in flight. Smallest
-        // wins on its own would rank this above every honest reading.
+        // wins on its own would rank this above every honest reading. Pinned at
+        // the edge as well as far from it: a round trip one millisecond below
+        // zero is as impossible as one a second below, and a rule that refused
+        // only the second would pass a test that tried only the second.
         let honest = reading(1_700_000_000_000, 250, 30, 30);
-        let stepped = ClockSample {
-            received_at: honest.sent_at - 1_000,
-            ..honest
-        };
-        assert!(stepped.round_trip_ms() < 0, "{stepped:?}");
-        assert_eq!(ClockSample::tightest(&[stepped, honest]), Some(honest));
-        assert_eq!(ClockSample::tightest(&[stepped]), None);
+        for stepped_back_by in [1, 1_000] {
+            let stepped = ClockSample {
+                received_at: honest.sent_at - stepped_back_by,
+                ..honest
+            };
+            assert_eq!(stepped.round_trip_ms(), -stepped_back_by, "{stepped:?}");
+            assert_eq!(
+                ClockSample::tightest(&[stepped, honest]),
+                Some(honest),
+                "{stepped:?}"
+            );
+            assert_eq!(ClockSample::tightest(&[stepped]), None, "{stepped:?}");
+        }
         assert_eq!(ClockSample::tightest(&[]), None);
 
         // And the boundary from the other side: a round trip inside one
