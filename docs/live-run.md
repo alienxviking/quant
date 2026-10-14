@@ -293,11 +293,28 @@ order's entire remaining quantity when the market trades through it.
 ### E — a crash in the indeterminate window is survivable.
 
 Kill the process between the journal's write-ahead `submitted` line and the
-venue's response. On restart the system must find the order via `openOrders`,
-match it to the journal entry by client order id, and resume — or, if the venue
-has no such order, record that the request never landed. It must not come back
-with `MaCrossover.working` latched forever on an order nobody will ever hear
-about again.
+venue's response. On restart the system must look the order up by its client
+order id, match it to the journal entry, and resume, or, if the venue has no such
+order, record that the request never landed. It must not come back with
+`MaCrossover.working` latched forever on an order nobody will ever hear about
+again.
+
+**The lookup is `GET /api/v3/order` with `origClientOrderId`, not `openOrders`.**
+This criterion said `openOrders` until slice (c) read the venue's documentation
+closely, and `openOrders` gets the likeliest case backwards. A market order that
+landed has already filled, so it is no longer open, and recovery would record
+that a filled order never landed: an engine that believes it is flat while the
+venue holds the position. `GET /api/v3/order` is documented as *"Check an order's
+status"*, with data source *"Memory => Database"*, so it finds an order whatever
+its status.
+
+Its "no such order" is conclusive only once the request can no longer reach the
+matching engine, and that bound is slice (d)'s question, not settled here. The
+venue checks `recvWindow` when it *forwards* a request, which bounds when one can
+be forwarded but not when the matching engine gets to it. The documentation's
+own `-1007` timeout is a response that took longer than ten seconds, and it says
+that this *"does not always mean that the request failed in the Matching
+Engine"*.
 
 ---
 
@@ -307,8 +324,8 @@ about again.
 |---|---|---|
 | a | The engine can receive what a venue says | wake on either input; `step_reports`; forward-only clock |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check` |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | the translator |
-| d | The indeterminate window | `InDoubt`, `openOrders` recovery |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`); `LiveVenue` remains |
+| d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
 
@@ -347,13 +364,28 @@ would mean discovering during a funded run that the engine cannot hear.
 
 ## 5. Decided before the code
 
-**`ClientOrderId` is the idempotency key, because it already is one.**
-`docs/engine-contract.md` §3 made it exist before the request leaves, for
-correlation. That property is exactly what an idempotency key needs, so it goes
-to the venue as `newClientOrderId` — and a retry after a timeout cannot open a
-second position, because the venue refuses the duplicate. It carries a
-run-scoped prefix (`q-<run>-<id>`): the bare counter restarts at 1 after a lost
-journal and would collide with orders still resting.
+**`ClientOrderId` goes to the venue as `newClientOrderId`, and it is a lookup
+key, not an idempotency key.** `docs/engine-contract.md` §3 made it exist before
+the request leaves, for correlation, which is exactly what finding an order after
+a timeout needs. It is *not* what makes a retry safe, and this paragraph used to
+say it was: *"a retry after a timeout cannot open a second position, because the
+venue refuses the duplicate"*. The venue's documentation for `newClientOrderId`
+says otherwise: *"A unique id among open orders"*, and *"Orders with the same
+`newClientOrderID` can be accepted only when the previous one is filled,
+otherwise the order will be rejected."* A duplicate is refused only while the
+first order is still open, and a market order is never open long enough for that
+to matter: at our size it fills the moment it lands. So a blind resend of a
+timed-out market order is **accepted** precisely when the first one went
+through, and the position doubles. A timed-out submission is therefore never
+resent. It is resolved by looking it up, per criterion E.
+
+The id carries a run-scoped prefix, `q-<run>-<id>` (`quant-binance::user_data`),
+and the same rule makes that prefix load-bearing rather than tidy. The bare
+counter restarts at 1 after a lost journal. A reminted id that collides with an
+order still resting is refused, loudly; one that collides with a *filled* order
+is accepted, silently, and every later lookup by that name is ambiguous. So the
+run tag must stay the same for the life of a journal, so that a restart still
+recognises its own orders, and must change whenever a journal is lost.
 
 **One authority per fact.** `Accepted` with its venue order id, and every
 `Filled`, come from the **user-data stream**. Rejections come from the REST

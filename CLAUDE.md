@@ -115,13 +115,13 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 476 tests green in debug
-and release, clippy and fmt clean, ~35,700 lines across 12 crates.
+same window exactly, on both symbols, to the satoshi. 509 tests green in debug
+and release, clippy and fmt clean, ~37,300 lines across 12 crates.
 
-> **The work moved off the MacBook Air to the HP Omen on 2026-10-08.** Read
-> *"Picking up on the Omen"* at the bottom of this file before anything else —
-> the artifacts travelled separately from the repository and the first job is
-> proving they arrived.
+> **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
+> artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
+> the bottom of this file has the numbers, where the data lives, and the two
+> things this machine still needs before a live run.
 
 M7.5, the run log, shipped over seven slices (2026-10-05 → 2026-10-06) and its
 three criteria are measured in `docs/run-log.md` §7. `JournalEntry` now holds
@@ -2097,7 +2097,8 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
 ## Picking up on the Omen
 
 Written on the Mac on 2026-10-08, as the last thing done there. The repository
-came over `git`; the artifacts did not, and the first job is proving they did.
+came over `git`; the artifacts did not, and the first job was proving they did,
+which §1 records as done.
 
 ### 1. The data, and the rule about deleting
 
@@ -2126,6 +2127,17 @@ every money-path change since has been checked against. Reproducing it on
 different hardware, a different OS and a different CPU architecture says the data
 survived *and* the platform is deterministic across all three. Only after that is
 anything safe to delete on the Mac.
+
+**Done on 2026-10-08.** The archive's sha256 matched; `quant-verify` exited 0
+over 97,937,822 frames with `missing 0`; `reconcile` AGREES on both journals;
+`normalize --write --check` rebuilt the normalized tier and matched raw event for
+event, including the merged final day; and the backtest above printed **824
+fills, cash 31.64743842** on x86-64 Windows, as it did on the Mac. So the
+condition for deleting the Mac's copy is met, and deleting it is the user's call.
+
+The tree is extracted once, at `data/paper`, normalized tier included. Look there
+before extracting again. The archive itself is in `Downloads` as
+`quant-m5-fortnight-001.tar`.
 
 ### 2. Two things this machine needs that the Mac did not
 
@@ -2166,19 +2178,47 @@ awake.
   pinned against RFC 4231), `TradeClient`, and `venue-check`. Verified against
   the real API: a wrong secret comes back HTTP 401, which is the venue's auth
   layer answering and therefore proof the request was well formed.
-- **(c) part done.** `FeeAsset` shipped — a spot venue takes its fee in the
+- **(c) part done.** `FeeAsset` shipped: a spot venue takes its fee in the
   asset you received, and modelling it turned out to need one field rather than
-  the two balances M4 predicted. **What remains is the translator**:
-  `executionReport` → `ExecutionEvent`, the `q-<run>-<id>` prefix with its three
-  inbound outcomes (not ours / ours and known / ours and unknown → orphan), and
-  the detail that a cancel's `c` field carries the *cancel request's* id while
-  `C` carries the original. Pure logic — no network, no credentials, no data.
+  the two balances M4 predicted. PR #50 then fixed what consuming a base-asset
+  fee got wrong before anything could produce one. The portfolio added a base
+  fee's raw value to a quote total, understating it by a factor of the price
+  (~80,000x on BTCUSDT); risk did the same to its loss budget and never shrank
+  its position by the fee; a sell handed the fee back to the position; and
+  `JournalWriter` stamped every fill `Quote`. The conversion now lives once, on
+  `Fill` (`fee_in_quote`, `fee_in_base`).
 
-One thing the `FeeAsset` work turned up that the translator has to settle:
-Binance's `N` is a commission **asset code**, and with the BNB discount enabled
-it is neither the base nor the quote. `FeeAsset` has two variants on purpose, so
-the translator must refuse an unrecognised asset **loudly** rather than coerce
-it, and the run procedure has to turn the discount off.
+  **The translator is done**: `quant-binance::user_data`, 27 tests, every one
+  seen red under a deliberate break. An `executionReport` is classified before
+  it is read: another symbol is set aside first, then the id decides between
+  ours, an orphan (our `q-` prefix, not this run) and not ours. A cancel is
+  matched on `C`, the order, not `c`, the cancel request. A fee in neither side
+  of the pair, which is what the BNB discount produces, is refused loudly, so
+  the run procedure must turn the discount off. Written against the venue's
+  documented example rather than a capture; criterion D's recorded reports have
+  to confirm it.
+
+  **What remains in (c) is `LiveVenue` itself**: submitting through
+  `TradeClient` with `newOrderRespType=ACK`, the user-data socket, and
+  dispatching what the translator returns. It inherits three things the
+  translator could not settle. Where the run tag lives, so that a restart reuses
+  it and a lost journal does not. How an orphan from another run is journalled,
+  since `JournalEntry::Orphaned` takes a numeric `ClientOrderId` and an orphan's
+  id is text by design. And recording the user-data socket into the raw tier,
+  which is a new `FrameKind` and container version 2 → 3 (`docs/live-run.md` §5).
+
+**Slice (c) also corrected the design it was built from.** `docs/live-run.md` §5
+called `ClientOrderId` an idempotency key, on the claim that the venue refuses a
+duplicate. Binance enforces uniqueness only *among open orders*, and a market
+order at our size fills the moment it lands, so a blind resend after a timeout is
+accepted exactly when the first one went through: a doubled position. Criterion
+E recovered through `openOrders`, which cannot see an order that has already
+filled, so it would have recorded a filled order as never having landed. Both
+are corrected: a timed-out submission is never resent, and is resolved by `GET
+/api/v3/order` with `origClientOrderId`, which finds an order whatever its
+status. Found by reading the venue's documentation of the parameter itself
+rather than what everyone remembers about it, which is worth doing for every
+parameter M8 sends.
 
 ### 4. Things that are easy to get wrong here specifically
 
