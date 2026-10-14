@@ -146,11 +146,26 @@ impl SnapshotClient {
     /// measure the clock by hand.
     ///
     /// It costs one request at startup and turns an ambiguous number into a stated
-    /// fact. The round trip is included in the measurement, which biases the
-    /// answer by a few milliseconds -- irrelevant against the threshold that
+    /// fact. The outbound leg is included in the measurement -- `local_millis` is
+    /// read before the request leaves, and on a client's first request that leg
+    /// carries the connection setup too -- which biases the answer towards a host
+    /// *behind* the venue: by a few milliseconds close to it, by hundreds over a
+    /// slow link. On a good link that is small against the threshold that
     /// matters, and correcting for it would mean pretending to a precision this
-    /// does not have.
+    /// does not have, so it is deliberately left uncorrected. The offset that
+    /// decides whether a host may *trade* is a different measurement: see
+    /// [`crate::trade::midpoint_offset_ms`].
     pub async fn clock_offset_millis(&self, local_millis: i64) -> Result<i64, SnapshotError> {
+        Ok(local_millis - self.server_time_millis().await?)
+    }
+
+    /// The venue's clock: `serverTime` from `GET /api/v3/time`, in milliseconds
+    /// since the Unix epoch.
+    ///
+    /// The bare reading, with nothing of ours subtracted from it, for a caller
+    /// that reads its own clock either side of the request and corrects for the
+    /// round trip -- see [`crate::trade::ClockSample`].
+    pub async fn server_time_millis(&self) -> Result<i64, SnapshotError> {
         #[derive(serde::Deserialize)]
         struct ServerTime {
             #[serde(rename = "serverTime")]
@@ -175,7 +190,7 @@ impl SnapshotClient {
             .map_err(|e| SnapshotError::Body(e.to_string()))?;
         let parsed: ServerTime =
             serde_json::from_slice(&body).map_err(|e| SnapshotError::Body(e.to_string()))?;
-        Ok(local_millis - parsed.server_time)
+        Ok(parsed.server_time)
     }
 
     /// Fetch one depth snapshot, returning the response body verbatim.
