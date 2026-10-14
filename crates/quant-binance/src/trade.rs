@@ -9,18 +9,21 @@
 //!
 //! # Why `recv_window` is small and the clock check is hard
 //!
-//! Every signed request carries a millisecond `timestamp`, and Binance rejects
-//! it outside `recvWindow` — five seconds by default. M1 already learned what a
-//! wrong clock does here: this machine was ~2 s ahead of the venue and the
-//! latency metric read 2883 ms, which is why `clock_offset_millis` exists and
-//! why the recorder warns above 1000 ms against *Binance's own tolerance for a
-//! signed request*. That was a warning because a wrong clock costs a capture
-//! nothing but a metric.
+//! Every signed request carries a millisecond `timestamp`, and Binance refuses
+//! it if that is a second or more ahead of the venue's clock, or older than
+//! `recvWindow` — five seconds by default — by the time it is processed. M1
+//! already learned what a wrong clock does here: this machine was ~2 s ahead of
+//! the venue and the latency metric read 2883 ms, which is why
+//! `clock_offset_millis` exists and why the recorder warns above 1000 ms, the
+//! venue's tolerance for a timestamp running ahead. That was a warning because
+//! a wrong clock costs a capture nothing but a metric.
 //!
-//! For signed requests it is not a warning. A clock far enough out produces a
-//! request the venue refuses, with an error that says the timestamp was outside
-//! the window and nothing about which machine was wrong — so this checks before
-//! it trades rather than after.
+//! For signed requests it is not a warning. A request stamped from a clock far
+//! enough out is refused, with an error that says the timestamp was outside the
+//! window and nothing about which machine was wrong — so this checks before it
+//! trades rather than after. [`TradeClient::check_ready`] stamps its own request
+//! with the measured offset taken off, which changes what the check guards:
+//! [`MAX_CLOCK_SKEW_MS`] says how.
 //!
 //! `recv_window` is set to 5000 ms and not raised. A wider window is the venue
 //! offering to accept staler requests; the thing it protects against is an order
@@ -32,19 +35,39 @@ use std::time::Duration;
 use crate::credentials::Credentials;
 use crate::rest::SnapshotError;
 
-/// The widest the venue will let a signed request be, in milliseconds.
+/// The `recvWindow` sent with every signed request, in milliseconds.
 ///
-/// Binance's default. Named rather than inlined because it is also the number
-/// the clock check is measured against: a host further out than this cannot
-/// trade at all, whatever else is true of it.
+/// Binance's default, and only one side of the venue's rule. A request is
+/// refused if its `timestamp` is older than this by the time the venue
+/// processes it -- so time on the wire counts against it -- and, whatever this
+/// is set to, if its `timestamp` is a second or more *ahead* of the venue's
+/// clock. A stamp may run up to this far behind the venue, and less than a
+/// second ahead of it.
+///
+/// It is not what the clock check compares against: that is
+/// [`MAX_CLOCK_SKEW_MS`].
 pub const RECV_WINDOW_MS: i64 = 5_000;
 
 /// How far the host clock may be from the venue's before this refuses to trade.
 ///
-/// A fifth of the window rather than the whole of it. At the boundary every
-/// request is one network hiccup from rejection, and a run that places orders
-/// which are *sometimes* refused for a reason unrelated to the order is worse
-/// than one that refuses to start.
+/// The venue's rule is lopsided ([`RECV_WINDOW_MS`] has it). A second is its
+/// *whole* tolerance for a timestamp running ahead of its clock, and a fifth of
+/// the room it gives one running behind, so this is no margin kept inside the
+/// venue's window on the side where that window is tight.
+///
+/// Nor does it bound how near rejection [`TradeClient::check_ready`]'s own
+/// request is. That request is stamped not with the host's clock as it stands
+/// but with `chrono_millis() - offset_ms`, the host's clock with the measured
+/// offset taken off. Its timestamp is out from the venue's by the error in that
+/// measurement, which is at most half the round trip of the reading it came
+/// from, plus whatever the host clock has moved since -- and not by the skew.
+/// A host at this limit is no nearer rejection on that request than one
+/// exactly on time.
+///
+/// What it is, then, is a refusal to trade from a host whose clock is a second
+/// out at all, placed where an *uncorrected* stamp from a host running ahead
+/// would be at the venue's edge. Whether a corrected stamp should be gated on
+/// the skew, and at what number, is not settled here.
 pub const MAX_CLOCK_SKEW_MS: i64 = 1_000;
 
 /// One reading of the venue's clock against the host's.
@@ -146,8 +169,9 @@ pub const fn midpoint_offset_ms(sent_at: i64, server_time: i64, received_at: i64
 /// Why a live session must not start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotReady {
-    /// The host clock is too far from the venue's for a signed request to be
-    /// reliably accepted.
+    /// The host clock is further from the venue's than [`MAX_CLOCK_SKEW_MS`]
+    /// allows. Not a forecast that the venue would refuse a request stamped
+    /// with the offset taken off: that constant says what the limit is.
     ClockSkew { offset_ms: i64, allowed_ms: i64 },
     /// The venue would not answer a signed request. Almost always a bad key, a
     /// bad secret, or a key without trading permission.
@@ -165,8 +189,10 @@ impl core::fmt::Display for NotReady {
             } => write!(
                 f,
                 "the host clock is {offset_ms} ms from the venue's, past the {allowed_ms} ms this \
-                 refuses to trade beyond (the venue's own window is {RECV_WINDOW_MS} ms). Sync \
-                 the clock -- ops/fix-clock.sh"
+                 refuses to trade beyond (the venue itself refuses a timestamp a second or more \
+                 ahead of its clock, or more than {RECV_WINDOW_MS} ms behind it). Sync the clock \
+                 -- ops/fix-clock.sh with sudo on macOS, ops/fix-clock.ps1 as Administrator on \
+                 Windows"
             ),
             Self::Rejected { status } => write!(
                 f,
@@ -505,9 +531,9 @@ mod tests {
     async fn a_skewed_clock_refuses_before_any_request_is_made() {
         // `example.invalid` does not resolve, so reaching the network at all
         // would surface as `Unreachable`. Getting `ClockSkew` proves the check
-        // ran first -- which is the point: a clock this far out cannot produce
-        // an acceptable request, and finding that out from the venue costs a
-        // round trip and an error that blames the wrong thing.
+        // ran first -- which is the point: a host refused on its clock is
+        // refused before anything is sent, with a message about the clock
+        // rather than whatever the venue would have said.
         let why = client()
             .check_ready(MAX_CLOCK_SKEW_MS + 1)
             .await
@@ -516,7 +542,18 @@ mod tests {
             matches!(why, NotReady::ClockSkew { .. }),
             "expected a clock refusal, got {why:?}"
         );
-        assert!(why.to_string().contains("fix-clock.sh"), "{why}");
+        // And the fix it names works on the machine reading it. `fix-clock.sh`
+        // drives macOS's network time and does nothing for Windows, which has
+        // its own script.
+        let said = why.to_string();
+        assert!(
+            said.contains("ops/fix-clock.sh with sudo on macOS"),
+            "{said}"
+        );
+        assert!(
+            said.contains("ops/fix-clock.ps1 as Administrator on Windows"),
+            "{said}"
+        );
     }
 
     #[tokio::test]
