@@ -168,9 +168,16 @@ pub struct Limits {
     /// moved. The mark is what makes it comparable across instruments.
     ///
     /// An order is checked on the position it would leave, but one that only
-    /// shrinks the position passes whatever it leaves: a position already over
-    /// this line -- carried there by the mark, say -- can be reduced in steps
-    /// rather than only closed in one.
+    /// shrinks the position passes whatever it leaves. Without that, the way
+    /// out of a position already over this line -- carried there by the mark,
+    /// say -- would have to land back inside it in a single order, and once
+    /// the position is over by more than `max_order_notional` no order could:
+    /// the two limits together would hold it at the size this one objects to.
+    ///
+    /// The position meant is risk's own tally, which starts flat after a
+    /// restart: [`RiskEngine::recover`] brings back the switch but not the
+    /// holdings, so an exit from a position held across one is checked as if
+    /// it opened the opposite position.
     pub max_position_notional: Option<Notional>,
     /// Realized loss in one UTC day that stops trading for that day.
     ///
@@ -453,11 +460,13 @@ impl RiskLayer for RiskEngine {
                 let exposure = mark
                     .notional(Qty::from_raw(after.abs()))
                     .unwrap_or(Notional::MAX_VALUE);
-                // Unless the order only shrinks the position. Refusing that
-                // would trap the very position the limit thinks too large --
-                // long ten against a limit worth five units, selling three
-                // would be turned away for leaving seven -- so it is exempt.
-                // A flip is not a reduction; see `only_reduces`.
+                // Unless the order only shrinks the position, which is exempt.
+                // Without that, long ten against a limit worth five units,
+                // selling three would be turned away for leaving seven: the
+                // way out would have to land back inside the limit in one
+                // order, and with a per-order limit smaller than the excess
+                // none could, trapping the very position this limit thinks
+                // too large. A flip is not a reduction; see `only_reduces`.
                 //
                 // Judged on risk's own tally of this instrument, which starts
                 // empty after a restart -- `recover` brings back the switch,
@@ -703,9 +712,12 @@ mod tests {
     fn a_partial_reduction_is_allowed_even_when_what_remains_is_over_the_limit() {
         // The case the full exit above cannot see. Ten units at the mark is
         // 1000 against a limit of 500; taking three off leaves seven, 700,
-        // still over. Refusing that holds the position at ten: trapped at the
-        // size the limit objects to, by the limit objecting to it. Both
-        // directions, because the exemption is about size and not side.
+        // still over. Refusing that keeps ten rather than seven, in the name
+        // of a limit on size. Selling five would still get back inside here,
+        // but with a per-order limit below the excess nothing could, which is
+        // the trap `a_reduction_is_spared_the_position_limit_and_nothing_else`
+        // sets up. Both directions, because the exemption is about size and
+        // not side.
         for held in [Side::Buy, Side::Sell] {
             let mut risk = RiskEngine::new(Limits {
                 max_position_notional: Some(amount("500")),
