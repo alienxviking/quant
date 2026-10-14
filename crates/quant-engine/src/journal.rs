@@ -763,13 +763,13 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
 ///
 /// One value, so that a session is resumed or not as a whole. The capital, the
 /// position, the kill switch and the id counter each have their own way of
-/// going wrong across a restart, and each of them already has once.
+/// going wrong across a restart, and each of those ways has been found in this
+/// codebase at least once.
 #[derive(Debug)]
 pub struct Resumption {
     /// The session's instrument, under the definition the caller gave.
     pub instrument: InstrumentId,
-    /// The capital the session began with: the first `Started` entry's, or the
-    /// configured cash when the journal is empty.
+    /// The capital the session began with, as [`resume`] decides it.
     pub starting_cash: Notional,
     /// What the journal replays to, or `None` when it holds nothing to resume.
     ///
@@ -805,7 +805,9 @@ pub struct Resumption {
 ///
 /// `cash` is what a fresh session starts with. Once the journal holds anything
 /// it is ignored, because the first `Started` entry is the authority on the
-/// capital a session began with and a restart must not reset it.
+/// capital a session began with and a restart must not reset it. A journal
+/// that holds entries and no `Started` at all, which nothing in this workspace
+/// writes, resumes from zero, as `paper` always did.
 #[must_use]
 pub fn resume(
     entries: &[JournalEntry],
