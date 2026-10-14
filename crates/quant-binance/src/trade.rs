@@ -296,7 +296,11 @@ impl TradeClient {
     ///
     /// [`NotReady`] with the reason, which is a thing to print and stop on.
     pub async fn check_ready(&self, offset_ms: i64) -> Result<(), NotReady> {
-        if offset_ms.abs() > MAX_CLOCK_SKEW_MS {
+        // `unsigned_abs`, not `abs`. `i64::MIN` has no positive counterpart in
+        // an `i64`, so `abs` panics on it in a debug build and hands it back
+        // unchanged in a release one -- negative, so never past the limit --
+        // which would let the most extreme offset there is through the gate.
+        if offset_ms.unsigned_abs() > MAX_CLOCK_SKEW_MS.unsigned_abs() {
             return Err(NotReady::ClockSkew {
                 offset_ms,
                 allowed_ms: MAX_CLOCK_SKEW_MS,
@@ -513,6 +517,35 @@ mod tests {
             "expected a clock refusal, got {why:?}"
         );
         assert!(why.to_string().contains("fix-clock.sh"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn an_offset_too_large_to_negate_is_refused_rather_than_wrapped() {
+        // `i64::MIN.abs()` is not an `i64`: a debug build panics on it, and a
+        // release build -- overflow checks off -- hands back `i64::MIN`, which
+        // is negative and so never past the limit. The most extreme offset
+        // there is would pass the gate. Every offset past the limit is clock
+        // skew, on either side, out to both ends of the range.
+        for offset_ms in [
+            i64::MIN,
+            i64::MIN + 1,
+            -(MAX_CLOCK_SKEW_MS + 1),
+            MAX_CLOCK_SKEW_MS + 1,
+            i64::MAX,
+        ] {
+            let why = client()
+                .check_ready(offset_ms)
+                .await
+                .expect_err("must refuse");
+            assert_eq!(
+                why,
+                NotReady::ClockSkew {
+                    offset_ms,
+                    allowed_ms: MAX_CLOCK_SKEW_MS
+                },
+                "{offset_ms}"
+            );
+        }
     }
 
     #[test]
