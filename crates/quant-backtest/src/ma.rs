@@ -1,9 +1,9 @@
 //! A moving-average crossover, kept as dumb as it can be.
 //!
-//! Long or flat, one instrument, fixed size, market orders. No stops, no sizing
-//! rule, no filter. Every one of those would be a knob, and a knob is something
-//! to blame a bad result on — the point of this strategy is that a bad result
-//! has nowhere to hide but the harness.
+//! Long or flat, one instrument, fixed-size entries, market orders. No stops,
+//! no sizing rule, no filter. Every one of those would be a knob, and a knob is
+//! something to blame a bad result on — the point of this strategy is that a
+//! bad result has nowhere to hide but the harness.
 //!
 //! # Why it samples on a clock rather than on every event
 //!
@@ -23,6 +23,34 @@
 //! indicator simply does not advance while we are blind, and resumes when a
 //! snapshot re-anchors the book. That is the invariant being structural rather
 //! than advisory.
+//!
+//! # Why the exit sells what is held, and not `qty`
+//!
+//! A spot venue takes a buyer's fee in the asset bought: buy 0.001 BTC on
+//! Binance and the position is 0.000999. An exit that sold `qty` would sell
+//! coins the strategy never bought -- refused by the venue, or, with spare BTC
+//! in the account, filled out of coins that were never the strategy's. And the
+//! position would never be exactly zero again, so the strategy would never
+//! count itself flat, and every later down-cross would try to sell `qty` once
+//! more.
+//!
+//! So the exit sells the position rounded **down** to the instrument's lot,
+//! 0.00099 here: the most a venue will take that is not more than is held.
+//! What remains is less than one lot, which no venue will buy, so a position
+//! smaller than one lot counts as flat -- for the entry decision as well as
+//! the exit, or the next up-cross would call that dust "already long" and
+//! never enter again.
+//!
+//! Wherever fees are charged in the quote asset, which is every backtest and
+//! all of M5, this changes nothing: the position is exactly zero or exactly
+//! `qty`, and `qty` is a whole number of lots (a size that is not is refused
+//! at construction), so rounding it down leaves it alone and less than one lot
+//! means zero. That is what lets the fortnight's result still reproduce to the
+//! satoshi.
+//!
+//! The lot arrives as configuration rather than through `Context`, which is
+//! the entire surface a strategy has and carries market data, not the venue's
+//! rules. Each binary sets it from the instrument definition it registered.
 
 use quant_book::Book;
 use quant_core::event::{MarketEvent, Side};
@@ -42,11 +70,15 @@ pub struct MaConfig {
     pub slow: usize,
     /// Event-time between samples.
     pub interval: i64,
-    /// Size of each position, in base units. A whole number of `lot`s, or the
+    /// Size of each entry, in base units. A whole number of `lot`s, or the
     /// venue would refuse every order sized from it.
+    ///
+    /// Not the size of each exit: a fee taken in the base asset leaves less
+    /// than this held, and the exit sells what is held. See the module docs.
     pub qty: Qty,
     /// The instrument's lot size: every order quantity must be a whole number
-    /// of these.
+    /// of these. An exit sells the position rounded down to it, and a
+    /// position smaller than one lot counts as flat.
     ///
     /// Configuration rather than something read through `Context`, which is
     /// the entire surface a strategy has and holds market data, not the
@@ -284,11 +316,11 @@ impl MaCrossover {
         ))
     }
 
-    fn order(&self, side: Side) -> OrderRequest {
+    fn order(&self, side: Side, qty: Qty) -> OrderRequest {
         OrderRequest {
             instrument: self.config.instrument,
             side,
-            qty: self.config.qty,
+            qty,
             // Market orders, so the test is of the harness and not of a queueing
             // model the simulator does not have.
             kind: OrderKind::Market,
@@ -361,14 +393,20 @@ impl Strategy for MaCrossover {
             return;
         }
 
-        let position = ctx.position(instrument);
-        if above && position.is_flat() {
+        // What an exit could sell: the position in whole lots, rounded down so
+        // it is never more than is held. Less than one lot is dust no venue
+        // will take, so it counts as flat -- for the entry as well as the exit,
+        // or dust left by a base-asset fee would keep the strategy "long"
+        // forever. See the module docs.
+        let sellable = ctx.position(instrument).qty.round_to_lot(self.config.lot);
+        let long = sellable.is_positive();
+        if above && !long {
             self.stats.entries += 1;
-            self.working = Some(ctx.submit(self.order(Side::Buy)));
+            self.working = Some(ctx.submit(self.order(Side::Buy, self.config.qty)));
             self.note("entry", "crossed up while flat");
-        } else if !above && !position.is_flat() {
+        } else if !above && long {
             self.stats.exits += 1;
-            self.working = Some(ctx.submit(self.order(Side::Sell)));
+            self.working = Some(ctx.submit(self.order(Side::Sell, sellable)));
             self.note("exit", "crossed down while long");
         } else {
             // The arm that did not exist. Both cases are legitimate -- the

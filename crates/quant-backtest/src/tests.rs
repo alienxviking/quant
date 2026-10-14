@@ -978,3 +978,196 @@ fn windows_that_cannot_cross_are_refused_rather_than_panicking() {
     );
     assert_eq!(windows(2, 3), None);
 }
+
+// --- M8.c: an exit sells what a base-asset fee left behind ---
+
+use quant_core::event::Side;
+use quant_core::execution::{ClientOrderId, ExecutionEvent, FeeAsset};
+use quant_engine::ExecutionVenue;
+
+/// The real simulator, with each buy's fee taken out of what was bought.
+///
+/// `SimulatedVenue` charges every fee in the quote -- M4's simplification, and
+/// still in its caveats -- so after a buy the position is exactly what was
+/// ordered, and an exit that sold `qty` cannot be told from one that sold what
+/// was held. A spot venue takes a buyer's fee in the base asset. This rewrites
+/// each buy's fill that way, a fixed `fee` of the base per fill, and leaves the
+/// matching, the prices and the sells to the simulator.
+#[derive(Debug)]
+struct BaseFeeOnBuys {
+    inner: SimulatedVenue,
+    fee: Qty,
+    buys: std::collections::HashSet<ClientOrderId>,
+    /// Every request the venue was told about, in order.
+    sent: Vec<OrderRequest>,
+}
+
+impl ExecutionVenue for BaseFeeOnBuys {
+    fn submit(&mut self, client_order_id: ClientOrderId, request: &OrderRequest, now: Ts) {
+        if request.side == Side::Buy {
+            self.buys.insert(client_order_id);
+        }
+        self.sent.push(*request);
+        self.inner.submit(client_order_id, request, now);
+    }
+
+    fn cancel(&mut self, client_order_id: ClientOrderId, now: Ts) {
+        self.inner.cancel(client_order_id, now);
+    }
+
+    // Forwarded explicitly: `observe` has a default that does nothing, and a
+    // wrapper that inherited it would hide the market from the simulator.
+    fn observe(&mut self, event: &MarketEvent, book: &quant_book::Book, now: Ts) {
+        self.inner.observe(event, book, now);
+    }
+
+    fn poll(&mut self, now: Ts, out: &mut Vec<ExecutionEvent>) {
+        let from = out.len();
+        self.inner.poll(now, out);
+        for event in &mut out[from..] {
+            if let ExecutionEvent::Filled {
+                client_order_id,
+                fill,
+                ..
+            } = event
+            {
+                if self.buys.contains(client_order_id) {
+                    // With a `Base` asset, `fee` holds a quantity of the base.
+                    fill.fee = Notional::from_raw(self.fee.raw());
+                    fill.fee_asset = FeeAsset::Base;
+                }
+            }
+        }
+    }
+}
+
+fn qty(s: &str) -> Qty {
+    s.parse().expect("a valid quantity")
+}
+
+/// The suite's crossover entering at `size`, against a venue that takes a
+/// buyer's fee in the base.
+fn run_base_fee(
+    steps: &[Step],
+    size: &str,
+) -> quant_engine::Engine<Script, BaseFeeOnBuys, AllowAll, Recorded<MaCrossover>> {
+    let instrument = instrument();
+    let rules = definition();
+    let strategy = Recorded::new(
+        MaCrossover::new(MaConfig {
+            instrument,
+            fast: 2,
+            slow: 3,
+            interval: SECOND,
+            qty: qty(size),
+            lot: rules.lot_size,
+        })
+        .expect("a valid configuration"),
+        instrument,
+        SECOND,
+    );
+    let venue = BaseFeeOnBuys {
+        // The venue enforces the lot, so an exit it would not take is refused
+        // rather than filled. Not the minimum notional: the script trades near
+        // 100, where 0.001 is worth a dime and the real $5 floor refuses all.
+        inner: SimulatedVenue::new().enforcing(
+            instrument,
+            quant_core::instrument::Filters {
+                tick_size: rules.tick_size,
+                lot_size: rules.lot_size,
+                min_notional: Notional::ZERO,
+            },
+        ),
+        // Per buy fill, in BTC. Ten basis points of 0.001, Binance's taker
+        // rate, so the suite's usual size pays what it would on the venue.
+        fee: qty("0.000001"),
+        buys: std::collections::HashSet::new(),
+        sent: Vec::new(),
+    };
+    let mut engine = Engine::new(Script::new(steps), venue, AllowAll, strategy, CASH);
+    engine.run().expect("the script cannot fail");
+    engine
+}
+
+#[test]
+fn an_exit_after_a_base_asset_fee_sells_what_is_held_in_whole_lots() {
+    // Buy 0.001 and pay 0.000001 of it in fee: 0.000999 is held, which is 99.9
+    // lots. The exit sells the 99 a venue will take -- not `qty`, which would
+    // sell coins that were never bought, and never more than is held.
+    let engine = run_base_fee(&up_then_down(), "0.001");
+    let ma = engine.strategy().inner().stats();
+    assert_eq!((ma.entries, ma.exits), (1, 1), "one round trip: {ma:?}");
+
+    let sent = &engine.venue().sent;
+    assert_eq!(sent.len(), 2, "an entry and an exit: {sent:?}");
+    assert_eq!((sent[0].side, sent[0].qty), (Side::Buy, qty("0.001")));
+    assert_eq!(
+        (sent[1].side, sent[1].qty),
+        (Side::Sell, qty("0.00099")),
+        "the 0.000999 held, rounded down to the lot of 0.00001"
+    );
+    assert_eq!(
+        engine.venue().inner.stats().filtered(),
+        0,
+        "and a venue enforcing the lot took both"
+    );
+    assert_eq!(engine.portfolio().fills(), 2);
+    assert_eq!(
+        engine.portfolio().position(instrument()).qty,
+        qty("0.000009"),
+        "what is left is under a lot and not below zero: nothing unheld was sold"
+    );
+}
+
+#[test]
+fn dust_below_one_lot_counts_as_flat_so_the_next_up_cross_enters_again() {
+    // The exit above leaves 0.000009: real, and unsellable. Counted as a
+    // holding, it would keep the strategy "long" for good -- every up-cross a
+    // no-op, so it never trades again.
+    let mut steps = up_then_down();
+    // From the bottom at 85, rise far enough to cross back up.
+    for mid in [88, 95, 104] {
+        steps.push(Step::Book(mid));
+    }
+    let engine = run_base_fee(&steps, "0.001");
+    let ma = engine.strategy().inner().stats();
+    assert_eq!(
+        (ma.entries, ma.exits, ma.no_ops),
+        (2, 1, 0),
+        "the second up-cross is an entry, not 'already long': {ma:?}"
+    );
+
+    let sent = &engine.venue().sent;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(
+        (sent[2].side, sent[2].qty),
+        (Side::Buy, qty("0.001")),
+        "a full entry, dust or no dust"
+    );
+    assert_eq!(
+        engine.portfolio().position(instrument()).qty,
+        qty("0.001008"),
+        "the dust, plus the 0.000999 the second buy delivered"
+    );
+}
+
+#[test]
+fn exactly_one_whole_lot_held_is_a_holding_and_is_sold() {
+    // The boundary from the other side. Less than a lot is dust, but one whole
+    // lot is a holding a venue will take, and the exit must sell it. Enter at
+    // two lots and pay 0.000001 of it: 0.000019 is held, one lot and change.
+    // Without this, a boundary moved up by a lot passed every test here.
+    let engine = run_base_fee(&up_then_down(), "0.00002");
+    let ma = engine.strategy().inner().stats();
+    assert_eq!((ma.entries, ma.exits), (1, 1), "{ma:?}");
+    let sent = &engine.venue().sent;
+    assert_eq!(
+        (sent[1].side, sent[1].qty),
+        (Side::Sell, qty("0.00001")),
+        "exactly one lot of the 0.000019 held"
+    );
+    assert_eq!(
+        engine.portfolio().position(instrument()).qty,
+        qty("0.000009")
+    );
+}
