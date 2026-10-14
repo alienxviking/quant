@@ -433,14 +433,24 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
         // this would have no reason not to fold it.
         #[allow(clippy::match_same_arms)]
         match entry {
+            // Every field named, and no `..` -- the exhaustive match above,
+            // applied one level down. `fee_asset` is what a `..` cost: the
+            // writer has recorded it since PR #50, this arm elided it and
+            // folded every fee as quote, and nothing complained, because a
+            // pattern with `..` compiles whatever the entry grows. Named, the
+            // next field is a compile error here until somebody has decided
+            // whether it moves money.
             JournalEntry::Filled {
+                // When it happened and which order it was are not money.
+                at: _,
+                client_order_id: _,
                 instrument,
                 side,
                 px,
                 qty,
                 fee,
                 is_maker,
-                ..
+                fee_asset,
             } => {
                 let id = resolve(registry, instrument);
                 portfolio.apply_fill(
@@ -451,7 +461,7 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
                         qty: *qty,
                         fee: *fee,
                         is_maker: *is_maker,
-                fee_asset: quant_core::execution::FeeAsset::Quote,
+                        fee_asset: *fee_asset,
                     },
                 );
             }
@@ -833,6 +843,62 @@ mod tests {
         assert_eq!(recomputed.realized(), direct.realized());
         assert_eq!(recomputed.fees(), direct.fees());
         assert_eq!(recomputed.position(id), direct.position(id));
+    }
+
+    #[test]
+    fn a_fee_taken_in_the_base_replays_as_the_engine_booked_it() {
+        // Binance takes a buyer's fee in what was bought, so the position
+        // arrives a fraction smaller and the cash does not pay the fee at all.
+        // `JournalWriter` has written the asset down since PR #50; replay threw
+        // it away and folded every fee as quote, which left the recompute's
+        // cash short by the fee and its position long by it -- and `agrees`
+        // then reported the engine's own, correct checkpoint as a disagreement.
+        // A restart resumes from this fold, so the strategy would have come
+        // back up holding a position it did not have.
+        let buy = Fill {
+            px: "76650".parse().expect("px"),
+            qty: "0.001".parse().expect("qty"),
+            // Ten basis points of what was bought, in BTC.
+            fee: "0.000001".parse().expect("a fee in base units"),
+            is_maker: false,
+            fee_asset: quant_core::execution::FeeAsset::Base,
+        };
+        let mut registry = InstrumentRegistry::new();
+        let id = resolve(&mut registry, &key());
+        let mut live = Portfolio::new(amount("100"));
+        live.apply_fill(id, Side::Buy, &buy);
+
+        let entries = vec![
+            JournalEntry::Started {
+                at: Ts::from_nanos(0),
+                cash: amount("100"),
+                schema: SCHEMA,
+            },
+            JournalEntry::Filled {
+                at: Ts::from_nanos(1),
+                client_order_id: ClientOrderId(1),
+                instrument: key(),
+                side: Side::Buy,
+                px: buy.px,
+                qty: buy.qty,
+                fee: buy.fee,
+                is_maker: buy.is_maker,
+                fee_asset: buy.fee_asset,
+            },
+            // What the engine writes down after booking that fill.
+            JournalEntry::checkpoint(Ts::from_nanos(2), &live),
+        ];
+
+        let replayed = replay(&entries, &mut registry);
+        assert_eq!(replayed.cash(), live.cash(), "the fee is not paid in cash");
+        assert_eq!(
+            replayed.position(id),
+            live.position(id),
+            "it comes out of the position instead"
+        );
+        assert_eq!(replayed.fees(), live.fees(), "and still counts as money");
+        assert_eq!(replayed, live, "exactly the portfolio the engine held");
+        assert_eq!(agrees(&entries), Agreement::Agrees);
     }
 
     #[test]
