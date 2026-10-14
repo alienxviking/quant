@@ -589,8 +589,17 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             // recompute disagree with a `Checkpoint` that is faithfully
             // reporting what the engine believed. The disagreement would then
             // read as an accounting bug rather than as what it is: a fill we
-            // cannot account for. It is recorded so a human can see it, and
-            // `runlog check` is where it becomes loud.
+            // cannot account for. It is recorded so a human can see it.
+            //
+            // Nothing that reads the journal back says so yet. The one thing
+            // that says it out loud is the error `JournalWriter` logs as it
+            // writes the line. `reconcile` agrees, because neither the
+            // checkpoint nor this fold counts it, and `runlog check` never
+            // reads an `Orphaned` line, so an orphan alone never changes its
+            // verdict. An orphaned line must be loud in `runlog check`, and
+            // making it so is owed to slice (c)'s pull request for what a live
+            // run writes down (`docs/live-run.md` §4) -- the one that gives an
+            // orphan from another run its entry.
             JournalEntry::Orphaned { .. } => {}
         }
     }
