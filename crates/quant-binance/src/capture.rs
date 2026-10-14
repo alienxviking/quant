@@ -62,12 +62,28 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 /// between two readings is still visible in the next one.
 const METRICS_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How far the host clock may drift from the venue's before it is a problem.
+/// How far the host clock may be from the venue's before the recorder warns.
 ///
-/// Binance's own number: it rejects a signed request whose timestamp is more than
-/// a second from server time. Borrowing the venue's threshold rather than
-/// inventing one means that when M8 places a real order, a clock this recorder
-/// already warned about is the same clock that would have had the order refused.
+/// Borrowed from the venue rather than invented, but from one side of a rule
+/// that has two. Binance refuses a signed request whose timestamp is a second or
+/// more *ahead* of its own clock, and one *behind* it only once it is older than
+/// `recvWindow` -- five seconds by default. So a second is the venue's whole
+/// tolerance in one direction and a fifth of it in the other.
+///
+/// The same number as [`crate::trade::MAX_CLOCK_SKEW_MS`], and not the same
+/// verdict, because it is not judging the same measurement. This one judges a
+/// single uncorrected reading, `local_millis - serverTime` on a fresh client's
+/// first request, which comes out short by the whole outbound leg and whatever
+/// DNS, TCP and TLS added to it ([`SnapshotClient::clock_offset_millis`] says
+/// why that is left alone). The trading gate judges the round-trip midpoint of
+/// the tightest of several readings, as `venue-check` takes them
+/// ([`crate::trade::ClockSample`]). So the two can disagree in either
+/// direction. A host exactly on time behind a 1200 ms cold first leg reads
+/// -1200 ms here and draws a warning, while the gate, reading it warm, finds it
+/// on time and passes it; one 1200 ms ahead behind a 300 ms leg reads 900 ms
+/// here, draws no warning, and is refused by the gate. A warning here says the
+/// latency figures want a second look. Neither the warning nor its absence says
+/// whether this host could trade.
 const MAX_CLOCK_OFFSET_MS: i64 = 1_000;
 
 /// The metadata tier, if one is configured.

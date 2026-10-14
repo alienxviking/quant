@@ -610,8 +610,11 @@ The correct unit is the **episode**: one connection's worth of stream.
 
 p50 "venue latency" read 2883 ms, which is absurd for Binance. The metric was right; the
 host was ~2 s fast with its time service stopped. Hence a startup check against the
-venue's own clock, warning above 1000 ms — Binance's own tolerance for a signed request,
-so the clock this warns about is the same clock that would get an order rejected at M8.
+venue's own clock, warning above 1000 ms — Binance's tolerance for a signed request
+stamped *ahead* of its clock; one stamped behind has the whole of `recvWindow`, five
+seconds by default. It is not the check M8 trades on. This one is a single cold reading,
+short by its outbound leg, while `venue-check` judges the midpoint of the tightest of
+several, so the two can disagree in either direction.
 
 > **A number that looks broken is broken, whatever its derivation says.**
 
