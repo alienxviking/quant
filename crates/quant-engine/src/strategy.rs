@@ -106,7 +106,15 @@ impl<'a> Context<'a> {
         self.portfolio.equity(instrument, mark)
     }
 
-    /// The engine clock: the `local_recv_ts` of the event being handled.
+    /// The engine clock: the newest time the engine has acted on.
+    ///
+    /// In a backtest and in paper that is the `local_recv_ts` of the market
+    /// event being handled, or of one before it if this one's went backwards
+    /// and the clock held. Live, venue reports move it too: a report received
+    /// after the market event and delivered on the same wake carries the clock
+    /// up to the report's time, and a report can arrive while the market is
+    /// silent, with no market event at all. Either way the clock never reads
+    /// earlier than a report the strategy has been told of.
     ///
     /// The only notion of time available. See the engine's module docs for why
     /// there is no other.

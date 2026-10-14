@@ -134,9 +134,17 @@ fn print_decisions(journal: &std::path::Path, at: quant_core::time::Ts, span: i6
                 "decided   BLIND since {} ({cause}), with nothing seen since",
                 quant_core::time::Ts::from_nanos(*stamp).to_rfc3339()
             );
+            // Both lines rest on the inference `decisions_at` makes: that
+            // nothing is journalled while the market is dark, because a venue
+            // report cannot arrive without a market event. True of a simulated
+            // venue, and so of every journal so far. A live venue breaks it: a
+            // fill delivered during an outage counts as the market's return,
+            // and this block stays silent about an outage still in progress.
+            // The explicit record of the market's return that fixes it is owed
+            // by slice (c)'s live-journal pull request -- see `decisions_at`.
             outln!(
-                "          Not a quiet hour. The clock is the event stream, so an outage \
-                 writes nothing while it lasts."
+                "          Not a quiet hour. Against a simulated venue the clock is the \
+                 event stream, so an outage writes nothing while it lasts."
             );
         }
         _ => {}

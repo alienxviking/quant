@@ -22,15 +22,26 @@
 //! pinned by a test rather than left to the reading order of a function body.
 //! For each event at time `T`:
 //!
-//! 1. **The clock advances to `T`.** Nothing else moves it, so there is no time
-//!    between events for a strategy to act in.
+//! 1. **The clock advances to `T`**, or holds if an input has already carried
+//!    it past (counted: [`EngineStats::clock_clamps`]). Only an input moves it
+//!    -- this step, or a venue report in step 4 -- and only forward, so there is
+//!    no time between inputs for a strategy to act in.
 //! 2. **The book is updated.** A `Gap` clears it, which is what makes "no prices
 //!    after a disconnect" structural rather than advisory.
 //! 3. **The venue sees the event.** Orders resting from *before* `T` match
 //!    against it. They were placed on earlier information, so trading against
 //!    `T` is exactly what would have happened.
-//! 4. **The strategy is told what happened to its orders**, from step 3.
+//! 4. **The strategy is told what happened to its orders**: the reports from
+//!    step 3 and, live, whatever the venue's own stream has delivered since the
+//!    last wake. A report stamped later than the clock moves the clock up to it
+//!    first, so the strategy is never told of something dated after the time it
+//!    reads. In a backtest that never happens: a simulated report is stamped by
+//!    this clock, so it is never later than it.
 //! 5. **The strategy sees the market event** and may submit.
+//!
+//! A wake on which the market said nothing -- the source idled -- skips steps 1,
+//! 2, 3 and 5, and ends before calling anything if the venue said nothing
+//! either.
 //!
 //! Step 5 comes after step 3, and that is the whole point. An order submitted on
 //! seeing the trade at `T` is **not** eligible to match against that trade — it
@@ -39,13 +50,17 @@
 //! information at the instant it is created. It is invisible in the output and
 //! it inflates every result.
 //!
-//! # The engine clock is the event stream
+//! # The engine clock is the input stream
 //!
-//! `now` is the `local_recv_ts` of the last event and nothing else — no system
-//! clock anywhere on this path, in any of the three worlds. In a backtest that
-//! makes the run deterministic and repeatable. Live it is still correct, because
-//! the last event's receive stamp *is* roughly now, and a strategy that used a
-//! finer notion of time would behave differently in the three worlds.
+//! `now` is the newest stamp the engine has acted on: the `local_recv_ts` of the
+//! market event in hand, or a venue report's stamp when that is later. It only
+//! moves forward, and there is no system clock anywhere on this path, in any of
+//! the three worlds. A simulated venue stamps its reports with this clock, so in
+//! a backtest and in paper `now` is exactly the market event stream, which makes
+//! a run deterministic and repeatable. Live, a venue report carries the time its
+//! bytes arrived, as a market event does, so `now` is still roughly now, and a
+//! strategy that used a finer notion of time would behave differently in the
+//! three worlds.
 //!
 //! That is invariant 4 arriving at its destination: components take a clock, and
 //! here the clock is the data.
@@ -85,20 +100,40 @@ pub struct EngineStats {
     pub cancels: u64,
     pub execution_events: u64,
     pub fills: u64,
-    /// First and last event times, for reporting the period actually covered.
+    /// The clock's first and last readings, for reporting the period actually
+    /// covered.
+    ///
+    /// Market event times in a backtest and in paper. Live, a venue report
+    /// stamped later than the market can set either end, and `last_ts` has to
+    /// follow it: the binaries stamp the closing checkpoint and `Stopped` from
+    /// it, which would otherwise land before a fill already journalled.
     pub first_ts: Option<Ts>,
     pub last_ts: Option<Ts>,
-    /// Times the engine refused to move its clock backwards.
+    /// Market events stamped before the clock, which the engine refused to
+    /// move it back for.
     ///
-    /// Two asynchronous inputs can deliver out of order — a venue report stamped
-    /// before a market event that reached us first — and the clock must not run
-    /// back, because everything downstream dispatches on it. Counted rather than
-    /// silently clamped: `quant-recorder::segment`'s `backdated_records` arriving
-    /// at the engine for the same reason, since a clamp is evidence about the
-    /// transport and one nobody counts is one nobody notices rising.
+    /// Two asynchronous inputs can be acted on out of the order they arrived.
+    /// A venue report stamped later than the market event in hand carries the
+    /// clock forward, and a market event received before that report, still
+    /// waiting in the source's queue, then arrives stamped in the past. The
+    /// clock must not run back, because everything downstream dispatches on
+    /// it. Counted rather than silently clamped: `quant-recorder::segment`'s
+    /// `backdated_records` arriving at the engine for the same reason, since a
+    /// clamp is evidence about the transport and one nobody counts is one
+    /// nobody notices rising.
     ///
-    /// **Always zero in a backtest.** `HistoricalSource` is monotone, so a
-    /// non-zero value from a replay means a source broke its own contract.
+    /// **Only a market event counts.** A venue report moves the clock when it
+    /// is stamped later and otherwise leaves it alone, on either kind of wake:
+    /// one stamped at or before the clock asks nothing of it. That is every
+    /// fill a simulator delivers late, and live, any report received before a
+    /// market event the engine has already acted on. Counting those would make
+    /// this number depend on whether a market wake or an idle one happened to
+    /// deliver the report, rather than on the order the inputs arrived in.
+    ///
+    /// **Always zero in a backtest.** `HistoricalSource` is monotone, and a
+    /// simulated report is never stamped after the clock, so nothing carries
+    /// the clock past the next market event; a non-zero value from a replay
+    /// means a source broke its own contract.
     pub clock_clamps: u64,
     /// Times the engine woke on nothing and went to look for venue reports.
     pub idle_wakes: u64,
@@ -403,11 +438,6 @@ where
         self
     }
 
-    /// Run to the end of the source.
-    ///
-    /// A source error stops the run and is returned, rather than being treated
-    /// as the end of the stream — see [`EventSource`] for why that distinction
-    /// is the difference between a short backtest and a wrong one.
     /// How long the engine waits on the market before going to look at the
     /// venue.
     ///
@@ -418,6 +448,16 @@ where
     /// a second is nothing against a market peak of 694 messages a second.
     const IDLE_TICK: core::time::Duration = core::time::Duration::from_millis(250);
 
+    /// Run to the end of the source.
+    ///
+    /// Wakes on whichever input speaks: a market event, or -- after a quarter
+    /// of a second with nothing from the market, for a source that can say so
+    /// -- whatever the venue has to report. A source that never idles, which is
+    /// every historical one, makes this the plain event loop it always was.
+    ///
+    /// A source error stops the run and is returned, rather than being treated
+    /// as the end of the stream — see [`EventSource`] for why that distinction
+    /// is the difference between a short backtest and a wrong one.
     pub fn run(&mut self) -> Result<EngineStats, SourceError> {
         while let Some(item) = self.source.next_event_timeout(Self::IDLE_TICK) {
             match item? {
@@ -438,14 +478,17 @@ where
 
     /// Move the clock forward, never back.
     ///
-    /// Until M8 the engine had one input and this was an assignment. Two
-    /// asynchronous inputs can deliver out of order -- a venue report stamped
-    /// before a market event that arrived first -- and every dispatch decision
-    /// downstream reads this clock, so letting it run backwards would make a
-    /// fill appear to happen before the order that caused it.
+    /// Until M8 the engine had one input and this was an assignment. With two,
+    /// it can act on them out of the order they arrived -- see
+    /// [`EngineStats::clock_clamps`] for how -- and every dispatch decision
+    /// downstream reads this clock, so letting it run backwards would date what
+    /// the engine does next before what it has already done and written down.
     ///
     /// Clamp and count, which is the answer `quant-recorder::segment` gave when
-    /// an NTP step put a record before the open segment's day.
+    /// an NTP step put a record before the open segment's day. Only a market
+    /// event's stamp can be clamped here: step 1 passes every one, and
+    /// `dispatch` passes a venue report's only when it is later than the
+    /// clock, on either kind of wake -- so a report never counts a clamp.
     fn advance_to(&mut self, ts: Ts) {
         if ts < self.now {
             self.ledger.stats.clock_clamps = self.ledger.stats.clock_clamps.saturating_add(1);
@@ -460,7 +503,8 @@ where
     /// wake from the venue has no event to take a timestamp from, no book to
     /// update and nothing to show the venue that it did not just say itself.
     fn observe_market(&mut self, event: &MarketEvent) {
-        // 1. The clock. Nothing else advances it.
+        // 1. The clock: the event's own stamp, or no move at all if the clock
+        //    is already past it.
         self.advance_to(event.meta().local_recv_ts);
         self.ledger.stats.events += 1;
         self.ledger.stats.first_ts.get_or_insert(self.now);
@@ -489,10 +533,12 @@ where
     /// Everything that happens because of one wake, in the order of the module
     /// docs.
     ///
-    /// `None` means the venue spoke and the market did not. Steps 2, 3 and 5 are
-    /// then skipped — there is no book to update, nothing to show the venue, and
-    /// no market event to tell the strategy about. Calling `on_market_event`
-    /// there would hand a strategy an event that did not happen.
+    /// `None` means the market did not speak: the source idled, and the venue may
+    /// have. Steps 1, 2, 3 and 5 are then skipped — there is no event to take a
+    /// time from, no book to update, nothing to show the venue, and no market
+    /// event to tell the strategy about. Calling `on_market_event` there would
+    /// hand a strategy an event that did not happen. If the venue has nothing
+    /// either, the wake ends before anything is called at all.
     ///
     /// One function rather than two, because the step order is the most
     /// load-bearing thing in this engine and splitting it would put half of it
@@ -519,10 +565,35 @@ where
             self.observe_market(event);
         }
 
+        // 4. What the venue has to report: the fills step 3 produced and, live,
+        //    whatever its own stream delivered since the last wake.
         self.scratch.clear();
         self.venue.poll(self.now, &mut self.scratch);
-        if event.is_none() {
-            if self.scratch.is_empty() {
+        let latest = self.scratch.iter().map(ExecutionEvent::ts).max();
+        if event.is_some() {
+            // The event set the clock in step 1, but a live venue's reports come
+            // down another socket, and one can have been received after the
+            // event in hand. Left at the event's instant, the clock would read
+            // earlier than a fill the strategy is about to be told of: the fill
+            // is journalled at its own instant, and whatever the strategy then
+            // decides -- submissions, notes -- would be journalled before it. So
+            // the clock catches up to the newest report first, before anything
+            // below reads it.
+            //
+            // Only when the report is later. One stamped at or before the clock
+            // is the ordinary case -- every fill a simulator delivers, stamped
+            // when it was made and delivered at or after that -- and asks
+            // nothing of the clock, so it must not count a clamp. That is what
+            // keeps every backtest number and stat where it was.
+            if let Some(latest) = latest.filter(|&ts| ts > self.now) {
+                self.advance_to(latest);
+                // The period covered runs to the report. The binaries stamp the
+                // closing checkpoint from this, which would otherwise land
+                // before the fill.
+                self.ledger.stats.last_ts = Some(self.now);
+            }
+        } else {
+            let Some(latest) = latest else {
                 // Woke on nothing and the venue had nothing to say, so nothing
                 // below this line has anything to act on.
                 //
@@ -533,19 +604,25 @@ where
                 // run would report a period beginning in 1970. A live source
                 // idles before its first frame as a matter of course.
                 return;
-            }
+            };
             // The clock comes from the reports, because there is no event to
             // take it from. Taking the latest rather than the first is what lets
             // a fill be booked at the instant the venue acted.
-            if let Some(latest) = self.scratch.iter().map(ExecutionEvent::ts).max() {
+            //
+            // Only when it is later, exactly as on a market wake. A report
+            // stamped at or before the clock -- received before a market event
+            // the engine has already acted on -- asks nothing of it, and must
+            // not count a clamp here either: whether a report counted one would
+            // otherwise depend on which kind of wake happened to deliver it.
+            if latest > self.now {
                 self.advance_to(latest);
             }
             self.ledger.stats.first_ts.get_or_insert(self.now);
             self.ledger.stats.last_ts = Some(self.now);
         }
 
-        // 4. Book what happened, then tell the strategy. Booking first means a
-        //    strategy reading its own position during `on_execution` sees the
+        //    Then book what happened, and tell the strategy. Booking first means
+        //    a strategy reading its own position during `on_execution` sees the
         //    fill it is being told about, rather than the state before it.
         for i in 0..self.scratch.len() {
             let execution = self.scratch[i].clone();

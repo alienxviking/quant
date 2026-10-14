@@ -894,7 +894,8 @@ fn an_engine_told_where_to_start_does_not_remint_ids_from_one() {
     );
 }
 
-/// A source that goes quiet: it yields its events, then idles forever.
+/// A source that goes quiet: it yields its events, then idles a given number of
+/// times before ending, because a test has to end.
 ///
 /// What a live source does when the market socket stalls. `Scripted` cannot
 /// express it — it ends the stream — and the difference is the whole of M8.a:
@@ -975,11 +976,31 @@ impl EventSource for IdlesFirst {
 /// Reports a fill on a later `poll`, having been told nothing in between.
 ///
 /// A live venue: the fill arrives from the user-data stream on the venue's
-/// schedule, not in response to anything the engine did.
-#[derive(Debug, Default)]
+/// schedule, not in response to anything the engine did, and carries a time of
+/// the venue's choosing rather than one the engine gave it.
+#[derive(Debug)]
 struct SpeaksLater {
     held: Option<ExecutionEvent>,
-    polls: usize,
+    stamp: Ts,
+}
+
+impl SpeaksLater {
+    fn stamping(stamp: Ts) -> Self {
+        Self { held: None, stamp }
+    }
+}
+
+impl Default for SpeaksLater {
+    /// Later than any market event in the fixture -- `meta` puts those near 2s
+    /// -- so the report moves the clock, and a test can see that it did.
+    ///
+    /// An earlier stamp would leave the clock where it was and count nothing,
+    /// on either kind of wake; see
+    /// `a_report_stamped_before_the_event_neither_moves_the_clock_nor_counts_a_clamp`
+    /// and its idle-wake twin.
+    fn default() -> Self {
+        Self::stamping(Ts::from_nanos(3_000_000_000))
+    }
 }
 
 impl ExecutionVenue for SpeaksLater {
@@ -994,25 +1015,17 @@ impl ExecutionVenue for SpeaksLater {
                 fee_asset: quant_core::execution::FeeAsset::Quote,
             },
             remaining: "0".parse().expect("qty"),
-            // Stamped by the venue, *later* than any market event in the
-            // fixture -- `meta` puts those near 2s. An earlier stamp is a
-            // legitimate thing for a venue to send and the clock clamps it,
-            // which is how the first draft of this fixture failed.
-            ts: Ts::from_nanos(3_000_000_000),
+            ts: self.stamp,
         });
     }
 
     fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
 
     fn poll(&mut self, _now: Ts, out: &mut Vec<ExecutionEvent>) {
-        self.polls += 1;
-        // Not on the poll that follows submission -- that one happens inside the
-        // same market event, and a venue answering there is the simulated one.
-        if self.polls > 1 {
-            if let Some(event) = self.held.take() {
-                out.push(event);
-            }
-        }
+        // On whichever wake comes next, market or idle. The engine polls before
+        // the strategy sees an event, so an order placed on one event cannot be
+        // reported on that same wake -- nothing is held yet when it polls.
+        out.extend(self.held.take());
     }
 }
 
@@ -1117,4 +1130,146 @@ fn a_source_that_never_idles_leaves_every_count_at_zero() {
     let stats = engine.run().expect("run");
     assert_eq!(stats.idle_wakes, 0, "a file has nothing to wait for");
     assert_eq!(stats.clock_clamps, 0, "and is monotone by construction");
+}
+
+/// Writes down what the clock read every time it was called, and submits once.
+#[derive(Debug, Default)]
+struct Clocked {
+    submitted: bool,
+    /// `(ingest_seq, ctx.now())` at each market event.
+    at_events: Vec<(u64, Ts)>,
+    /// `(the report's own time, ctx.now())` at each execution report.
+    at_executions: Vec<(Ts, Ts)>,
+}
+
+impl Strategy for Clocked {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &mut Context<'_>) {
+        self.at_events.push((event.meta().ingest_seq, ctx.now()));
+        if !self.submitted {
+            self.submitted = true;
+            ctx.submit(buy());
+        }
+    }
+
+    fn on_execution(&mut self, event: &ExecutionEvent, ctx: &mut Context<'_>) {
+        self.at_executions.push((event.ts(), ctx.now()));
+    }
+}
+
+/// Two trades and a venue that reports the order placed on the first one
+/// during the second, stamped `report`. `Scripted` never idles, so the report
+/// arrives on a market wake.
+fn reported_on_the_next_event(report: Ts) -> Engine<Scripted, SpeaksLater, AllowAll, Clocked> {
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00"), trade(2, "100.00")]),
+        SpeaksLater::stamping(report),
+        AllowAll,
+        Clocked::default(),
+        CASH,
+    );
+    engine.run().expect("no source failure");
+    engine
+}
+
+#[test]
+fn a_report_received_after_the_event_moves_the_clock_before_the_strategy_reads_it() {
+    // Live, the venue's reports come down another socket, so one can be
+    // received after the market event in hand and polled on that same wake.
+    // Only an idle wake used to take its time from a report. On a market wake
+    // the fill was booked at its own later instant while the strategy, told of
+    // it and then shown the event, read the earlier one -- and journalled what
+    // it decided before the fill it was deciding on.
+    let report = Ts::from_nanos(3_000_000_000);
+    assert!(
+        report > meta(2).local_recv_ts,
+        "the fixture's report is the later"
+    );
+    let engine = reported_on_the_next_event(report);
+    let stats = engine.stats();
+    let strategy = engine.strategy();
+
+    assert_eq!(stats.idle_wakes, 0, "polled on a market wake");
+    assert_eq!(
+        strategy.at_executions,
+        vec![(report, report)],
+        "told of the fill no earlier than the fill itself"
+    );
+    assert_eq!(
+        strategy.at_events,
+        vec![(1, meta(1).local_recv_ts), (2, report)],
+        "and shown the event after it at the report's time, not the event's own"
+    );
+    assert_eq!(stats.clock_clamps, 0, "moving forward is not a clamp");
+    assert_eq!(
+        stats.last_ts,
+        Some(report),
+        "the period covered runs to the fill, or a closing checkpoint lands before it"
+    );
+}
+
+#[test]
+fn a_report_stamped_before_the_event_neither_moves_the_clock_nor_counts_a_clamp() {
+    // The ordinary case, and every backtest with latency is made of it: a
+    // simulated fill is stamped when it was made and delivered on a later
+    // event. It asks nothing of the clock. Moving the clock to it would run the
+    // clock backwards, and counting it as a clamp would make a stat that is
+    // documented as always zero in a backtest non-zero in every one with
+    // latency.
+    let report = meta(1).local_recv_ts;
+    let engine = reported_on_the_next_event(report);
+    let stats = engine.stats();
+    let strategy = engine.strategy();
+
+    assert_eq!(
+        strategy.at_executions,
+        vec![(report, meta(2).local_recv_ts)],
+        "delivered on the second event, and the clock stayed on it"
+    );
+    assert_eq!(strategy.at_events[1], (2, meta(2).local_recv_ts));
+    assert_eq!(stats.clock_clamps, 0, "an earlier report is not a clamp");
+    assert_eq!(stats.last_ts, Some(meta(2).local_recv_ts));
+}
+
+#[test]
+fn a_report_stamped_before_the_clock_on_an_idle_wake_neither_moves_it_nor_counts_a_clamp() {
+    // The test above, with the report delivered by an idle wake instead of a
+    // market one. The idle path used to advance to the newest report
+    // unconditionally, so the same report counted a clamp here and none there:
+    // the count said which kind of wake happened to deliver it, and nothing
+    // about the order the inputs arrived in.
+    //
+    // Arranged the shortest way: the report is stamped before the only event,
+    // so nothing but an idle wake can deliver it. Live it takes a market event
+    // acted on between the report's arrival and its delivery, or the host
+    // clock stepping back; the engine cannot tell which, and neither is a
+    // reason to move its clock or count anything.
+    let report = Ts::from_nanos(1_000_000_000);
+    assert!(
+        report < meta(1).local_recv_ts,
+        "the fixture's report is the earlier"
+    );
+    let mut engine = Engine::new(
+        GoesQuiet::new(vec![trade(1, "100.00")], 2),
+        SpeaksLater::stamping(report),
+        AllowAll,
+        Clocked::default(),
+        CASH,
+    );
+    let stats = engine.run().expect("no source failure");
+
+    assert_eq!(
+        stats.fills, 1,
+        "delivered, and only an idle wake could have"
+    );
+    assert_eq!(stats.idle_wakes, 2);
+    assert_eq!(
+        engine.strategy().at_executions,
+        vec![(report, meta(1).local_recv_ts)],
+        "told of it at the clock the event set, which did not move back"
+    );
+    assert_eq!(
+        stats.clock_clamps, 0,
+        "an earlier report is not a clamp on an idle wake either"
+    );
+    assert_eq!(stats.last_ts, Some(meta(1).local_recv_ts));
 }

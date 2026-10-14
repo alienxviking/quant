@@ -48,9 +48,11 @@ use tracing::error;
 /// time-based checkpoint would close it and needs a periodic hook the engine
 /// still does not have. `RunObserver` has eleven methods as of M7.5 and fires on
 /// nine things besides fills, but every one of them is driven by an *event* —
-/// there is no tick, and `Engine::run` blocks — so a quiet stretch produces no
-/// callback to checkpoint from. That is a change to the seam, not a thing to
-/// slip in before a run.
+/// there is no tick an observer can see. Since M8 `Engine::run` does wake on a
+/// quiet market, but only to ask the venue, and a wake on which the venue has
+/// nothing to say returns before any callback — so a quiet stretch still
+/// produces no callback to checkpoint from. That is a change to the seam, not a
+/// thing to slip in before a run.
 pub const CHECKPOINT_EVERY: u64 = 5;
 
 /// Writes fills down before the strategy is told about them.
