@@ -330,12 +330,6 @@ fn print_ours(
     }
 }
 
-/// The operational picture for the containing minute, with time bases.
-///
-/// The labels are the point. One line mixes instantaneous, lifetime and
-/// 60-second-window figures with nothing marking which is which, and
-/// `queue_peak=270` beside `queue=0` is how an operator concludes the wrong
-/// thing at 3am.
 /// What happened across the span, when one was asked for.
 fn print_window(market: &MarketAt) {
     let Some(window) = &market.window else {
@@ -377,6 +371,12 @@ fn span(nanos: i64) -> String {
     }
 }
 
+/// The operational picture for the containing minute, with time bases.
+///
+/// The labels are the point. One line mixes instantaneous, lifetime and
+/// 60-second-window figures with nothing marking which is which, and
+/// `queue_peak=270` beside `queue=0` is how an operator concludes the wrong
+/// thing at 3am.
 fn print_health(args: &Args) {
     match quant_explain::health_at(&args.root, &args.symbol, args.at) {
         Err(why) => outln!("health    {why}"),
