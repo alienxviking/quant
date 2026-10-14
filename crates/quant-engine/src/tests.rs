@@ -894,7 +894,8 @@ fn an_engine_told_where_to_start_does_not_remint_ids_from_one() {
     );
 }
 
-/// A source that goes quiet: it yields its events, then idles forever.
+/// A source that goes quiet: it yields its events, then idles a given number of
+/// times before ending, because a test has to end.
 ///
 /// What a live source does when the market socket stalls. `Scripted` cannot
 /// express it — it ends the stream — and the difference is the whole of M8.a:

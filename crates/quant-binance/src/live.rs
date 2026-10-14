@@ -10,7 +10,7 @@
 //!
 //! # Two ways to wait, and the engine uses the one that gives up
 //!
-//! [`EventSource::next_event`] blocks until a record arrives.
+//! [`EventSource::next_event`] blocks until there is an event to hand over.
 //! [`EventSource::next_event_timeout`] waits no longer than it is told and then
 //! returns [`Wake::Idle`], and that is the one `Engine::run` calls.
 //!
