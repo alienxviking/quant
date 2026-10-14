@@ -563,8 +563,20 @@ have. The latter lets every order through right up to the one that mattered.
 Exposure is absolute, so a short counts: a limit that only looked at longs would
 permit an unlimited short, which is the more dangerous direction.
 
-**Reducing an oversized position is always allowed.** A risk layer that trapped a
-position it considered too large would be the most dangerous thing in the system.
+**The position limit never blocks a reduction of a position the risk layer has
+seen — and after a restart it has seen none.** Risk judges an order against its own
+tally, built from the fills it has been told about since the process started, and
+`RiskEngine::recover` brings back the switch but not the holdings. So an exit from
+a position held across a restart reads as opening the opposite position, and is
+refused if that position would be over the limit, however much the exit really
+reduces. Within what it has seen, an order that leaves the position on the same
+side, or flat, and strictly smaller is exempt from the limit, because a risk layer
+that trapped a position it considered too large would be the most dangerous thing
+in the system. A flip is not a reduction: the position it opens is checked like any
+other. The exemption is from that one limit. A reducing order still meets the
+per-order limit (a fat finger on the way out is still a fat finger, and an exit can
+be split), the no-price refusal and the daily limits, and a tripped switch refuses
+even a flattening order, as below.
 
 **Fees count against the daily loss budget.** A limit ignoring them would be
 reached late by exactly the amount a high-turnover strategy pays — which §8 showed
