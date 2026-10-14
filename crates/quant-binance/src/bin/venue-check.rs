@@ -78,8 +78,8 @@ async fn main() -> ExitCode {
                 server_time,
                 received_at: millis(),
             }),
-            // Stop at the first failure: a venue that will not answer one
-            // reading is not worth four more timeouts to confirm.
+            // Stop at the first failure rather than wait out a timeout per
+            // remaining reading to learn the same thing again.
             Err(e) => {
                 failure = Some(e);
                 break;
@@ -88,7 +88,7 @@ async fn main() -> ExitCode {
     }
     let Some(best) = ClockSample::tightest(&readings) else {
         if let Some(e) = &failure {
-            eprintln!("clock        could not reach the venue: {e}");
+            eprintln!("clock        could not read the venue's clock: {e}");
         }
         if !readings.is_empty() {
             eprintln!(
