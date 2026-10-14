@@ -398,24 +398,39 @@ mod tests {
 
     #[test]
     fn the_reading_with_the_smallest_round_trip_is_the_one_believed() {
-        // One clock, 250 ms ahead, read five times over legs of different length
+        // One clock, 250 ms ahead, read six times over legs of different length
         // and symmetry, so each reading tells a different story. The first
         // carries a handshake on its outbound leg, as a cold first request does,
         // and is the furthest from the truth. The tightest is neither first nor
         // last, so a rule that took either -- or the largest round trip --
         // believes a different reading and fails.
+        //
+        // Nor is the tightest the extreme of anything but its round trip. Its
+        // return leg is the longer of its two, and a decoy beats it on each key
+        // a rule could mistake for the round trip: the largest midpoint, the
+        // largest naive offset (which is the shortest outbound leg), and the
+        // shortest return leg. Where the outbound leg is always the longer, all
+        // of those rank the readings as the round trip does, and a fixture built
+        // only of such readings cannot tell any of them from the right rule.
         let theta = 250;
         let readings = [
             reading(1_700_000_000_000, theta, 400, 100), // round trip 500, reads 100
             reading(1_700_000_001_000, theta, 150, 30),  // 180, reads 190
-            reading(1_700_000_002_000, theta, 20, 20),   // 40, reads 250
-            reading(1_700_000_003_000, theta, 60, 30),   // 90, reads 235
-            reading(1_700_000_004_000, theta, 35, 25),   // 60, reads 245
+            reading(1_700_000_002_000, theta, 5, 70),    // 75, reads 282: shortest out
+            reading(1_700_000_003_000, theta, 15, 25),   // 40, reads 255: the tightest
+            reading(1_700_000_004_000, theta, 50, 8),    // 58, reads 229: shortest back
+            reading(1_700_000_005_000, theta, 10, 110),  // 120, reads 300: largest midpoint
         ];
-        let believed = ClockSample::tightest(&readings).expect("five to choose from");
-        assert_eq!(believed, readings[2]);
+        let believed = ClockSample::tightest(&readings).expect("six to choose from");
+        assert_eq!(believed, readings[3]);
         assert_eq!(believed.round_trip_ms(), 40);
-        assert_eq!(believed.offset_ms(), theta);
+        // Its legs are uneven, so the midpoint misses -- by no more than half
+        // the round trip, which is the bound the choice is made for.
+        assert_eq!(believed.offset_ms(), 255);
+        assert!(
+            (believed.offset_ms() - theta).abs() <= believed.round_trip_ms() / 2,
+            "{believed:?}"
+        );
     }
 
     #[test]
