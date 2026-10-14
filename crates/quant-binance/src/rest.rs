@@ -151,6 +151,16 @@ impl SnapshotClient {
     /// matters, and correcting for it would mean pretending to a precision this
     /// does not have.
     pub async fn clock_offset_millis(&self, local_millis: i64) -> Result<i64, SnapshotError> {
+        Ok(local_millis - self.server_time_millis().await?)
+    }
+
+    /// The venue's clock: `serverTime` from `GET /api/v3/time`, in milliseconds
+    /// since the Unix epoch.
+    ///
+    /// The bare reading, with nothing of ours subtracted from it, for a caller
+    /// that reads its own clock either side of the request and corrects for the
+    /// round trip -- see [`crate::trade::ClockSample`].
+    pub async fn server_time_millis(&self) -> Result<i64, SnapshotError> {
         #[derive(serde::Deserialize)]
         struct ServerTime {
             #[serde(rename = "serverTime")]
@@ -175,7 +185,7 @@ impl SnapshotClient {
             .map_err(|e| SnapshotError::Body(e.to_string()))?;
         let parsed: ServerTime =
             serde_json::from_slice(&body).map_err(|e| SnapshotError::Body(e.to_string()))?;
-        Ok(local_millis - parsed.server_time)
+        Ok(parsed.server_time)
     }
 
     /// Fetch one depth snapshot, returning the response body verbatim.
