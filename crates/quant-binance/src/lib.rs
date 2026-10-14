@@ -65,6 +65,7 @@ pub mod rest;
 pub mod sequence;
 pub mod stream;
 pub mod trade;
+pub mod user_data;
 
 /// Install the TLS backend, if the process has not already chosen one.
 ///
