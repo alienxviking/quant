@@ -8,18 +8,58 @@
 //! instants and make `docs/engine-contract.md` §9's agreement criterion
 //! unachievable.
 //!
-//! # Why blocking is right here
+//! # Two ways to wait, and the engine uses the one that gives up
 //!
-//! [`EventSource::next_event`] blocks until a record arrives. That is not a
-//! compromise: the engine clock *is* the event stream, in all three worlds, so a
-//! quiet market means no time passes for the strategy. A live source that woke
-//! the engine on a timer would give it a notion of time the backtest does not
-//! have, and the same strategy would then behave differently in the two — which
-//! is the one property the whole seam exists to protect.
+//! [`EventSource::next_event`] blocks until a record arrives.
+//! [`EventSource::next_event_timeout`] waits no longer than it is told and then
+//! returns [`Wake::Idle`], and that is the one `Engine::run` calls.
+//!
+//! This module used to argue that blocking was right, and while the engine had
+//! one input it was. M8 gives it a second. A live venue's reports arrive on
+//! their own socket, on their own schedule, and an engine parked on this channel
+//! while the market socket is stalled -- which Binance's own 24-hour stream
+//! rotation makes routine -- cannot book a fill, cannot tell the strategy, and
+//! cannot move the risk layer's tally. M8.a taught the engine to stop waiting,
+//! but this source never let it: the trait's default calls `next_event`, so it
+//! can never idle, and until this override the default is what the engine got.
+//!
+//! What the old argument protected still holds, because an idle wake is not a
+//! timer the strategy can see. The engine clock *is* the input stream, so a
+//! quiet market must not let time pass for the strategy, and `Wake::Idle`
+//! carries no time at all. The engine uses it only to ask the venue whether it
+//! has anything to say. If not, it goes back to waiting without calling the
+//! strategy; if so, the clock moves to the report's own stamp when that is
+//! later, and never to the wall clock. Against `SimulatedVenue` an idle wake
+//! finds nothing, ever: the simulator makes reports only inside `observe`, the
+//! engine polls it straight afterwards, and an idle wake polls again at a clock
+//! nothing has moved since, so nothing new can be due. Paper therefore makes
+//! the same strategy calls a backtest over the same data would.
+//!
+//! # The timeout bounds the wait, not the silence
+//!
+//! One deadline per call, and each `recv_timeout` gets only what is left of it.
+//! Restarting the full timeout per record would bound how long the channel stays
+//! *silent* rather than how long the call waits: a record that yields nothing --
+//! a message type we do not model -- would buy the market another full wait, and
+//! a steady trickle of them would keep the engine from ever looking at the
+//! venue. That is M1's flush bug in a new place, the block that never sealed
+//! because a steady trickle never went quiet.
+//!
+//! The deadline is the only use of the wall clock in this module, and it does
+//! not breach invariant 4. The invariant exists so that a component can be
+//! backtested; this one is live by definition, and the `recv_timeout` it bounds
+//! measures wall time already. Nothing read from the clock reaches an event or
+//! the engine's clock -- it only decides when to stop waiting.
+//!
+//! A record already queued is taken even once the deadline has passed, because
+//! `recv_timeout` tries the channel before it looks at the time. So `Idle` means
+//! the channel was found empty, never that a backlog went unread -- which
+//! matters, because a wake the engine spends on the venue while market records
+//! sit unread would act on the two inputs out of the order they arrived.
 //!
 //! `None` means the channel closed: the recorder is gone. That is the end of the
 //! stream and not an error, because a recorder that has stopped has already said
-//! why in its own logs.
+//! why in its own logs. Records sent before it closed are delivered first.
 //!
 //! # Why a dropped record becomes a gap
 //!
@@ -43,11 +83,12 @@
 //! message whose effect on the book we do not know. That is blindness, and
 //! blindness has a representation already.
 
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use quant_core::event::{Gap, GapCause, MarketEvent};
 use quant_core::instrument::InstrumentId;
-use quant_core::source::{EventSource, SourceError};
+use quant_core::source::{EventSource, SourceError, Wake};
 use quant_core::time::Ts;
 use quant_recorder::record::CaptureRecord;
 
@@ -189,9 +230,34 @@ impl EventSource for LiveSource {
             if let Some(event) = self.pending.pop_front() {
                 return Some(Ok(event));
             }
-            // Blocking, on purpose: see the module docs.
+            // Blocking, on purpose: a caller that asks for the next event and
+            // nothing else is asking to wait for it. The engine asks
+            // `next_event_timeout` instead; see the module docs.
             let record = self.records.recv().ok()?;
             self.take(&record);
+        }
+    }
+
+    fn next_event_timeout(&mut self, timeout: Duration) -> Option<Result<Wake, SourceError>> {
+        // Taken once, so a record that yields nothing spends the wait rather
+        // than restarting it. `None` only for a timeout too long to be an
+        // instant, which `recv_timeout` itself treats as waiting for ever -- so
+        // handing it the whole timeout again is the same answer.
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            // Whatever the last record produced comes out before anything is
+            // waited for. A hole and the record that revealed it are a gap *and*
+            // an event from one receive, and the event must not be left waiting
+            // behind a record that may be minutes away.
+            if let Some(event) = self.pending.pop_front() {
+                return Some(Ok(Wake::Event(event)));
+            }
+            let left = deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
+            match self.records.recv_timeout(left) {
+                Ok(record) => self.take(&record),
+                Err(RecvTimeoutError::Timeout) => return Some(Ok(Wake::Idle)),
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
         }
     }
 }
@@ -337,5 +403,158 @@ mod tests {
             panic!("expected a gap: {events:?}");
         };
         assert_eq!(gap.meta.ingest_seq, 1, "the last one we actually saw");
+    }
+
+    /// Short, because every wait in these tests is meant to expire.
+    const TICK: Duration = Duration::from_millis(50);
+
+    /// Make one call on a thread of its own, so that a source which blocks
+    /// fails the test instead of hanging the suite.
+    fn bounded<T: Send + 'static>(
+        mut source: LiveSource,
+        call: impl FnOnce(&mut LiveSource) -> T + Send + 'static,
+    ) -> (T, LiveSource) {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = call(&mut source);
+            // The receiver is gone only if the test has already failed.
+            let _ = done.send((out, source));
+        });
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the call blocked instead of returning")
+    }
+
+    #[test]
+    fn a_quiet_channel_idles_instead_of_blocking() {
+        // What the override is for. An engine parked on a stalled market socket
+        // cannot hear the venue, and the trait's default calls `next_event`,
+        // which blocks -- so without the override the first call here never
+        // returns, and `bounded` turns that into a failure.
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let source = LiveSource::new(rx, instrument());
+
+        let (woke, source) = bounded(source, |s| s.next_event_timeout(TICK));
+        assert_eq!(
+            woke,
+            Some(Ok(Wake::Idle)),
+            "nothing arrived, so nothing to say"
+        );
+
+        // An idle wake is not an ending: what arrives afterwards still comes
+        // out. Closed before the call, so the record has to outlive its channel.
+        tx.try_send(venue(1, TRADE)).expect("room");
+        drop(tx);
+        let (woke, source) = bounded(source, |s| s.next_event_timeout(TICK));
+        assert!(
+            matches!(&woke, Some(Ok(Wake::Event(MarketEvent::Trade(t)))) if t.meta.ingest_seq == 1),
+            "the record sent after the idle wake: {woke:?}"
+        );
+
+        let (woke, _source) = bounded(source, |s| s.next_event_timeout(TICK));
+        assert_eq!(
+            woke, None,
+            "a closed channel is the end, not a quiet market"
+        );
+    }
+
+    #[test]
+    fn everything_one_record_yields_comes_out_before_the_source_waits_again() {
+        // A hole is found on the record after it, so that record yields a gap
+        // *and* its own event. The event is owed before the source goes back to
+        // the channel: waiting first would hold it behind a record that may be
+        // minutes away, and on a quiet market report an idle wake while a trade
+        // sat undelivered.
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        tx.try_send(venue(1, TRADE)).expect("room");
+        tx.try_send(venue(5, TRADE)).expect("room");
+        let mut source = LiveSource::new(rx, instrument());
+
+        let woke: Vec<_> = (0..4).map(|_| source.next_event_timeout(TICK)).collect();
+        assert!(
+            matches!(&woke[0], Some(Ok(Wake::Event(MarketEvent::Trade(t)))) if t.meta.ingest_seq == 1),
+            "{woke:?}"
+        );
+        assert!(
+            matches!(
+                &woke[1],
+                Some(Ok(Wake::Event(MarketEvent::Gap(g)))) if g.cause == GapCause::LocalOverflow
+            ),
+            "the hole first: {woke:?}"
+        );
+        assert!(
+            matches!(&woke[2], Some(Ok(Wake::Event(MarketEvent::Trade(t)))) if t.meta.ingest_seq == 5),
+            "then the event that revealed it, without waiting for another record: {woke:?}"
+        );
+        assert_eq!(woke[3], Some(Ok(Wake::Idle)), "and only then nothing");
+        // Held open until here, so running dry reads as quiet rather than closed.
+        drop(tx);
+    }
+
+    #[test]
+    fn a_record_that_yields_nothing_does_not_restart_the_wait() {
+        // A message type we do not model is consumed and produces nothing. Were
+        // each one to restart the timeout, a steady trickle of them would hold
+        // the engine on the market socket for as long as the trickle lasted, and
+        // the venue would go unheard -- M1's block that never sealed.
+        let wait = Duration::from_millis(400);
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let mut source = LiveSource::new(rx, instrument());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let feeder = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // Every 50 ms, well inside the wait, for three times as long.
+                for seq in 1..=24 {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    tx.send(venue(seq, KLINE))
+                        .expect("the source is still listening");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                // Handed back rather than dropped, so the channel stays open and
+                // a wait that restarted ends late and idle rather than closed.
+                tx
+            })
+        };
+
+        let started = Instant::now();
+        let woke = source.next_event_timeout(wait);
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _tx = feeder.join().expect("the feeder cannot panic");
+
+        assert_eq!(woke, Some(Ok(Wake::Idle)));
+        assert!(
+            source.stats().ignored >= 2,
+            "the trickle has to arrive during the wait, or this proves nothing: {:?}",
+            source.stats()
+        );
+        assert!(
+            took < Duration::from_millis(1_000),
+            "waited {took:?} on a timeout of {wait:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_already_queued_is_read_even_with_no_time_left() {
+        // `Idle` has to mean the channel was empty. An idle wake while market
+        // records sat unread would send the engine to the venue ahead of market
+        // events that reached us first -- the two inputs out of order.
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        tx.try_send(venue(1, TRADE)).expect("room");
+        let mut source = LiveSource::new(rx, instrument());
+        let woke = source.next_event_timeout(Duration::ZERO);
+        assert!(
+            matches!(&woke, Some(Ok(Wake::Event(MarketEvent::Trade(_))))),
+            "a queued record, even with no time to wait: {woke:?}"
+        );
+        assert_eq!(
+            source.next_event_timeout(Duration::ZERO),
+            Some(Ok(Wake::Idle)),
+            "and with nothing queued, no time means idle at once"
+        );
+        drop(tx);
     }
 }

@@ -35,9 +35,12 @@
 //! ```
 //!
 //! Two consumers of one ingress, per `docs/engine-contract.md` §9. The engine
-//! runs on its own thread because [`LiveSource::next_event`] blocks — which is
-//! correct, since the engine clock *is* the event stream and a quiet market means
-//! no time passes for the strategy.
+//! runs on its own thread because it spends the whole run waiting on
+//! [`LiveSource`] -- in bounded waits, so that a live venue's reports are looked
+//! for while the market is quiet, but for a thread's whole life all the same. A
+//! quiet market still means no time passes for the strategy: an idle wake
+//! carries no time, and against `SimulatedVenue` it never finds anything to
+//! deliver. `quant_binance::live`'s module docs have the argument.
 //!
 //! # Why this refuses to run free
 //!
@@ -252,7 +255,7 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let tee_dropped = tee_drops.load(std::sync::atomic::Ordering::Relaxed);
 
     // The capture is finished, so its sender is gone, so the engine's channel is
-    // closed, so `next_event` returns None and the thread ends on its own.
+    // closed, so the source returns None and the thread ends on its own.
     let (outcome, engine) = engine_thread
         .join()
         .map_err(|_| "the paper engine thread panicked")?;
