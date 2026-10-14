@@ -70,6 +70,16 @@ pub const RECV_WINDOW_MS: i64 = 5_000;
 /// the skew, and at what number, is not settled here.
 pub const MAX_CLOCK_SKEW_MS: i64 = 1_000;
 
+/// The fewest usable readings of the venue's clock a verdict on it may rest on.
+///
+/// Two, so that no verdict rests on one reading alone. The first request a
+/// client makes opens its connection, so DNS, TCP and TLS all ride on its
+/// outbound leg -- the asymmetry a midpoint cannot correct, and one
+/// [`ClockSample::tightest`] can pass over only when there is another reading
+/// to prefer. A reading whose round trip ran backwards is not usable and does
+/// not count.
+pub const MIN_CLOCK_READINGS: usize = 2;
+
 /// One reading of the venue's clock against the host's.
 ///
 /// All three are milliseconds since the Unix epoch. `sent_at` and `received_at`
@@ -120,9 +130,39 @@ impl ClockSample {
     pub fn tightest(readings: &[Self]) -> Option<Self> {
         readings
             .iter()
-            .filter(|r| r.round_trip_ms() >= 0)
+            .filter(|r| r.ran_forwards())
             .min_by_key(|r| r.round_trip_ms())
             .copied()
+    }
+
+    /// The reading to judge the host clock by, from those that came back of
+    /// `attempts` tried: the [`tightest`](Self::tightest), provided at least
+    /// [`MIN_CLOCK_READINGS`] of them ran forwards.
+    ///
+    /// # Errors
+    ///
+    /// [`NotReady::TooFewClockReadings`] when fewer did. A refusal to judge,
+    /// not a verdict that the clock is wrong -- and not a reason to judge on
+    /// whatever did come back, because one reading on its own may be the cold
+    /// one.
+    pub fn best_of(readings: &[Self], attempts: usize) -> Result<Self, NotReady> {
+        let usable = readings.iter().filter(|r| r.ran_forwards()).count();
+        match Self::tightest(readings) {
+            Some(best) if usable >= MIN_CLOCK_READINGS => Ok(best),
+            _ => Err(NotReady::TooFewClockReadings {
+                attempts,
+                came_back: readings.len(),
+                usable,
+            }),
+        }
+    }
+
+    /// Whether the host clock ran forwards across the request, as it must have
+    /// for the reading to be usable at all: see [`Self::tightest`]. One
+    /// predicate for choosing a reading and for counting the usable ones, so
+    /// the two cannot disagree about which readings those are.
+    const fn ran_forwards(&self) -> bool {
+        self.round_trip_ms() >= 0
     }
 }
 
@@ -173,6 +213,13 @@ pub enum NotReady {
     /// allows. Not a forecast that the venue would refuse a request stamped
     /// with the offset taken off: that constant says what the limit is.
     ClockSkew { offset_ms: i64, allowed_ms: i64 },
+    /// Too few readings of the venue's clock came back usable to judge the
+    /// host's by: no verdict either way. See [`MIN_CLOCK_READINGS`].
+    TooFewClockReadings {
+        attempts: usize,
+        came_back: usize,
+        usable: usize,
+    },
     /// The venue would not answer a signed request. Almost always a bad key, a
     /// bad secret, or a key without trading permission.
     Rejected { status: u16 },
@@ -194,6 +241,38 @@ impl core::fmt::Display for NotReady {
                  -- ops/fix-clock.sh with sudo on macOS, ops/fix-clock.ps1 as Administrator on \
                  Windows"
             ),
+            Self::TooFewClockReadings {
+                attempts,
+                came_back,
+                usable,
+            } => {
+                write!(
+                    f,
+                    "{came_back} of {attempts} readings of the venue's clock came back"
+                )?;
+                if usable < came_back {
+                    write!(
+                        f,
+                        ", {} with a round trip that ran backwards (the host clock stepped while \
+                         it was being read)",
+                        came_back.saturating_sub(*usable)
+                    )?;
+                }
+                write!(
+                    f,
+                    ", and this will not judge the clock on fewer than {MIN_CLOCK_READINGS} usable \
+                     ones"
+                )?;
+                if *usable > 0 {
+                    // Why not judge on what there is: the question a reading
+                    // that did come back invites.
+                    f.write_str(
+                        ": a lone reading may be the cold one, its outbound leg carrying the \
+                         connection's DNS, TCP and TLS, which no midpoint corrects",
+                    )?;
+                }
+                Ok(())
+            }
             Self::Rejected { status } => write!(
                 f,
                 "the venue refused a signed request with HTTP {status}. The key, the secret, or \
@@ -491,6 +570,93 @@ mod tests {
         let instant = reading(1_700_000_000_000, 250, 0, 0);
         assert_eq!(instant.round_trip_ms(), 0);
         assert_eq!(ClockSample::tightest(&[honest, instant]), Some(instant));
+    }
+
+    #[test]
+    fn no_verdict_on_the_clock_rests_on_fewer_than_two_readings() {
+        // However many were tried. A client's first request carries its
+        // connection's setup on the outbound leg, so a reading that came back
+        // alone may be the cold one -- and with nothing to prefer it over, it
+        // would be believed. This one reads a host 250 ms ahead as 100.
+        let cold = reading(1_700_000_000_000, 250, 400, 100);
+        let warm = reading(1_700_000_001_000, 250, 20, 20);
+        assert_eq!(cold.offset_ms(), 100);
+
+        for came_back in [&[][..], &[cold][..]] {
+            assert_eq!(
+                ClockSample::best_of(came_back, 5),
+                Err(NotReady::TooFewClockReadings {
+                    attempts: 5,
+                    came_back: came_back.len(),
+                    usable: came_back.len(),
+                }),
+                "{came_back:?}"
+            );
+        }
+
+        // A reading whose round trip ran backwards came back, and still does
+        // not count: two came back, one is usable, and one is not enough.
+        let stepped = ClockSample {
+            received_at: warm.sent_at - 1,
+            ..warm
+        };
+        assert_eq!(
+            ClockSample::best_of(&[cold, stepped], 5),
+            Err(NotReady::TooFewClockReadings {
+                attempts: 5,
+                came_back: 2,
+                usable: 1,
+            })
+        );
+
+        // Two that ran forwards are enough, and the one believed is the tighter.
+        assert_eq!(ClockSample::best_of(&[cold, warm], 5), Ok(warm));
+        assert_eq!(ClockSample::best_of(&[cold, stepped, warm], 5), Ok(warm));
+    }
+
+    #[test]
+    fn a_refusal_to_judge_the_clock_says_how_many_readings_came_back() {
+        // One back says why one is not enough; none back has nothing to explain.
+        let said = NotReady::TooFewClockReadings {
+            attempts: 5,
+            came_back: 1,
+            usable: 1,
+        }
+        .to_string();
+        assert!(
+            said.starts_with("1 of 5 readings of the venue's clock came back, and "),
+            "{said}"
+        );
+        assert!(
+            said.contains("a lone reading may be the cold one"),
+            "{said}"
+        );
+        let said = NotReady::TooFewClockReadings {
+            attempts: 5,
+            came_back: 0,
+            usable: 0,
+        }
+        .to_string();
+        assert!(
+            said.starts_with("0 of 5 readings of the venue's clock came back, and "),
+            "{said}"
+        );
+        assert!(!said.contains("lone reading"), "{said}");
+
+        // And when some came back unusable, how many, and why.
+        let said = NotReady::TooFewClockReadings {
+            attempts: 5,
+            came_back: 3,
+            usable: 1,
+        }
+        .to_string();
+        assert!(
+            said.starts_with(
+                "3 of 5 readings of the venue's clock came back, 2 with a round trip that ran \
+                 backwards"
+            ),
+            "{said}"
+        );
     }
 
     #[test]
