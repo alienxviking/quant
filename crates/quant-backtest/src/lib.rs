@@ -21,7 +21,7 @@ pub mod ma;
 pub mod record;
 
 pub use equity::{EquityCurve, EquityPoint, Recorded};
-pub use ma::{MaConfig, MaCrossover};
+pub use ma::{MaConfig, MaConfigError, MaCrossover};
 
 /// The risk limits, as one report line.
 ///

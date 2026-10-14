@@ -7,7 +7,7 @@
 //! not of any one piece.
 
 use quant_core::event::{BookSnapshot, EventMeta, Gap, GapCause, Level, MarketEvent};
-use quant_core::fixed::{Notional, Px};
+use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::{
     Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };
@@ -17,14 +17,14 @@ use quant_engine::{AllowAll, Engine};
 use quant_sim::SimulatedVenue;
 
 use crate::equity::{EquityCurve, EquityPoint};
-use crate::ma::MaConfig;
+use crate::ma::{MaConfig, MaConfigError};
 use crate::{MaCrossover, Recorded};
 
 const SECOND: i64 = 1_000_000_000;
 const CASH: Notional = Notional::from_raw(100 * quant_core::SCALE);
 
-fn instrument() -> InstrumentId {
-    InstrumentRegistry::new().register(InstrumentDef {
+fn definition() -> InstrumentDef {
+    InstrumentDef {
         exchange: Exchange::Binance,
         symbol: "BTCUSDT".to_owned(),
         base: "BTC".to_owned(),
@@ -33,7 +33,17 @@ fn instrument() -> InstrumentId {
         tick_size: "0.01".parse().expect("tick"),
         lot_size: "0.00001".parse().expect("lot"),
         min_notional: "5".parse().expect("notional"),
-    })
+    }
+}
+
+fn instrument() -> InstrumentId {
+    InstrumentRegistry::new().register(definition())
+}
+
+/// The lot the crossover sizes to, read off the definition the instrument was
+/// registered from -- as the binaries do -- rather than typed in again.
+fn lot() -> Qty {
+    definition().lot_size
 }
 
 /// What each scripted step is.
@@ -107,7 +117,9 @@ fn run(steps: &[Step]) -> Wired {
             slow: 3,
             interval: SECOND,
             qty: "0.001".parse().expect("qty"),
-        }),
+            lot: lot(),
+        })
+        .expect("a valid configuration"),
         instrument,
         SECOND,
     );
@@ -310,7 +322,9 @@ fn run_with(steps: &[Step], costs: quant_sim::Costs) -> Wired {
             slow: 3,
             interval: SECOND,
             qty: "0.001".parse().expect("qty"),
-        }),
+            lot: lot(),
+        })
+        .expect("a valid configuration"),
         instrument,
         SECOND,
     );
@@ -613,7 +627,9 @@ fn a_strategy_that_loses_its_budget_is_stopped_for_the_day() {
             slow: 3,
             interval: SECOND,
             qty: "0.001".parse().expect("qty"),
-        }),
+            lot: lot(),
+        })
+        .expect("a valid configuration"),
         instrument,
         SECOND,
     );
@@ -718,7 +734,9 @@ fn run_crossover_risked(
             slow: 3,
             interval: SECOND,
             qty: "0.001".parse().expect("qty"),
-        }),
+            lot: lot(),
+        })
+        .expect("a valid configuration"),
         instrument,
         SECOND,
     );
@@ -890,4 +908,73 @@ fn a_wrapped_strategy_still_gets_its_notes_out() {
         vec!["hello"],
         "the wrapper has to pass the diary through"
     );
+}
+
+// --- M8.c: the size, in whole lots ---
+
+/// A configuration that differs from the suite's only in size and lot.
+fn sized(qty: &str, lot: &str) -> MaConfig {
+    MaConfig {
+        instrument: instrument(),
+        fast: 2,
+        slow: 3,
+        interval: SECOND,
+        qty: qty.parse().expect("qty"),
+        lot: lot.parse().expect("lot"),
+    }
+}
+
+#[test]
+fn a_size_that_is_not_whole_lots_is_refused_at_construction() {
+    // An order the venue would reject anyway, so it is refused once, here --
+    // not on every order, and not by a live venue on the first funded trade.
+    let refused = |qty: &str, lot: &str| MaCrossover::new(sized(qty, lot)).err();
+
+    // 1.23 lots of 0.00001.
+    assert_eq!(
+        refused("0.0000123", "0.00001"),
+        Some(MaConfigError::Size {
+            qty: "0.0000123".parse().expect("qty"),
+            lot: "0.00001".parse().expect("lot"),
+        })
+    );
+    // Zero and negative are whole numbers of lots, and not sizes.
+    assert!(matches!(
+        refused("0", "0.00001"),
+        Some(MaConfigError::Size { .. })
+    ));
+    assert!(matches!(
+        refused("-0.001", "0.00001"),
+        Some(MaConfigError::Size { .. })
+    ));
+    // A lot of zero would make every size "whole", and is no lot at all.
+    assert_eq!(refused("0.001", "0"), Some(MaConfigError::Lot(Qty::ZERO)));
+
+    // The boundary from the other side: whole lots are fine, down to one.
+    assert_eq!(refused("0.001", "0.00001"), None);
+    assert_eq!(refused("0.00001", "0.00001"), None);
+}
+
+#[test]
+fn windows_that_cannot_cross_are_refused_rather_than_panicking() {
+    // This was an `assert!` until the size check made the constructor
+    // fallible; one constructor with two ways of saying no would have left
+    // every caller handling both.
+    let windows = |fast: usize, slow: usize| {
+        MaCrossover::new(MaConfig {
+            fast,
+            slow,
+            ..sized("0.001", "0.00001")
+        })
+        .err()
+    };
+    assert_eq!(
+        windows(3, 3),
+        Some(MaConfigError::Windows { fast: 3, slow: 3 })
+    );
+    assert_eq!(
+        windows(0, 3),
+        Some(MaConfigError::Windows { fast: 0, slow: 3 })
+    );
+    assert_eq!(windows(2, 3), None);
 }

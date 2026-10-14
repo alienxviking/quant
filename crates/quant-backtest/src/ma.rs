@@ -42,9 +42,51 @@ pub struct MaConfig {
     pub slow: usize,
     /// Event-time between samples.
     pub interval: i64,
-    /// Size of each position, in base units.
+    /// Size of each position, in base units. A whole number of `lot`s, or the
+    /// venue would refuse every order sized from it.
     pub qty: Qty,
+    /// The instrument's lot size: every order quantity must be a whole number
+    /// of these.
+    ///
+    /// Configuration rather than something read through `Context`, which is
+    /// the entire surface a strategy has and holds market data, not the
+    /// venue's rules. Whoever registered the instrument sets this from the
+    /// definition it registered, rather than typing the venue's rule in a
+    /// second time.
+    pub lot: Qty,
 }
+
+/// Why a configuration cannot be a crossover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaConfigError {
+    /// `fast` is zero or not shorter than `slow`, so the averages never cross.
+    Windows { fast: usize, slow: usize },
+    /// The lot is zero or negative, so no size is a whole number of them.
+    Lot(Qty),
+    /// `qty` is not a positive whole number of lots: every order sized from it
+    /// is one the venue would refuse anyway.
+    Size { qty: Qty, lot: Qty },
+}
+
+impl std::fmt::Display for MaConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Windows { fast, slow } => write!(
+                f,
+                "a fast window of {fast} against a slow one of {slow} never crosses; \
+                 fast must be at least 1 and shorter than slow"
+            ),
+            Self::Lot(lot) => write!(f, "a lot of {lot} is no lot at all; it must be positive"),
+            Self::Size { qty, lot } => write!(
+                f,
+                "a size of {qty} is not a positive whole number of {lot} lots, \
+                 so the venue would refuse every order sized from it"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MaConfigError {}
 
 /// What the strategy did, for reporting.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -110,13 +152,36 @@ pub struct MaCrossover {
 const CLAIM_INTERVAL_NANOS: i64 = 3_600 * 1_000_000_000;
 
 impl MaCrossover {
-    #[must_use]
-    pub fn new(config: MaConfig) -> Self {
-        assert!(
-            config.slow > config.fast && config.fast > 0,
-            "a crossover needs a fast window shorter than its slow one"
-        );
-        Self {
+    /// A crossover for `config`, or the reason there cannot be one.
+    ///
+    /// The size is refused here, once, rather than by the venue on every
+    /// order: a quantity that is not a whole number of lots is an order the
+    /// venue rejects anyway, and the first live trade is the expensive place
+    /// to find that out. The windows are refused here too, where they used to
+    /// be an `assert!` -- one constructor with two ways of saying no would make
+    /// every caller handle both.
+    ///
+    /// # Errors
+    ///
+    /// [`MaConfigError`] when the windows cannot cross, the lot is not
+    /// positive, or `qty` is not a positive whole number of lots.
+    pub fn new(config: MaConfig) -> Result<Self, MaConfigError> {
+        if config.fast == 0 || config.slow <= config.fast {
+            return Err(MaConfigError::Windows {
+                fast: config.fast,
+                slow: config.slow,
+            });
+        }
+        if !config.lot.is_positive() {
+            return Err(MaConfigError::Lot(config.lot));
+        }
+        if !config.qty.is_positive() || config.qty.round_to_lot(config.lot) != config.qty {
+            return Err(MaConfigError::Size {
+                qty: config.qty,
+                lot: config.lot,
+            });
+        }
+        Ok(Self {
             config,
             samples: std::collections::VecDeque::with_capacity(config.slow),
             next_sample_at: None,
@@ -127,7 +192,7 @@ impl MaCrossover {
             last_pair: None,
             next_claim_at: None,
             tally: std::collections::BTreeMap::new(),
-        }
+        })
     }
 
     /// Write something down, for the engine to collect.
