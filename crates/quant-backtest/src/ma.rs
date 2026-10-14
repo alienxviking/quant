@@ -39,11 +39,11 @@
 //! more.
 //!
 //! So the exit sells the position rounded **down** to the instrument's lot,
-//! 0.00099 here: the most a venue will take that is not more than is held.
-//! What remains is less than one lot, which no venue will buy, so a position
-//! smaller than one lot counts as flat -- for the entry decision as well as
-//! the exit, or the next up-cross would call that dust "already long" and
-//! never enter again.
+//! 0.00099 here: the largest size the lot rule allows that is not more than
+//! is held. What remains is less than one lot, which no venue will buy, so a
+//! position smaller than one lot counts as flat -- for the entry decision as
+//! well as the exit, or the next up-cross would call that dust "already long"
+//! and never enter again.
 //!
 //! Wherever fees are charged in the quote asset, which is every backtest and
 //! all of M5, this changes nothing: the position is exactly zero or exactly
@@ -55,6 +55,28 @@
 //! The lot arrives as configuration rather than through `Context`, which is
 //! the entire surface a strategy has and carries market data, not the venue's
 //! rules. Each binary sets it from the instrument definition it registered.
+//!
+//! # Why `qty` needs more than the minimum notional
+//!
+//! Whole lots satisfy the lot rule, and a venue has others. Where the fee is
+//! taken in the base, the exit is smaller than the entry by that fee rounded
+//! up to a whole lot -- one lot wherever the fee is no bigger than a lot, as
+//! at 0.001 BTC: 0.00099 out against 0.001 in. And an exit follows a
+//! down-cross, so it is usually sold lower than the entry was bought. A `qty`
+//! that clears the venue's `min_notional` by less than those two together
+//! leaves an exit under it, which the venue refuses.
+//!
+//! The strategy is then stuck. The lot or more still held is a holding, not
+//! dust, so every up-cross is "already long" and enters nothing, and every
+//! down-cross sends the same exit to be refused again, until one comes at a
+//! price high enough to lift it over the minimum. With the fee in the quote,
+//! the fall alone can do the same.
+//!
+//! So `qty` has to clear `min_notional` by more than one lot plus the move
+//! expected between an entry and its exit. Nothing here checks that: the
+//! check needs a price, and the strategy has none at construction. It belongs
+//! to the binary that trades live, which can read one before it sends
+//! anything.
 
 use quant_book::Book;
 use quant_core::event::{MarketEvent, Side};
@@ -79,6 +101,14 @@ pub struct MaConfig {
     ///
     /// Not the size of each exit: a fee taken in the base asset leaves less
     /// than this held, and the exit sells what is held. See the module docs.
+    ///
+    /// Size it to clear the venue's minimum notional by more than one lot
+    /// plus the move expected between an entry and its exit. The exit can be
+    /// a lot smaller than this, and it is sold after a down-cross. One that
+    /// falls under the minimum is refused, and the lot or more still held
+    /// keeps every up-cross "already long", so the strategy stops trading
+    /// until the price climbs far enough to lift the exit over it. Not checked
+    /// here, because there is no price at construction.
     pub qty: Qty,
     /// The instrument's lot size: every order quantity must be a whole number
     /// of these. An exit sells the position rounded down to it, and a

@@ -1092,8 +1092,8 @@ fn run_base_fee(
 #[test]
 fn an_exit_after_a_base_asset_fee_sells_what_is_held_in_whole_lots() {
     // Buy 0.001 and pay 0.000001 of it in fee: 0.000999 is held, which is 99.9
-    // lots. The exit sells the 99 a venue will take -- not `qty`, which would
-    // sell coins that were never bought, and never more than is held.
+    // lots. The exit sells the 99 whole ones -- not `qty`, which would sell
+    // coins that were never bought, and never more than is held.
     let engine = run_base_fee(&up_then_down(), "0.001");
     let ma = engine.strategy().inner().stats();
     assert_eq!((ma.entries, ma.exits), (1, 1), "one round trip: {ma:?}");
