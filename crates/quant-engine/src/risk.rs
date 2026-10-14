@@ -655,6 +655,55 @@ mod tests {
     }
 
     #[test]
+    fn a_flip_is_checked_on_the_position_it_opens() {
+        // Long ten at the mark is 1000 against a limit of 500. Selling sixteen
+        // closes those ten and opens a short of six, 600: too large, whatever
+        // the order did to the long on the way. A flip that ends smaller than
+        // it started is still a new position, and the limit is about the
+        // position an order creates.
+        let mut risk = RiskEngine::new(Limits {
+            max_position_notional: Some(amount("500")),
+            ..Limits::default()
+        });
+        risk.on_fill(instrument(), Side::Buy, &fill("100", "10", "0"), NOW);
+        assert_eq!(
+            risk.check(&order(Side::Sell, "16"), MARK, NOW)
+                .and_then(|r| r.bound),
+            Some(Bound::PositionNotional),
+            "a short of six is 600, over the limit however it was reached"
+        );
+        // The other side of the same boundary: a flip is checked, not banned.
+        // Selling fourteen opens a short of four, 400, which fits.
+        assert_eq!(
+            risk.check(&order(Side::Sell, "14"), MARK, NOW),
+            None,
+            "a short of four is 400, inside the limit"
+        );
+    }
+
+    #[test]
+    fn adding_to_a_position_already_over_the_limit_is_refused() {
+        // Whatever lets the way out through must not also let the way further
+        // in. Ten units, long or short, is already twice the limit; one more on
+        // the same side is eleven, and is refused in both directions.
+        for side in [Side::Buy, Side::Sell] {
+            let mut risk = RiskEngine::new(Limits {
+                max_position_notional: Some(amount("500")),
+                ..Limits::default()
+            });
+            risk.on_fill(instrument(), side, &fill("100", "10", "0"), NOW);
+            assert_eq!(
+                risk.check(&order(side, "1"), MARK, NOW)
+                    .and_then(|r| r.bound),
+                Some(Bound::PositionNotional),
+                "{side:?} ten, then one more the same way"
+            );
+            // A refusal is not activity, so it does not spend the day's count.
+            assert_eq!(risk.orders_today(), 0, "{side:?}");
+        }
+    }
+
+    #[test]
     fn a_short_counts_against_the_position_limit_too() {
         // Exposure is absolute. A limit that only looked at longs would permit
         // an unlimited short, which is the more dangerous direction.
