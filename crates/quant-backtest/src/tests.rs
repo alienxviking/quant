@@ -1047,11 +1047,16 @@ fn qty(s: &str) -> Qty {
     s.parse().expect("a valid quantity")
 }
 
-/// The suite's crossover entering at `size`, against a venue that takes a
-/// buyer's fee in the base.
+/// The suite's crossover entering at `size`, against a venue that takes `fee`
+/// of the base out of every buy fill.
+///
+/// The usual pair is 0.001 and 0.000001: ten basis points, Binance's taker
+/// rate, so the suite's usual size pays what it would on the venue. A test
+/// that needs the holding to land somewhere exact chooses its own.
 fn run_base_fee(
     steps: &[Step],
     size: &str,
+    fee: &str,
 ) -> quant_engine::Engine<Script, BaseFeeOnBuys, AllowAll, Recorded<MaCrossover>> {
     let instrument = instrument();
     let rules = definition();
@@ -1080,9 +1085,8 @@ fn run_base_fee(
                 min_notional: Notional::ZERO,
             },
         ),
-        // Per buy fill, in BTC. Ten basis points of 0.001, Binance's taker
-        // rate, so the suite's usual size pays what it would on the venue.
-        fee: qty("0.000001"),
+        // Per buy fill, in BTC.
+        fee: qty(fee),
         buys: std::collections::HashSet::new(),
         sent: Vec::new(),
     };
@@ -1096,7 +1100,7 @@ fn an_exit_after_a_base_asset_fee_sells_what_is_held_in_whole_lots() {
     // Buy 0.001 and pay 0.000001 of it in fee: 0.000999 is held, which is 99.9
     // lots. The exit sells the 99 whole ones -- not `qty`, which would sell
     // coins that were never bought, and never more than is held.
-    let engine = run_base_fee(&up_then_down(), "0.001");
+    let engine = run_base_fee(&up_then_down(), "0.001", "0.000001");
     let ma = engine.strategy().inner().stats();
     assert_eq!((ma.entries, ma.exits), (1, 1), "one round trip: {ma:?}");
 
@@ -1131,7 +1135,7 @@ fn dust_below_one_lot_counts_as_flat_so_the_next_up_cross_enters_again() {
     for mid in [88, 95, 104] {
         steps.push(Step::Book(mid));
     }
-    let engine = run_base_fee(&steps, "0.001");
+    let engine = run_base_fee(&steps, "0.001", "0.000001");
     let ma = engine.strategy().inner().stats();
     assert_eq!(
         (ma.entries, ma.exits, ma.no_ops),
@@ -1154,12 +1158,12 @@ fn dust_below_one_lot_counts_as_flat_so_the_next_up_cross_enters_again() {
 }
 
 #[test]
-fn exactly_one_whole_lot_held_is_a_holding_and_is_sold() {
-    // The boundary from the other side. Less than a lot is dust, but one whole
-    // lot is a holding a venue will take, and the exit must sell it. Enter at
-    // two lots and pay 0.000001 of it: 0.000019 is held, one lot and change.
-    // Without this, a boundary moved up by a lot passed every test here.
-    let engine = run_base_fee(&up_then_down(), "0.00002");
+fn one_lot_and_change_held_sells_the_lot_and_keeps_the_change() {
+    // Just above the boundary. Enter at two lots and pay 0.000001 of it:
+    // 0.000019 is held, one whole lot and nine tenths of another. The exit
+    // sells the whole lot and keeps the change, which is dust. A flat
+    // boundary moved up by a lot fails here, as it does at exactly one lot.
+    let engine = run_base_fee(&up_then_down(), "0.00002", "0.000001");
     let ma = engine.strategy().inner().stats();
     assert_eq!((ma.entries, ma.exits), (1, 1), "{ma:?}");
     let sent = &engine.venue().sent;
@@ -1171,5 +1175,42 @@ fn exactly_one_whole_lot_held_is_a_holding_and_is_sold() {
     assert_eq!(
         engine.portfolio().position(instrument()).qty,
         qty("0.000009")
+    );
+}
+
+#[test]
+fn exactly_one_whole_lot_held_is_a_holding_and_is_sold() {
+    // The flat boundary itself. Enter at two lots and pay a whole lot of it
+    // in fee: 0.00001 is held, one lot and not a satoshi over. As far as the
+    // lot rule goes that is a holding, so the down-cross sells all of it and
+    // leaves nothing behind.
+    //
+    // The test that first had this name held 0.000019, over a lot, so a
+    // boundary drawn on the unrounded position -- long only while it is
+    // strictly more than a lot -- passed every test in the file.
+    let engine = run_base_fee(&up_then_down(), "0.00002", "0.00001");
+    let ma = engine.strategy().inner().stats();
+    assert_eq!(
+        (ma.entries, ma.exits, ma.no_ops),
+        (1, 1, 0),
+        "the down-cross is an exit, not 'already flat': {ma:?}"
+    );
+
+    let sent = &engine.venue().sent;
+    assert_eq!(sent.len(), 2, "an entry and an exit: {sent:?}");
+    assert_eq!((sent[0].side, sent[0].qty), (Side::Buy, qty("0.00002")));
+    assert_eq!(
+        (sent[1].side, sent[1].qty),
+        (Side::Sell, qty("0.00001")),
+        "the one lot held, all of it"
+    );
+    assert_eq!(
+        engine.venue().inner.stats().filtered(),
+        0,
+        "a venue enforcing the lot took both"
+    );
+    assert!(
+        engine.portfolio().position(instrument()).qty.is_zero(),
+        "and nothing is left: a whole lot is not dust"
     );
 }
