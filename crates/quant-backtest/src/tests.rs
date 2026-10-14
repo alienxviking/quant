@@ -7,7 +7,7 @@
 //! not of any one piece.
 
 use quant_core::event::{BookSnapshot, EventMeta, Gap, GapCause, Level, MarketEvent};
-use quant_core::fixed::{Notional, Px};
+use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::{
     Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };
@@ -17,14 +17,14 @@ use quant_engine::{AllowAll, Engine};
 use quant_sim::SimulatedVenue;
 
 use crate::equity::{EquityCurve, EquityPoint};
-use crate::ma::MaConfig;
+use crate::ma::{MaConfig, MaConfigError};
 use crate::{MaCrossover, Recorded};
 
 const SECOND: i64 = 1_000_000_000;
 const CASH: Notional = Notional::from_raw(100 * quant_core::SCALE);
 
-fn instrument() -> InstrumentId {
-    InstrumentRegistry::new().register(InstrumentDef {
+fn definition() -> InstrumentDef {
+    InstrumentDef {
         exchange: Exchange::Binance,
         symbol: "BTCUSDT".to_owned(),
         base: "BTC".to_owned(),
@@ -33,7 +33,17 @@ fn instrument() -> InstrumentId {
         tick_size: "0.01".parse().expect("tick"),
         lot_size: "0.00001".parse().expect("lot"),
         min_notional: "5".parse().expect("notional"),
-    })
+    }
+}
+
+fn instrument() -> InstrumentId {
+    InstrumentRegistry::new().register(definition())
+}
+
+/// The lot the crossover sizes to, read off the definition the instrument was
+/// registered from -- as the binaries do -- rather than typed in again.
+fn lot() -> Qty {
+    definition().lot_size
 }
 
 /// What each scripted step is.
@@ -107,7 +117,9 @@ fn run(steps: &[Step]) -> Wired {
             slow: 3,
             interval: SECOND,
             qty: "0.001".parse().expect("qty"),
-        }),
+            lot: lot(),
+        })
+        .expect("a valid configuration"),
         instrument,
         SECOND,
     );
@@ -318,7 +330,9 @@ fn wire<S: EventSource>(
             slow: 3,
             interval: SECOND,
             qty: "0.001".parse().expect("qty"),
-        }),
+            lot: lot(),
+        })
+        .expect("a valid configuration"),
         instrument,
         SECOND,
     );
@@ -729,7 +743,9 @@ fn a_strategy_that_loses_its_budget_is_stopped_for_the_day() {
             slow: 3,
             interval: SECOND,
             qty: "0.001".parse().expect("qty"),
-        }),
+            lot: lot(),
+        })
+        .expect("a valid configuration"),
         instrument,
         SECOND,
     );
@@ -834,7 +850,9 @@ fn run_crossover_risked(
             slow: 3,
             interval: SECOND,
             qty: "0.001".parse().expect("qty"),
-        }),
+            lot: lot(),
+        })
+        .expect("a valid configuration"),
         instrument,
         SECOND,
     );
@@ -1005,5 +1023,310 @@ fn a_wrapped_strategy_still_gets_its_notes_out() {
         notes.iter().map(|n| n.kind).collect::<Vec<_>>(),
         vec!["hello"],
         "the wrapper has to pass the diary through"
+    );
+}
+
+// --- M8.c: the size, in whole lots ---
+
+/// A configuration that differs from the suite's only in size and lot.
+fn sized(qty: &str, lot: &str) -> MaConfig {
+    MaConfig {
+        instrument: instrument(),
+        fast: 2,
+        slow: 3,
+        interval: SECOND,
+        qty: qty.parse().expect("qty"),
+        lot: lot.parse().expect("lot"),
+    }
+}
+
+#[test]
+fn a_size_that_is_not_whole_lots_is_refused_at_construction() {
+    // An order the venue would reject anyway, so it is refused once, here --
+    // not on every order, and not by a live venue on the first funded trade.
+    let refused = |qty: &str, lot: &str| MaCrossover::new(sized(qty, lot)).err();
+
+    // 1.23 lots of 0.00001.
+    assert_eq!(
+        refused("0.0000123", "0.00001"),
+        Some(MaConfigError::Size {
+            qty: "0.0000123".parse().expect("qty"),
+            lot: "0.00001".parse().expect("lot"),
+        })
+    );
+    // Zero and negative are whole numbers of lots, and not sizes.
+    assert!(matches!(
+        refused("0", "0.00001"),
+        Some(MaConfigError::Size { .. })
+    ));
+    assert!(matches!(
+        refused("-0.001", "0.00001"),
+        Some(MaConfigError::Size { .. })
+    ));
+    // A lot of zero would make every size "whole", and is no lot at all.
+    assert_eq!(refused("0.001", "0"), Some(MaConfigError::Lot(Qty::ZERO)));
+
+    // The boundary from the other side: whole lots are fine, down to one.
+    assert_eq!(refused("0.001", "0.00001"), None);
+    assert_eq!(refused("0.00001", "0.00001"), None);
+}
+
+#[test]
+fn windows_that_cannot_cross_are_refused_rather_than_panicking() {
+    // This was an `assert!` until the size check made the constructor
+    // fallible; one constructor with two ways of saying no would have left
+    // every caller handling both.
+    let windows = |fast: usize, slow: usize| {
+        MaCrossover::new(MaConfig {
+            fast,
+            slow,
+            ..sized("0.001", "0.00001")
+        })
+        .err()
+    };
+    assert_eq!(
+        windows(3, 3),
+        Some(MaConfigError::Windows { fast: 3, slow: 3 })
+    );
+    assert_eq!(
+        windows(0, 3),
+        Some(MaConfigError::Windows { fast: 0, slow: 3 })
+    );
+    assert_eq!(windows(2, 3), None);
+}
+
+// --- M8.c: an exit sells what a base-asset fee left behind ---
+
+use quant_core::event::Side;
+use quant_core::execution::{ClientOrderId, ExecutionEvent, FeeAsset};
+use quant_engine::ExecutionVenue;
+
+/// The real simulator, with each buy's fee taken out of what was bought.
+///
+/// `SimulatedVenue` charges every fee in the quote -- M4's simplification, and
+/// still in its caveats -- so after a buy that fills in full, as every buy
+/// these tests make does against books a whole unit deep, the position is
+/// exactly what was ordered, and an exit that sold `qty` cannot be told from
+/// one that sold what was held. A spot venue takes a buyer's fee in the base
+/// asset. This rewrites each buy's fill that way, a fixed `fee` of the base
+/// per fill, and leaves the matching, the prices and the sells to the
+/// simulator.
+#[derive(Debug)]
+struct BaseFeeOnBuys {
+    inner: SimulatedVenue,
+    fee: Qty,
+    buys: std::collections::HashSet<ClientOrderId>,
+    /// Every request the venue was told about, in order.
+    sent: Vec<OrderRequest>,
+}
+
+impl ExecutionVenue for BaseFeeOnBuys {
+    fn submit(&mut self, client_order_id: ClientOrderId, request: &OrderRequest, now: Ts) {
+        if request.side == Side::Buy {
+            self.buys.insert(client_order_id);
+        }
+        self.sent.push(*request);
+        self.inner.submit(client_order_id, request, now);
+    }
+
+    fn cancel(&mut self, client_order_id: ClientOrderId, now: Ts) {
+        self.inner.cancel(client_order_id, now);
+    }
+
+    // Forwarded explicitly: `observe` has a default that does nothing, and a
+    // wrapper that inherited it would hide the market from the simulator.
+    fn observe(&mut self, event: &MarketEvent, book: &quant_book::Book, now: Ts) {
+        self.inner.observe(event, book, now);
+    }
+
+    fn poll(&mut self, now: Ts, out: &mut Vec<ExecutionEvent>) {
+        let from = out.len();
+        self.inner.poll(now, out);
+        for event in &mut out[from..] {
+            if let ExecutionEvent::Filled {
+                client_order_id,
+                fill,
+                ..
+            } = event
+            {
+                if self.buys.contains(client_order_id) {
+                    // With a `Base` asset, `fee` holds a quantity of the base.
+                    fill.fee = Notional::from_raw(self.fee.raw());
+                    fill.fee_asset = FeeAsset::Base;
+                }
+            }
+        }
+    }
+}
+
+fn qty(s: &str) -> Qty {
+    s.parse().expect("a valid quantity")
+}
+
+/// The suite's crossover entering at `size`, against a venue that takes `fee`
+/// of the base out of every buy fill.
+///
+/// The usual pair is 0.001 and 0.000001: ten basis points, Binance's taker
+/// rate, so the suite's usual size pays what it would on the venue. A test
+/// that needs the holding to land somewhere exact chooses its own.
+fn run_base_fee(
+    steps: &[Step],
+    size: &str,
+    fee: &str,
+) -> quant_engine::Engine<Script, BaseFeeOnBuys, AllowAll, Recorded<MaCrossover>> {
+    let instrument = instrument();
+    let rules = definition();
+    let strategy = Recorded::new(
+        MaCrossover::new(MaConfig {
+            instrument,
+            fast: 2,
+            slow: 3,
+            interval: SECOND,
+            qty: qty(size),
+            lot: rules.lot_size,
+        })
+        .expect("a valid configuration"),
+        instrument,
+        SECOND,
+    );
+    let venue = BaseFeeOnBuys {
+        // The venue enforces the lot, so an exit it would not take is refused
+        // rather than filled. Not the minimum notional: the script trades near
+        // 100, where 0.001 is worth a dime and the real $5 floor refuses all.
+        inner: SimulatedVenue::new().enforcing(
+            instrument,
+            quant_core::instrument::Filters {
+                tick_size: rules.tick_size,
+                lot_size: rules.lot_size,
+                min_notional: Notional::ZERO,
+            },
+        ),
+        // Per buy fill, in BTC.
+        fee: qty(fee),
+        buys: std::collections::HashSet::new(),
+        sent: Vec::new(),
+    };
+    let mut engine = Engine::new(Script::new(steps), venue, AllowAll, strategy, CASH);
+    engine.run().expect("the script cannot fail");
+    engine
+}
+
+#[test]
+fn an_exit_after_a_base_asset_fee_sells_what_is_held_in_whole_lots() {
+    // Buy 0.001 and pay 0.000001 of it in fee: 0.000999 is held, which is 99.9
+    // lots. The exit sells the 99 whole ones -- not `qty`, which would sell
+    // coins that were never bought, and never more than is held.
+    let engine = run_base_fee(&up_then_down(), "0.001", "0.000001");
+    let ma = engine.strategy().inner().stats();
+    assert_eq!((ma.entries, ma.exits), (1, 1), "one round trip: {ma:?}");
+
+    let sent = &engine.venue().sent;
+    assert_eq!(sent.len(), 2, "an entry and an exit: {sent:?}");
+    assert_eq!((sent[0].side, sent[0].qty), (Side::Buy, qty("0.001")));
+    assert_eq!(
+        (sent[1].side, sent[1].qty),
+        (Side::Sell, qty("0.00099")),
+        "the 0.000999 held, rounded down to the lot of 0.00001"
+    );
+    assert_eq!(
+        engine.venue().inner.stats().filtered(),
+        0,
+        "and a venue enforcing the lot took both"
+    );
+    assert_eq!(engine.portfolio().fills(), 2);
+    assert_eq!(
+        engine.portfolio().position(instrument()).qty,
+        qty("0.000009"),
+        "what is left is under a lot and not below zero: nothing unheld was sold"
+    );
+}
+
+#[test]
+fn dust_below_one_lot_counts_as_flat_so_the_next_up_cross_enters_again() {
+    // The exit above leaves 0.000009: real, and unsellable. Counted as a
+    // holding, it would keep the strategy "long" for good -- every up-cross a
+    // no-op, so it never trades again.
+    let mut steps = up_then_down();
+    // From the bottom at 85, rise far enough to cross back up.
+    for mid in [88, 95, 104] {
+        steps.push(Step::Book(mid));
+    }
+    let engine = run_base_fee(&steps, "0.001", "0.000001");
+    let ma = engine.strategy().inner().stats();
+    assert_eq!(
+        (ma.entries, ma.exits, ma.no_ops),
+        (2, 1, 0),
+        "the second up-cross is an entry, not 'already long': {ma:?}"
+    );
+
+    let sent = &engine.venue().sent;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(
+        (sent[2].side, sent[2].qty),
+        (Side::Buy, qty("0.001")),
+        "a full entry, dust or no dust"
+    );
+    assert_eq!(
+        engine.portfolio().position(instrument()).qty,
+        qty("0.001008"),
+        "the dust, plus the 0.000999 the second buy delivered"
+    );
+}
+
+#[test]
+fn one_lot_and_change_held_sells_the_lot_and_keeps_the_change() {
+    // Just above the boundary. Enter at two lots and pay 0.000001 of it:
+    // 0.000019 is held, one whole lot and nine tenths of another. The exit
+    // sells the whole lot and keeps the change, which is dust. A flat
+    // boundary moved up by a lot fails here, as it does at exactly one lot.
+    let engine = run_base_fee(&up_then_down(), "0.00002", "0.000001");
+    let ma = engine.strategy().inner().stats();
+    assert_eq!((ma.entries, ma.exits), (1, 1), "{ma:?}");
+    let sent = &engine.venue().sent;
+    assert_eq!(
+        (sent[1].side, sent[1].qty),
+        (Side::Sell, qty("0.00001")),
+        "exactly one lot of the 0.000019 held"
+    );
+    assert_eq!(
+        engine.portfolio().position(instrument()).qty,
+        qty("0.000009")
+    );
+}
+
+#[test]
+fn exactly_one_whole_lot_held_is_a_holding_and_is_sold() {
+    // The flat boundary itself. Enter at two lots and pay a whole lot of it
+    // in fee: 0.00001 is held, one lot and not a satoshi over. As far as the
+    // lot rule goes that is a holding, so the down-cross sells all of it and
+    // leaves nothing behind.
+    //
+    // The test that first had this name held 0.000019, over a lot, so a
+    // boundary drawn on the unrounded position -- long only while it is
+    // strictly more than a lot -- passed every test in the file.
+    let engine = run_base_fee(&up_then_down(), "0.00002", "0.00001");
+    let ma = engine.strategy().inner().stats();
+    assert_eq!(
+        (ma.entries, ma.exits, ma.no_ops),
+        (1, 1, 0),
+        "the down-cross is an exit, not 'already flat': {ma:?}"
+    );
+
+    let sent = &engine.venue().sent;
+    assert_eq!(sent.len(), 2, "an entry and an exit: {sent:?}");
+    assert_eq!((sent[0].side, sent[0].qty), (Side::Buy, qty("0.00002")));
+    assert_eq!(
+        (sent[1].side, sent[1].qty),
+        (Side::Sell, qty("0.00001")),
+        "the one lot held, all of it"
+    );
+    assert_eq!(
+        engine.venue().inner.stats().filtered(),
+        0,
+        "a venue enforcing the lot took both"
+    );
+    assert!(
+        engine.portfolio().position(instrument()).qty.is_zero(),
+        "and nothing is left: a whole lot is not dust"
     );
 }

@@ -1,9 +1,9 @@
 //! A moving-average crossover, kept as dumb as it can be.
 //!
-//! Long or flat, one instrument, fixed size, market orders. No stops, no sizing
-//! rule, no filter. Every one of those would be a knob, and a knob is something
-//! to blame a bad result on — the point of this strategy is that a bad result
-//! has nowhere to hide but the harness.
+//! Long or flat, one instrument, fixed-size entries, market orders. No stops,
+//! no sizing rule, no filter. Every one of those would be a knob, and a knob is
+//! something to blame a bad result on — the point of this strategy is that a
+//! bad result has nowhere to hide but the harness.
 //!
 //! # Why it samples on a clock rather than on every event
 //!
@@ -13,8 +13,12 @@
 //! per interval of **event time** gives a window that means the same thing all
 //! week.
 //!
-//! The clock is `ctx.now()`, which is the last event's `local_recv_ts`. There is
-//! no other clock available, which is the point.
+//! The clock is `ctx.now()`, the engine clock, which only runs forward. With a
+//! simulated venue only market events move it, so it is the last event's
+//! `local_recv_ts`. With a live venue a report can move it too -- one stamped
+//! later than the last market event carries the clock past it -- so in general
+//! it is the engine's clock and not any one event's stamp. There is no other
+//! clock available, which is the point.
 //!
 //! # Why it will not trade across a gap
 //!
@@ -23,6 +27,64 @@
 //! indicator simply does not advance while we are blind, and resumes when a
 //! snapshot re-anchors the book. That is the invariant being structural rather
 //! than advisory.
+//!
+//! # Why the exit sells what is held, and not `qty`
+//!
+//! A spot venue takes a buyer's fee in the asset bought: buy 0.001 BTC on
+//! Binance and the position is 0.000999. An exit that sold `qty` would sell
+//! coins the strategy never bought -- refused by the venue, or, with spare BTC
+//! in the account, filled out of coins that were never the strategy's. And the
+//! position would never be exactly zero again, so the strategy would never
+//! count itself flat, and every later down-cross would try to sell `qty` once
+//! more.
+//!
+//! So the exit sells the position rounded **down** to the instrument's lot,
+//! 0.00099 here: the largest size the lot rule allows that is not more than
+//! is held. What remains is less than one lot, which no venue will buy, so a
+//! position smaller than one lot counts as flat -- for the entry decision as
+//! well as the exit, or the next up-cross would call that dust "already long"
+//! and never enter again.
+//!
+//! Where fees are charged in the quote asset, as in every backtest and all of
+//! M5, this changes nothing for a run whose entries fill in full and whose
+//! position was built at the same `qty`. The position is then exactly zero or
+//! exactly `qty`, and `qty` is a whole number of lots (a size that is not is
+//! refused at construction), so rounding it down leaves it alone and less
+//! than one lot means zero. That is what lets the fortnight's result still
+//! reproduce to the satoshi.
+//!
+//! Two kinds of run differ even with the fee in the quote: one whose entry
+//! the book could fill only in part -- the simulator fills what is there and
+//! cancels the rest -- and one resumed holding a position built at another
+//! `--qty`. Either leaves something other than `qty` held. The exit used to
+//! sell `qty` regardless, too much or too little; it now sells what is held.
+//! A different answer from before, and the better one.
+//!
+//! The lot arrives as configuration rather than through `Context`, which is
+//! the entire surface a strategy has and carries market data, not the venue's
+//! rules. Each binary sets it from the instrument definition it registered.
+//!
+//! # Why `qty` needs more than the minimum notional
+//!
+//! Whole lots satisfy the lot rule, and a venue has others. Where the fee is
+//! taken in the base, the exit is smaller than the entry by that fee rounded
+//! up to a whole lot -- one lot wherever the fee is no bigger than a lot, as
+//! at 0.001 BTC: 0.00099 out against 0.001 in. And an exit follows a
+//! down-cross, so it is usually sold lower than the entry was bought. A `qty`
+//! that clears the venue's `min_notional` by less than those two together
+//! leaves an exit under it, which the venue refuses.
+//!
+//! The strategy is then stuck. The lot or more still held is a holding, not
+//! dust, so every up-cross is "already long" and enters nothing, and every
+//! down-cross sends the same exit to be refused again, until one comes at a
+//! price high enough to lift it over the minimum. With the fee in the quote,
+//! the fall alone can do the same.
+//!
+//! So `qty` has to clear `min_notional` by more than one lot plus the move
+//! expected between an entry and its exit. Nothing here checks that: the
+//! check needs a price, and the strategy has none at construction. It belongs
+//! to the binary that trades live, which can read one before it sends
+//! anything.
 
 use quant_book::Book;
 use quant_core::event::{MarketEvent, Side};
@@ -42,9 +104,63 @@ pub struct MaConfig {
     pub slow: usize,
     /// Event-time between samples.
     pub interval: i64,
-    /// Size of each position, in base units.
+    /// Size of each entry, in base units. A whole number of `lot`s, or the
+    /// venue would refuse every order sized from it.
+    ///
+    /// Not the size of each exit: a fee taken in the base asset leaves less
+    /// than this held, and the exit sells what is held. See the module docs.
+    ///
+    /// Size it to clear the venue's minimum notional by more than one lot
+    /// plus the move expected between an entry and its exit. The exit can be
+    /// a lot smaller than this, and it is sold after a down-cross. One that
+    /// falls under the minimum is refused, and the lot or more still held
+    /// keeps every up-cross "already long", so the strategy stops trading
+    /// until the price climbs far enough to lift the exit over it. Not checked
+    /// here, because there is no price at construction.
     pub qty: Qty,
+    /// The instrument's lot size: every order quantity must be a whole number
+    /// of these. An exit sells the position rounded down to it, and a
+    /// position smaller than one lot counts as flat.
+    ///
+    /// Configuration rather than something read through `Context`, which is
+    /// the entire surface a strategy has and holds market data, not the
+    /// venue's rules. Whoever registered the instrument sets this from the
+    /// definition it registered, rather than typing the venue's rule in a
+    /// second time.
+    pub lot: Qty,
 }
+
+/// Why a configuration cannot be a crossover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaConfigError {
+    /// `fast` is zero or not shorter than `slow`, so the averages never cross.
+    Windows { fast: usize, slow: usize },
+    /// The lot is zero or negative, so no size is a whole number of them.
+    Lot(Qty),
+    /// `qty` is not a positive whole number of lots: every order sized from it
+    /// is one the venue would refuse anyway.
+    Size { qty: Qty, lot: Qty },
+}
+
+impl std::fmt::Display for MaConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Windows { fast, slow } => write!(
+                f,
+                "a fast window of {fast} against a slow one of {slow} never crosses; \
+                 fast must be at least 1 and shorter than slow"
+            ),
+            Self::Lot(lot) => write!(f, "a lot of {lot} is no lot at all; it must be positive"),
+            Self::Size { qty, lot } => write!(
+                f,
+                "a size of {qty} is not a positive whole number of {lot} lots, \
+                 so the venue would refuse every order sized from it"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MaConfigError {}
 
 /// What the strategy did, for reporting.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -110,13 +226,36 @@ pub struct MaCrossover {
 const CLAIM_INTERVAL_NANOS: i64 = 3_600 * 1_000_000_000;
 
 impl MaCrossover {
-    #[must_use]
-    pub fn new(config: MaConfig) -> Self {
-        assert!(
-            config.slow > config.fast && config.fast > 0,
-            "a crossover needs a fast window shorter than its slow one"
-        );
-        Self {
+    /// A crossover for `config`, or the reason there cannot be one.
+    ///
+    /// The size is refused here, once, rather than by the venue on every
+    /// order: a quantity that is not a whole number of lots is an order the
+    /// venue rejects anyway, and the first live trade is the expensive place
+    /// to find that out. The windows are refused here too, where they used to
+    /// be an `assert!` -- one constructor with two ways of saying no would make
+    /// every caller handle both.
+    ///
+    /// # Errors
+    ///
+    /// [`MaConfigError`] when the windows cannot cross, the lot is not
+    /// positive, or `qty` is not a positive whole number of lots.
+    pub fn new(config: MaConfig) -> Result<Self, MaConfigError> {
+        if config.fast == 0 || config.slow <= config.fast {
+            return Err(MaConfigError::Windows {
+                fast: config.fast,
+                slow: config.slow,
+            });
+        }
+        if !config.lot.is_positive() {
+            return Err(MaConfigError::Lot(config.lot));
+        }
+        if !config.qty.is_positive() || config.qty.round_to_lot(config.lot) != config.qty {
+            return Err(MaConfigError::Size {
+                qty: config.qty,
+                lot: config.lot,
+            });
+        }
+        Ok(Self {
             config,
             samples: std::collections::VecDeque::with_capacity(config.slow),
             next_sample_at: None,
@@ -127,7 +266,7 @@ impl MaCrossover {
             last_pair: None,
             next_claim_at: None,
             tally: std::collections::BTreeMap::new(),
-        }
+        })
     }
 
     /// Write something down, for the engine to collect.
@@ -219,11 +358,11 @@ impl MaCrossover {
         ))
     }
 
-    fn order(&self, side: Side) -> OrderRequest {
+    fn order(&self, side: Side, qty: Qty) -> OrderRequest {
         OrderRequest {
             instrument: self.config.instrument,
             side,
-            qty: self.config.qty,
+            qty,
             // Market orders, so the test is of the harness and not of a queueing
             // model the simulator does not have.
             kind: OrderKind::Market,
@@ -296,14 +435,20 @@ impl Strategy for MaCrossover {
             return;
         }
 
-        let position = ctx.position(instrument);
-        if above && position.is_flat() {
+        // What an exit could sell: the position in whole lots, rounded down so
+        // it is never more than is held. Less than one lot is dust no venue
+        // will take, so it counts as flat -- for the entry as well as the exit,
+        // or dust left by a base-asset fee would keep the strategy "long"
+        // forever. See the module docs.
+        let sellable = ctx.position(instrument).qty.round_to_lot(self.config.lot);
+        let long = sellable.is_positive();
+        if above && !long {
             self.stats.entries += 1;
-            self.working = Some(ctx.submit(self.order(Side::Buy)));
+            self.working = Some(ctx.submit(self.order(Side::Buy, self.config.qty)));
             self.note("entry", "crossed up while flat");
-        } else if !above && !position.is_flat() {
+        } else if !above && long {
             self.stats.exits += 1;
-            self.working = Some(ctx.submit(self.order(Side::Sell)));
+            self.working = Some(ctx.submit(self.order(Side::Sell, sellable)));
             self.note("exit", "crossed down while long");
         } else {
             // The arm that did not exist. Both cases are legitimate -- the

@@ -146,14 +146,29 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // the symbol, which a fresh registry cannot.
     let recovered = journal::read(&journal_path)?;
     let mut registry = InstrumentRegistry::new();
-    let resumed = journal::resume(
-        &recovered.entries,
-        &mut registry,
-        definition(&args.symbol),
-        args.cash,
-    )?;
+    let traded = definition(&args.symbol);
+    // The strategy sizes its exits in the venue's lots, so it is handed the
+    // lot of the definition the session trades under, which `resume` has just
+    // made the registry's own (it refuses a registry that held other rules).
+    let lot = traded.lot_size;
+    let resumed = journal::resume(&recovered.entries, &mut registry, traded, args.cash)?;
     let instrument = resumed.instrument;
     let starting = resumed.starting_cash;
+
+    // Built before anything is written, so a size the venue would refuse stops
+    // the session here rather than after the journal says one started.
+    let strategy = Recorded::new(
+        MaCrossover::new(MaConfig {
+            instrument,
+            fast: args.fast,
+            slow: args.slow,
+            interval: args.interval_secs * 1_000_000_000,
+            qty: args.qty,
+            lot,
+        })?,
+        instrument,
+        args.interval_secs * 1_000_000_000,
+    );
 
     print_banner(args, &journal_path, &recovered, &resumed);
 
@@ -178,17 +193,6 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // either way -- the tee drops the engine's copy, never the writer's.
     let (engine_tx, engine_rx) = sync_channel(8192);
 
-    let strategy = Recorded::new(
-        MaCrossover::new(MaConfig {
-            instrument,
-            fast: args.fast,
-            slow: args.slow,
-            interval: args.interval_secs * 1_000_000_000,
-            qty: args.qty,
-        }),
-        instrument,
-        args.interval_secs * 1_000_000_000,
-    );
     let observer = Box::new(JournalWriter::new(
         Arc::clone(&journal),
         args.symbol.clone(),

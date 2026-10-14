@@ -38,10 +38,12 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use quant_backtest::record::{write, JournalWriter};
-use quant_backtest::{EquityCurve, MaCrossover, Recorded};
+use quant_backtest::{EquityCurve, MaConfig, MaConfigError, MaCrossover, Recorded};
 use quant_core::fixed::{Notional, Qty};
 use quant_core::fixed::{Px, Rate};
-use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
+use quant_core::instrument::{
+    Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
+};
 use quant_core::time::Ts;
 use quant_engine::journal::{Journal, JournalEntry};
 use quant_engine::{Engine, EngineStats, Limits, Portfolio, RiskEngine};
@@ -116,6 +118,10 @@ fn main() -> ExitCode {
         lot_size: "0.00001".parse().expect("lot"),
         min_notional: "5".parse().expect("notional"),
     });
+    // The venue's rules for it, read back once: the simulated venue enforces
+    // them and the strategy is given their lot, so the two are told the same
+    // rules by construction rather than by two literals agreeing.
+    let filters = registry.get(instrument).expect("just registered").filters();
 
     let days = discover_days(&args.root, Exchange::Binance, &args.symbol);
     if days.is_empty() {
@@ -134,17 +140,13 @@ fn main() -> ExitCode {
         instrument,
         days.clone(),
     );
-    let strategy = Recorded::new(
-        MaCrossover::new(quant_backtest::ma::MaConfig {
-            instrument,
-            fast: args.fast,
-            slow: args.slow,
-            interval: args.interval_secs * NANOS_PER_SEC,
-            qty: args.qty,
-        }),
-        instrument,
-        args.interval_secs * NANOS_PER_SEC,
-    );
+    let strategy = match recorded_crossover(&args, instrument, filters.lot_size) {
+        Ok(strategy) => strategy,
+        Err(e) => {
+            eprintln!("the strategy cannot be built: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let journal = match open_journal(&args) {
         Ok(j) => j,
@@ -160,10 +162,7 @@ fn main() -> ExitCode {
         // backtest fills orders a real venue would refuse -- which is not
         // hypothetical: M5's ETHUSDT leg submitted 822 orders worth $2.58 each
         // against a $5 minimum, and every one of them would have been rejected.
-        SimulatedVenue::with_costs(args.costs).enforcing(
-            instrument,
-            registry.get(instrument).expect("just registered").filters(),
-        ),
+        SimulatedVenue::with_costs(args.costs).enforcing(instrument, filters),
         RiskEngine::new(args.limits),
         strategy,
         args.cash,
@@ -212,6 +211,25 @@ fn main() -> ExitCode {
 }
 
 type Wiring = Engine<HistoricalSource, SimulatedVenue, RiskEngine, Recorded<MaCrossover>>;
+
+/// The crossover the arguments describe, sampled for equity on its own
+/// interval -- or why the arguments describe no crossover at all.
+fn recorded_crossover(
+    args: &Args,
+    instrument: InstrumentId,
+    lot: Qty,
+) -> Result<Recorded<MaCrossover>, MaConfigError> {
+    let interval = args.interval_secs * NANOS_PER_SEC;
+    let crossover = MaCrossover::new(MaConfig {
+        instrument,
+        fast: args.fast,
+        slow: args.slow,
+        interval,
+        qty: args.qty,
+        lot,
+    })?;
+    Ok(Recorded::new(crossover, instrument, interval))
+}
 
 /// Open the run log, if one was asked for.
 ///
