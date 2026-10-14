@@ -11,7 +11,7 @@ use quant_core::fixed::{Notional, Px};
 use quant_core::instrument::{
     Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };
-use quant_core::source::{EventSource, SourceError};
+use quant_core::source::{EventSource, SourceError, Wake};
 use quant_core::time::Ts;
 use quant_engine::{AllowAll, Engine};
 use quant_sim::SimulatedVenue;
@@ -302,6 +302,14 @@ fn a_curve_with_no_valuation_at_all_reports_nothing_rather_than_zero() {
 
 /// The same wiring, with costs.
 fn run_with(steps: &[Step], costs: quant_sim::Costs) -> Wired {
+    wire(Script::new(steps), costs)
+}
+
+/// The same wiring around any source, run to its end.
+fn wire<S: EventSource>(
+    source: S,
+    costs: quant_sim::Costs,
+) -> Engine<S, SimulatedVenue, AllowAll, Recorded<MaCrossover>> {
     let instrument = instrument();
     let strategy = Recorded::new(
         MaCrossover::new(MaConfig {
@@ -315,7 +323,7 @@ fn run_with(steps: &[Step], costs: quant_sim::Costs) -> Wired {
         SECOND,
     );
     let mut engine = Engine::new(
-        Script::new(steps),
+        source,
         SimulatedVenue::with_costs(costs),
         AllowAll,
         strategy,
@@ -469,6 +477,110 @@ fn a_latency_longer_than_the_data_means_nothing_ever_arrives() {
         "not even acknowledged"
     );
     assert!(engine.stats().submitted > 0, "but orders were sent");
+}
+
+/// The script, with the market going quiet before every event and for a while
+/// after the last: a live socket, as `LiveSource` reports one since M8.
+struct Quiet {
+    script: Script,
+    /// Flipped on every call, so idle wakes and events alternate, starting
+    /// with an idle wake -- a socket that is up before its first frame.
+    idle_next: bool,
+    /// Idle wakes still to give once the script has run out.
+    trailing: usize,
+}
+
+impl EventSource for Quiet {
+    fn next_event(&mut self) -> Option<Result<MarketEvent, SourceError>> {
+        self.script.next_event()
+    }
+
+    fn next_event_timeout(
+        &mut self,
+        _timeout: std::time::Duration,
+    ) -> Option<Result<Wake, SourceError>> {
+        self.idle_next = !self.idle_next;
+        if self.idle_next {
+            return Some(Ok(Wake::Idle));
+        }
+        match self.script.next_event() {
+            Some(event) => Some(event.map(Wake::Event)),
+            None if self.trailing > 0 => {
+                self.trailing -= 1;
+                Some(Ok(Wake::Idle))
+            }
+            None => None,
+        }
+    }
+}
+
+#[test]
+fn idle_wakes_change_nothing_against_a_simulated_venue() {
+    // Paper is `LiveSource + SimulatedVenue`, and since M8 `LiveSource` idles
+    // whenever the market goes quiet. That must not move a number. The
+    // simulator makes its reports only inside `observe` and the engine polls it
+    // straight afterwards, so an idle wake polls again at a clock nothing has
+    // moved and finds nothing due -- not even a fill still in flight on inbound
+    // latency, which a backtest leaves undelivered at the end. Were that to stop
+    // holding, M5's criterion -- paper reproduces the backtest to the satoshi --
+    // would be measuring idle wakes rather than live data.
+    //
+    // Reports travel back for three seconds -- three events. Short enough that
+    // fills are booked along the way, long enough that the last order's reports
+    // are still in flight when the script ends; the first two assertions say so
+    // if a change to the path or the strategy ever makes either untrue.
+    let costs = quant_sim::Costs {
+        latency: quant_sim::Latency {
+            outbound: 0,
+            inbound: 3 * SECOND,
+        },
+        ..quant_sim::Costs::NONE
+    };
+    // Both runs start a second in. The script's first event sits at the epoch,
+    // which is exactly where a run that dated itself from an idle wake would
+    // begin -- so from there the two periods would agree even if that broke.
+    let script = || {
+        let mut script = Script::new(&choppy());
+        script.events.next();
+        script
+    };
+    let busy = wire(script(), costs);
+    let quiet = wire(
+        Quiet {
+            script: script(),
+            idle_next: false,
+            trailing: 5,
+        },
+        costs,
+    );
+
+    assert!(
+        busy.stats().fills > 0,
+        "fills have to be booked along the way, or the idle wakes between \
+         events test nothing"
+    );
+    assert!(
+        busy.venue().stats().undelivered > 0,
+        "a report has to be in flight at the end, or the quiet tail tests nothing"
+    );
+    assert!(
+        quiet.stats().idle_wakes > 0,
+        "and the quiet run has to idle"
+    );
+    assert_eq!(quiet.portfolio(), busy.portfolio());
+    assert_eq!(
+        quiet.strategy().curve().points,
+        busy.strategy().curve().points
+    );
+    assert_eq!(quiet.venue().stats(), busy.venue().stats());
+    assert_eq!(
+        quant_engine::EngineStats {
+            idle_wakes: 0,
+            ..quiet.stats()
+        },
+        busy.stats(),
+        "every count but the idle wakes themselves"
+    );
 }
 
 // --- M6: limits provably veto a misbehaving strategy ---
