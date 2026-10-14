@@ -991,12 +991,13 @@ impl SpeaksLater {
 }
 
 impl Default for SpeaksLater {
-    /// Later than any market event in the fixture -- `meta` puts those near 2s.
+    /// Later than any market event in the fixture -- `meta` puts those near 2s
+    /// -- so the report moves the clock, and a test can see that it did.
     ///
-    /// On an idle wake an earlier stamp is clamped and counted, which is how
-    /// the first draft of this fixture failed. On a market wake an earlier
-    /// stamp is the ordinary case and is not counted at all; see
-    /// `a_report_stamped_before_the_event_neither_moves_the_clock_nor_counts_a_clamp`.
+    /// An earlier stamp would leave the clock where it was and count nothing,
+    /// on either kind of wake; see
+    /// `a_report_stamped_before_the_event_neither_moves_the_clock_nor_counts_a_clamp`
+    /// and its idle-wake twin.
     fn default() -> Self {
         Self::stamping(Ts::from_nanos(3_000_000_000))
     }
@@ -1227,4 +1228,48 @@ fn a_report_stamped_before_the_event_neither_moves_the_clock_nor_counts_a_clamp(
     assert_eq!(strategy.at_events[1], (2, meta(2).local_recv_ts));
     assert_eq!(stats.clock_clamps, 0, "an earlier report is not a clamp");
     assert_eq!(stats.last_ts, Some(meta(2).local_recv_ts));
+}
+
+#[test]
+fn a_report_stamped_before_the_clock_on_an_idle_wake_neither_moves_it_nor_counts_a_clamp() {
+    // The test above, with the report delivered by an idle wake instead of a
+    // market one. The idle path used to advance to the newest report
+    // unconditionally, so the same report counted a clamp here and none there:
+    // the count said which kind of wake happened to deliver it, and nothing
+    // about the order the inputs arrived in.
+    //
+    // Arranged the shortest way: the report is stamped before the only event,
+    // so nothing but an idle wake can deliver it. Live it takes a market event
+    // acted on between the report's arrival and its delivery, or the host
+    // clock stepping back; the engine cannot tell which, and neither is a
+    // reason to move its clock or count anything.
+    let report = Ts::from_nanos(1_000_000_000);
+    assert!(
+        report < meta(1).local_recv_ts,
+        "the fixture's report is the earlier"
+    );
+    let mut engine = Engine::new(
+        GoesQuiet::new(vec![trade(1, "100.00")], 2),
+        SpeaksLater::stamping(report),
+        AllowAll,
+        Clocked::default(),
+        CASH,
+    );
+    let stats = engine.run().expect("no source failure");
+
+    assert_eq!(
+        stats.fills, 1,
+        "delivered, and only an idle wake could have"
+    );
+    assert_eq!(stats.idle_wakes, 2);
+    assert_eq!(
+        engine.strategy().at_executions,
+        vec![(report, meta(1).local_recv_ts)],
+        "told of it at the clock the event set, which did not move back"
+    );
+    assert_eq!(
+        stats.clock_clamps, 0,
+        "an earlier report is not a clamp on an idle wake either"
+    );
+    assert_eq!(stats.last_ts, Some(meta(1).local_recv_ts));
 }

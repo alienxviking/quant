@@ -109,27 +109,31 @@ pub struct EngineStats {
     /// it, which would otherwise land before a fill already journalled.
     pub first_ts: Option<Ts>,
     pub last_ts: Option<Ts>,
-    /// Times the engine refused to move its clock backwards.
+    /// Market events stamped before the clock, which the engine refused to
+    /// move it back for.
     ///
     /// Two asynchronous inputs can be acted on out of the order they arrived.
     /// A venue report stamped later than the market event in hand carries the
     /// clock forward, and a market event received before that report, still
-    /// waiting in the source's queue, then arrives stamped in the past. On an
-    /// idle wake the reports are the only clock, and the newest of them can be
-    /// older than the last market event. Either way the clock must not run
-    /// back, because everything downstream dispatches on it. Counted rather
-    /// than silently clamped: `quant-recorder::segment`'s `backdated_records`
-    /// arriving at the engine for the same reason, since a clamp is evidence
-    /// about the transport and one nobody counts is one nobody notices rising.
+    /// waiting in the source's queue, then arrives stamped in the past. The
+    /// clock must not run back, because everything downstream dispatches on
+    /// it. Counted rather than silently clamped: `quant-recorder::segment`'s
+    /// `backdated_records` arriving at the engine for the same reason, since a
+    /// clamp is evidence about the transport and one nobody counts is one
+    /// nobody notices rising.
     ///
-    /// A report stamped at or before the clock on a market wake is **not** a
-    /// clamp. The event has already set the time and the report asks nothing
-    /// of it; that is every fill a simulator delivers late.
+    /// **Only a market event counts.** A venue report moves the clock when it
+    /// is stamped later and otherwise leaves it alone, on either kind of wake:
+    /// one stamped at or before the clock asks nothing of it. That is every
+    /// fill a simulator delivers late, and live, any report received before a
+    /// market event the engine has already acted on. Counting those would make
+    /// this number depend on whether a market wake or an idle one happened to
+    /// deliver the report, rather than on the order the inputs arrived in.
     ///
-    /// **Always zero in a backtest.** `HistoricalSource` is monotone, a
-    /// historical replay never idles, and a simulated report is never stamped
-    /// after the clock, so a non-zero value from a replay means a source broke
-    /// its own contract.
+    /// **Always zero in a backtest.** `HistoricalSource` is monotone, and a
+    /// simulated report is never stamped after the clock, so nothing carries
+    /// the clock past the next market event; a non-zero value from a replay
+    /// means a source broke its own contract.
     pub clock_clamps: u64,
     /// Times the engine woke on nothing and went to look for venue reports.
     pub idle_wakes: u64,
@@ -481,7 +485,10 @@ where
     /// the engine does next before what it has already done and written down.
     ///
     /// Clamp and count, which is the answer `quant-recorder::segment` gave when
-    /// an NTP step put a record before the open segment's day.
+    /// an NTP step put a record before the open segment's day. Only a market
+    /// event's stamp can be clamped here: step 1 passes every one, and
+    /// `dispatch` passes a venue report's only when it is later than the
+    /// clock, on either kind of wake -- so a report never counts a clamp.
     fn advance_to(&mut self, ts: Ts) {
         if ts < self.now {
             self.ledger.stats.clock_clamps = self.ledger.stats.clock_clamps.saturating_add(1);
@@ -601,7 +608,15 @@ where
             // The clock comes from the reports, because there is no event to
             // take it from. Taking the latest rather than the first is what lets
             // a fill be booked at the instant the venue acted.
-            self.advance_to(latest);
+            //
+            // Only when it is later, exactly as on a market wake. A report
+            // stamped at or before the clock -- received before a market event
+            // the engine has already acted on -- asks nothing of it, and must
+            // not count a clamp here either: whether a report counted one would
+            // otherwise depend on which kind of wake happened to deliver it.
+            if latest > self.now {
+                self.advance_to(latest);
+            }
             self.ledger.stats.first_ts.get_or_insert(self.now);
             self.ledger.stats.last_ts = Some(self.now);
         }
