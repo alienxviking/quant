@@ -47,6 +47,79 @@ pub const RECV_WINDOW_MS: i64 = 5_000;
 /// than one that refuses to start.
 pub const MAX_CLOCK_SKEW_MS: i64 = 1_000;
 
+/// One reading of the venue's clock against the host's.
+///
+/// All three are milliseconds since the Unix epoch. `sent_at` and `received_at`
+/// are the host's wall clock, read immediately before the request leaves and
+/// immediately after the answer arrives; `server_time` is the venue's
+/// `serverTime` from `GET /api/v3/time`, read somewhere in between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockSample {
+    pub sent_at: i64,
+    pub server_time: i64,
+    pub received_at: i64,
+}
+
+impl ClockSample {
+    /// How long the request took, by the host's clock.
+    #[must_use]
+    pub const fn round_trip_ms(&self) -> i64 {
+        self.received_at - self.sent_at
+    }
+
+    /// `sent_at - server_time`: the offset read naively, short of the true one
+    /// by the outbound leg. Worth printing beside the estimate, so the size of
+    /// the correction is on the screen rather than taken on trust.
+    #[must_use]
+    pub const fn naive_offset_ms(&self) -> i64 {
+        self.sent_at - self.server_time
+    }
+
+    /// This reading's [`midpoint_offset_ms`]. Positive means the host is ahead.
+    #[must_use]
+    pub const fn offset_ms(&self) -> i64 {
+        midpoint_offset_ms(self.sent_at, self.server_time, self.received_at)
+    }
+}
+
+/// How far the host clock is from the venue's, in milliseconds, from one
+/// reading: the host's clock at `sent_at` and `received_at` either side of the
+/// request, and the venue's `server_time` in between.
+///
+/// **Positive means the host is ahead.** That is the sign
+/// [`TradeClient::check_ready`] expects -- it subtracts the offset from the
+/// host's clock to stamp a request in the venue's time -- and the magnitude is
+/// what [`MAX_CLOCK_SKEW_MS`] bounds. `ops/preflight.sh` and `ops/fix-clock.sh`
+/// compute the same midpoint with the opposite sign: positive there means the
+/// host is behind.
+///
+/// # Why the midpoint
+///
+/// Say the host is `theta` ahead and each leg of the request takes `d`. The
+/// venue reads its clock as the request arrives, `d` after `sent_at`, so the
+/// naive `sent_at - server_time` comes out at `theta - d`: short by the outbound
+/// leg, which makes a slow link look like a clock behind the venue. The round
+/// trip is `2d`, and adding half of it back gives `theta` exactly -- the venue's
+/// reading is taken to describe the host's instant halfway through the round
+/// trip. *Subtracting* that half instead lands on `theta - 2d`: wrong by the
+/// whole round trip, twice the error the correction exists to remove, and in
+/// the same misleading direction.
+///
+/// What no arithmetic on one reading can remove is asymmetry. With an outbound
+/// leg of `d1` and a return of `d2` the estimate is off by `(d2 - d1) / 2`, which
+/// can never exceed half the round trip. So half the round trip bounds the
+/// error, give or take a millisecond of rounding, and of several readings the
+/// one with the smallest round trip is the one to believe.
+#[must_use]
+pub const fn midpoint_offset_ms(sent_at: i64, server_time: i64, received_at: i64) -> i64 {
+    let reading = ClockSample {
+        sent_at,
+        server_time,
+        received_at,
+    };
+    reading.naive_offset_ms() + reading.round_trip_ms() / 2
+}
+
 /// Why a live session must not start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotReady {
@@ -247,7 +320,10 @@ fn redact_signature(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_signature, NotReady, TradeClient, MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS};
+    use super::{
+        midpoint_offset_ms, redact_signature, ClockSample, NotReady, TradeClient,
+        MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
+    };
     use crate::credentials::Credentials;
     use std::time::Duration;
 
@@ -258,6 +334,43 @@ mod tests {
             Credentials::new("the-key".to_owned(), "the-secret"),
         )
         .expect("builds")
+    }
+
+    /// A reading of a host clock `theta` ms ahead of the venue's (negative:
+    /// behind), over a request that takes `out` ms to arrive and `back` ms to
+    /// return. The venue reads its clock as the request arrives, and its clock
+    /// is the host's minus `theta`.
+    fn reading(sent_at: i64, theta: i64, out: i64, back: i64) -> ClockSample {
+        ClockSample {
+            sent_at,
+            server_time: sent_at + out - theta,
+            received_at: sent_at + out + back,
+        }
+    }
+
+    #[test]
+    fn the_midpoint_recovers_the_offset_exactly_when_the_legs_are_symmetric() {
+        // Subtracting half the round trip instead of adding it gives
+        // `theta - 2d`, which fails every case with a leg at all -- and puts
+        // several on the wrong side of the gate, in both directions. A host
+        // exactly on time behind a 600 ms leg would read -1200 ms and be refused
+        // for a clock that is fine; one 2500 ms ahead behind a 995 ms leg would
+        // read 510 ms and be let through.
+        for theta in [-2_500, -1_001, -450, -1, 0, 1, 450, 1_001, 2_500] {
+            for d in [0, 1, 37, 250, 600, 995] {
+                let r = reading(1_700_000_000_000, theta, d, d);
+                assert_eq!(
+                    midpoint_offset_ms(r.sent_at, r.server_time, r.received_at),
+                    theta,
+                    "a host {theta} ms ahead, {d} ms each way"
+                );
+                assert_eq!(r.offset_ms(), theta, "{r:?}");
+                // What the correction is for: the naive reading is short by
+                // exactly the outbound leg, which is half the round trip.
+                assert_eq!(r.naive_offset_ms(), theta - d, "{r:?}");
+                assert_eq!(r.round_trip_ms(), 2 * d, "{r:?}");
+            }
+        }
     }
 
     #[test]
