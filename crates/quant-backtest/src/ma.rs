@@ -45,12 +45,20 @@
 //! well as the exit, or the next up-cross would call that dust "already long"
 //! and never enter again.
 //!
-//! Wherever fees are charged in the quote asset, which is every backtest and
-//! all of M5, this changes nothing: the position is exactly zero or exactly
-//! `qty`, and `qty` is a whole number of lots (a size that is not is refused
-//! at construction), so rounding it down leaves it alone and less than one lot
-//! means zero. That is what lets the fortnight's result still reproduce to the
-//! satoshi.
+//! Where fees are charged in the quote asset, as in every backtest and all of
+//! M5, this changes nothing for a run whose entries fill in full and whose
+//! position was built at the same `qty`. The position is then exactly zero or
+//! exactly `qty`, and `qty` is a whole number of lots (a size that is not is
+//! refused at construction), so rounding it down leaves it alone and less
+//! than one lot means zero. That is what lets the fortnight's result still
+//! reproduce to the satoshi.
+//!
+//! Two kinds of run differ even with the fee in the quote: one whose entry
+//! the book could fill only in part -- the simulator fills what is there and
+//! cancels the rest -- and one resumed holding a position built at another
+//! `--qty`. Either leaves something other than `qty` held. The exit used to
+//! sell `qty` regardless, too much or too little; it now sells what is held.
+//! A different answer from before, and the better one.
 //!
 //! The lot arrives as configuration rather than through `Context`, which is
 //! the entire surface a strategy has and carries market data, not the venue's

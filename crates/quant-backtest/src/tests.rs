@@ -988,11 +988,13 @@ use quant_engine::ExecutionVenue;
 /// The real simulator, with each buy's fee taken out of what was bought.
 ///
 /// `SimulatedVenue` charges every fee in the quote -- M4's simplification, and
-/// still in its caveats -- so after a buy the position is exactly what was
-/// ordered, and an exit that sold `qty` cannot be told from one that sold what
-/// was held. A spot venue takes a buyer's fee in the base asset. This rewrites
-/// each buy's fill that way, a fixed `fee` of the base per fill, and leaves the
-/// matching, the prices and the sells to the simulator.
+/// still in its caveats -- so after a buy that fills in full, as every buy
+/// these tests make does against books a whole unit deep, the position is
+/// exactly what was ordered, and an exit that sold `qty` cannot be told from
+/// one that sold what was held. A spot venue takes a buyer's fee in the base
+/// asset. This rewrites each buy's fill that way, a fixed `fee` of the base
+/// per fill, and leaves the matching, the prices and the sells to the
+/// simulator.
 #[derive(Debug)]
 struct BaseFeeOnBuys {
     inner: SimulatedVenue,
