@@ -25,8 +25,29 @@
 //! millions of records a day and its density decides whether a week fits on a
 //! laptop; a journal is a few hundred lines a week. What matters instead is that
 //! it can be read at three in the morning by a person, and by `jq`, and appended
-//! to safely after a crash — and a torn last line is trivially detectable and
+//! to safely after a crash — and a torn line is trivially detectable and
 //! discardable, whereas a torn binary frame needed a whole container format.
+//!
+//! # A torn line, and the restart after it
+//!
+//! A process killed mid-`append` leaves a partial last line. The supervisor
+//! then restarts it, and the restart appends — so a torn line does not stay
+//! the last line for long. Two rules keep that safe, and both keep every byte
+//! and the file append-only:
+//!
+//! - **Opening terminates the fragment.** [`Journal::open`] writes a newline
+//!   first when the file does not end in one, so the next entry starts on its
+//!   own line instead of being glued onto the fragment. Glued, the two became
+//!   one unreadable line in the middle of the file, which `read` refused as
+//!   damage — so a journal that had survived a hard kill was made unreadable
+//!   by the restart that followed it: to `reconcile`, to `explain`, and to the
+//!   next restart, which is when it is needed most.
+//! - **Reading tolerates exactly that shape and counts it.** A bad line may be
+//!   the last line, or it may be followed by a `Started` entry, which is the
+//!   first thing every session writes. Either is an interrupted write and is
+//!   reported in [`Recovered`]; a bad line followed by anything else is damage
+//!   and an error, because nothing else writes into the middle of an
+//!   append-only file.
 //!
 //! # Why the instrument is `(exchange, symbol)`
 //!
@@ -36,7 +57,7 @@
 //! changed. Identity is reattached on replay.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::RefusedBy;
@@ -66,6 +87,10 @@ pub enum JournalEntry {
     /// authority on starting capital, and later ones mark restarts — so the
     /// number a report quotes is the capital the whole session began with, not
     /// whatever it happened to have when it last came up.
+    ///
+    /// And written *first*, before anything else a run appends. [`read`] relies
+    /// on that to tell a line a crash tore and a restart wrote past from damage
+    /// in the middle of the file.
     Started {
         at: Ts,
         cash: Notional,
@@ -312,8 +337,27 @@ pub struct Journal {
 
 impl Journal {
     /// Open for appending, creating it if absent.
+    ///
+    /// A file that does not end in a newline gets one before anything else is
+    /// written. That is the mark of a process killed mid-`append`, and writing
+    /// straight after the fragment would glue the next entry onto it: one
+    /// unreadable line in the middle of the file, where `read` cannot tell an
+    /// interrupted write from damage. Terminated, the fragment keeps every one
+    /// of its bytes, the file stays append-only, and the next entry — a
+    /// restart's `Started` — begins on its own line, which is the shape `read`
+    /// accepts and counts.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        if ends_mid_line(&mut file)? {
+            // Not synced here: the first `append` syncs the file, and a crash
+            // before it leaves a torn tail either way, which `read` tolerates
+            // and the next `open` terminates again.
+            file.write_all(b"\n")?;
+        }
         Ok(Self {
             path: path.to_owned(),
             out: BufWriter::new(file),
@@ -348,6 +392,18 @@ impl Journal {
     }
 }
 
+/// Whether a file has bytes after its last newline: a line was being written
+/// when the writer stopped.
+fn ends_mid_line(file: &mut File) -> std::io::Result<bool> {
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
 /// What reading a journal back found.
 #[derive(Debug, Default, Clone)]
 pub struct Recovered {
@@ -357,15 +413,31 @@ pub struct Recovered {
     /// Reported rather than treated as an error: a process killed mid-`write`
     /// leaves a partial last line, and that is a *torn tail* — the same
     /// distinction `quant-storage` draws between an interrupted write and
-    /// corruption. Only the last line may be torn; a bad line anywhere else is
-    /// an error, because nothing writes into the middle of an append-only file.
+    /// corruption.
     pub torn_tail: bool,
+    /// Lines a crash tore and a restart then wrote past, numbered from 1.
+    ///
+    /// A torn tail stops being the tail as soon as the supervisor restarts the
+    /// process: [`Journal::open`] terminates the fragment and the restart
+    /// appends its `Started` on the next line. So a bad line can sit in the
+    /// middle of the file in exactly one honest way, immediately before a
+    /// `Started`, and these are those lines. Listed rather than counted
+    /// silently, so a person can find each one; the entry that was being
+    /// written when the process died is lost, and this is where it was.
+    ///
+    /// A bad line followed by anything else is damage and `read` refuses it,
+    /// because nothing else writes into the middle of an append-only file.
+    pub torn_before_restart: Vec<usize>,
 }
 
 /// Read a journal back.
 ///
 /// A missing file is an empty journal, not an error: the first run of a session
 /// has not written one yet.
+///
+/// A line that is not an entry is tolerated in two places only, both of them
+/// an interrupted write: as the last line, and immediately before a `Started`
+/// entry. Anywhere else it is an error. See the module docs.
 pub fn read(path: &Path) -> std::io::Result<Recovered> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -374,18 +446,32 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
     };
     let mut out = Recovered::default();
     let lines: Vec<String> = BufReader::new(file).lines().collect::<Result<_, _>>()?;
-    let last = lines.len().saturating_sub(1);
-    for (i, line) in lines.iter().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<JournalEntry>(line) {
-            Ok(entry) => out.entries.push(entry),
-            Err(_) if i == last => out.torn_tail = true,
-            Err(e) => {
+    // Numbered from 1, as an editor numbers them. Blank lines are dropped first
+    // because they were never entries, so "the line after a torn one" is the
+    // next line that says anything.
+    let mut parsed = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(i, line)| (i + 1, serde_json::from_str::<JournalEntry>(line)))
+        .peekable();
+    while let Some((number, line)) = parsed.next() {
+        let e = match line {
+            Ok(entry) => {
+                out.entries.push(entry);
+                continue;
+            }
+            Err(e) => e,
+        };
+        match parsed.peek() {
+            // The write the crash interrupted, not yet written past.
+            None => out.torn_tail = true,
+            // The same, and the restart that followed it.
+            Some((_, Ok(JournalEntry::Started { .. }))) => out.torn_before_restart.push(number),
+            Some(_) => {
                 return Err(std::io::Error::other(format!(
-                    "journal line {} is not readable, and only the last line may be torn: {e}",
-                    i + 1
+                    "journal line {number} is not readable, and only the last line may be torn, \
+                     or a line a restart's `started` entry follows: {e}"
                 )))
             }
         }
@@ -1022,10 +1108,73 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_after_a_torn_write_keeps_every_line_and_counts_the_torn_one() {
+        // A hard kill mid-write leaves a partial last line, and the supervisor
+        // restarts the process. The restart used to append straight after the
+        // fragment, gluing its own `started` onto it: a bad line in the middle,
+        // which `read` refuses as damage. From then on the journal was
+        // unreadable -- to `reconcile`, and to the next restart, which is when
+        // it is needed most.
+        let scratch = Scratch::new("torn-then-restarted");
+        write_all(&scratch.path, &session());
+        let mut bytes = std::fs::read(&scratch.path).expect("read");
+        bytes.extend_from_slice(b"{\"type\":\"fil");
+        std::fs::write(&scratch.path, &bytes).expect("write");
+
+        // What a restart does: open for append, write its `Started`, carry on.
+        let restarted = JournalEntry::Started {
+            at: Ts::from_nanos(10),
+            cash: amount("100"),
+            schema: SCHEMA,
+        };
+        let after = filled(11, Side::Buy, "76800", "0.001", "0.0768");
+        write_all(&scratch.path, &[restarted.clone(), after.clone()]);
+
+        let recovered = read(&scratch.path).expect("a torn line a restart followed is not damage");
+        let mut expected = session();
+        expected.push(restarted);
+        expected.push(after);
+        assert_eq!(
+            recovered.entries, expected,
+            "every whole entry survives, both starts included"
+        );
+        assert_eq!(
+            recovered.torn_before_restart,
+            vec![5],
+            "the torn line is reported where it is, not skipped in silence"
+        );
+        assert!(!recovered.torn_tail, "the tail itself is whole");
+
+        // Every byte kept: the fragment is still there, terminated rather than
+        // overwritten or removed.
+        let text = std::fs::read_to_string(&scratch.path).expect("read");
+        assert!(text.contains("{\"type\":\"fil\n"), "{text}");
+    }
+
+    #[test]
+    fn opening_a_journal_that_ends_cleanly_adds_nothing_to_it() {
+        // The newline `open` writes is for a torn fragment and nothing else.
+        // Written every time, each restart would leave a blank line behind:
+        // harmless to `read`, and noise in the one file a person reads by hand.
+        let whole = Scratch::new("reopened-whole");
+        write_all(&whole.path, &session());
+        let before = std::fs::read(&whole.path).expect("read");
+        drop(Journal::open(&whole.path).expect("open"));
+        assert_eq!(std::fs::read(&whole.path).expect("read"), before);
+
+        // Nor does a journal that does not exist yet start with one.
+        let fresh = Scratch::new("reopened-fresh");
+        drop(Journal::open(&fresh.path).expect("open"));
+        assert_eq!(std::fs::read(&fresh.path).expect("read"), Vec::<u8>::new());
+    }
+
+    #[test]
     fn a_bad_line_in_the_middle_is_an_error() {
-        // Nothing writes into the middle of an append-only file, so this is
-        // damage rather than an interrupted write -- and silently skipping it
-        // would drop a fill and quietly change the position.
+        // A torn line ends up in the middle only when a restart wrote past it,
+        // and a restart always begins with `started`. Anything else in the
+        // middle of an append-only file is damage rather than an interrupted
+        // write -- and silently skipping it would drop a fill and quietly
+        // change the position.
         let scratch = Scratch::new("corrupt-middle");
         write_all(&scratch.path, &session());
         let mut text = std::fs::read_to_string(&scratch.path).expect("read");
