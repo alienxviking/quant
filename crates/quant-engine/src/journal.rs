@@ -470,15 +470,23 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
         Err(e) => return Err(e),
     };
     let mut out = Recovered::default();
-    let lines: Vec<String> = BufReader::new(file).lines().collect::<Result<_, _>>()?;
+    // Bytes, not `String`s. A write cut through a multi-byte character leaves a
+    // line that is not UTF-8, and reading text would refuse the whole file over
+    // it before the rule below could judge that one line. `from_slice` reports
+    // invalid UTF-8 as a syntax error, which is what such a line is. A lossy
+    // decode would be worse: a whole line with one damaged byte would parse,
+    // with the damage quietly replaced.
+    let lines: Vec<Vec<u8>> = BufReader::new(file)
+        .split(b'\n')
+        .collect::<Result<_, _>>()?;
     // Numbered from 1, as an editor numbers them. Blank lines are dropped first
     // because they were never entries, so "the line after a torn one" is the
     // next line that says anything.
     let mut parsed = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(i, line)| (i + 1, serde_json::from_str::<JournalEntry>(line)))
+        .filter(|(_, line)| !line.iter().all(u8::is_ascii_whitespace))
+        .map(|(i, line)| (i + 1, serde_json::from_slice::<JournalEntry>(line)))
         .peekable();
     while let Some((number, line)) = parsed.next() {
         let e = match line {
@@ -1327,6 +1335,54 @@ mod tests {
         // overwritten or removed.
         let text = std::fs::read_to_string(&scratch.path).expect("read");
         assert!(text.contains("{\"type\":\"fil\n"), "{text}");
+    }
+
+    #[test]
+    fn a_write_cut_through_a_multibyte_character_is_torn_like_any_other() {
+        // A note's detail is free text, so an entry can hold a character UTF-8
+        // spells in more than one byte, and a crash can cut the write between
+        // them. The line is then not UTF-8 at all. Read as text, that refused
+        // the whole journal before the torn-line rule could judge the line.
+        let scratch = Scratch::new("torn-mid-character");
+        write_all(&scratch.path, &session());
+        let note = JournalEntry::Note {
+            at: Ts::from_nanos(9),
+            kind: "claim".to_owned(),
+            detail: serde_json::json!({ "why": "prix moyen à 76 800" }),
+        };
+        let mut line = serde_json::to_vec(&note).expect("serialize");
+        // `à` is 0xC3 0xA0; keep the first byte and lose the second.
+        let cut = line
+            .iter()
+            .position(|&b| b == 0xC3)
+            .expect("a two-byte character")
+            + 1;
+        line.truncate(cut);
+        let mut bytes = std::fs::read(&scratch.path).expect("read");
+        bytes.extend_from_slice(&line);
+        std::fs::write(&scratch.path, &bytes).expect("write");
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "the fixture must not be valid UTF-8, or it tests nothing new"
+        );
+
+        let recovered = read(&scratch.path).expect("a write cut mid-character is a torn tail");
+        assert!(recovered.torn_tail);
+        assert_eq!(recovered.entries, session());
+
+        // And once a restart has written past it.
+        let restarted = JournalEntry::Started {
+            at: Ts::from_nanos(10),
+            cash: amount("100"),
+            schema: SCHEMA,
+        };
+        write_all(&scratch.path, std::slice::from_ref(&restarted));
+        let recovered = read(&scratch.path).expect("a restart after it is not damage");
+        assert_eq!(recovered.torn_before_restart, vec![5]);
+        assert!(!recovered.torn_tail);
+        let mut expected = session();
+        expected.push(restarted);
+        assert_eq!(recovered.entries, expected);
     }
 
     #[test]
