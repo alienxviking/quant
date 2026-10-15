@@ -397,15 +397,30 @@ feature.
    `timeInForce` on a market order and always sends `newOrderRespType=ACK` and the
    run-tagged `newClientOrderId`; and a classifier sorting every response into
    *placed*, *refused* (with its code and message) or *unknown*. Any 5xx, `-1007`
-   and `-1006` are unknown, never refused. Accepted when Binance's documented
-   signature examples reproduce and a table test maps every documented code to
-   its class. The credentials half is `m8c-ed25519-credentials`: the Ed25519 key
-   read from the environment, a REST signer that reproduces Binance's published
-   Ed25519 example signature, the WebSocket API signer `session.logon` needs, and
-   `venue-check` on the new key. The requests half follows, and with it
-   `POST /api/v3/order/test` (`TRADE`, weight 1, rest-api.md:2321-2333), the
-   probe that tests the key's permission to trade, which `venue-check`'s
-   `USER_DATA` request cannot.
+   and `-1006` are unknown, never refused. Accepted when the one Ed25519
+   signature Binance publishes together with its private key reproduces byte for
+   byte, the WebSocket API's documented signature payload is rebuilt exactly,
+   and a table test maps every documented code to its class.
+
+   That signature is the FIX API's Logon example (fix-api.md:287-312), and it is
+   the only one that can be reproduced. The REST page's two Ed25519 examples are
+   not Ed25519 signatures: each is 256 bytes, an RSA-2048 signature's size where
+   an Ed25519 signature is always 64; the command beside them,
+   `openssl dgst -sha256 -sign`, is one OpenSSL refuses for an Ed25519 key; and
+   the second is byte for byte the RSA section's own (rest-api.md:477, :633,
+   :641). The WebSocket API's is a genuine 64-byte Ed25519 signature, but under
+   a private key the page names only as a file and never prints
+   (web-socket-api.md:1067, :1177), so its payload is pinned and its signature
+   can only be checked by a round trip.
+
+   The credentials half is `m8c-ed25519-credentials`: the Ed25519 key read from
+   the environment; one signer, shared by REST and the WebSocket API, that
+   reproduces the FIX vector; the REST query percent-encoded as
+   rest-api.md:644-650 shows and verified as it went over the wire; the
+   WebSocket API signer `session.logon` needs; and `venue-check` on the new key.
+   The requests half follows, and with it `POST /api/v3/order/test` (`TRADE`,
+   weight 1, rest-api.md:2321-2333), the probe that tests the key's permission
+   to trade, which `venue-check`'s `USER_DATA` request cannot.
 2. **The instrument comes from the venue.** `exchangeInfo` parsed into an
    `InstrumentDef`, naming the venue rules our `Filters` do not model
    (`MARKET_LOT_SIZE`, `applyMinToMarket`, `maxNotional`). Accepted when the
