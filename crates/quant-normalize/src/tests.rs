@@ -13,7 +13,9 @@ use quant_core::instrument::{
     Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };
 use quant_core::time::{Ts, UtcDate};
-use quant_recorder::{catalog, CaptureStream, CaptureTarget, SessionFiles};
+use quant_recorder::{
+    account_catalog, catalog, CaptureStream, CaptureTarget, SessionFiles, ACCOUNT_STREAM,
+};
 use quant_storage::{ControlRecord, FileHeader, RawWriter, WriterOptions};
 
 use quant_core::event::MarketEvent;
@@ -419,6 +421,91 @@ fn an_account_frame_is_refused_by_name_and_never_becomes_an_event() {
     // And a write across it is abandoned, saying why.
     let out = tree.root.join("out");
     let result = crate::normalize_session(&tree.only_session(), instrument(), Some(&out));
+    assert!(
+        result
+            .write_error
+            .as_deref()
+            .is_some_and(|e| e.contains("account-stream")),
+        "{:?}",
+        result.write_error
+    );
+}
+
+#[test]
+fn an_account_capture_never_becomes_market_events() {
+    // A run root holds the account stream beside the market's. The market
+    // catalog -- the only way normalize, explain and the replay find sessions --
+    // never yields it. And a caller who handed its files to the replay anyway
+    // gets a refusal and not one event: not its frames, and not its gap records
+    // either, which read as market gaps would clear a book over a socket that
+    // has nothing to do with the market.
+    let tree = Tree::new("account-capture");
+    two_day_session(&tree);
+    let account = CaptureTarget {
+        stream: CaptureStream::Account,
+        ..Tree::target_for([0xac; 16], 21)
+    };
+    let path = account.file(&tree.root);
+    std::fs::create_dir_all(path.parent().expect("a file has a parent")).expect("mkdir");
+    let file = std::fs::File::create(&path).expect("create");
+    let mut writer = RawWriter::create(
+        file,
+        FileHeader::new(Exchange::Binance, ACCOUNT_STREAM, [0xac; 16]),
+        WriterOptions::default(),
+    )
+    .expect("writer");
+    let gap = |cause, ts| ControlRecord::Gap {
+        cause,
+        exchange_ts: ts,
+        last_good_ts: ts,
+    };
+    writer
+        .write_control(
+            Ts::from_millis(1),
+            1,
+            &gap(GapCause::RecorderRestart, Ts::from_millis(1)),
+        )
+        .expect("restart marker");
+    writer
+        .write_account_payload(
+            Ts::from_millis(2),
+            2,
+            br#"{"subscriptionId":0,"event":{"e":"executionReport","s":"BTCUSDT"}}"#,
+        )
+        .expect("account frame");
+    writer
+        .write_control(
+            Ts::from_millis(3),
+            3,
+            &gap(GapCause::Disconnect, Ts::from_millis(3)),
+        )
+        .expect("gap");
+    writer.finish().expect("finish");
+
+    let market = catalog(&tree.root);
+    assert_eq!(market.sessions.len(), 1, "{:?}", market.sessions);
+    assert_eq!(market.sessions[0].symbol, SYMBOL);
+    assert!(market.strays.is_empty(), "{:?}", market.strays);
+
+    let mut accounts = account_catalog(&tree.root).sessions;
+    assert_eq!(accounts.len(), 1);
+    let mistaken = SessionFiles {
+        exchange: Exchange::Binance,
+        symbol: ACCOUNT_STREAM.to_owned(),
+        session_id: accounts[0].session_id,
+        segments: accounts.remove(0).segments,
+    };
+    let items: Vec<ReplayItem> = SessionReplay::open(&mistaken, instrument()).collect();
+    assert!(
+        matches!(
+            items.as_slice(),
+            [ReplayItem::Break(b)] if matches!(b.kind, BreakKind::AccountStream)
+        ),
+        "one refusal by name, and nothing else: {items:?}"
+    );
+
+    let result = crate::normalize_session(&mistaken, instrument(), Some(&tree.root.join("out")));
+    assert_eq!(result.summary.replay.events, 0);
     assert!(
         result
             .write_error

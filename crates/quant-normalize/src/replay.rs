@@ -52,7 +52,7 @@ use std::path::PathBuf;
 use quant_core::event::MarketEvent;
 use quant_core::instrument::{Exchange, InstrumentId};
 use quant_core::time::UtcDate;
-use quant_recorder::{CatalogEntry, SessionFiles};
+use quant_recorder::{CaptureStream, CatalogEntry, SessionFiles};
 use quant_storage::{FrameKind, RawFrame, RawReader, Truncation};
 
 /// What the replay hands out, in order.
@@ -96,12 +96,14 @@ pub enum BreakKind {
     /// Bytes from the account stream, which are never market data.
     ///
     /// The venue's reports about our own orders, recorded in a capture of their
-    /// own. Reaching one here means account bytes were handed to a market
+    /// own. Reaching them here means account bytes were handed to a market
     /// replay, and the replay refuses them by name rather than reading them: an
     /// account frame parsed as a market message would at best fail and at worst
-    /// yield a trade nobody printed. A break, not a skipped frame, because the
-    /// frame took a sequence number from this stream and whatever wrote it to
-    /// the wrong place may have dropped something else.
+    /// yield a trade nobody printed. Raised once for a whole session of account
+    /// files, which yields nothing else, and once per account frame found inside
+    /// a market file -- a break there, not a skipped frame, because the frame
+    /// took a sequence number from this stream and whatever wrote it to the
+    /// wrong place may have dropped something else.
     AccountStream,
     /// No adapter in this build knows how to read this venue's bytes.
     UnsupportedVenue(Exchange),
@@ -212,6 +214,24 @@ impl SessionReplay {
                     .segments
                     .first()
                     .map_or_else(PathBuf::new, |s| s.path.clone()),
+                after_seq: None,
+            }));
+            replay.stats.breaks += 1;
+            replay.done = true;
+        } else if let Some(account) = files
+            .segments
+            .iter()
+            .find(|s| s.target.stream == CaptureStream::Account)
+        {
+            // The account stream's files, handed to a market replay. The market
+            // catalog never yields them, so only a caller who mistook one for the
+            // other gets here -- and the whole session is refused, not just its
+            // account frames: its gap records describe the account's socket, and
+            // read as market gaps they would clear a book over a connection that
+            // has nothing to do with it.
+            replay.pending.push_back(ReplayItem::Break(Break {
+                kind: BreakKind::AccountStream,
+                segment: account.path.clone(),
                 after_seq: None,
             }));
             replay.stats.breaks += 1;
