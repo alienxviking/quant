@@ -13,7 +13,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use quant_core::execution::{ClientOrderId, Fill, OrderRequest, RejectReason, VenueOrderId};
+use quant_core::execution::{
+    ClientOrderId, Fill, OrderRequest, RejectReason, VenueOrderId, VenueTradeId,
+};
 use quant_core::fixed::{Px, Qty};
 use quant_core::instrument::Exchange;
 use quant_core::report::{Ended, FillIds, Notice, OrderReport, RejectedWhy};
@@ -173,16 +175,16 @@ impl RunObserver for JournalWriter {
         // Every field named, so one added to `Booked` has to be decided here.
         let Booked {
             client_order_id,
+            // A registry index, never persisted: the line names the
+            // instrument by `(exchange, symbol)`.
             instrument: _,
             side,
             fill,
-            remaining: _,
+            remaining,
             ids,
             at,
         } = *booked;
-        if let Some(ids) = ids {
-            self.unwritten("a fill's venue ids", ids);
-        }
+        let (venue_order_id, trade_id) = fill_ids(ids);
         self.fills += 1;
         self.record(
             &JournalEntry::Filled {
@@ -195,6 +197,9 @@ impl RunObserver for JournalWriter {
                 fee: fill.fee,
                 is_maker: fill.is_maker,
                 fee_asset: fill.fee_asset,
+                remaining: Some(remaining),
+                venue_order_id,
+                trade_id,
             },
             "a fill",
         );
@@ -266,13 +271,11 @@ impl RunObserver for JournalWriter {
         venue_order_id: Option<&VenueOrderId>,
         at: Ts,
     ) {
-        if let Some(venue_order_id) = venue_order_id {
-            self.unwritten("an acceptance's venue order id", venue_order_id);
-        }
         self.record(
             &JournalEntry::Accepted {
                 at,
                 client_order_id,
+                venue_order_id: venue_order_id.cloned(),
             },
             "an acceptance",
         );
@@ -285,14 +288,22 @@ impl RunObserver for JournalWriter {
         why: Option<&RejectedWhy>,
         at: Ts,
     ) {
-        if let Some(why) = why {
-            self.unwritten("why the venue rejected an order", why);
-        }
+        let (cited, breach) = match why {
+            // A simulator's rejection: nothing to cite.
+            None => (None, None),
+            Some(RejectedWhy::Declined { cited, breach }) => (Some(cited.clone()), *breach),
+            Some(RejectedWhy::NeverLanded(landing)) => {
+                self.unwritten("an order that never reached the venue", landing);
+                (None, None)
+            }
+        };
         self.record(
             &JournalEntry::Rejected {
                 at,
                 client_order_id,
                 reason,
+                cited,
+                breach,
             },
             "a rejection",
         );
@@ -315,14 +326,20 @@ impl RunObserver for JournalWriter {
         ended: Option<&Ended>,
         at: Ts,
     ) {
-        if let Some(ended) = ended {
-            self.unwritten("how the venue ended an order", ended);
-        }
+        let (venue_order_id, ended) = ended.map_or((None, None), |ended| {
+            let Ended {
+                venue_order_id,
+                how,
+            } = ended;
+            (Some(venue_order_id.clone()), Some(*how))
+        });
         self.record(
             &JournalEntry::Cancelled {
                 at,
                 client_order_id,
                 remaining,
+                venue_order_id,
+                ended,
             },
             "a cancellation",
         );
@@ -335,9 +352,7 @@ impl RunObserver for JournalWriter {
         ids: Option<&FillIds>,
         at: Ts,
     ) {
-        if let Some(ids) = ids {
-            self.unwritten("an orphaned fill's venue ids", ids);
-        }
+        let (venue_order_id, trade_id) = fill_ids(ids);
         // Loud as well as recorded: an unattributable fill means the venue and
         // our books disagree about what we own, and that is the one condition
         // where carrying on quietly is worse than the noise.
@@ -354,6 +369,8 @@ impl RunObserver for JournalWriter {
                 qty: fill.qty,
                 fee: fill.fee,
                 fee_asset: fill.fee_asset,
+                venue_order_id,
+                trade_id,
             },
             "an orphaned fill",
         );
@@ -366,6 +383,21 @@ impl RunObserver for JournalWriter {
     fn on_stray(&mut self, report: &OrderReport, _at: Ts) {
         self.unwritten("a report about an order the engine is not working", report);
     }
+}
+
+/// The venue's names for a fill, as the two optional fields a line holds.
+///
+/// Both or neither, because the venue names an order and its trade together;
+/// destructured without `..`, so a third name added to [`FillIds`] has to be
+/// given a field here before this builds.
+fn fill_ids(ids: Option<&FillIds>) -> (Option<VenueOrderId>, Option<VenueTradeId>) {
+    ids.map_or((None, None), |ids| {
+        let FillIds {
+            venue_order_id,
+            trade_id,
+        } = ids;
+        (Some(venue_order_id.clone()), Some(trade_id.clone()))
+    })
 }
 
 /// Append one entry to the shared journal.
@@ -386,6 +418,8 @@ mod tests {
     use quant_core::event::Side;
     use quant_core::execution::FeeAsset;
     use quant_core::fixed::Notional;
+    use quant_core::instrument::FilterBreach;
+    use quant_core::report::{Cited, EndedBy, VenueText};
     use quant_engine::portfolio::Portfolio;
 
     /// A journal in a fresh temp file, unique to the calling test.
@@ -437,6 +471,127 @@ mod tests {
             _ => None,
         });
         assert_eq!(asset, Some(FeeAsset::Base));
+    }
+
+    // Long because it spells out every line whole: a comparison of whole
+    // entries is what shows a name written into the wrong field.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn what_a_live_venue_says_beside_an_event_lands_on_the_event_s_line() {
+        // J1, through the writer. The engine hands the record the venue's
+        // names and words beside each event, and the line that records the
+        // event is where they belong: one `filled` line is one `myTrades` row,
+        // with no second line to pair it with. Every value distinct and
+        // non-zero, so a name written into the wrong field shows.
+        let (path, journal) = journal("detail");
+        let mut writer = JournalWriter::new(journal, "BTCUSDT".to_owned(), 0);
+        let portfolio = Portfolio::new(Notional::from_raw(1_000 * quant_core::SCALE));
+        let venue = |id: &str| VenueOrderId(id.to_owned());
+        let ids = FillIds {
+            venue_order_id: venue("4293153"),
+            trade_id: VenueTradeId("12345".to_owned()),
+        };
+        let fill = base_fee_fill();
+        writer.on_accepted(ClientOrderId(1), Some(&venue("4293153")), Ts::from_nanos(1));
+        writer.on_fill(
+            &Booked {
+                client_order_id: ClientOrderId(1),
+                instrument: quant_core::instrument::InstrumentId::from_index(0),
+                side: Side::Buy,
+                fill: &fill,
+                remaining: "0.25".parse().expect("qty"),
+                ids: Some(&ids),
+                at: Ts::from_nanos(2),
+            },
+            &portfolio,
+        );
+        let cited = Cited {
+            http_status: Some(400),
+            code: -1013,
+            msg: VenueText::new("Filter failure: NOTIONAL"),
+        };
+        writer.on_rejected(
+            ClientOrderId(2),
+            RejectReason::Venue,
+            Some(&RejectedWhy::Declined {
+                cited: cited.clone(),
+                breach: Some(FilterBreach::MinNotional),
+            }),
+            Ts::from_nanos(3),
+        );
+        writer.on_cancelled(
+            ClientOrderId(3),
+            "0.75".parse().expect("qty"),
+            Some(&Ended {
+                venue_order_id: venue("4293155"),
+                how: EndedBy::SelfTradePrevention,
+            }),
+            Ts::from_nanos(4),
+        );
+        let orphan_ids = FillIds {
+            venue_order_id: venue("4293156"),
+            trade_id: VenueTradeId("12346".to_owned()),
+        };
+        writer.on_orphaned(
+            ClientOrderId(9),
+            &fill,
+            Some(&orphan_ids),
+            Ts::from_nanos(5),
+        );
+
+        let entries = quant_engine::journal::read(&path).expect("read").entries;
+        let key = || InstrumentKey {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+        };
+        assert_eq!(
+            entries,
+            vec![
+                JournalEntry::Accepted {
+                    at: Ts::from_nanos(1),
+                    client_order_id: ClientOrderId(1),
+                    venue_order_id: Some(venue("4293153")),
+                },
+                JournalEntry::Filled {
+                    at: Ts::from_nanos(2),
+                    client_order_id: ClientOrderId(1),
+                    instrument: key(),
+                    side: Side::Buy,
+                    px: fill.px,
+                    qty: fill.qty,
+                    fee: fill.fee,
+                    is_maker: fill.is_maker,
+                    fee_asset: fill.fee_asset,
+                    remaining: Some("0.25".parse().expect("qty")),
+                    venue_order_id: Some(venue("4293153")),
+                    trade_id: Some(VenueTradeId("12345".to_owned())),
+                },
+                JournalEntry::Rejected {
+                    at: Ts::from_nanos(3),
+                    client_order_id: ClientOrderId(2),
+                    reason: RejectReason::Venue,
+                    cited: Some(cited),
+                    breach: Some(FilterBreach::MinNotional),
+                },
+                JournalEntry::Cancelled {
+                    at: Ts::from_nanos(4),
+                    client_order_id: ClientOrderId(3),
+                    remaining: "0.75".parse().expect("qty"),
+                    venue_order_id: Some(venue("4293155")),
+                    ended: Some(EndedBy::SelfTradePrevention),
+                },
+                JournalEntry::Orphaned {
+                    at: Ts::from_nanos(5),
+                    client_order_id: ClientOrderId(9),
+                    px: fill.px,
+                    qty: fill.qty,
+                    fee: fill.fee,
+                    fee_asset: fill.fee_asset,
+                    venue_order_id: Some(venue("4293156")),
+                    trade_id: Some(VenueTradeId("12346".to_owned())),
+                },
+            ]
+        );
     }
 
     #[test]

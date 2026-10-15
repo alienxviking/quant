@@ -765,6 +765,7 @@ mod tests {
             },
             JournalEntry::Stopped {
                 at: Ts::from_nanos(200),
+                working: Vec::new(),
             },
         ];
         let d = decisions_at(&entries, 10_000, 1_000);

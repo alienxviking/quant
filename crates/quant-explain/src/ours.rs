@@ -132,7 +132,7 @@ pub fn ours_at(
             ));
         }
     }
-    if let Some(JournalEntry::Stopped { at: stopped }) = recovered
+    if let Some(JournalEntry::Stopped { at: stopped, .. }) = recovered
         .entries
         .iter()
         .rev()
@@ -229,7 +229,7 @@ const fn entry_ts(entry: &JournalEntry) -> Option<Ts> {
         | JournalEntry::Orphaned { at, .. }
         | JournalEntry::Blind { at, .. }
         | JournalEntry::Note { at, .. }
-        | JournalEntry::Stopped { at } => Some(*at),
+        | JournalEntry::Stopped { at, .. } => Some(*at),
     }
 }
 
@@ -256,6 +256,9 @@ mod tests {
             fee: fee.parse().expect("fee"),
             is_maker: false,
             fee_asset,
+            remaining: None,
+            venue_order_id: None,
+            trade_id: None,
         }
     }
 

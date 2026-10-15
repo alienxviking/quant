@@ -78,11 +78,12 @@ use serde_json::error::Category;
 
 use crate::RefusedBy;
 use quant_core::event::Side;
-use quant_core::execution::{ClientOrderId, Fill, RejectReason};
+use quant_core::execution::{ClientOrderId, Fill, RejectReason, VenueOrderId, VenueTradeId};
 use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::{
-    Exchange, Instrument, InstrumentDef, InstrumentId, InstrumentRegistry,
+    Exchange, FilterBreach, Instrument, InstrumentDef, InstrumentId, InstrumentRegistry,
 };
+use quant_core::report::{Cited, EndedBy};
 use quant_core::time::Ts;
 
 use crate::portfolio::Portfolio;
@@ -161,6 +162,23 @@ pub enum JournalEntry {
         /// which is what those runs actually did.
         #[serde(default)]
         fee_asset: quant_core::execution::FeeAsset,
+        /// What of the order was still working after this fill.
+        ///
+        /// Schema 3. A venue reports it on every trade, and a restart that
+        /// finds an order with something left knows the order may still be
+        /// working at the venue, which the fill alone cannot say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remaining: Option<Qty>,
+        /// The venue's id for the order. With `trade_id`, the key one of the
+        /// venue's `myTrades` rows is found by: one line here is one row
+        /// there, which is what criterion A compares. Schema 3, and only ever
+        /// written by a venue that names its orders, which a simulator does
+        /// not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order_id: Option<VenueOrderId>,
+        /// The venue's id for the trade. Schema 3, as `venue_order_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trade_id: Option<VenueTradeId>,
     },
     /// What the *engine* believed at this moment.
     ///
@@ -214,12 +232,28 @@ pub enum JournalEntry {
     Accepted {
         at: Ts,
         client_order_id: ClientOrderId,
+        /// The venue's id for the order, when it named one. Schema 3; a
+        /// simulator names none, and its lines read as they always did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order_id: Option<VenueOrderId>,
     },
     /// The venue declined an order it had been told about.
+    ///
+    /// Keeps that meaning in schema 3: the venue had the request. One that
+    /// never reached it is not a rejection by the venue.
     Rejected {
         at: Ts,
         client_order_id: ClientOrderId,
         reason: RejectReason,
+        /// What the venue said, as it said it: the only durable copy of a
+        /// REST answer, because REST bodies are not in raw. Schema 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cited: Option<Cited>,
+        /// The filter rule the venue named, when it is one we model, for
+        /// criterion B to compare with the rule `Filters::rejects` names.
+        /// Schema 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        breach: Option<FilterBreach>,
     },
     /// A cancel was sent; whether it won the race is a separate entry.
     CancelRequested {
@@ -231,6 +265,14 @@ pub enum JournalEntry {
         at: Ts,
         client_order_id: ClientOrderId,
         remaining: Qty,
+        /// The venue's id for the order, when it named one. Schema 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order_id: Option<VenueOrderId>,
+        /// How the venue says it ended: cancelled, expired, or stopped by
+        /// self-trade prevention. One outcome to the strategy and three to a
+        /// person reconciling against the venue. Schema 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended: Option<EndedBy>,
     },
     /// A fill arrived for an order this engine has no record of.
     ///
@@ -249,6 +291,13 @@ pub enum JournalEntry {
         /// `Quote`, which is what every fill before then was.
         #[serde(default)]
         fee_asset: quant_core::execution::FeeAsset,
+        /// The venue's ids for the order and the trade, when it gave them:
+        /// for a fill nobody can attribute, the only handle a person has on
+        /// the venue's own record of it. Schema 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order_id: Option<VenueOrderId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trade_id: Option<VenueTradeId>,
     },
     /// The kill switch was thrown.
     ///
@@ -322,7 +371,21 @@ pub enum JournalEntry {
     ///
     /// Its absence is how a crash is told from a clean stop — the same
     /// two-sided-completeness idea as the raw container's trailer.
-    Stopped { at: Ts },
+    Stopped {
+        at: Ts,
+        /// The orders the engine was still working when it stopped, lowest id
+        /// first: the engine's claim, which a fold of the lifecycle lines can
+        /// be checked against. Stopping is not flattening, and a restart that
+        /// does not know an order may still be live at the venue would trade
+        /// as though it were not.
+        ///
+        /// Schema 3, and written only when not empty. Against the simulator it
+        /// is empty unless reports were still in flight when the data ended,
+        /// which inbound latency makes ordinary: M4 decided those are counted,
+        /// not delivered, so the engine still holds the order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        working: Vec<ClientOrderId>,
+    },
 }
 
 impl JournalEntry {
@@ -342,7 +405,7 @@ impl JournalEntry {
             | Self::Orphaned { at, .. }
             | Self::Blind { at, .. }
             | Self::Note { at, .. }
-            | Self::Stopped { at } => *at,
+            | Self::Stopped { at, .. } => *at,
         }
     }
 }
@@ -631,6 +694,11 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
                 fee,
                 is_maker,
                 fee_asset,
+                // What was left, and the venue's names for the order and the
+                // trade: facts about the order, not money.
+                remaining: _,
+                venue_order_id: _,
+                trade_id: _,
             } => {
                 let id = resolve(registry, instrument);
                 portfolio.apply_fill(
@@ -1150,6 +1218,9 @@ mod tests {
             fee: fee.parse().expect("fee"),
             is_maker: false,
             fee_asset: quant_core::execution::FeeAsset::Quote,
+            remaining: None,
+            venue_order_id: None,
+            trade_id: None,
         }
     }
 
@@ -1165,6 +1236,7 @@ mod tests {
             filled(2, Side::Sell, "76700", "0.001", "0.0767"),
             JournalEntry::Stopped {
                 at: Ts::from_nanos(3),
+                working: Vec::new(),
             },
         ]
     }
@@ -1309,6 +1381,9 @@ mod tests {
                 fee: buy.fee,
                 is_maker: buy.is_maker,
                 fee_asset: buy.fee_asset,
+                remaining: None,
+                venue_order_id: None,
+                trade_id: None,
             },
             // What the engine writes down after booking that fill.
             JournalEntry::checkpoint(Ts::from_nanos(2), &live),
@@ -2136,6 +2211,7 @@ mod m75a_tests {
             },
             JournalEntry::Stopped {
                 at: Ts::from_nanos(6),
+                working: Vec::new(),
             },
         ];
         let a = replay(&fills_only, &mut registry);
@@ -2158,6 +2234,222 @@ mod m75a_tests {
             fee: "0.0001".parse().expect("fee"),
             is_maker: false,
             fee_asset: quant_core::execution::FeeAsset::Quote,
+            remaining: None,
+            venue_order_id: None,
+            trade_id: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod schema3_tests {
+    //! What schema 3 added, pinned as bytes: every new field written with
+    //! distinct, non-zero values (J1), and every line that carries none of
+    //! them written exactly as schema 2 wrote it (J2).
+
+    use super::{InstrumentKey, JournalEntry};
+    use crate::risk::Bound;
+    use crate::RefusedBy;
+    use quant_core::event::Side;
+    use quant_core::execution::{
+        ClientOrderId, FeeAsset, RejectReason, VenueOrderId, VenueTradeId,
+    };
+    use quant_core::instrument::{Exchange, FilterBreach};
+    use quant_core::report::{Cited, EndedBy, VenueText};
+    use quant_core::time::Ts;
+
+    fn key() -> InstrumentKey {
+        InstrumentKey {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+        }
+    }
+
+    const KEY: &str = r#"{"exchange":"binance","symbol":"BTCUSDT"}"#;
+
+    /// `entry` writes exactly `json`, and `json` reads back as `entry`.
+    fn golden(entry: &JournalEntry, json: &str) {
+        assert_eq!(serde_json::to_string(entry).expect("serialize"), json);
+        assert_eq!(
+            &serde_json::from_str::<JournalEntry>(json).expect("deserialize"),
+            entry,
+            "{json}"
+        );
+    }
+
+    fn venue_order(id: &str) -> VenueOrderId {
+        VenueOrderId(id.to_owned())
+    }
+
+    #[test]
+    fn a_line_with_nothing_from_a_live_venue_is_the_line_schema_2_wrote() {
+        // J2. Every backtest and paper session writes these, and `runlog diff`
+        // compares a new replay with an old live journal: a line that changed
+        // shape for a field it does not carry would make the two files differ
+        // for a reason that has nothing to do with either run.
+        golden(
+            &JournalEntry::Accepted {
+                at: Ts::from_nanos(7),
+                client_order_id: ClientOrderId(3),
+                venue_order_id: None,
+            },
+            r#"{"type":"accepted","at":7,"client_order_id":3}"#,
+        );
+        golden(
+            &JournalEntry::Rejected {
+                at: Ts::from_nanos(8),
+                client_order_id: ClientOrderId(3),
+                reason: RejectReason::InsufficientFunds,
+                cited: None,
+                breach: None,
+            },
+            r#"{"type":"rejected","at":8,"client_order_id":3,"reason":"insufficient_funds"}"#,
+        );
+        golden(
+            &JournalEntry::Cancelled {
+                at: Ts::from_nanos(9),
+                client_order_id: ClientOrderId(3),
+                remaining: "0.05".parse().expect("qty"),
+                venue_order_id: None,
+                ended: None,
+            },
+            r#"{"type":"cancelled","at":9,"client_order_id":3,"remaining":5000000}"#,
+        );
+        golden(
+            &JournalEntry::Refused {
+                at: Ts::from_nanos(10),
+                client_order_id: ClientOrderId(4),
+                instrument: key(),
+                side: Side::Buy,
+                qty: "0.002".parse().expect("qty"),
+                reason: RejectReason::Malformed,
+                bound: None,
+                by: RefusedBy::Seam,
+            },
+            &format!(
+                r#"{{"type":"refused","at":10,"client_order_id":4,"instrument":{KEY},"side":"buy","qty":200000,"reason":"malformed","bound":null,"by":"seam"}}"#
+            ),
+        );
+        golden(
+            &JournalEntry::Refused {
+                at: Ts::from_nanos(11),
+                client_order_id: ClientOrderId(5),
+                instrument: key(),
+                side: Side::Sell,
+                qty: "0.001".parse().expect("qty"),
+                reason: RejectReason::RiskLimit,
+                bound: Some(Bound::OrderNotional),
+                by: RefusedBy::Risk,
+            },
+            &format!(
+                r#"{{"type":"refused","at":11,"client_order_id":5,"instrument":{KEY},"side":"sell","qty":100000,"reason":"risk_limit","bound":"order_notional","by":"risk"}}"#
+            ),
+        );
+        golden(
+            &JournalEntry::Stopped {
+                at: Ts::from_nanos(12),
+                working: Vec::new(),
+            },
+            r#"{"type":"stopped","at":12}"#,
+        );
+        // A fill without the venue's names, as every fill a schema-2 build
+        // wrote reads back. (A schema-3 writer always adds `remaining`.)
+        golden(
+            &JournalEntry::Filled {
+                at: Ts::from_nanos(13),
+                client_order_id: ClientOrderId(6),
+                instrument: key(),
+                side: Side::Buy,
+                px: "76650".parse().expect("px"),
+                qty: "0.001".parse().expect("qty"),
+                fee: "0.0766".parse().expect("fee"),
+                is_maker: false,
+                fee_asset: FeeAsset::Quote,
+                remaining: None,
+                venue_order_id: None,
+                trade_id: None,
+            },
+            &format!(
+                r#"{{"type":"filled","at":13,"client_order_id":6,"instrument":{KEY},"side":"buy","px":7665000000000,"qty":100000,"fee":7660000,"is_maker":false,"fee_asset":"quote"}}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn the_fields_schema_3_added_to_existing_lines_have_a_fixed_wire_form() {
+        // J1, for the fields on lines that already existed. Every value is
+        // distinct and none is zero, so a field dropped, swapped or defaulted
+        // on the way through shows here.
+        golden(
+            &JournalEntry::Filled {
+                at: Ts::from_nanos(21),
+                client_order_id: ClientOrderId(7),
+                instrument: key(),
+                side: Side::Sell,
+                px: "76651".parse().expect("px"),
+                qty: "0.0004".parse().expect("qty"),
+                fee: "0.0003".parse().expect("fee"),
+                is_maker: true,
+                fee_asset: FeeAsset::Base,
+                remaining: Some("0.0006".parse().expect("qty")),
+                venue_order_id: Some(venue_order("4293153")),
+                trade_id: Some(VenueTradeId("12345".to_owned())),
+            },
+            &format!(
+                r#"{{"type":"filled","at":21,"client_order_id":7,"instrument":{KEY},"side":"sell","px":7665100000000,"qty":40000,"fee":30000,"is_maker":true,"fee_asset":"base","remaining":60000,"venue_order_id":"4293153","trade_id":"12345"}}"#
+            ),
+        );
+        golden(
+            &JournalEntry::Accepted {
+                at: Ts::from_nanos(22),
+                client_order_id: ClientOrderId(8),
+                venue_order_id: Some(venue_order("4293154")),
+            },
+            r#"{"type":"accepted","at":22,"client_order_id":8,"venue_order_id":"4293154"}"#,
+        );
+        golden(
+            &JournalEntry::Rejected {
+                at: Ts::from_nanos(23),
+                client_order_id: ClientOrderId(9),
+                reason: RejectReason::Venue,
+                cited: Some(Cited {
+                    http_status: Some(400),
+                    code: -1013,
+                    msg: VenueText::new("Filter failure: NOTIONAL"),
+                }),
+                breach: Some(FilterBreach::MinNotional),
+            },
+            r#"{"type":"rejected","at":23,"client_order_id":9,"reason":"venue","cited":{"http_status":400,"code":-1013,"msg":"Filter failure: NOTIONAL"},"breach":"min_notional"}"#,
+        );
+        golden(
+            &JournalEntry::Cancelled {
+                at: Ts::from_nanos(24),
+                client_order_id: ClientOrderId(10),
+                remaining: "0.0007".parse().expect("qty"),
+                venue_order_id: Some(venue_order("4293155")),
+                ended: Some(EndedBy::Expired),
+            },
+            r#"{"type":"cancelled","at":24,"client_order_id":10,"remaining":70000,"venue_order_id":"4293155","ended":"expired"}"#,
+        );
+        golden(
+            &JournalEntry::Orphaned {
+                at: Ts::from_nanos(25),
+                client_order_id: ClientOrderId(11),
+                px: "76652".parse().expect("px"),
+                qty: "0.0002".parse().expect("qty"),
+                fee: "0.0001".parse().expect("fee"),
+                fee_asset: FeeAsset::Base,
+                venue_order_id: Some(venue_order("4293156")),
+                trade_id: Some(VenueTradeId("12346".to_owned())),
+            },
+            r#"{"type":"orphaned","at":25,"client_order_id":11,"px":7665200000000,"qty":20000,"fee":10000,"fee_asset":"base","venue_order_id":"4293156","trade_id":"12346"}"#,
+        );
+        golden(
+            &JournalEntry::Stopped {
+                at: Ts::from_nanos(26),
+                working: vec![ClientOrderId(12), ClientOrderId(14)],
+            },
+            r#"{"type":"stopped","at":26,"working":[12,14]}"#,
+        );
     }
 }
