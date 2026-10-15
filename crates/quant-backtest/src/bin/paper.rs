@@ -154,6 +154,13 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let resumed = journal::resume(&recovered.entries, &mut registry, traded, args.cash)?;
     let instrument = resumed.instrument;
     let starting = resumed.starting_cash;
+    // The risk layer's tally, recounted from the same journal on the registry
+    // `resume` just made the instrument's own, so the holding lands under the
+    // id the engine trades. Recovering the switch alone would check this
+    // session's first orders as if from flat on a fresh day: an addition to a
+    // real position against nothing, a real exit as the opposite position,
+    // and a loss budget and order count already spent today as unspent.
+    let risk = journal::recover_risk(&recovered.entries, &mut registry, args.limits);
 
     // Built before anything is written, so a size the venue would refuse stops
     // the session here rather than after the journal says one started.
@@ -170,7 +177,7 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         args.interval_secs * 1_000_000_000,
     );
 
-    print_banner(args, &journal_path, &recovered, &resumed);
+    print_banner(args, &journal_path, &recovered, &resumed, &risk);
 
     let journal = Arc::new(Mutex::new(Journal::open(&journal_path)?));
     write(
@@ -185,6 +192,9 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
             at: quant_core::time::Clock::now(&quant_core::time::SystemClock),
             cash: starting,
             schema: quant_engine::journal::SCHEMA,
+            // No run tag: nothing here is sent to a venue, so there are no
+            // client ids at the venue to tell apart.
+            run: None,
         },
     )?;
 
@@ -207,7 +217,7 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
             instrument,
             registry.get(instrument).expect("just registered").filters(),
         ),
-        RiskEngine::recover(args.limits, resumed.tripped),
+        risk,
         strategy,
         starting,
     )
@@ -278,7 +288,15 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Some(cause) = engine.risk().tripped() {
         warn!(%cause, "the kill switch is thrown; the next session will refuse orders");
     }
-    write(&journal, &JournalEntry::Stopped { at: stopped_at })?;
+    // With the orders still working, which against the simulator is any whose
+    // reports were still in flight when the capture ended.
+    write(
+        &journal,
+        &JournalEntry::Stopped {
+            at: stopped_at,
+            working: engine.working(),
+        },
+    )?;
 
     report(&engine, &journal_path, tee_dropped)?;
     capture.map(|()| ExitCode::SUCCESS)
@@ -290,6 +308,7 @@ fn print_banner(
     journal_path: &std::path::Path,
     recovered: &journal::Recovered,
     resumed: &journal::Resumption,
+    risk: &RiskEngine,
 ) {
     println!("root      {}", args.root.display());
     println!("symbol    {} on {}", args.symbol, Exchange::Binance);
@@ -329,6 +348,24 @@ fn print_banner(
             portfolio.cash(),
             portfolio.fills()
         ),
+    }
+    if resumed.portfolio.is_some() {
+        // What the limits will be judged against, said before the first
+        // order: the holding and the day's count and loss the journal
+        // recounts to, by risk's own reckoning rather than the portfolio's.
+        // Named by the day they belong to, which is the journal's last and
+        // may be yesterday: the first check today rolls them to zero, so
+        // calling them "today" would overstate what is spent.
+        let holding = risk.position(resumed.instrument);
+        match risk.counted_day() {
+            Some(day) => println!(
+                "risk      holding {holding}, and on {day}, the last day the journal \
+                 counted: {} orders, realized {}",
+                risk.orders_today(),
+                risk.realized_today()
+            ),
+            None => println!("risk      holding {holding}, and no order or fill counted yet"),
+        }
     }
     if let Some(cause) = resumed.tripped {
         // Loud, because it means this process will refuse every order until a

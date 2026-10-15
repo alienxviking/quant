@@ -64,13 +64,37 @@ fn check(path: &std::path::Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = runlog::check(&recovered.entries);
+    let report = runlog::check_file(&recovered);
     println!("runlog    {}", path.display());
     println!(
         "entries   {} lines, {} decisions, {} strategy claims",
         report.entries, report.decisions, report.claims
     );
 
+    if report.not_ours > 0 {
+        // Counted, not flagged: an account shared with a person or another
+        // program is a fact about the account, not a gap in this record.
+        println!(
+            "not ours  {} order(s) on the account this system did not place: counted, \
+             not a finding",
+            report.not_ours
+        );
+    }
+
+    // Findings before the empty case. A file with no decision can still hold
+    // a fill nobody explains, and "nothing to check" would bury it.
+    if !report.is_complete() {
+        println!();
+        for finding in &report.findings {
+            println!("{:<9} {finding}", finding.label());
+        }
+        println!();
+        println!(
+            "verdict   INCOMPLETE: {} thing(s) this file does not account for",
+            report.findings.len()
+        );
+        return ExitCode::FAILURE;
+    }
     if report.decisions == 0 && report.claims == 0 {
         println!();
         println!(
@@ -79,25 +103,13 @@ fn check(path: &std::path::Path) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    if report.is_complete() {
-        println!();
-        println!(
-            "verdict   COMPLETE: every id minted from 1 to {} was written down, and every \
-             claim folds",
-            report.decisions
-        );
-        return ExitCode::SUCCESS;
-    }
-    println!();
-    for finding in &report.findings {
-        println!("missing   {finding}");
-    }
     println!();
     println!(
-        "verdict   INCOMPLETE: {} thing(s) this file implies happened are not in it",
-        report.findings.len()
+        "verdict   COMPLETE: every id minted from 1 to {} was written down, every claim \
+         folds, and nothing the venue said is left unaccounted for",
+        report.decisions
     );
-    ExitCode::FAILURE
+    ExitCode::SUCCESS
 }
 
 fn diff(live: &std::path::Path, replay: &std::path::Path) -> ExitCode {
@@ -155,16 +167,14 @@ fn diff(live: &std::path::Path, replay: &std::path::Path) -> ExitCode {
                 "verdict   CANNOT COMPARE: the live side holds {started} `started` entries, so \
                  it restarted"
             );
+            println!("          A restart forfeits the exact match. The journal brings back the");
             println!(
-                "          A restart forfeits the exact match. `Engine::resuming` replaces only"
+                "          portfolio and the risk tally but not the strategy, so the session came"
             );
             println!(
-                "          the portfolio, so the session came back with empty indicator windows"
+                "          back with empty indicator windows while the replay ran straight through."
             );
-            println!(
-                "          and a zeroed risk tally while the replay ran straight through. Compare"
-            );
-            println!("          the segments between restarts instead.");
+            println!("          Compare the segments between restarts instead.");
             ExitCode::from(2)
         }
     }

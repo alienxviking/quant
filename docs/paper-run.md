@@ -320,7 +320,7 @@ supervisor restart holds this:
 | the kill switch | `RiskEngine::recover` reads the last `Tripped` | — |
 | `MaCrossover`'s fast and slow windows | — | empty; rebuilt from nothing |
 | `Recorded`'s equity sampler | — | zeroed; the curve starts again |
-| the day's risk tally (orders, realized) | — | zeroed by `RiskEngine::recover` |
+| the day's risk tally (orders, realized) | — | zeroed by `RiskEngine::recover` in the fortnight's build; recounted from the journal by `journal::recover_risk` since `m8c-journal-readers` |
 
 The judging backtest of step 4 runs straight through that boundary with all of
 it intact, because nothing ever interrupted it. So after a restart the two sides

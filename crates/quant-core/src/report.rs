@@ -614,6 +614,19 @@ pub enum AccountCause {
     Unsubscribed,
 }
 
+/// What the venue says an account holds of one asset: what is free to spend,
+/// and what open orders hold.
+///
+/// Generic over the amount's type, because a base asset is a quantity and a
+/// quote asset is money, and the journal keeps them as such. Not serialized
+/// as a whole: the journal's `balances` line holds both assets' amounts as
+/// fields of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Holding<T> {
+    pub free: T,
+    pub locked: T,
+}
+
 /// What was wrong with a report that could not be taken at its word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

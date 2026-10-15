@@ -340,6 +340,13 @@ jq -r 'select(.type=="note" and .kind=="no_op") | .detail.why' run.jsonl | sort 
 #   412 crossed down while already flat          (ETHUSDT)
 ```
 
+That first answer was measured while `backtest --journal` still stamped its
+`started` line at zero. The post-M7.5 audit stamped it on the wall clock, which
+is right, and `decisions_at`, which stopped at the first entry stamped after the
+instant, then stopped at line one: the same command printed nothing, from any
+backtest journal. `m8c-journal-readers` filters by stamp instead (§9), and on
+2026-10-15 the command above printed the BLIND line again.
+
 The first question is the one that needed more than `jq`, and finding out why is
 the useful part. The engine's clock *is* the event stream, so a twelve-hour
 outage writes nothing while it lasts — the `blind` line sits at the moment the
@@ -368,3 +375,208 @@ discarded the only evidence.
 
 All six checks ship with the sabotage that reddens them, and each sabotage
 reddens its own tests and nothing else.
+
+---
+
+## 8. Schema 3: what a live run writes (M8 slice (c))
+
+M7.5 widened the journal from money to decisions. A live venue widens it again,
+to what only a real venue knows: its own names for orders and trades, what it
+cited when it declined, and facts that are not events at all. Built in
+`m8c-journal-live`, from the seam `docs/engine-contract.md` §11 describes. The
+reasoning for each line is in that section and in this one; `docs/live-run.md`
+§5 has the run tag's and the balances'.
+
+**The rule that keeps every old file readable:** every field added to an
+existing line is defaulted on read and written only when it holds something.
+So the fortnight's schema-1 journals and every schema-2 journal read unchanged,
+and a line that carries none of the new fields is byte for byte the line schema 2
+wrote. `read` refuses a session begun in a schema newer than its own, naming both
+numbers, rather than reporting a readable file as damage at its first unfamiliar
+line.
+
+### Fields on lines that already existed
+
+| line | gains | why |
+|---|---|---|
+| `started` | `run` | the tag every order is sent under; the first line's is the session's |
+| `filled` | `remaining`, `venue_order_id`, `trade_id` | one line is one `myTrades` row (criterion A) |
+| `accepted` | `venue_order_id` | |
+| `rejected` | `cited`, `breach` | the only durable copy of a REST answer; the rule criterion B compares |
+| `cancelled` | `venue_order_id`, `ended` | cancelled, expired or self-trade prevention |
+| `orphaned` | `venue_order_id`, `trade_id` | the one handle on an unattributable fill |
+| `stopped` | `working` | the orders still live at a stop: stopping is not flattening |
+
+`rejected` keeps its meaning: the venue had the request and declined it. A
+request that never reached the venue is not a rejection, and has a line of its
+own. `filled.remaining` is written on every fill, so it is text that changes in
+every new backtest and paper journal; no number does.
+
+### Lines of their own
+
+| line | what it records |
+|---|---|
+| `placed` | the venue's REST acknowledgement and its order id, which finds the order after a cancel replaced its client id (criterion E) |
+| `never_landed` | a request that never became an order the venue had |
+| `doubt` | an order's outcome becoming unknown, or known again, explicitly both ways |
+| `cancel_refused` | a cancel the venue did not carry out, or whose fate is unknown |
+| `foreign` | a report about an order this run did not send; a trade kept whole, commission asset verbatim |
+| `account` | the account stream lost or regained |
+| `anomaly` | a report that could not be read, or contradicts what came before it |
+| `stray` | a report, other than a fill, about an order the engine is not working |
+| `sighted` | the market came into view: a book went from meaning nothing to meaning something |
+| `balances` | the account's two balances, at start and stop, on the wall clock (criterion A's baseline) |
+
+The writer maps every `Notice` through one exhaustive `match` with no `_` arm, so
+a fact a venue learns to report later does not build until it has a line. A
+doubt raised, a stranger's trade, the account stream lost, an anomaly and a
+request that never landed are logged as errors as well as written, as an orphan
+always was.
+
+### What each reader decided
+
+Every site that matches journal entries without a `_` arm had to decide each
+new line, and the compiler would not let one be skipped.
+
+| | `replay` | `next_order_id` | `explain`'s instant | evidence the market came back |
+|---|---|---|---|---|
+| `placed`, `doubt`, `cancel_refused`, `account`, `anomaly`, `stray`, `never_landed` | not money | no id | its stamp | no |
+| `foreign` | **its own arm, not folded**: money, and not this run's | no id: text never becomes a `ClientOrderId` | its stamp | no |
+| `balances` | **its own arm, not folded**: folding the venue's claim would make criterion A compare the venue with itself | no id | **none**: the wall clock, like `started` | no |
+| `sighted` | nothing | no id | its stamp | **yes**, from schema 3 |
+
+No new line moves the id counter: every id this engine minted is already on a
+`submitted` or `refused` line, and an id the venue named must never move it.
+Two older lines stopped moving it too, for the same reason: `cancel_requested`,
+because `Context::cancel` journals whatever id the strategy passes, and
+`orphaned`, the fill twin of a `stray`. Either could name an id never minted,
+and the next session would mint past it and leave the hole check holes it
+could not explain.
+
+**The market's return is read, not inferred, from schema 3.** Before it, a line
+the engine wrote after `blind` was taken to mean the market came back, which
+holds while a venue cannot speak without the market: true of the simulator, and
+so of every journal written before. A live venue reports on idle wakes, so a fill
+during an outage, and whatever the strategy decided on it, would read the outage
+as over. `explain` now reads the schema of each session off its `started` line:
+in a schema-3 session only `sighted` ends a blindness, and an older one is read
+exactly as it always was.
+
+### The strict writer
+
+`JournalWriter::new` is lenient, for paper and backtests: a line it cannot write
+is counted and logged, and the run goes on. `JournalWriter::strict` is the live
+run's. From its first failed append it writes nothing more and answers every
+submission `Withhold`, which the engine turns into `RefusedBy::Record` for that
+order and every later one. Nothing more written, because a line appended after a
+torn one sits in the middle of the file, where `read` refuses the whole journal.
+
+### Checked against the real artifacts
+
+On 2026-10-15, with the schema-3 build, against the fortnight's two journals
+(schema 1): `reconcile` AGREES on both (BTCUSDT 824 fills, cash 31.64743842;
+ETHUSDT 822 fills, cash 97.65757574), and `explain --check-journal` finds all
+166 checkpoints agreeing in each. `runlog check` exits 2, *nothing to check*,
+as it always has on them: they predate M7.5 and hold no decisions and no claims.
+
+A `backtest --journal` over the same window writes a schema-3 journal of 3,862
+lines: §7's 3,845 and one `sighted` line for each of the 17 `blind` ones. Its
+money is the backtest's to the satoshi (824 fills, cash 31.64743842), `reconcile`
+AGREES, `runlog check` is COMPLETE over 824 decisions and 337 claims, and all 165
+checkpoints agree. The text of a new journal changes (`schema`, `remaining`,
+`sighted`); no number does.
+
+---
+## 9. The readers schema 3 owed (`m8c-journal-readers`)
+
+Schema 3 wrote the venue's lines down; three readers still had to read them,
+and one older reader had stopped reading backtest journals at all.
+
+### `runlog check`: what the venue said that the record cannot account for
+
+Six new findings, each failing the check (exit 1) as every finding before them
+does. The check asks whether the record is complete, and each is a place where
+it is not: what was decided, what happened to it, or what it cost.
+
+| label | finding | from |
+|---|---|---|
+| `orphan` | a fill for an order this run was not working: money moved with no decision of this run behind it | each `orphaned` line |
+| `stray` | a report other than a fill about an order the engine was not working | each `stray` line |
+| `foreign` | another run's order, or one under our prefix that parses as nothing we send | one per order, however many `foreign` lines it has, with its line and trade counts |
+| `in doubt` | a doubt raised and never cleared, about an order never seen to end | a fold of `doubt` lines against the order's end |
+| `anomaly` | a report the run could not take at its word: unreadable, a trade id already booked, a report after an order's end, a second end, a contradiction | each `anomaly` line |
+| `torn` | a line an interrupted write tore and a restart wrote past: the entry on it is lost | `read`'s `torn_before_restart` |
+
+**A stranger's order is counted, not flagged.** A `foreign` line whose
+provenance is `not_ours`, a person's order or another program's on the same
+account, is a fact about the account rather than a gap in this run's record,
+and a check that failed every run on a shared account would teach everyone to
+ignore it. `runlog check` prints the count; criterion A accounts for those
+trades against the venue's balances.
+
+**What ends a doubt** is a `doubt` line clearing it, or the order's end: a
+`rejected`, `cancelled` or `never_landed` line, or a `filled` line with nothing
+`remaining`. An end that came first settles a doubt raised after it: a REST
+error can arrive after the stream has already reported the fill, and the order
+was still seen to end. An acceptance, a partial fill, a refused cancel and a
+placement say nothing about how the order ends, so none of them settles it,
+before the doubt or after it, and a restart does not either.
+
+**An anomaly is a finding in its own right; a lost account stream is not.**
+The first draft let both through on the ground that the venue raises a doubt
+beside each. For an anomaly no venue code has that duty, and most kinds could
+not discharge it: a second end or a contradiction has no doubt cause that fits,
+and an unreadable report may name no order to doubt. So the check flags the
+anomaly itself, which is invariant 5 (a report our model of the venue cannot
+read is loud) applied to the record. If criterion D's recorded reports show a
+kind is routine, it moves to counted with an argument, as a stranger's order
+did. A lost account stream does rest on a doubt, and that duty is written down:
+every order working across the blind stretch is in doubt (`account_blind`;
+`docs/live-run.md` §5 and §4 item 7's acceptance), and with nothing working
+nothing of this run's could have changed.
+
+**Findings come before the empty verdict.** A file with no decision and no claim
+used to read NOTHING TO CHECK, exit 2, before anything else was looked at; a
+file with no decision can still hold a fill nobody explains, so findings are now
+reported first, and exit 1. Both fortnight journals still read NOTHING TO CHECK:
+they hold no decisions and none of the new lines.
+
+### Torn lines, where an operator reads
+
+A line torn by a crash and written past by the restart is an entry lost for
+good, and agreement cannot see it: the restarted engine resumed from the same
+short file, so its checkpoints and the fold are short by the same entry. Until
+now only `reconcile`'s full report said so, on a `torn` line nobody reads at
+3am. `Recovered::torn_note` says it in one phrase, which now rides on
+`reconcile`'s verdict line whatever the verdict, without changing the exit code
+(that line is what `ops/verify-loop.sh` copies into `verify.log` and
+`ops/status.sh` shows, so no script changed); is a `torn` finding in `runlog
+check`, through `check_file`, because a lost submission with the highest id
+leaves no hole: the restart mints that id again; and is printed by `explain
+--check-journal` and in `explain --at`'s decisions block. A torn *tail* is left
+out: it is the ordinary state of a journal still being written.
+
+### `explain --at` reads backtest journals again
+
+`decisions_at` stopped at the first entry stamped after the instant, which
+equals filtering only while stamps never fall. A `backtest --journal` file's
+first line is stamped on the wall clock, later than every event the backtest
+replayed, so it read nothing. It now skips a later entry and carries on, and
+still reads every `started` line whatever its stamp, for its schema: the
+session's entries follow that line in the file however it is stamped, and
+skipping the wall-clock one would read a schema-3 backtest by the old inference
+again. A `started` line after the instant still ends no blindness before it,
+which keeps a paper restart from reporting an earlier outage as over.
+
+Measured against M5's fortnight with a fresh money-check journal: at
+2026-09-29T20:00Z, inside the twelve-hour outage, *BLIND since
+2026-09-29T18:35:01.943299000Z (Disconnect), with nothing seen since*; at
+2026-09-30T07:00Z, not blind, with order #693's submission in a 10-minute window.
+
+### The risk tally, recounted on restart
+
+Not a reader of the run log, but a reader of the journal, and owed by the same
+item: `journal::recover_risk` folds a journal through the risk layer as the
+earlier process counted it, so a restart resumes the holding and the day's
+order count and loss rather than starting flat on a fresh day.
+`docs/engine-contract.md` §10 has the rule for each line.

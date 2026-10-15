@@ -1002,9 +1002,10 @@ problem and is not. `JournalEntry` records the session start, the fills, the
 checkpoints and the kill switch — and nothing about the strategy — while
 `Engine::resuming` (`crates/quant-engine/src/lib.rs`) replaces the portfolio and
 only the portfolio. So a restarted paper process comes back up holding the right
-position and the right cash, and with **empty `MaCrossover` windows, a zeroed
-equity sampler and a zeroed daily risk tally**. The judging backtest runs all
-three straight through the same boundary, because nothing interrupted it. An
+position and the right cash, and with **empty `MaCrossover` windows and a
+zeroed equity sampler** (and, until `m8c-journal-readers` recounted it from the
+journal, a zeroed daily risk tally). The judging backtest runs all of it
+straight through the same boundary, because nothing interrupted it. An
 indicator that was mid-warm-up live is warm in the replay, so the two disagree
 about when a crossing fires, so the fill counts differ — and the comparison fails
 for a reason that has nothing to do with live-versus-replay, which is the only

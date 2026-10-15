@@ -736,9 +736,10 @@ question, and not this document's to answer. `JournalEntry` records fills, check
 trip, a stop, the order lifecycle and the strategy's own notes (fourteen
 variants as of M7.5) — but still nothing from which in-memory strategy state
 could be rebuilt, and `Engine::resuming` still replaces only the portfolio — so a restarted paper process
-comes back with the right cash and position and with empty indicator windows, a
-zeroed equity sampler and a zeroed daily risk tally, while the backtest it is
-compared against runs all three continuously across the same instant. That
+comes back with the right cash and position and with empty indicator windows and
+a zeroed equity sampler (and, until `m8c-journal-readers` recounted it from the
+journal, a zeroed daily risk tally), while the backtest it is compared against
+runs all of it continuously across the same instant. That
 belongs to M5 and to `docs/paper-run.md`; it is named here only so the merge is
 not mistaken for a guarantee it does not make.
 

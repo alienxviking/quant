@@ -1806,3 +1806,294 @@ fn every_report_the_simulator_makes_is_about_an_order_the_engine_is_working() {
         "every report the engine handled reached the strategy"
     );
 }
+
+// --- M8.c: the risk tally across a real restart ---
+
+/// One snapshot per second from `start`, a hundred units deep a side at
+/// these mids, so a market order never walks off the book.
+fn timed(start: i64, mids: &[i64]) -> Vec<MarketEvent> {
+    mids.iter()
+        .enumerate()
+        .map(|(i, mid)| {
+            let seq = u64::try_from(i).expect("small") + 1;
+            let ts = Ts::from_nanos(start + i64::try_from(i).expect("small") * SECOND);
+            MarketEvent::BookSnapshot(BookSnapshot {
+                meta: EventMeta {
+                    instrument: instrument(),
+                    exchange_ts: ts,
+                    local_recv_ts: ts,
+                    ingest_seq: seq,
+                },
+                last_update_id: 100 + seq,
+                bids: vec![Level::new(
+                    Px::from_raw((mid - 1) * quant_core::SCALE),
+                    "100".parse().expect("qty"),
+                )],
+                asks: vec![Level::new(
+                    Px::from_raw((mid + 1) * quant_core::SCALE),
+                    "100".parse().expect("qty"),
+                )],
+            })
+        })
+        .collect()
+}
+
+/// A recorded stream, replayed.
+struct Replayed(std::vec::IntoIter<MarketEvent>);
+
+impl EventSource for Replayed {
+    fn next_event(&mut self) -> Option<Result<MarketEvent, SourceError>> {
+        self.0.next().map(Ok)
+    }
+}
+
+/// Buys two units when it holds less than one, and sells one otherwise, on
+/// even seconds only.
+///
+/// Without state of its own on purpose: it decides from the position the
+/// engine shows it, which a restart brings back, so a run cut and resumed
+/// decides exactly what an uninterrupted one does. Any difference between
+/// the two is then the risk layer's. And only on even seconds, so that an
+/// order sent at one second fills at the next and none is in flight at an
+/// odd second, which is where a run is cut: a restart does not yet adopt an
+/// order still working (slice (d)).
+struct Stepper;
+
+impl quant_engine::Strategy for Stepper {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &mut quant_engine::Context<'_>) {
+        let instrument = event.meta().instrument;
+        if (event.meta().local_recv_ts.as_nanos() / SECOND) % 2 != 0 {
+            return;
+        }
+        let one: Qty = "1".parse().expect("qty");
+        let (side, qty) = if ctx.position(instrument).qty < one {
+            (Side::Buy, "2")
+        } else {
+            (Side::Sell, "1")
+        };
+        ctx.submit(OrderRequest {
+            instrument,
+            side,
+            qty: qty.parse().expect("qty"),
+            kind: OrderKind::Market,
+            time_in_force: TimeInForce::Gtc,
+        });
+    }
+}
+
+/// Ten basis points, a buy's in the base: so the recount has to take a fee
+/// out of the holding, as the live tally did.
+fn stepper_costs() -> quant_sim::Costs {
+    quant_sim::Costs {
+        fees: quant_sim::FeeSchedule::flat("0.001".parse().expect("rate")),
+        fee_in: quant_sim::FeeIn::Received,
+        ..quant_sim::Costs::NONE
+    }
+}
+
+type Stepped = Engine<Replayed, SimulatedVenue, RiskEngine, Stepper>;
+
+/// A journal under the temp directory, removed on drop.
+struct TempJournal(std::path::PathBuf);
+
+impl TempJournal {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "quant-backtest-restart-{name}-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+}
+
+impl Drop for TempJournal {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// One session over `events`, journalled to `path` as `paper` journals: a
+/// `started` line, then everything the engine decides and books. Resumed
+/// from what `path` already holds, as `paper` resumes.
+fn session(path: &std::path::Path, events: Vec<MarketEvent>, limits: Limits) -> Stepped {
+    use quant_engine::journal;
+    use std::sync::{Arc, Mutex};
+
+    let entries = journal::read(path).expect("readable").entries;
+    let mut registry = InstrumentRegistry::new();
+    let resumed =
+        journal::resume(&entries, &mut registry, definition(), CASH).expect("a fresh registry");
+    let risk = quant_engine::journal::recover_risk(&entries, &mut registry, limits);
+    let fills = entries
+        .iter()
+        .filter(|e| matches!(e, quant_engine::JournalEntry::Filled { .. }))
+        .count();
+
+    let file = Arc::new(Mutex::new(quant_engine::Journal::open(path).expect("open")));
+    crate::record::write(
+        &file,
+        &quant_engine::JournalEntry::Started {
+            at: events
+                .first()
+                .map_or(Ts::from_nanos(0), |e| e.meta().local_recv_ts),
+            cash: resumed.starting_cash,
+            schema: journal::SCHEMA,
+            run: None,
+        },
+    )
+    .expect("append");
+    let mut engine = Engine::new(
+        Replayed(events.into_iter()),
+        SimulatedVenue::with_costs(stepper_costs()),
+        risk,
+        Stepper,
+        resumed.starting_cash,
+    )
+    .observing_fills(Box::new(crate::record::JournalWriter::new(
+        file,
+        "BTCUSDT".to_owned(),
+        u64::try_from(fills).expect("small"),
+    )));
+    if let Some(portfolio) = resumed.portfolio {
+        engine = engine
+            .resuming(portfolio)
+            .minting_from(resumed.next_order_id);
+    }
+    engine.run().expect("a replay cannot fail");
+    engine
+}
+
+/// What a limit is judged against: the switch, the holding, and today's count
+/// and loss.
+fn tally(risk: &RiskEngine) -> (Option<TripCause>, Qty, u64, Notional) {
+    (
+        risk.tripped(),
+        risk.position(instrument()),
+        risk.orders_today(),
+        risk.realized_today(),
+    )
+}
+
+/// Recount a journal on a registry holding the session's instrument first,
+/// as `paper` does after `resume`.
+fn recount_file(path: &std::path::Path, limits: Limits) -> RiskEngine {
+    let entries = quant_engine::journal::read(path).expect("readable").entries;
+    let mut registry = InstrumentRegistry::new();
+    registry.register(definition());
+    quant_engine::journal::recover_risk(&entries, &mut registry, limits)
+}
+
+#[test]
+fn a_restart_resumes_the_risk_tally_the_uninterrupted_run_had_at_the_cut() {
+    // A real restart: one session journalled and cut, a second resumed from
+    // the file, against one session that ran straight through. Run twice,
+    // with a limit that binds after the cut each time: the day's loss
+    // budget, which a restart that started the day fresh reaches late; and
+    // the position limit, against which a restart that started flat would
+    // let an addition through.
+    const START: i64 = 1_790_000_000 * SECOND;
+    let mids = [100; 26];
+    let cases = [
+        Limits {
+            max_daily_loss: Some("9".parse().expect("amount")),
+            max_orders_per_day: Some(50),
+            ..Limits::default()
+        },
+        Limits {
+            max_position_notional: Some("250".parse().expect("amount")),
+            ..Limits::default()
+        },
+    ];
+    // After second 9: the order sent at 8 filled at 9, and none is in flight.
+    let cut = 10;
+
+    for limits in cases {
+        let whole = TempJournal::new("whole");
+        let straight = session(&whole.0, timed(START, &mids), limits);
+
+        let journal = TempJournal::new("cut");
+        let first = session(&journal.0, timed(START, &mids[..cut]), limits);
+        assert_eq!(
+            tally(&recount_file(&journal.0, limits)),
+            tally(first.risk()),
+            "the journal recounts to what the live tally held at the cut"
+        );
+        // Or the equality above would prove nothing.
+        assert!(first.risk().orders_today() > 0);
+        assert!(!first.risk().realized_today().is_zero());
+        assert!(
+            !first.risk().position(instrument()).is_zero(),
+            "held across the cut"
+        );
+
+        let rest = timed(START, &mids)[cut..].to_vec();
+        let second = session(&journal.0, rest, limits);
+        assert!(
+            second.stats().refused > 0,
+            "a limit binds after the cut: {limits:?}"
+        );
+        assert_eq!(
+            tally(second.risk()),
+            tally(straight.risk()),
+            "the resumed run ends where the straight one did: {limits:?}"
+        );
+        assert_eq!(
+            first.stats().submitted + second.stats().submitted,
+            straight.stats().submitted,
+            "the same orders got out: {limits:?}"
+        );
+        assert_eq!(
+            first.stats().refused + second.stats().refused,
+            straight.stats().refused,
+            "and the same were refused: {limits:?}"
+        );
+    }
+}
+
+#[test]
+fn a_restart_across_midnight_resets_the_day_and_keeps_the_switch() {
+    // The order limit trips on day D; the run carries on past midnight with
+    // every order refused; the restart comes on D+1. The recount must roll
+    // the day where the live check did -- D's orders and loss are not
+    // D+1's -- and must not take the new day as a reason to re-arm.
+    const DAY: i64 = 86_400 * SECOND;
+    let start = 20_700 * DAY - 10 * SECOND;
+    let mids = [100; 14];
+    let limits = Limits {
+        max_orders_per_day: Some(4),
+        ..Limits::default()
+    };
+    let journal = TempJournal::new("midnight");
+    // From 23:59:50: four orders and a trip on D, two refusals on D+1.
+    let first = session(&journal.0, timed(start, &mids), limits);
+    assert_eq!(first.risk().tripped(), Some(TripCause::OrderCount));
+    assert_eq!(first.risk().orders_today(), 0, "D+1 has counted nothing");
+    assert_eq!(first.risk().realized_today(), Notional::ZERO);
+    assert!(!first.risk().position(instrument()).is_zero());
+
+    // What the file holds for D, so that the zeros above are a reset and
+    // not a day that did nothing.
+    let entries = quant_engine::journal::read(&journal.0)
+        .expect("readable")
+        .entries;
+    let on_d = |e: &&quant_engine::JournalEntry| e.at().as_nanos() < start + 10 * SECOND;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(on_d)
+            .filter(|e| matches!(e, quant_engine::JournalEntry::Submitted { .. }))
+            .count(),
+        4
+    );
+    assert!(entries.iter().filter(on_d).any(|e| matches!(
+        e,
+        quant_engine::JournalEntry::Filled {
+            side: Side::Sell,
+            ..
+        }
+    )));
+
+    let from_file = recount_file(&journal.0, limits);
+    assert_eq!(tally(&from_file), tally(first.risk()));
+}

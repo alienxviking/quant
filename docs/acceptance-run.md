@@ -157,7 +157,8 @@ has `Started`, `Filled`, `Checkpoint`, `Tripped` and `Stopped`, and no strategy
 entry at all; `Engine::resuming` replaces the portfolio and only the portfolio. So
 a restarted paper session comes back with the right cash and the right position,
 which is exactly what the journal was built to guarantee, and with **empty
-indicator windows, a zeroed equity sampler and a zeroed daily risk tally**.
+indicator windows and a zeroed equity sampler** (and, until
+`m8c-journal-readers` recounted it from the journal, a zeroed daily risk tally).
 
 For a capture that costs nothing. For M5's criterion it is fatal: the judging
 backtest runs that state continuously across the same boundary, so it takes a
