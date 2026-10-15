@@ -769,7 +769,10 @@ mod tests {
     }
 
     fn temp_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("quant-verify-session-{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "quant-verify-session-{name}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

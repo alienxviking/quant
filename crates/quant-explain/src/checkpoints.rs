@@ -119,7 +119,10 @@ mod tests {
     fn check(name: &str, lines: &str) -> Agreement {
         let thread = std::thread::current();
         let unique = thread.name().unwrap_or("unnamed").replace("::", "-");
-        let path = std::env::temp_dir().join(format!("quant-explain-cp-{name}-{unique}.jsonl"));
+        let path = std::env::temp_dir().join(format!(
+            "quant-explain-cp-{name}-{unique}-{}.jsonl",
+            std::process::id()
+        ));
         let mut file = std::fs::File::create(&path).expect("create");
         file.write_all(lines.as_bytes()).expect("write");
         file.write_all(b"\n").expect("newline");

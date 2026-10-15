@@ -362,7 +362,8 @@ mod tests {
         // instead of the run. "No line covers this instant" says the process was
         // down; "no line is recognisable" says this parser went stale. Reporting
         // the second as the first sends whoever is on call to the wrong place.
-        let root = std::env::temp_dir().join("quant-explain-format-drift");
+        let root =
+            std::env::temp_dir().join(format!("quant-explain-format-drift-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("logs")).expect("mkdir");
         // Real JSON events that are not metrics events.

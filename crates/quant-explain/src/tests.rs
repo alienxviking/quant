@@ -67,7 +67,10 @@ impl Tree {
     fn new(name: &str) -> Self {
         let thread = std::thread::current();
         let unique = thread.name().unwrap_or("unnamed").replace("::", "-");
-        let root = std::env::temp_dir().join(format!("quant-explain-{name}-{unique}"));
+        let root = std::env::temp_dir().join(format!(
+            "quant-explain-{name}-{unique}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         Self { root }
     }

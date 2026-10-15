@@ -174,7 +174,8 @@ mod tests {
 
     impl Tree {
         fn new(name: &str) -> Self {
-            let root = std::env::temp_dir().join(format!("quant-catalog-{name}"));
+            let root =
+                std::env::temp_dir().join(format!("quant-catalog-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             Self { root }
         }
