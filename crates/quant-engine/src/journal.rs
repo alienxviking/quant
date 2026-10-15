@@ -2991,6 +2991,19 @@ mod venue_entry_tests {
         let mut entries: Vec<JournalEntry> = (1..=5).map(submitted).collect();
         entries.extend(every_venue_entry().into_iter().map(|(entry, _)| entry));
         assert_eq!(next_order_id(&entries), 6);
+
+        // And each line on its own, with nothing minted beside it. Behind
+        // five submissions only an id above 5 could show, and most of the
+        // table's ids are 5 or below, so the assertion above sees two of the
+        // eight lines that carry one. Alone, any id a line contributed would
+        // lift the answer off 1.
+        for (entry, json) in every_venue_entry() {
+            assert_eq!(
+                next_order_id(std::slice::from_ref(&entry)),
+                1,
+                "{json} moved the counter"
+            );
+        }
     }
 
     fn filled(id: u64, side: Side, px: &str) -> JournalEntry {
