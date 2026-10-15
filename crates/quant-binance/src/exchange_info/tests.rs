@@ -944,6 +944,117 @@ fn a_filter_the_definition_reads_cannot_be_listed_twice() {
     assert_eq!(got.unmodelled, ethbtc_reports(vec![once.clone(), once]));
 }
 
+#[test]
+fn a_key_named_twice_in_one_object_is_refused_by_name() {
+    // JSON leaves a repeated key's meaning open, and a map keeps whichever
+    // value came last without a word: this lot would quietly be 0.01, or
+    // 0.001 under a parser that keeps the first. Refused for the reason a
+    // repeated filter or entry is, naming the key and neither value.
+    let twice = r#"[{"filterType": "LOT_SIZE", "stepSize": "0.00100000", "minQty": "0.00100000", "stepSize": "0.01000000"}]"#;
+    let refused = ethbtc_from(&with_filters(twice));
+    assert_eq!(
+        refused,
+        Err(ExchangeInfoError::RepeatedKey("stepSize".to_owned()))
+    );
+    let said = refused.expect_err("refused").to_string();
+    assert!(said.contains("`stepSize`"), "{said}");
+    assert!(
+        !said.contains("0.00100000") && !said.contains("0.01000000"),
+        "{said}"
+    );
+
+    // Every object the module reads, and every key in it: the ones the
+    // definition takes, the ones only reported, the ones that name a rule,
+    // and the ones nothing looks at.
+    let cases = [
+        (
+            "a field a filter only reports",
+            with_filters(
+                r#"[{"filterType": "LOT_SIZE", "stepSize": "0.001", "maxQty": "9000", "maxQty": "100"}]"#,
+            ),
+            "maxQty",
+        ),
+        (
+            "a filter's name",
+            with_filters(
+                r#"[{"filterType": "LOT_SIZE", "filterType": "MARKET_LOT_SIZE", "stepSize": "0.001"}]"#,
+            ),
+            "filterType",
+        ),
+        (
+            "the symbol's entry, ahead of its status",
+            edit(
+                REST_ANSWER,
+                "\"status\": \"TRADING\",",
+                "\"status\": \"TRADING\", \"status\": \"HALT\",",
+            ),
+            "status",
+        ),
+        (
+            "the symbol's entry, at a field it reads",
+            edit(
+                REST_ANSWER,
+                "\"baseAsset\": \"ETH\",",
+                "\"baseAsset\": \"ETH\", \"baseAsset\": \"BNB\",",
+            ),
+            "baseAsset",
+        ),
+        (
+            "another symbol's entry, at the name it is matched by",
+            edit(
+                REST_ANSWER,
+                "\"symbols\": [",
+                r#""symbols": [{"symbol": "BTCUSDT", "symbol": "ETHBTC", "status": "TRADING"},"#,
+            ),
+            "symbol",
+        ),
+        (
+            "an exchange filter",
+            edit(
+                REST_ANSWER,
+                "\"exchangeFilters\": [\n    ]",
+                r#""exchangeFilters": [{"filterType": "EXCHANGE_MAX_NUM_ORDERS", "maxNumOrders": 1000, "maxNumOrders": 10}]"#,
+            ),
+            "maxNumOrders",
+        ),
+        (
+            "a rate limit",
+            edit(
+                REST_ANSWER,
+                PLACEHOLDER_RATE_LIMITS,
+                r#""rateLimits": [{"rateLimitType": "ORDERS", "interval": "SECOND", "intervalNum": 10, "limit": 50, "limit": 5}],
+"#,
+            ),
+            "limit",
+        ),
+        (
+            "the answer, at a list it reads",
+            edit(
+                REST_ANSWER,
+                "\"exchangeFilters\": [",
+                "\"exchangeFilters\": [], \"exchangeFilters\": [",
+            ),
+            "exchangeFilters",
+        ),
+        (
+            "the answer, at a field nothing reads",
+            edit(
+                REST_ANSWER,
+                "\"serverTime\": 1565246363776,",
+                "\"serverTime\": 1565246363776, \"serverTime\": 1,",
+            ),
+            "serverTime",
+        ),
+    ];
+    for (place, answer, key) in cases {
+        assert_eq!(
+            ethbtc_from(&answer),
+            Err(ExchangeInfoError::RepeatedKey(key.to_owned())),
+            "{place}"
+        );
+    }
+}
+
 /// A `MIN_NOTIONAL` filter with `floor`, as the venue would list it.
 fn older_filter(floor: &str) -> String {
     format!(

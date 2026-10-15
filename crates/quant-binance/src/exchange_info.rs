@@ -156,6 +156,13 @@
 //! Binance adds to a filter tomorrow is reported rather than ignored, and a field
 //! nothing here uses cannot make an answer unreadable.
 //!
+//! No object it reads may name a key twice: the answer, each symbol's entry,
+//! each filter and each rate limit. A map keeps the last of a repeated key's
+//! values and says nothing, which would have the answer choose between two
+//! values where this module refuses to choose between two filters or two
+//! entries. So an object that repeats a key is refused before anything in it
+//! is read, naming the key and neither value.
+//!
 //! # What it does not read
 //!
 //! - **The rest of the symbol's entry** -- `orderTypes`, the `…Allowed` flags,
@@ -183,10 +190,12 @@
 //! [`Instrument::round_price`]: quant_core::instrument::Instrument::round_price
 
 use core::fmt;
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 use quant_core::fixed::{Notional, ParseFixedError, Px, Qty};
 use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind};
+use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::value::RawValue;
 
 use crate::rest::{SnapshotClient, SnapshotError};
@@ -312,6 +321,10 @@ pub enum ExchangeInfoError {
     /// A filter the definition reads, listed more than once, so which one the
     /// venue enforces cannot be told.
     RepeatedFilter(&'static str),
+    /// An object in the answer names this key more than once, so which of its
+    /// values the venue meant cannot be told. Names the key and never a value:
+    /// printing either would read as the venue's.
+    RepeatedKey(String),
 }
 
 impl fmt::Display for ExchangeInfoError {
@@ -357,6 +370,11 @@ impl fmt::Display for ExchangeInfoError {
                 f,
                 "the symbol lists `{filter}` more than once, and which one the venue enforces \
                  cannot be told"
+            ),
+            Self::RepeatedKey(key) => write!(
+                f,
+                "an object in the answer names `{key}` more than once, and which of its values \
+                 the venue meant cannot be told"
             ),
         }
     }
@@ -432,12 +450,13 @@ pub async fn fetch(client: &SnapshotClient, symbol: &str) -> Result<VenueInstrum
 /// lists it as anything but [`TRADING`], or states a rule the definition reads
 /// in a way it cannot take (see the module docs).
 pub fn parse(symbol: &str, body: &[u8]) -> Result<VenueInstrument, ExchangeInfoError> {
-    let answer: Answer = serde_json::from_slice(body)
-        .map_err(|e| ExchangeInfoError::NotExchangeInfo(e.to_string()))?;
+    let answer = Answer::read(body)?;
     let entry = listed(symbol, &answer.symbols)?;
 
     // Status first: a symbol that is not trading is the fact a reader needs,
-    // whatever else is wrong with its entry.
+    // whatever else is wrong with its entry. Only a repeated key comes before
+    // it, refused as the answer was read: in an entry that has one, no value
+    // -- the status's included -- can be taken for the venue's.
     let status = text(entry, "status")?;
     if status != TRADING {
         return Err(ExchangeInfoError::NotTrading {
@@ -449,16 +468,14 @@ pub fn parse(symbol: &str, body: &[u8]) -> Result<VenueInstrument, ExchangeInfoE
     let quote = text(entry, "quoteAsset")?;
 
     let raw_filters = field(entry, "filters").ok_or(ExchangeInfoError::MissingField("filters"))?;
-    let filters: Vec<Object> =
+    let filters: Vec<AsSent> =
         serde_json::from_str(raw_filters.get()).map_err(|_| ExchangeInfoError::Malformed {
             field: "filters",
             value: raw_filters.get().to_owned(),
         })?;
+    let filters = checked_all(filters)?;
     let filters = named(&filters, "filters[].filterType")?;
-    let exchange_filters = named(
-        answer.exchange_filters.as_deref().unwrap_or_default(),
-        "exchangeFilters[].filterType",
-    )?;
+    let exchange_filters = named(&answer.exchange_filters, "exchangeFilters[].filterType")?;
 
     let rules = Rules::read(&filters)?;
 
@@ -496,7 +513,7 @@ pub fn parse(symbol: &str, body: &[u8]) -> Result<VenueInstrument, ExchangeInfoE
     }
     // Every rate limit, whole: none is read, and `ORDERS` is a rule about
     // orders the model does not have (see the module docs).
-    for limit in answer.rate_limits.as_deref().unwrap_or_default() {
+    for limit in &answer.rate_limits {
         unmodelled.push(UnmodelledRule {
             scope: RuleScope::Exchange,
             name: RATE_LIMITS.to_owned(),
@@ -520,21 +537,112 @@ pub fn parse(symbol: &str, body: &[u8]) -> Result<VenueInstrument, ExchangeInfoE
     })
 }
 
-/// A JSON object with every value kept as the venue's own text.
-type Object = BTreeMap<String, Box<RawValue>>;
+/// A JSON object with every value kept as the venue's own text, and no key
+/// in it twice.
+///
+/// A type of its own with no `Deserialize`, on purpose: JSON becomes one only
+/// through [`AsSent`] and [`checked`], so reading an object without refusing
+/// its repeats first does not compile, rather than depending on each caller
+/// remembering to.
+#[derive(Debug)]
+struct Object(BTreeMap<String, Box<RawValue>>);
+
+/// A JSON object as the venue sent it: its fields, or the first key it
+/// repeats.
+///
+/// A map's own `Deserialize` keeps the last value of a repeated key and says
+/// nothing, so the answer would choose between two values where this module
+/// refuses to choose between two filters or two entries. So the parser
+/// carries a repeat out as a value rather than failing on it: the refusal is
+/// then [`ExchangeInfoError::RepeatedKey`], naming the key, rather than a line
+/// of serde's prose, and [`checked`] is the only way to the fields, so nothing
+/// in an object is read before its repeat is refused.
+#[derive(Debug)]
+struct AsSent(Result<Object, String>);
+
+impl<'de> Deserialize<'de> for AsSent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(AsSentVisitor)
+    }
+}
+
+#[derive(Debug)]
+struct AsSentVisitor;
+
+impl<'de> Visitor<'de> for AsSentVisitor {
+    type Value = AsSent;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<AsSent, A::Error> {
+        let mut fields = BTreeMap::new();
+        let mut repeated = None;
+        while let Some((key, value)) = map.next_entry::<String, Box<RawValue>>()? {
+            match fields.entry(key) {
+                Entry::Vacant(slot) => {
+                    slot.insert(value);
+                }
+                // Not stopped at: the rest is read regardless, so the answer
+                // is still checked for being JSON at all.
+                Entry::Occupied(slot) => {
+                    repeated.get_or_insert_with(|| slot.key().clone());
+                }
+            }
+        }
+        Ok(AsSent(repeated.map_or(Ok(Object(fields)), Err)))
+    }
+}
+
+/// An object's fields, or the refusal of the key it repeats: which of that
+/// key's values the venue meant cannot be told.
+fn checked(object: AsSent) -> Result<Object, ExchangeInfoError> {
+    object.0.map_err(ExchangeInfoError::RepeatedKey)
+}
+
+/// [`checked`], for every object in a list.
+fn checked_all(objects: Vec<AsSent>) -> Result<Vec<Object>, ExchangeInfoError> {
+    objects.into_iter().map(checked).collect()
+}
 
 /// The parts of the answer read as a whole. Everything else in it -- the
-/// server time, `sors` -- is not looked at.
-#[derive(serde::Deserialize)]
+/// server time, `sors` -- is not looked at, beyond the answer itself naming
+/// no key twice.
 struct Answer {
     symbols: Vec<Object>,
-    /// Absent or `null` is no exchange-wide filters, which are optional too.
-    #[serde(rename = "exchangeFilters", default)]
-    exchange_filters: Option<Vec<Object>>,
-    /// Absent or `null` is no rate limits: *"All limits are optional"*
-    /// (`rest-api.md` line 819).
-    #[serde(rename = "rateLimits", default)]
-    rate_limits: Option<Vec<Object>>,
+    exchange_filters: Vec<Object>,
+    rate_limits: Vec<Object>,
+}
+
+impl Answer {
+    fn read(body: &[u8]) -> Result<Self, ExchangeInfoError> {
+        let whole: AsSent = serde_json::from_slice(body)
+            .map_err(|e| ExchangeInfoError::NotExchangeInfo(e.to_string()))?;
+        let whole = checked(whole)?;
+        Ok(Self {
+            symbols: objects(&whole, "symbols")?.ok_or_else(|| {
+                ExchangeInfoError::NotExchangeInfo("the answer has no `symbols`".to_owned())
+            })?,
+            // Absent or `null` is no exchange-wide filters, which are optional
+            // too.
+            exchange_filters: objects(&whole, "exchangeFilters")?.unwrap_or_default(),
+            // Absent or `null` is no rate limits: *"All limits are optional"*
+            // (`rest-api.md` line 819).
+            rate_limits: objects(&whole, "rateLimits")?.unwrap_or_default(),
+        })
+    }
+}
+
+/// The objects the answer lists under `key`, each refused if it repeats a
+/// key, or `None` when `key` is absent or `null`.
+fn objects(whole: &Object, key: &str) -> Result<Option<Vec<Object>>, ExchangeInfoError> {
+    let Some(raw) = field(whole, key) else {
+        return Ok(None);
+    };
+    let listed: Vec<AsSent> = serde_json::from_str(raw.get())
+        .map_err(|e| ExchangeInfoError::NotExchangeInfo(format!("`{key}`: {e}")))?;
+    checked_all(listed).map(Some)
 }
 
 /// The three rules the definition takes, as read from the symbol's filters.
@@ -659,6 +767,7 @@ fn named<'a>(
 /// A field, unless it is absent or `null`, which this module treats alike.
 fn field<'a>(object: &'a Object, key: &str) -> Option<&'a RawValue> {
     object
+        .0
         .get(key)
         .map(Box::as_ref)
         .filter(|raw| raw.get() != "null")
@@ -725,6 +834,7 @@ fn untaken(filter: &Object, taken: Option<&str>) -> Vec<(String, String)> {
 /// each, every value as the venue wrote it.
 fn as_written(object: &Object, keep: impl Fn(&str) -> bool) -> Vec<(String, String)> {
     object
+        .0
         .iter()
         .filter(|(key, _)| keep(key))
         .map(|(key, raw)| (key.clone(), venue_text(raw)))
