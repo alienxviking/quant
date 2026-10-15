@@ -37,8 +37,11 @@ use crate::time::Ts;
 
 /// Our identifier for an order, minted before it is sent.
 ///
-/// Opaque and monotonic within a run. Not persisted across runs, and not the
-/// thing to reconcile an exchange statement against — that is
+/// Dense from 1 and monotonic within a run, and persisted: written on every
+/// journal line about the order, carried across a restart by the engine's
+/// `minting_from`, and sent to a live venue as `q-<run>-<id>`, so that a report
+/// can be told apart from one about an earlier run's order with the same
+/// number. Not the thing to reconcile an exchange statement against — that is
 /// [`VenueOrderId`].
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -64,6 +67,25 @@ impl core::fmt::Display for ClientOrderId {
 pub struct VenueOrderId(pub String);
 
 impl core::fmt::Display for VenueOrderId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The venue's identifier for one execution: Binance's `t` on a stream report,
+/// and `id` on a `myTrades` row.
+///
+/// A type of its own rather than a second [`VenueOrderId`], because the order
+/// id and the trade id are both integers on one `myTrades` row, and a swap must
+/// not compile. A `String` for the reason `VenueOrderId` is one: it is the
+/// venue's namespace, and pasting it into the venue's interface has to find the
+/// trade.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct VenueTradeId(pub String);
+
+impl core::fmt::Display for VenueTradeId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.0)
     }
@@ -160,7 +182,10 @@ pub enum RejectReason {
     InsufficientFunds,
     /// The risk layer refused it. Never reaches a venue at all.
     RiskLimit,
-    /// The venue declined for a reason of its own, or was unreachable.
+    /// The venue declined for a reason of its own, the request never reached
+    /// it, or it was not ready to take an order. Never an order whose outcome
+    /// is unknown: that is no event at all, because a rejection would make the
+    /// engine forget an order that may yet fill.
     Venue,
     /// The book was invalid — a gap, or no prices yet — so there was nothing to
     /// price against. Its own variant because it is the *expected* rejection
@@ -260,18 +285,48 @@ pub enum FeeAsset {
     Base,
 }
 
-/// What happened to an order we sent.
+/// What happened to an order we sent, as a strategy is told it.
 ///
 /// Every variant quotes the [`ClientOrderId`], because that is the only
 /// identifier guaranteed to exist — see the module docs.
+///
+/// **Every field is one a simulator can produce exactly as a live venue does.**
+/// A strategy is told this and nothing else, and a field only a real venue
+/// could fill is a field by which a strategy could tell which venue it is
+/// wired to, which is a bug. What only a real venue knows travels beside the
+/// event, to the record alone, in a [`crate::report::OrderReport`]. The
+/// acceptance carried one such field, the venue's order id, until M8 slice (c)
+/// found it: the live translator filled it and the simulator left it empty.
+/// It is gone, and a compile-time check below keeps anything like it out:
+///
+/// ```compile_fail
+/// use quant_core::execution::{ClientOrderId, ExecutionEvent};
+/// use quant_core::time::Ts;
+/// let _ = ExecutionEvent::Accepted {
+///     client_order_id: ClientOrderId(1),
+///     venue_order_id: None,
+///     ts: Ts::from_nanos(1),
+/// };
+/// ```
+///
+/// while an acceptance a simulator can make is what remains:
+///
+/// ```
+/// use quant_core::execution::{ClientOrderId, ExecutionEvent};
+/// use quant_core::time::Ts;
+/// let _ = ExecutionEvent::Accepted {
+///     client_order_id: ClientOrderId(1),
+///     ts: Ts::from_nanos(1),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecutionEvent {
     /// The venue has the order and it is live.
+    ///
+    /// Not the venue's name for it: that is the record's, beside the event.
     Accepted {
         client_order_id: ClientOrderId,
-        /// Absent when the venue does not supply one, which is legal.
-        venue_order_id: Option<VenueOrderId>,
         ts: Ts,
     },
     /// The order was refused and does not exist.
@@ -322,7 +377,9 @@ impl ExecutionEvent {
         }
     }
 
-    /// When it happened, on the engine clock.
+    /// When it was heard: from a simulator, the engine clock when the event was
+    /// generated; from a live venue, when its bytes arrived. Never a time the
+    /// venue wrote (invariant 2).
     #[must_use]
     pub const fn ts(&self) -> Ts {
         match self {
@@ -344,6 +401,124 @@ impl ExecutionEvent {
             Self::Rejected { .. } | Self::Cancelled { .. } => true,
             Self::Filled { remaining, .. } => remaining.raw() == 0,
             Self::Accepted { .. } => false,
+        }
+    }
+}
+
+/// What a strategy may be told, closed by a compile error rather than a
+/// paragraph.
+///
+/// A type is `Modelled` when a simulator produces its values exactly as a live
+/// venue does, so a strategy reading one learns nothing about its wiring. The
+/// trait is private to this module, so nothing elsewhere can declare a type
+/// modelled; and [`strategy_may_see`] names every field of every
+/// [`ExecutionEvent`] variant, with no `..`, and requires each to be
+/// `Modelled`. A field added to an event therefore fails to compile until its
+/// type is argued into this list, here, where the argument is visible.
+///
+/// That closes fields, and an enum a field carries has variants too. So the two
+/// enums an event carries, [`RejectReason`] and [`FeeAsset`], are not declared
+/// modelled on their own say-so: [`reject_reason_is_modelled`] and
+/// [`fee_asset_is_modelled`] match every variant, with no `_` arm, and an arm
+/// for a variant that carries a value passes every value to [`modelled`].
+/// `RejectReason::VenueCode(i64)`, a venue's error code that a simulator has
+/// none of, therefore fails to compile here rather than reaching a strategy.
+///
+/// There is deliberately no `impl<T: Modelled> Modelled for Option<T>`: an
+/// optional field is how a venue's order id got in, absent in one world and
+/// present in the other.
+mod vocabulary {
+    pub(super) trait Modelled {}
+}
+
+use vocabulary::Modelled;
+
+impl Modelled for ClientOrderId {}
+impl Modelled for Ts {}
+impl Modelled for crate::fixed::Px {}
+impl Modelled for Qty {}
+impl Modelled for crate::fixed::Notional {}
+impl Modelled for RejectReason {}
+impl Modelled for FeeAsset {}
+impl Modelled for bool {}
+
+/// Requires `T` to be [`Modelled`], and does nothing else.
+const fn modelled<T: Modelled>(_: &T) {}
+
+/// Checked when the crate compiles, never called.
+const _: fn(&ExecutionEvent) = strategy_may_see;
+const _: fn(RejectReason) = reject_reason_is_modelled;
+const _: fn(FeeAsset) = fee_asset_is_modelled;
+
+/// Every variant, by name. None carries a value; one that did would bind it
+/// here and pass it to [`modelled`].
+const fn reject_reason_is_modelled(reason: RejectReason) {
+    match reason {
+        RejectReason::Malformed
+        | RejectReason::InsufficientFunds
+        | RejectReason::RiskLimit
+        | RejectReason::Venue
+        | RejectReason::NoMarket => {}
+    }
+}
+
+/// Every variant, by name. None carries a value; one that did would bind it
+/// here and pass it to [`modelled`].
+const fn fee_asset_is_modelled(asset: FeeAsset) {
+    match asset {
+        FeeAsset::Quote | FeeAsset::Base => {}
+    }
+}
+
+/// Every field of every variant, each required to be [`Modelled`].
+fn strategy_may_see(event: &ExecutionEvent) {
+    match event {
+        ExecutionEvent::Accepted {
+            client_order_id,
+            ts,
+        } => {
+            modelled(client_order_id);
+            modelled(ts);
+        }
+        ExecutionEvent::Rejected {
+            client_order_id,
+            reason,
+            ts,
+        } => {
+            modelled(client_order_id);
+            modelled(reason);
+            modelled(ts);
+        }
+        ExecutionEvent::Filled {
+            client_order_id,
+            fill:
+                Fill {
+                    px,
+                    qty,
+                    fee,
+                    is_maker,
+                    fee_asset,
+                },
+            remaining,
+            ts,
+        } => {
+            modelled(client_order_id);
+            modelled(px);
+            modelled(qty);
+            modelled(fee);
+            modelled(is_maker);
+            modelled(fee_asset);
+            modelled(remaining);
+            modelled(ts);
+        }
+        ExecutionEvent::Cancelled {
+            client_order_id,
+            remaining,
+            ts,
+        } => {
+            modelled(client_order_id);
+            modelled(remaining);
+            modelled(ts);
         }
     }
 }
@@ -447,8 +622,7 @@ mod tests {
         .is_terminal());
         assert!(!ExecutionEvent::Accepted {
             client_order_id: id,
-            venue_order_id: None,
-            ts,
+            ts
         }
         .is_terminal());
     }
@@ -462,7 +636,6 @@ mod tests {
         let events = [
             ExecutionEvent::Accepted {
                 client_order_id: id,
-                venue_order_id: None,
                 ts,
             },
             ExecutionEvent::Rejected {

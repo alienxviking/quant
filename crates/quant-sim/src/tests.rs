@@ -16,6 +16,7 @@ use quant_core::fixed::{Notional, Qty};
 use quant_core::instrument::{
     Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };
+use quant_core::report::VenueReport;
 use quant_core::time::Ts;
 use quant_engine::ExecutionVenue;
 
@@ -113,9 +114,37 @@ fn run(
 ) -> Vec<ExecutionEvent> {
     venue.submit(ClientOrderId(1), &request, NOW);
     venue.observe(event, book, NOW);
+    poll(venue, NOW)
+}
+
+/// What the venue has delivered by `now`, as the events a strategy would be
+/// told.
+fn poll(venue: &mut SimulatedVenue, now: Ts) -> Vec<ExecutionEvent> {
     let mut out = Vec::new();
-    venue.poll(NOW, &mut out);
-    out
+    venue.poll(now, &mut out);
+    plain(out)
+}
+
+/// `reports` as the events a strategy would be told, having checked that a
+/// simulator said nothing beside them and nothing that is not an event.
+///
+/// Every test that reads the venue goes through this, so a simulator that
+/// started attaching venue detail would fail all of them, not only the one
+/// written for it.
+fn plain(reports: Vec<VenueReport>) -> Vec<ExecutionEvent> {
+    reports
+        .into_iter()
+        .map(|report| match report {
+            VenueReport::Order(report) => {
+                assert!(
+                    report.is_plain(),
+                    "a simulator has nothing to say beside an event: {report:?}"
+                );
+                report.event()
+            }
+            VenueReport::Notice(notice) => panic!("a simulator has no notices: {notice:?}"),
+        })
+        .collect()
 }
 
 fn fill_of(events: &[ExecutionEvent]) -> Option<(String, String)> {
@@ -136,8 +165,7 @@ fn nothing_happens_at_submission() {
         &order(Side::Buy, "1", OrderKind::Market),
         NOW,
     );
-    let mut out = Vec::new();
-    venue.poll(NOW, &mut out);
+    let out = poll(&mut venue, NOW);
     assert!(out.is_empty(), "not even an acceptance: {out:?}");
     assert_eq!(venue.open_orders(), 1);
 }
@@ -336,13 +364,11 @@ fn a_cancel_after_a_fill_says_nothing_because_it_lost_the_race() {
         NOW,
     );
     venue.observe(&tick(), &book(), NOW);
-    let mut out = Vec::new();
-    venue.poll(NOW, &mut out);
+    let out = poll(&mut venue, NOW);
     assert!(fill_of(&out).is_some());
 
     venue.cancel(ClientOrderId(1), NOW);
-    let mut after = Vec::new();
-    venue.poll(NOW, &mut after);
+    let after = poll(&mut venue, NOW);
     assert!(after.is_empty(), "{after:?}");
     assert_eq!(venue.stats().cancelled, 0);
 }
@@ -355,8 +381,7 @@ fn a_cancel_before_a_fill_returns_the_unfilled_size() {
     // A cancel travels the same wire an order does, so it takes effect when the
     // venue next looks at the market -- not the instant it is asked for.
     venue.observe(&tick(), &book(), NOW);
-    let mut out = Vec::new();
-    venue.poll(NOW, &mut out);
+    let out = poll(&mut venue, NOW);
     assert!(
         out.iter().any(|e| matches!(
             e,
@@ -374,8 +399,7 @@ fn an_order_is_accepted_once_and_only_once() {
     for _ in 0..3 {
         venue.observe(&tick(), &book(), NOW);
     }
-    let mut out = Vec::new();
-    venue.poll(NOW, &mut out);
+    let out = poll(&mut venue, NOW);
     let accepts = out
         .iter()
         .filter(|e| matches!(e, ExecutionEvent::Accepted { .. }))
@@ -384,23 +408,114 @@ fn an_order_is_accepted_once_and_only_once() {
 }
 
 #[test]
-fn a_simulated_venue_offers_no_venue_order_id() {
-    // Inventing one would make backtest output look like it came from an
-    // exchange, and it is the field somebody reconciles a statement against.
-    let mut venue = SimulatedVenue::new();
-    let events = run(
-        &mut venue,
-        order(Side::Buy, "1", limit("90.0")),
-        &tick(),
-        &book(),
+fn every_report_a_simulator_makes_is_an_event_with_nothing_beside_it() {
+    // What only a real venue knows -- its own order id, a trade id, the code it
+    // cited, a lost stream -- a simulator does not know, and inventing any of
+    // it would make backtest output look like it came from an exchange. It is
+    // also what the engine's record would otherwise write down beside every
+    // backtest fill, so a backtest journal would stop matching the one before
+    // it. Driven down every path the simulator has, read raw rather than
+    // through `plain`, so the claim is about the venue and not the helper.
+    fn raw(venue: &mut SimulatedVenue, now: Ts) -> Vec<VenueReport> {
+        let mut out = Vec::new();
+        venue.poll(now, &mut out);
+        out
+    }
+    let filters = quant_core::instrument::Filters {
+        tick_size: "0.01".parse().expect("tick"),
+        lot_size: "0.00001".parse().expect("lot"),
+        min_notional: "5".parse().expect("notional"),
+    };
+    let in_flight = crate::Costs {
+        latency: crate::Latency {
+            outbound: 50 * MILLI,
+            inbound: 0,
+        },
+        ..crate::Costs::NONE
+    };
+    let mut reports = Vec::new();
+
+    // A market order that fills, and one too big for the book.
+    for size in ["0.5", "20"] {
+        let mut venue = SimulatedVenue::new();
+        venue.submit(
+            ClientOrderId(1),
+            &order(Side::Buy, size, OrderKind::Market),
+            NOW,
+        );
+        venue.observe(&tick(), &book(), NOW);
+        reports.extend(raw(&mut venue, NOW));
+    }
+    // A filter breach, judged on receipt.
+    let mut venue = SimulatedVenue::new().enforcing(instrument(), filters);
+    venue.submit(
+        ClientOrderId(1),
+        &order(Side::Buy, "0.01", OrderKind::Market),
+        NOW,
     );
-    assert!(matches!(
-        events.first(),
-        Some(ExecutionEvent::Accepted {
-            venue_order_id: None,
-            ..
-        })
-    ));
+    venue.observe(&tick(), &book(), NOW);
+    reports.extend(raw(&mut venue, NOW));
+    // No market to trade against.
+    let mut venue = SimulatedVenue::new();
+    venue.submit(
+        ClientOrderId(1),
+        &order(Side::Buy, "1", OrderKind::Market),
+        NOW,
+    );
+    venue.observe(&tick(), &dark_book(), NOW);
+    reports.extend(raw(&mut venue, NOW));
+    // An immediate-or-cancel limit with nothing to take.
+    let mut venue = SimulatedVenue::new();
+    venue.submit(
+        ClientOrderId(1),
+        &OrderRequest {
+            time_in_force: TimeInForce::Ioc,
+            ..order(Side::Buy, "1", limit("90.0"))
+        },
+        NOW,
+    );
+    venue.observe(&tick(), &book(), NOW);
+    reports.extend(raw(&mut venue, NOW));
+    // A resting limit the market trades through.
+    let mut venue = SimulatedVenue::new();
+    venue.submit(
+        ClientOrderId(1),
+        &order(Side::Buy, "1", limit("100.0")),
+        NOW,
+    );
+    venue.observe(&tick(), &book(), NOW);
+    venue.observe(&print_at("99.0"), &book(), NOW);
+    reports.extend(raw(&mut venue, NOW));
+    // A cancel that lands with the order it cancels, before it is ever
+    // matched.
+    let mut venue = SimulatedVenue::with_costs(in_flight);
+    venue.submit(
+        ClientOrderId(1),
+        &order(Side::Buy, "1", limit("90.0")),
+        Ts::from_nanos(0),
+    );
+    venue.cancel(ClientOrderId(1), Ts::from_nanos(0));
+    venue.observe(&tick(), &book(), Ts::from_nanos(60 * MILLI));
+    reports.extend(raw(&mut venue, Ts::from_nanos(60 * MILLI)));
+
+    let mut kinds = std::collections::BTreeSet::new();
+    for report in &reports {
+        let VenueReport::Order(report) = report else {
+            panic!("a simulator has no notices: {report:?}");
+        };
+        assert!(report.is_plain(), "nothing beside the event: {report:?}");
+        kinds.insert(match report.event() {
+            ExecutionEvent::Accepted { .. } => "accepted",
+            ExecutionEvent::Rejected { .. } => "rejected",
+            ExecutionEvent::Filled { .. } => "filled",
+            ExecutionEvent::Cancelled { .. } => "cancelled",
+        });
+    }
+    assert_eq!(
+        kinds.into_iter().collect::<Vec<_>>(),
+        ["accepted", "cancelled", "filled", "rejected"],
+        "every kind of report was made, or some path was not checked: {reports:?}"
+    );
 }
 
 #[test]
@@ -717,7 +832,7 @@ fn tick_through(venue: &mut SimulatedVenue, times: &[i64]) -> Vec<ExecutionEvent
     for t in times {
         let at = Ts::from_nanos(*t);
         venue.observe(&tick(), &book(), at);
-        venue.poll(at, &mut out);
+        out.extend(poll(venue, at));
     }
     out
 }
@@ -1092,9 +1207,7 @@ fn under_fees_in_the_asset_received_a_buy_pays_in_the_base_and_a_sell_in_the_quo
         NOW,
     );
     venue.observe(&tick(), &book(), NOW);
-    let mut out = Vec::new();
-    venue.poll(NOW, &mut out);
-    let sold = the_fill(&out);
+    let sold = the_fill(&poll(&mut venue, NOW));
     assert_eq!(
         sold.fee_asset,
         FeeAsset::Quote,
@@ -1230,4 +1343,49 @@ fn a_free_run_is_free_whichever_asset_its_fees_would_be_taken_in() {
         ..crate::Costs::retail()
     }
     .is_free());
+}
+
+#[test]
+fn a_simulated_venue_is_ready_for_any_order_and_judges_its_rules_on_receipt() {
+    // `ready` is for what a live venue can lose: a stream, a check, an order's
+    // fate. A simulator has none of them. Its rules are a venue's to judge on
+    // receipt, with a `Rejected` counted by the rule broken; judged in `ready`,
+    // a breach would turn into our refusal, and every backtest that enforces
+    // filters would move.
+    let filters = quant_core::instrument::Filters {
+        tick_size: "0.01".parse().expect("tick"),
+        lot_size: "0.00001".parse().expect("lot"),
+        min_notional: "5".parse().expect("notional"),
+    };
+    let enforcing = SimulatedVenue::new().enforcing(instrument(), filters);
+    let requests = [
+        // 1.00, against a minimum of 5.
+        order(Side::Buy, "0.01", limit("100.0")),
+        // A tenth of a lot.
+        order(Side::Buy, "0.000001", limit("100.0")),
+        // Off the tick.
+        order(Side::Sell, "1", limit("100.001")),
+        // Not an order at all.
+        order(Side::Buy, "0", OrderKind::Market),
+        order(Side::Buy, "1", OrderKind::Market),
+    ];
+    for request in &requests {
+        assert_eq!(enforcing.ready(request), Ok(()), "{request:?}");
+        assert_eq!(SimulatedVenue::new().ready(request), Ok(()), "{request:?}");
+    }
+
+    // The breach is still found, by the venue, when the order arrives.
+    let mut venue = enforcing;
+    let events = run(&mut venue, requests[0], &tick(), &book());
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ExecutionEvent::Rejected {
+                reason: RejectReason::Malformed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    assert_eq!(venue.stats().filtered_min_notional, 1);
 }

@@ -1,5 +1,6 @@
 //! The user-data stream, translated: what Binance says happened to an order,
-//! as the engine's [`ExecutionEvent`].
+//! as the engine's [`OrderReport`] -- the event a strategy is told, with the
+//! venue's names for the order and the trade beside it, for the record alone.
 //!
 //! Pure logic. No network, no credentials, no clock: the transport stamps a
 //! message's receive time before it is parsed (invariant 2) and hands both here,
@@ -79,9 +80,10 @@
 use core::fmt;
 
 use quant_core::event::Side;
-use quant_core::execution::{ClientOrderId, ExecutionEvent, FeeAsset, Fill, VenueOrderId};
+use quant_core::execution::{ClientOrderId, FeeAsset, Fill, VenueOrderId, VenueTradeId};
 use quant_core::fixed::{Notional, ParseFixedError, Px, Qty};
 use quant_core::instrument::InstrumentDef;
+use quant_core::report::{Ended, EndedBy, FillIds, OrderReport};
 use quant_core::time::Ts;
 
 /// What every client order id this system sends begins with.
@@ -228,12 +230,17 @@ pub enum OrphanReason {
 pub enum Outcome {
     /// The venue has the order.
     Accepted,
-    /// Some or all of it traded.
-    Filled { fill: Fill, remaining: Qty },
+    /// Some or all of it traded, in the venue's trade `trade_id`.
+    Filled {
+        fill: Fill,
+        remaining: Qty,
+        trade_id: VenueTradeId,
+    },
     /// It will not trade again: cancelled, expired, or expired by self-trade
     /// prevention. One outcome to the engine, which needs to know only that the
-    /// order is over and how much of it never traded.
-    Ended { remaining: Qty },
+    /// order is over and how much of it never traded; `how` is which of the
+    /// three, for a person reconciling against the venue.
+    Ended { remaining: Qty, how: EndedBy },
 }
 
 /// A report about an order with our prefix that this run did not send.
@@ -251,8 +258,9 @@ pub struct OrphanReport {
 /// What one message on the user-data stream means to this run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {
-    /// About one of this run's orders.
-    Ours(ExecutionEvent),
+    /// About one of this run's orders: the event, with the venue's order id
+    /// and, for a fill, its trade id beside it.
+    Ours(OrderReport),
     /// About an order with our prefix that this run did not send. Needs a
     /// person.
     Orphan(OrphanReport),
@@ -452,20 +460,32 @@ impl Translator {
             Whose::Ours(client_order_id) => {
                 let (venue_order_id, outcome) = self.detail(r, exec_type)?;
                 Ok(Inbound::Ours(match outcome {
-                    Outcome::Accepted => ExecutionEvent::Accepted {
+                    Outcome::Accepted => OrderReport::Accepted {
                         client_order_id,
                         venue_order_id: Some(venue_order_id),
                         ts: recv,
                     },
-                    Outcome::Filled { fill, remaining } => ExecutionEvent::Filled {
+                    Outcome::Filled {
+                        fill,
+                        remaining,
+                        trade_id,
+                    } => OrderReport::Filled {
                         client_order_id,
                         fill,
                         remaining,
+                        ids: Some(FillIds {
+                            venue_order_id,
+                            trade_id,
+                        }),
                         ts: recv,
                     },
-                    Outcome::Ended { remaining } => ExecutionEvent::Cancelled {
+                    Outcome::Ended { remaining, how } => OrderReport::Cancelled {
                         client_order_id,
                         remaining,
+                        ended: Some(Ended {
+                            venue_order_id,
+                            how,
+                        }),
                         ts: recv,
                     },
                 }))
@@ -520,16 +540,25 @@ impl Translator {
             "TRADE" => self.trade(r, status, filled, remaining)?,
             "CANCELED" => {
                 status_is("CANCELED")?;
-                Outcome::Ended { remaining }
+                Outcome::Ended {
+                    remaining,
+                    how: EndedBy::Cancelled,
+                }
             }
             // How a market order ends when the book runs out before it does.
             "EXPIRED" => {
                 status_is("EXPIRED")?;
-                Outcome::Ended { remaining }
+                Outcome::Ended {
+                    remaining,
+                    how: EndedBy::Expired,
+                }
             }
             "TRADE_PREVENTION" => {
                 status_is("EXPIRED_IN_MATCH")?;
-                Outcome::Ended { remaining }
+                Outcome::Ended {
+                    remaining,
+                    how: EndedBy::SelfTradePrevention,
+                }
             }
             "REJECTED" => {
                 return Err(ReportError::Unsupported(
@@ -590,6 +619,15 @@ impl Translator {
         }
         let (fee, fee_asset) = self.commission(r)?;
         let is_maker = r.is_maker.ok_or(ReportError::MissingField("m"))?;
+        // `t`, the trade, and not `I`, the execution: `I` numbers every report
+        // about the order, and `myTrades` names a row by `t`. The documentation
+        // gives `-1` for a report that is not a trade, so on a trade a missing
+        // or negative `t` is a report that cannot be matched to the venue's
+        // own record of the fill, and criterion A could not be judged on it.
+        let trade_id = match r.trade_id {
+            Some(t) if t >= 0 => VenueTradeId(t.to_string()),
+            _ => return Err(ReportError::MissingField("t")),
+        };
         Ok(Outcome::Filled {
             fill: Fill {
                 px,
@@ -599,6 +637,7 @@ impl Translator {
                 fee_asset,
             },
             remaining,
+            trade_id,
         })
     }
 
@@ -712,6 +751,8 @@ struct RawReport {
     commission_asset: Option<String>,
     #[serde(rename = "m")]
     is_maker: Option<bool>,
+    #[serde(rename = "t")]
+    trade_id: Option<i64>,
 }
 
 #[cfg(test)]
@@ -857,10 +898,23 @@ mod tests {
 
     fn filled(inbound: Result<Inbound, ReportError>) -> (Fill, Qty) {
         match inbound {
-            Ok(Inbound::Ours(ExecutionEvent::Filled {
+            Ok(Inbound::Ours(OrderReport::Filled {
                 fill, remaining, ..
             })) => (fill, remaining),
             other => panic!("expected a fill of ours, got {other:?}"),
+        }
+    }
+
+    /// The documented example's order id.
+    fn documented_order() -> VenueOrderId {
+        VenueOrderId("4293153".to_owned())
+    }
+
+    /// What the venue calls the fill in [`partial_fill`].
+    fn the_partial_fills_ids() -> FillIds {
+        FillIds {
+            venue_order_id: documented_order(),
+            trade_id: VenueTradeId("12345".to_owned()),
         }
     }
 
@@ -879,9 +933,9 @@ mod tests {
     fn our_new_order_is_accepted_with_the_venues_id_for_it() {
         assert_eq!(
             translate(&[("c", json!("q-r1-7"))]),
-            Ok(Inbound::Ours(ExecutionEvent::Accepted {
+            Ok(Inbound::Ours(OrderReport::Accepted {
                 client_order_id: ClientOrderId(7),
-                venue_order_id: Some(VenueOrderId("4293153".to_owned())),
+                venue_order_id: Some(documented_order()),
                 ts: RECV,
             }))
         );
@@ -891,13 +945,57 @@ mod tests {
     fn a_trade_is_the_last_execution_not_the_order_price_or_the_running_total() {
         assert_eq!(
             translate(&partial_fill()),
-            Ok(Inbound::Ours(ExecutionEvent::Filled {
+            Ok(Inbound::Ours(OrderReport::Filled {
                 client_order_id: ClientOrderId(7),
                 fill: the_partial_fill(),
                 remaining: qty("0.4"),
+                ids: Some(the_partial_fills_ids()),
                 ts: RECV,
             }))
         );
+    }
+
+    #[test]
+    fn a_trade_is_named_by_its_trade_id_not_by_its_execution_id() {
+        // `t` and `I` are both integers on the same report, and only `t` finds
+        // the row in `myTrades` that criterion A compares this fill with. The
+        // fixture's are distinct (12345 and the documented 8641984), so reading
+        // the wrong one shows.
+        let (ids, _) = fill_ids(translate(&partial_fill()));
+        assert_eq!(ids, the_partial_fills_ids());
+        let (ids, _) = fill_ids(translate(&with(partial_fill(), &[("t", json!(0))])));
+        assert_eq!(
+            ids.trade_id,
+            VenueTradeId("0".to_owned()),
+            "zero is a trade id"
+        );
+    }
+
+    #[test]
+    fn a_trade_without_a_trade_id_is_refused_rather_than_defaulted() {
+        // A fill that cannot be matched to the venue's own record of it would
+        // leave criterion A unjudgeable on exactly the row that matters.
+        let mut absent = partial_fill();
+        absent.retain(|(field, _)| *field != "t");
+        absent.push(("t", Value::Null));
+        for fields in [absent, with(partial_fill(), &[("t", json!(-1))])] {
+            assert_eq!(
+                translate(&fields),
+                Err(ReportError::MissingField("t")),
+                "{fields:?}"
+            );
+        }
+    }
+
+    fn fill_ids(inbound: Result<Inbound, ReportError>) -> (FillIds, Qty) {
+        match inbound {
+            Ok(Inbound::Ours(OrderReport::Filled {
+                ids: Some(ids),
+                remaining,
+                ..
+            })) => (ids, remaining),
+            other => panic!("expected a fill of ours with its ids, got {other:?}"),
+        }
     }
 
     #[test]
@@ -922,9 +1020,13 @@ mod tests {
         ];
         assert_eq!(
             translate(&cancel),
-            Ok(Inbound::Ours(ExecutionEvent::Cancelled {
+            Ok(Inbound::Ours(OrderReport::Cancelled {
                 client_order_id: ClientOrderId(7),
                 remaining: qty("0.75"),
+                ended: Some(Ended {
+                    venue_order_id: documented_order(),
+                    how: EndedBy::Cancelled,
+                }),
                 ts: RECV,
             }))
         );
@@ -944,9 +1046,13 @@ mod tests {
 
     #[test]
     fn expiry_and_self_trade_prevention_end_the_order_with_what_never_traded() {
-        for (exec_type, status) in [
-            ("EXPIRED", "EXPIRED"),
-            ("TRADE_PREVENTION", "EXPIRED_IN_MATCH"),
+        for (exec_type, status, how) in [
+            ("EXPIRED", "EXPIRED", EndedBy::Expired),
+            (
+                "TRADE_PREVENTION",
+                "EXPIRED_IN_MATCH",
+                EndedBy::SelfTradePrevention,
+            ),
         ] {
             let fields = [
                 ("c", json!("q-r1-7")),
@@ -956,9 +1062,13 @@ mod tests {
             ];
             assert_eq!(
                 translate(&fields),
-                Ok(Inbound::Ours(ExecutionEvent::Cancelled {
+                Ok(Inbound::Ours(OrderReport::Cancelled {
                     client_order_id: ClientOrderId(7),
                     remaining: qty("0.75"),
+                    ended: Some(Ended {
+                        venue_order_id: documented_order(),
+                        how,
+                    }),
                     ts: RECV,
                 })),
                 "{exec_type}"
@@ -975,7 +1085,7 @@ mod tests {
         ];
         for fields in [vec![("c", json!("q-r1-7"))], partial_fill(), cancel] {
             match translate(&fields) {
-                Ok(Inbound::Ours(event)) => assert_eq!(event.ts(), RECV, "{event:?}"),
+                Ok(Inbound::Ours(report)) => assert_eq!(report.ts(), RECV, "{report:?}"),
                 other => panic!("expected an event of ours, got {other:?}"),
             }
         }
@@ -1078,6 +1188,7 @@ mod tests {
                 outcome: Outcome::Filled {
                     fill: the_partial_fill(),
                     remaining: qty("0.4"),
+                    trade_id: VenueTradeId("12345".to_owned()),
                 },
             }))
         );
@@ -1257,9 +1368,9 @@ mod tests {
             .replace("q-r1-7", "q-r1-\\u0037");
         assert_eq!(
             translator().translate(message.as_bytes(), RECV),
-            Ok(Inbound::Ours(ExecutionEvent::Accepted {
+            Ok(Inbound::Ours(OrderReport::Accepted {
                 client_order_id: ClientOrderId(7),
-                venue_order_id: Some(VenueOrderId("4293153".to_owned())),
+                venue_order_id: Some(documented_order()),
                 ts: RECV,
             }))
         );

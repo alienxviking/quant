@@ -14,7 +14,7 @@
 
 use quant_book::Book;
 use quant_core::event::MarketEvent;
-use quant_core::execution::{ClientOrderId, ExecutionEvent, OrderRequest};
+use quant_core::execution::{ClientOrderId, ExecutionEvent, OrderRequest, RejectReason};
 use quant_core::fixed::{Notional, Px};
 use quant_core::instrument::InstrumentId;
 use quant_core::time::Ts;
@@ -22,7 +22,7 @@ use quant_core::time::Ts;
 use crate::portfolio::{Portfolio, Position};
 use crate::risk::RiskLayer;
 use crate::venue::ExecutionVenue;
-use crate::{seam_check, Ledger};
+use crate::{seam_check, Ledger, WriteAhead};
 
 /// Everything a strategy can reach.
 ///
@@ -110,11 +110,14 @@ impl<'a> Context<'a> {
     ///
     /// In a backtest and in paper that is the `local_recv_ts` of the market
     /// event being handled, or of one before it if this one's went backwards
-    /// and the clock held. Live, venue reports move it too: a report received
-    /// after the market event and delivered on the same wake carries the clock
-    /// up to the report's time, and a report can arrive while the market is
-    /// silent, with no market event at all. Either way the clock never reads
-    /// earlier than a report the strategy has been told of.
+    /// and the clock held. Live, what the venue says moves it too, order
+    /// reports and notices alike: one received after the market event and
+    /// delivered on the same wake carries the clock up to its time, and one
+    /// can arrive while the market is silent, with no market event at all.
+    /// Either way the clock never reads earlier than anything the venue said
+    /// on the wakes the strategy has been called on. A wake that brought only
+    /// notices does not call the strategy at all, so a notice can move the
+    /// clock between two readings and say nothing else.
     ///
     /// The only notion of time available. See the engine's module docs for why
     /// there is no other.
@@ -160,6 +163,22 @@ impl<'a> Context<'a> {
             self.ledger.refuse(client_order_id, reason, self.now);
             return client_order_id;
         }
+        // The record's latch: once it has failed to hold a submission, nothing
+        // more leaves this process (see `Ledger::unrecorded`). Before the venue
+        // is asked, because no answer of the venue's changes what the record
+        // can hold.
+        if self.ledger.unrecorded {
+            return self.refuse_unsent(client_order_id, &request, crate::RefusedBy::Record);
+        }
+        // Whether the venue can take it now. After the seam, because a
+        // malformed request is ours to refuse whatever state the venue is in;
+        // before the risk layer, so an order the venue could not take spends
+        // none of the day's count and trips nothing; and before anything is
+        // written down as submitted, so the record never says an order went to
+        // a venue that was not there to take it.
+        if let Err(unready) = self.venue.ready(&request) {
+            return self.refuse_unsent(client_order_id, &request, crate::RefusedBy::Venue(unready));
+        }
         // The mark the risk layer prices against: this instrument's mid, or
         // `None` when the book has no prices. A money limit must refuse rather
         // than guess -- see `RiskLayer::check`.
@@ -202,9 +221,19 @@ impl<'a> Context<'a> {
 
         // Written down *before* the venue is told, which is the fill rule
         // generalised: an order at a venue that we never recorded is an orphan
-        // position, and nothing read afterwards recovers it.
-        if let Some(observer) = self.observer.as_mut() {
-            observer.on_submitted(client_order_id, &request, mark, self.now);
+        // position, and nothing read afterwards recovers it. Enforced rather
+        // than hoped for: a record that could not hold the order says so, and
+        // the order does not go.
+        let now = self.now;
+        let ahead = self
+            .observer
+            .as_mut()
+            .map_or(WriteAhead::Proceed, |observer| {
+                observer.on_submitted(client_order_id, &request, mark, now)
+            });
+        if ahead == WriteAhead::Withhold {
+            self.ledger.unrecorded = true;
+            return self.refuse_unsent(client_order_id, &request, crate::RefusedBy::Record);
         }
         self.ledger.stats.submitted += 1;
         // Remembered so the fill can be booked: a fill names only the order.
@@ -212,6 +241,32 @@ impl<'a> Context<'a> {
             .orders
             .insert(client_order_id, (request.instrument, request.side));
         self.venue.submit(client_order_id, &request, self.now);
+        client_order_id
+    }
+
+    /// Refuse a well-formed order because the record or the venue could not
+    /// take it now, and hand back its id.
+    ///
+    /// The strategy hears `RejectReason::Venue` and not which of the two, or
+    /// why: that is the record's, for the reason a risk refusal's `bound` is.
+    fn refuse_unsent(
+        &mut self,
+        client_order_id: ClientOrderId,
+        request: &OrderRequest,
+        by: crate::RefusedBy,
+    ) -> ClientOrderId {
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_refused(
+                client_order_id,
+                request,
+                RejectReason::Venue,
+                None,
+                by,
+                self.now,
+            );
+        }
+        self.ledger
+            .refuse(client_order_id, RejectReason::Venue, self.now);
         client_order_id
     }
 
