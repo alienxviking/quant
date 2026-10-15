@@ -110,6 +110,11 @@ pub struct LiveStats {
     pub parse_failures: u64,
     /// Gaps handed to the engine, from every cause including the recorder's own.
     pub gaps_emitted: u64,
+    /// Account-stream records that reached this market feed. Each is turned
+    /// into nothing: the account's reports are not market data, and they leave
+    /// the book as it was. Should always be zero -- the account stream has an
+    /// ingress and a tee of its own -- so the first is also logged.
+    pub foreign: u64,
 }
 
 /// A venue stream, as the engine sees it.
@@ -193,6 +198,21 @@ impl LiveSource {
             // `quant-storage` owns the mapping and every reader shares it.
             CaptureRecord::Control { record, .. } => {
                 Ok(record.into_market_event(self.instrument, at, seq))
+            }
+            // Never decoded as a market message, whatever its bytes look like.
+            // Not a gap either: nothing the market sent was lost, so the book
+            // is no less true than it was. Something wired the account stream
+            // into the market's ingress, and that is said once, loudly.
+            CaptureRecord::Account { .. } => {
+                self.stats.foreign += 1;
+                if self.stats.foreign == 1 {
+                    tracing::error!(
+                        ingest_seq = seq,
+                        "an account-stream record reached the market feed; it is not \
+                         market data and was not read as such"
+                    );
+                }
+                return;
             }
         };
 
@@ -393,6 +413,24 @@ mod tests {
             Some(MarketEvent::Gap(g)) if g.cause == GapCause::Disconnect
         ));
         assert_eq!(stats.gaps_emitted, 1);
+    }
+
+    #[test]
+    fn an_account_record_on_the_market_feed_is_never_market_data() {
+        // The account stream has an ingress and a tee of its own, so one of its
+        // records here is a wiring fault. Its bytes are a perfectly good trade
+        // on purpose: read as a market message, it would become one.
+        let account = CaptureRecord::Account {
+            local_recv_ts: Ts::from_nanos(2),
+            ingest_seq: 2,
+            payload: TRADE.to_vec(),
+        };
+        let (events, stats) = drain(vec![venue(1, TRADE), account, venue(3, TRADE)]);
+        let seqs: Vec<u64> = events.iter().map(|e| e.meta().ingest_seq).collect();
+        assert_eq!(seqs, vec![1, 3], "{events:?}");
+        assert_eq!(stats.foreign, 1);
+        assert_eq!(stats.holes, 0, "it held its place in the sequence");
+        assert_eq!(stats.gaps_emitted, 0, "and nothing was lost, so no gap");
     }
 
     #[test]

@@ -35,7 +35,14 @@ pub const MAGIC: [u8; 8] = *b"QUANTRAW";
 ///   bumped rather than the kind quietly added -- the alternative is a v1 reader
 ///   getting halfway through a good file and reporting `UnknownFrameKind`, which
 ///   looks like corruption. See `docs/data-contract.md` §6.
-pub const CONTAINER_VERSION: u16 = 2;
+/// - **v3** -- adds [`FrameKind::AccountPayload`], for M8's account stream.
+///   Bumped for v2's reason: a v2 reader refuses a v3 file at the header rather
+///   than reading most of it and then calling a good file corrupt.
+///
+/// A reader reads every version up to this one, and a file admits only the
+/// frame kinds and control records its own version had: see
+/// [`FrameKind::since`] and [`ControlRecord::since`].
+pub const CONTAINER_VERSION: u16 = 3;
 
 /// Marks the start of a block: ASCII `QRAB`.
 ///
@@ -132,15 +139,62 @@ pub enum FrameKind {
     /// the endpoint exactly. A second REST-sourced artifact is when an envelope
     /// earns itself.
     VenueSnapshot,
+    /// Venue bytes from the account's own socket, verbatim: the stream in which
+    /// a venue reports what happened to the account's orders, as opposed to what
+    /// happened in the market. Never parsed by this crate.
+    ///
+    /// # Why this is not just a `VenuePayload`
+    ///
+    /// [`Self::VenueSnapshot`]'s argument, and a stronger case of it. These bytes
+    /// are equally the venue's, but they answer a question about the account,
+    /// not the market, and a reader that took one for a market message would at
+    /// best fail to parse it and at worst find a trade in it. One byte of kind
+    /// says which question a payload answers for as long as the file exists.
+    ///
+    /// # What is recorded, and what never is
+    ///
+    /// Every frame the venue sends on that socket -- the account's events, the
+    /// venue's notice that it is closing the connection, the answers to our
+    /// subscription requests -- byte for byte, so that a disagreement between
+    /// our record of an order and the venue's can be argued from what the venue
+    /// said rather than from our reading of it. Two things are never recorded,
+    /// because the raw tier is kept forever and a credential written into it
+    /// cannot be taken back: anything we sent, which carries the key and its
+    /// signature, and any answer that echoes the key. Binance's answers to
+    /// `session.logon` and `session.status` do (`web-socket-api.md`:3418 and
+    /// :3459). The transport sorts those out before the bytes reach ingress;
+    /// nothing below it parses a payload, so nothing below it could.
+    ///
+    /// # Where these frames live
+    ///
+    /// In files of their own, never beside market data. The account stream gets
+    /// its own capture session and so its own `ingest_seq`, which keeps a gap on
+    /// one socket from reading as blindness on the other; a market file holding
+    /// one of these is misfiled, and its readers say so rather than read it.
+    AccountPayload,
 }
 
 impl FrameKind {
+    /// Every kind, in code order: `ALL[n]` is the kind whose code is `n`.
+    ///
+    /// For anything that keeps one of something per kind. Sized by hand, so a
+    /// test holds it to [`FrameKind::from_code`], which is what a reader actually
+    /// accepts: a kind missing from here would be a slot that does not exist, and
+    /// a panic the first time a file holding that kind is read.
+    pub const ALL: [Self; 4] = [
+        Self::VenuePayload,
+        Self::Control,
+        Self::VenueSnapshot,
+        Self::AccountPayload,
+    ];
+
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
             Self::VenuePayload => 0,
             Self::Control => 1,
             Self::VenueSnapshot => 2,
+            Self::AccountPayload => 3,
         }
     }
 
@@ -150,8 +204,35 @@ impl FrameKind {
             0 => Some(Self::VenuePayload),
             1 => Some(Self::Control),
             2 => Some(Self::VenueSnapshot),
+            3 => Some(Self::AccountPayload),
             _ => None,
         }
+    }
+
+    /// The container version that introduced this kind.
+    ///
+    /// A file admits only the kinds its own header's version had. A kind-2
+    /// frame in a v1 file is not a v1 file using a newer feature: no v1 writer
+    /// could have written that byte, so the file is not what its header says it
+    /// is, and a reader treats it as corruption rather than reading on. Without
+    /// this a newer reader would accept any kind it knows in a file of any age,
+    /// and the version in the header would stop meaning anything.
+    ///
+    /// Exhaustive on purpose, like `Exchange::wire_code`: a new kind is a compile
+    /// error here until someone says which version brought it.
+    #[must_use]
+    pub const fn since(self) -> u16 {
+        match self {
+            Self::VenuePayload | Self::Control => 1,
+            Self::VenueSnapshot => 2,
+            Self::AccountPayload => 3,
+        }
+    }
+
+    /// Whether a file whose header says `container_version` may hold this kind.
+    #[must_use]
+    pub const fn admitted_in(self, container_version: u16) -> bool {
+        self.since() <= container_version
     }
 
     /// Whether the payload is uninterpreted venue bytes.
@@ -159,9 +240,15 @@ impl FrameKind {
     /// The distinction that matters for provenance: everything except
     /// [`Self::Control`] is what the venue said, and nothing in this crate has
     /// looked at it.
+    ///
+    /// Exhaustive rather than a `matches!`, so a new kind has to say which it is
+    /// instead of silently answering "no".
     #[must_use]
     pub const fn is_venue_bytes(self) -> bool {
-        matches!(self, Self::VenuePayload | Self::VenueSnapshot)
+        match self {
+            Self::VenuePayload | Self::VenueSnapshot | Self::AccountPayload => true,
+            Self::Control => false,
+        }
     }
 }
 
@@ -545,6 +632,39 @@ impl ControlRecord {
         serde_json::from_slice(bytes).map_err(StorageError::Json)
     }
 
+    /// The record's name on disk: the `type` tag its JSON carries.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Gap { .. } => "gap",
+            Self::SnapshotFailed { .. } => "snapshot_failed",
+        }
+    }
+
+    /// The container version that introduced this record.
+    ///
+    /// The control-record twin of [`FrameKind::since`], for the same reason: a
+    /// `SnapshotFailed` in a v1 file is not a v1 file using a newer feature, it
+    /// is a file no v1 writer produced. v2 brought this record together with
+    /// [`FrameKind::VenueSnapshot`], and checking only the kind would let half
+    /// of what v2 introduced pass under a v1 header.
+    ///
+    /// Exhaustive on purpose: a new record is a compile error here until
+    /// someone says which version brought it.
+    #[must_use]
+    pub const fn since(&self) -> u16 {
+        match self {
+            Self::Gap { .. } => 1,
+            Self::SnapshotFailed { .. } => 2,
+        }
+    }
+
+    /// Whether a file whose header says `container_version` may hold this record.
+    #[must_use]
+    pub const fn admitted_in(&self, container_version: u16) -> bool {
+        self.since() <= container_version
+    }
+
     /// Reattach the identity that was deliberately not persisted.
     ///
     /// `instrument` comes from looking up the file header's
@@ -731,6 +851,7 @@ mod tests {
             (FrameKind::VenuePayload, 0),
             (FrameKind::Control, 1),
             (FrameKind::VenueSnapshot, 2),
+            (FrameKind::AccountPayload, 3),
         ] {
             assert_eq!(kind.code(), code);
             assert_eq!(FrameKind::from_code(code), Some(kind));
@@ -738,7 +859,49 @@ mod tests {
         // A control frame is the only thing in the raw tier we authored.
         assert!(FrameKind::VenuePayload.is_venue_bytes());
         assert!(FrameKind::VenueSnapshot.is_venue_bytes());
+        assert!(FrameKind::AccountPayload.is_venue_bytes());
         assert!(!FrameKind::Control.is_venue_bytes());
+    }
+
+    #[test]
+    fn each_kind_is_pinned_to_the_version_that_introduced_it() {
+        // In every recorded file, because the header's version decides which
+        // kinds the file may hold. Moving a kind to a later version would make
+        // good files of the earlier one read as corrupt.
+        for (kind, since) in [
+            (FrameKind::VenuePayload, 1),
+            (FrameKind::Control, 1),
+            (FrameKind::VenueSnapshot, 2),
+            (FrameKind::AccountPayload, 3),
+        ] {
+            assert_eq!(kind.since(), since, "{kind:?}");
+            assert!(kind.admitted_in(since), "{kind:?} in v{since}");
+            assert!(
+                kind.admitted_in(CONTAINER_VERSION),
+                "{kind:?} in the current version"
+            );
+            assert!(!kind.admitted_in(since - 1), "{kind:?} before v{since}");
+        }
+    }
+
+    #[test]
+    fn every_kind_is_listed_once_in_code_order() {
+        // `ALL` sizes whatever keeps one of something per kind -- `dump`'s
+        // samples, for one -- so it is held to `from_code` across every byte a
+        // frame header can hold, not to a list someone remembered to update.
+        for code in 0..=u8::MAX {
+            match FrameKind::from_code(code) {
+                Some(kind) => assert_eq!(
+                    FrameKind::ALL.get(usize::from(code)),
+                    Some(&kind),
+                    "code {code} is read but not listed in its place"
+                ),
+                None => assert!(
+                    usize::from(code) >= FrameKind::ALL.len(),
+                    "code {code} is listed but a reader refuses it"
+                ),
+            }
+        }
     }
 
     #[test]

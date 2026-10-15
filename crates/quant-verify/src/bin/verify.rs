@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! verify [DATA_ROOT] [--reconcile]
-//! verify data                  # every session under ./data
+//! verify data                  # every session under ./data: raw/ and account/
 //! verify data --reconcile      # also cross-check the metadata index
 //! ```
 //!
@@ -87,10 +87,13 @@ async fn main() -> ExitCode {
 fn print_report(report: &Report, root: &std::path::Path, reconciled: bool) {
     let t = report.totals;
     println!("root      {}", root.display());
-    println!("sessions  {} in {} segments", t.sessions, t.segments);
     println!(
-        "frames    {} ({} stream, {} snapshot, {} gap)",
-        t.frames, t.stream_messages, t.snapshots, t.gaps
+        "sessions  {} in {} segments ({} of the account stream)",
+        t.sessions, t.segments, t.account_sessions
+    );
+    println!(
+        "frames    {} ({} stream, {} snapshot, {} account, {} gap)",
+        t.frames, t.stream_messages, t.snapshots, t.account_messages, t.gaps
     );
     println!(
         "streams   {} depth deltas, {} trades",
@@ -132,18 +135,6 @@ fn print_report(report: &Report, root: &std::path::Path, reconciled: bool) {
         }
     }
 
-    // Errors first: "nothing verified" is a guard against a *false clean bill of
-    // health*, so it must not displace the reason a run actually failed. A capture
-    // corrupt in its first block reads zero frames, and saying "no files found"
-    // about it would send whoever is on call looking in the wrong place.
-    println!(
-        "verdict   {}",
-        if !report.is_clean() {
-            "UNEXPLAINED FINDINGS: this capture cannot be trusted as complete"
-        } else if t.frames == 0 {
-            "NOTHING VERIFIED: no capture frames found under this root"
-        } else {
-            "every discontinuity is explained by a record in the capture"
-        }
-    );
+    // In the library, where a test can hold it: see `Report::verdict`.
+    println!("verdict   {}", report.verdict());
 }

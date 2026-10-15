@@ -6,6 +6,26 @@
 //! `ClickHouse` all discover `key=value` directories by convention, and one
 //! typo'd `symbol=btcusdt` would create a second partition that every one of
 //! those tools reads as a different instrument.
+//!
+//! # Two trees, one per kind of stream
+//!
+//! ```text
+//! <root>/raw/exchange=binance/symbol=BTCUSDT/date=2026-10-15/session=<uuid>/part-00000.bin.zst
+//! <root>/account/exchange=binance/date=2026-10-15/session=<uuid>/part-00000.bin.zst
+//! ```
+//!
+//! Market data is filed by instrument, because every question asked of it is
+//! "this instrument, these days". The account stream -- the venue's reports on
+//! the account's own orders, which M8 records before it parses them -- has no
+//! instrument to file under: one socket carries every instrument the account
+//! trades. So its path has no `symbol=`, and it lives in a tree of its own beside
+//! `raw/` rather than inside it, which is `docs/live-run.md` §5's decision: every
+//! reader of market data walks `raw/`, so none of them can ever be handed one of
+//! its files, and a gap on the account's socket can never clear a book.
+//!
+//! The path needs no account key, because an M8 run root holds one account: the
+//! session tells two runs apart. A second account under one root is when an
+//! `account=` key would earn itself.
 
 use core::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -13,26 +33,94 @@ use std::path::{Path, PathBuf};
 use quant_core::instrument::Exchange;
 use quant_core::time::UtcDate;
 
+/// The tree market data is captured under.
+pub const RAW_DIR: &str = "raw";
+
+/// The account stream's name, wherever it needs one: the tree its captures
+/// live under, beside [`RAW_DIR`], and the file header's symbol field.
+///
+/// That field is where a market capture names its instrument. It is
+/// fixed-width and may not be empty, and the account stream has no instrument,
+/// so its files name the stream there instead -- in lower case, which is not
+/// how Binance writes a symbol, so the name is no Binance instrument's. Which
+/// stream a file holds is still decided by where it sits and what its frames
+/// are, never by this name alone.
+pub const ACCOUNT_STREAM: &str = "account";
+
+/// What a capture file records, which decides the tree it lives in.
+///
+/// A sum rather than a symbol and a flag, so that an account capture with a
+/// symbol cannot be written down at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureStream {
+    /// One instrument's market data -- trades, depth, book snapshots -- under
+    /// [`RAW_DIR`].
+    Market {
+        /// The venue's own symbol, verbatim and in the venue's own case.
+        symbol: String,
+    },
+    /// The account's own stream, under [`ACCOUNT_STREAM`]: what the venue says
+    /// happened to the account's orders, on every instrument it trades.
+    Account,
+}
+
+impl CaptureStream {
+    #[must_use]
+    pub fn market(symbol: impl Into<String>) -> Self {
+        Self::Market {
+            symbol: symbol.into(),
+        }
+    }
+
+    /// The instrument, for market data. The account stream has none.
+    #[must_use]
+    pub fn symbol(&self) -> Option<&str> {
+        match self {
+            Self::Market { symbol } => Some(symbol),
+            Self::Account => None,
+        }
+    }
+
+    /// What this stream's files carry in their header's symbol field.
+    ///
+    /// One definition, because the session writes it and the verifier holds a
+    /// file's header to its path by it, and two copies could disagree.
+    #[must_use]
+    pub fn header_symbol(&self) -> &str {
+        match self {
+            Self::Market { symbol } => symbol,
+            Self::Account => ACCOUNT_STREAM,
+        }
+    }
+}
+
 /// Identifies one capture file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureTarget {
     pub exchange: Exchange,
-    /// The venue's own symbol, verbatim and in the venue's own case.
-    pub symbol: String,
+    /// One instrument's market data, or the account stream.
+    pub stream: CaptureStream,
     pub date: UtcDate,
     pub session_id: [u8; 16],
-    /// Sequence within the session. Reserved for the size-based file rolling
-    /// that arrives with M1.c; today a session writes `part-00000` only.
+    /// Sequence within the session's day. Reserved for size-based rolling
+    /// within a day, which has never been needed; today a session writes
+    /// `part-00000` only.
     pub part: u32,
 }
 
 impl CaptureTarget {
-    /// Directory holding this session's parts.
+    /// Directory holding this session's parts for its day.
     #[must_use]
     pub fn directory(&self, root: &Path) -> PathBuf {
-        root.join("raw")
-            .join(format!("exchange={}", self.exchange))
-            .join(format!("symbol={}", self.symbol))
+        let exchange = format!("exchange={}", self.exchange);
+        let stream = match &self.stream {
+            CaptureStream::Market { symbol } => root
+                .join(RAW_DIR)
+                .join(exchange)
+                .join(format!("symbol={symbol}")),
+            CaptureStream::Account => root.join(ACCOUNT_STREAM).join(exchange),
+        };
+        stream
             .join(format!("date={}", self.date))
             .join(format!("session={}", format_session_id(&self.session_id)))
     }
@@ -58,19 +146,38 @@ impl CaptureTarget {
     ///
     /// Returns `None` for anything that is not a capture file at the expected
     /// depth. The verifier treats that as a finding rather than skipping it
-    /// quietly -- a stray file under `raw/` means either a bug or somebody
+    /// quietly -- a stray file in a capture tree means either a bug or somebody
     /// tidying by hand, and both are worth hearing about.
     ///
-    /// Only the last five components are read, so the data root may be anything
-    /// and may itself contain `=`.
+    /// Exactly the last five components are read, so the data root may be
+    /// anything and may itself contain `=`. For market data they are the four
+    /// partition keys and the file. The account stream has one key fewer, so its
+    /// fifth is the tree itself, and it must say `account`: that is the path
+    /// stating what it holds, and without the check a market path that had lost
+    /// its `symbol=` directory would read as the account's.
     #[must_use]
     pub fn parse(path: &Path) -> Option<Self> {
         let mut parts = path.components().rev().map(|c| c.as_os_str().to_str());
         let file = parts.next()??;
         let session = parts.next()??;
         let date = parts.next()??;
-        let symbol = parts.next()??;
-        let exchange = parts.next()??;
+        let fourth = parts.next()??;
+        let fifth = parts.next()??;
+
+        // Market data names its symbol fourth from the end; the account stream
+        // names its exchange there, with its own tree directly above. No
+        // component starts with both `symbol=` and `exchange=`, so neither shape
+        // can be taken for the other.
+        let (exchange, stream) = match fourth.strip_prefix("symbol=") {
+            Some(symbol) => (
+                fifth.strip_prefix("exchange=")?,
+                CaptureStream::market(symbol),
+            ),
+            None if fifth == ACCOUNT_STREAM => {
+                (fourth.strip_prefix("exchange=")?, CaptureStream::Account)
+            }
+            None => return None,
+        };
 
         let part = file
             .strip_prefix("part-")?
@@ -79,8 +186,8 @@ impl CaptureTarget {
             .ok()?;
 
         Some(Self {
-            exchange: Exchange::from_name(exchange.strip_prefix("exchange=")?)?,
-            symbol: symbol.strip_prefix("symbol=")?.to_owned(),
+            exchange: Exchange::from_name(exchange)?,
+            stream,
             date: parse_utc_date(date.strip_prefix("date=")?)?,
             session_id: parse_session_id(session.strip_prefix("session=")?)?,
             part,
@@ -162,7 +269,7 @@ mod tests {
     fn target() -> CaptureTarget {
         CaptureTarget {
             exchange: Exchange::Binance,
-            symbol: "BTCUSDT".to_owned(),
+            stream: CaptureStream::market("BTCUSDT"),
             date: UtcDate {
                 year: 2026,
                 month: 7,
@@ -273,6 +380,90 @@ mod tests {
                 "should have been refused: {bad}"
             );
         }
+    }
+
+    fn account_target() -> CaptureTarget {
+        CaptureTarget {
+            stream: CaptureStream::Account,
+            ..target()
+        }
+    }
+
+    #[test]
+    fn the_account_stream_has_a_tree_of_its_own_and_no_symbol() {
+        // Pinned against docs/data-contract.md §5, as the market path is above.
+        // Beside raw/ rather than inside it, so that nothing which walks raw/ for
+        // market data is ever handed one of these files.
+        let text = account_target()
+            .file(Path::new("data"))
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(
+            text,
+            "data/account/exchange=binance/date=2026-07-29/\
+             session=01234567-89ab-cdef-fedc-ba9876543210/part-00000.bin.zst"
+        );
+    }
+
+    #[test]
+    fn an_account_path_parses_back_to_the_target_that_wrote_it() {
+        // `file` and `parse` stay inverses for both streams, including under
+        // roots that are themselves called `account` or `raw` -- where reading
+        // the tree's name off the wrong component would swap one stream for the
+        // other.
+        for original in [account_target(), target()] {
+            for root in [
+                "data",
+                "/var/lib/quant",
+                "C:/caps",
+                "weird=root/x",
+                "account",
+                "raw",
+                "x/account/raw",
+            ] {
+                let path = original.file(Path::new(root));
+                assert_eq!(
+                    CaptureTarget::parse(&path).as_ref(),
+                    Some(&original),
+                    "round trip failed for {:?} under root {root}",
+                    original.stream
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn neither_stream_can_be_read_as_the_other() {
+        // The account tree's own name is what marks its files, so a market path
+        // that lost its `symbol=` directory is refused rather than read as the
+        // account's, and so is a misnamed tree.
+        for bad in [
+            "data/raw/exchange=binance/date=2026-07-29/session=01234567-89ab-cdef-fedc-ba9876543210/part-00000.bin.zst",
+            "data/accounts/exchange=binance/date=2026-07-29/session=01234567-89ab-cdef-fedc-ba9876543210/part-00000.bin.zst",
+            "data/account/date=2026-07-29/session=01234567-89ab-cdef-fedc-ba9876543210/part-00000.bin.zst",
+        ] {
+            assert_eq!(
+                CaptureTarget::parse(Path::new(bad)),
+                None,
+                "should have been refused: {bad}"
+            );
+        }
+        // A market-shaped path is market data wherever it sits. The catalog
+        // that walks the account tree is what refuses one found there.
+        let market_shaped = "data/account/exchange=binance/symbol=BTCUSDT/date=2026-07-29/\
+                             session=01234567-89ab-cdef-fedc-ba9876543210/part-00000.bin.zst";
+        assert_eq!(
+            CaptureTarget::parse(Path::new(market_shaped)).map(|t| t.stream),
+            Some(CaptureStream::market("BTCUSDT"))
+        );
+    }
+
+    #[test]
+    fn a_header_names_the_instrument_or_the_account_stream() {
+        assert_eq!(CaptureStream::market("BTCUSDT").header_symbol(), "BTCUSDT");
+        assert_eq!(CaptureStream::Account.header_symbol(), "account");
+        assert_eq!(CaptureStream::Account.symbol(), None);
+        assert_eq!(CaptureStream::market("BTCUSDT").symbol(), Some("BTCUSDT"));
     }
 
     #[test]

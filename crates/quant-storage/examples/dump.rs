@@ -66,10 +66,11 @@ fn dump(path: &str, sample: usize) -> Result<bool, Box<dyn std::error::Error>> {
 
     let stats = reader.stats();
     println!(
-        "frames    {} ({} stream, {} snapshot, {} control)",
+        "frames    {} ({} stream, {} snapshot, {} account, {} control)",
         stats.frames,
         scan.venue,
         scan.snapshots,
+        scan.account,
         scan.control.len()
     );
     println!("blocks    {}", stats.blocks);
@@ -125,8 +126,6 @@ fn dump(path: &str, sample: usize) -> Result<bool, Box<dyn std::error::Error>> {
         }
     );
 
-    // `map_or`, not `is_none_or`: the latter is stable only from 1.82 and the
-    // workspace declares an MSRV of 1.75.
     Ok(explained
         && reader
             .truncation()
@@ -144,6 +143,9 @@ struct Scan {
     venue: u64,
     snapshots: u64,
     snapshot_bytes: u64,
+    /// Frames from the account stream's socket. A file of the account stream
+    /// holds these and control records; a market file should hold none.
+    account: u64,
     /// Where the book anchors sit. Worth printing: a snapshot's position in the
     /// sequence is what tells the book builder which deltas precede it and are
     /// therefore stale, so "is it in a sensible place" is a real question.
@@ -165,7 +167,10 @@ fn scan<R: std::io::Read>(
     sample: usize,
 ) -> Result<Scan, Box<dyn std::error::Error>> {
     let mut scan = Scan::default();
-    let mut sampled = [0_usize; 3];
+    // One count per kind, sized from the kinds rather than written as a number:
+    // a literal here compiled happily when a kind was added and would have
+    // panicked on the first file that held one.
+    let mut sampled = [0_usize; FrameKind::ALL.len()];
 
     while let Some(frame) = reader.next_frame() {
         let frame = frame?;
@@ -180,11 +185,9 @@ fn scan<R: std::io::Read>(
         scan.last_seq = Some(frame.ingest_seq);
 
         // Printed before the counters so the first of each kind is the one shown.
-        let slot = match frame.kind {
-            FrameKind::VenuePayload => 0,
-            FrameKind::VenueSnapshot => 1,
-            FrameKind::Control => 2,
-        };
+        // A kind's code is its place in `FrameKind::ALL`, which quant-storage's
+        // tests hold to every code a reader accepts.
+        let slot = usize::from(frame.kind.code());
         if sampled[slot] < sample {
             sampled[slot] += 1;
             let text = String::from_utf8_lossy(&frame.payload);
@@ -210,6 +213,7 @@ fn scan<R: std::io::Read>(
                     .collect();
                 scan.snapshot_seqs.push((frame.ingest_seq, head));
             }
+            FrameKind::AccountPayload => scan.account += 1,
             FrameKind::Control => match frame.control()? {
                 Some(ControlRecord::Gap { cause, .. }) => {
                     scan.gaps += 1;

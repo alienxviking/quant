@@ -13,6 +13,8 @@
 use core::fmt;
 use std::io;
 
+use crate::frame::{ControlRecord, FrameKind};
+
 /// Result alias for the raw format.
 pub type StorageResult<T> = Result<T, StorageError>;
 
@@ -100,6 +102,33 @@ pub enum StorageError {
     /// Unknown [`crate::FrameKind`] discriminant.
     UnknownFrameKind(u8),
 
+    /// A frame of a kind the file's own container version did not have.
+    ///
+    /// Not a newer feature: no writer of that version could have produced the
+    /// byte, so the file is not what its header claims -- corrupted, or stamped
+    /// wrong. Kept apart from [`Self::UnknownFrameKind`] because the kind *is*
+    /// known, and the message should say which version it belongs to rather
+    /// than suggest this build is too old. See [`crate::FrameKind::since`].
+    FrameKindNotInVersion {
+        kind: FrameKind,
+        container_version: u16,
+        /// The refused frame's own number, so a report can point at it.
+        ingest_seq: u64,
+    },
+
+    /// A control record the file's own container version did not have.
+    ///
+    /// [`Self::FrameKindNotInVersion`] for what is inside a `Control` frame:
+    /// the kind is as old as the format, but `SnapshotFailed` arrived in v2, so
+    /// a v1 file holding one is not what its header claims either. See
+    /// [`ControlRecord::since`].
+    ControlRecordNotInVersion {
+        record: ControlRecord,
+        container_version: u16,
+        /// The refused frame's own number, so a report can point at it.
+        ingest_seq: u64,
+    },
+
     /// A control frame's JSON did not parse.
     Json(serde_json::Error),
 
@@ -166,8 +195,46 @@ impl fmt::Display for StorageError {
             ),
             Self::MalformedFrame(why) => write!(f, "malformed frame: {why}"),
             Self::UnknownFrameKind(code) => write!(f, "unknown frame kind {code}"),
+            Self::FrameKindNotInVersion {
+                kind,
+                container_version,
+                ..
+            } => write!(
+                f,
+                "frame kind {} ({kind:?}) arrived in container v{}, but this file says it is \
+                 v{container_version}: the file is not what its header claims",
+                kind.code(),
+                kind.since()
+            ),
+            Self::ControlRecordNotInVersion {
+                record,
+                container_version,
+                ..
+            } => write!(
+                f,
+                "control record {} arrived in container v{}, but this file says it is \
+                 v{container_version}: the file is not what its header claims",
+                record.name(),
+                record.since()
+            ),
             Self::Json(e) => write!(f, "control record json error: {e}"),
             Self::Compression(msg) => write!(f, "compression error: {msg}"),
+        }
+    }
+}
+
+impl StorageError {
+    /// The sequence number of the frame this error refused, when it names one.
+    ///
+    /// For a reader that stopped mid-file, so a report can point at the frame
+    /// that ended the read rather than at the last one that did not.
+    #[must_use]
+    pub const fn ingest_seq(&self) -> Option<u64> {
+        match self {
+            Self::FrameKindNotInVersion { ingest_seq, .. }
+            | Self::ControlRecordNotInVersion { ingest_seq, .. } => Some(*ingest_seq),
+            Self::NonMonotonicIngestSeq { found, .. } => Some(*found),
+            _ => None,
         }
     }
 }

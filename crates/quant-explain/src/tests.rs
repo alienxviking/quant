@@ -87,7 +87,7 @@ impl Tree {
     fn segment(&self, day: u8, from_secs: i64, from_seq: u64, frames: &[Frame]) {
         let target = quant_recorder::CaptureTarget {
             exchange: Exchange::Binance,
-            symbol: SYMBOL.to_owned(),
+            stream: quant_recorder::CaptureStream::market(SYMBOL),
             date: date(day),
             session_id: SESSION,
             part: 0,

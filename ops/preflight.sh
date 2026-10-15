@@ -246,8 +246,20 @@ fi
 # The run's verdict has to mean something. Pointing the verifier at a tree that
 # already holds captures from an older build makes every report ambiguous -- which
 # is exactly what the pre-snapshot sessions in this repo's data/raw do.
-if [ -d "$root/raw" ]; then
-    existing="$(find "$root/raw" -name 'part-*.bin.zst' 2>/dev/null | wc -l | tr -d ' ')"
+#
+# Both capture trees, not only raw/. verify walks $root/account as well as
+# $root/raw, so an earlier live run's account capture left here would be
+# verified -- and counted -- as part of this run's verdict just the same.
+any_tree=false
+existing=0
+for tree in "$root/raw" "$root/account"; do
+    if [ -d "$tree" ]; then
+        any_tree=true
+        found="$(find "$tree" -name 'part-*.bin.zst' 2>/dev/null | wc -l | tr -d ' ')"
+        existing=$((existing + found))
+    fi
+done
+if [ "$any_tree" = true ]; then
     if [ "$existing" -gt 0 ]; then
         report 'capture root' blocker "$existing capture files already here -- the run's verdict would cover them too"
     else
@@ -258,8 +270,8 @@ else
 fi
 
 # --- a clean root, part two: the journal ----------------------------------
-# The check above walks $root/raw, which is everything a recorder leaves in the
-# root and not everything a paper run does. The journal lands at
+# The check above walks $root/raw and $root/account, which is every capture a
+# run leaves in the root and not everything a paper run does. The journal lands at
 # $root/paper-SYMBOL.jsonl -- beside raw/, not inside it -- and nothing else
 # looks there: quant-recorder::catalog walks only root/raw, so a stale journal is
 # invisible to quant-verify. This is the one place it can be caught.

@@ -16,11 +16,14 @@
 //!
 //! # Layout
 //!
-//! One file is one `(exchange, symbol, capture session)`. That matches the
-//! Hive partitioning in `docs/data-contract.md` §5, and it makes `ingest_seq`
-//! -- which is per `(recorder process, instrument)` -- strictly increasing
-//! within a single file, so completeness is checkable per file with no
-//! cross-file bookkeeping.
+//! One file is one capture session's UTC day of one stream, filed by the
+//! partitioning in `docs/data-contract.md` §5: one instrument's market data,
+//! which the header names by `(exchange, symbol)`, or the account stream, whose
+//! header carries the stream's name where a symbol would go. `ingest_seq`
+//! belongs to the session, so it is strictly increasing within a file -- the
+//! writer and the reader both hold it to that -- and carries on into the
+//! session's next file; whether anything is missing *between* files is the
+//! verifier's question, answered by joining a session's files in order.
 //!
 //! ```text
 //! file := FileHeader Block* FileTrailer?
@@ -46,6 +49,7 @@
 //!   kind                  u8    0 = venue stream payload
 //!                               1 = control record (ours, JSON)
 //!                               2 = venue snapshot (REST body, verbatim)
+//!                               3 = account stream payload (verbatim; v3)
 //!   local_recv_ts         i64   epoch nanos, stamped at socket read
 //!   ingest_seq            u64   ours, strictly increasing within the file
 //!   payload_len           u32
@@ -96,6 +100,19 @@
 //! different JSON shape answering a different question, and a snapshot misread as
 //! a delta corrupts a book silently instead of failing. One byte of frame kind
 //! replaces a try-parse-both on every frame in the file, forever.
+//!
+//! And again for the account stream, the venue's reports on our own orders,
+//! which M8 records before it parses them: [`FrameKind::AccountPayload`] is
+//! venue bytes too, about the account rather than the market, and no reader of
+//! market data may ever take one for a market message.
+//!
+//! A kind belongs to the container version that introduced it, and a file
+//! admits only the kinds its own version had -- see [`FrameKind::since`]. A v2
+//! file holding an account frame is not using a newer feature; no v2 writer
+//! could have written it, so it is reported as the corruption it is. The same
+//! holds one level in, for the control records a `Control` frame carries: a v1
+//! file holding a `SnapshotFailed` is refused too -- see
+//! [`ControlRecord::since`].
 //!
 //! ## 3. Holes in `ingest_seq` are legal, and they are evidence
 //!

@@ -59,6 +59,7 @@ fn run(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let mut trades = 0_u64;
     let mut deltas = 0_u64;
     let mut snapshots = 0_u64;
+    let mut account = 0_u64;
     let mut ignored = 0_u64;
     let mut levels = 0_u64;
     // Grouped rather than listed: one systematic defect over millions of frames
@@ -103,6 +104,10 @@ fn run(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
                     Err(e) => note(e.to_string(), frame.ingest_seq),
                 }
             }
+            // The account stream's bytes. Counted and left alone: they are not
+            // market data, and this parses market data -- run against a market
+            // capture, any number here but zero is itself the finding.
+            FrameKind::AccountPayload => account += 1,
             FrameKind::Control => {}
         }
     }
@@ -112,6 +117,7 @@ fn run(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     println!("parsed    {trades} trades, {deltas} deltas, {snapshots} snapshots");
     println!("levels    {levels} price levels through fixed-point");
     println!("ignored   {ignored} (event types this build does not interpret)");
+    println!("account   {account} frames from the account stream (not market data, not parsed)");
     if failures.is_empty() {
         println!("failures  none");
     } else {

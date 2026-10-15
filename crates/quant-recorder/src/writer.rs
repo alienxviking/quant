@@ -1,4 +1,4 @@
-﻿//! The blocking consumer that turns records into a capture file.
+//! The blocking consumer that turns records into a capture file.
 
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
@@ -341,6 +341,148 @@ mod tests {
         assert_eq!(truncation, None);
         assert_eq!(reader.trailer().unwrap().frames, 10);
         assert_eq!(reader.trailer().unwrap().last_ingest_seq, Some(10));
+    }
+
+    /// The account stream through the same plumbing as the market's, end to
+    /// end: its own ingress, a tee whose second consumer stands in for the
+    /// translator, a real channel, the writer thread, and a session writing real
+    /// files under a real root. What `docs/live-run.md` §5 decided it would
+    /// reuse, and what reusing it is supposed to buy: holes as evidence, a gap
+    /// record behind them, a trailer, a tree of its own -- and a second consumer
+    /// that sees byte for byte what the capture recorded.
+    #[test]
+    fn the_account_stream_is_captured_by_the_market_streams_plumbing() {
+        use crate::catalog::{account_catalog, catalog};
+        use crate::layout::CaptureStream;
+        use crate::record::CaptureRecord;
+        use crate::segment::FileStore;
+        use crate::sink::test_sink::TestSink;
+        use crate::tee::TeeSink;
+
+        let unique = thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .replace("::", "-");
+        // The process id too: the thread name is unique within one run, and two
+        // `cargo test` runs at once -- two worktrees, say -- would otherwise
+        // write to one directory and delete it out from under each other.
+        let root = std::env::temp_dir().join(format!(
+            "quant-recorder-account-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Mid-day, so nothing here rolls.
+        let clock: Arc<dyn Clock> =
+            Arc::new(ManualClock::new(Ts::from_secs(BEFORE_MIDNIGHT - 43_200)));
+        let metrics = Metrics::new(4);
+        let (tx, rx) = channel(4, Arc::clone(&metrics));
+        let tee = TeeSink::new(tx, TestSink::with_capacity(1_024));
+        let mut ing = Ingress::new(tee, Arc::clone(&clock), metrics);
+
+        // Opened as the transport will open it, then a burst the writer is not
+        // yet draining: three frames fit behind the marker, seven are dropped.
+        ing.record_gap(GapCause::RecorderRestart).unwrap();
+        let mut dropped = 0;
+        for i in 0..10_u8 {
+            let frame =
+                format!(r#"{{"subscriptionId":0,"event":{{"e":"executionReport","i":{i}}}}}"#);
+            let stamped = Ts::from_nanos(clock.now().as_nanos() + i64::from(i));
+            if ing.accept_account_at(frame.into_bytes(), stamped).unwrap() == Accepted::Dropped {
+                dropped += 1;
+            }
+        }
+        assert_eq!(dropped, 7, "the channel holds four records");
+
+        let mut session = CaptureSession::account(
+            FileStore::new(&root),
+            Exchange::Binance,
+            Arc::clone(&clock),
+            WriterOptions::default(),
+        );
+        let writer = thread::spawn(move || {
+            let outcome = run_writer(&rx, &mut session, Duration::from_millis(20));
+            (outcome, session)
+        });
+        within_ten_seconds("make room for the gap record", || {
+            ing.pump().unwrap();
+            ing.pending_gaps() == 0
+        });
+        // Until the writer has emptied the channel, so the last frame has room:
+        // one that found none would be dropped, and a drop is not this test's.
+        within_ten_seconds("empty the channel", || ing.metrics().queue_depth() == 0);
+        assert_eq!(
+            ing.accept_account_at(
+                b"{\"event\":{\"e\":\"serverShutdown\"}}".to_vec(),
+                clock.now(),
+            )
+            .unwrap(),
+            Accepted::Enqueued
+        );
+        let translator_saw = ing.sink().secondary().accepted.clone();
+        drop(ing);
+        let (outcome, session) = writer.join().unwrap();
+        outcome.unwrap();
+        session.finish().unwrap();
+
+        // In the account's own tree, and nowhere a reader of market data looks.
+        let accounts = account_catalog(&root);
+        assert_eq!(accounts.sessions.len(), 1, "{:?}", accounts.strays);
+        let market = catalog(&root);
+        assert!(market.sessions.is_empty(), "{:?}", market.sessions);
+        assert!(market.strays.is_empty(), "{:?}", market.strays);
+
+        let segment = &accounts.sessions[0].segments[0];
+        assert_eq!(segment.target.stream, CaptureStream::Account);
+        let file = std::fs::File::open(&segment.path).unwrap();
+        let mut reader = RawReader::open(std::io::BufReader::new(file)).unwrap();
+        let (frames, truncation) = reader.read_all().unwrap();
+        assert_eq!(truncation, None);
+        assert!(reader.is_finalized(), "sealed with a trailer");
+
+        // The hole is the drop's evidence, and the gap record sits right after it.
+        let seqs: Vec<u64> = frames.iter().map(|f| f.ingest_seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 12, 13]);
+        assert!(matches!(
+            frames[4].control().unwrap(),
+            Some(ControlRecord::Gap {
+                cause: GapCause::LocalOverflow,
+                ..
+            })
+        ));
+
+        // What the second consumer was handed is what the file holds.
+        assert_eq!(translator_saw.len(), frames.len());
+        for (record, frame) in translator_saw.iter().zip(&frames) {
+            assert_eq!(record.ingest_seq(), frame.ingest_seq);
+            assert_eq!(record.local_recv_ts(), frame.local_recv_ts);
+            match record {
+                CaptureRecord::Account { payload, .. } => {
+                    assert_eq!(frame.kind, FrameKind::AccountPayload);
+                    assert_eq!(payload, &frame.payload);
+                }
+                CaptureRecord::Control { record, .. } => {
+                    assert_eq!(frame.kind, FrameKind::Control);
+                    assert_eq!(frame.control().unwrap(), Some(*record));
+                }
+                other => panic!("not an account capture's record: {other:?}"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Spin until `done`, waiting on the writer thread -- bounded, so a writer
+    /// that died or wedged fails the test instead of hanging the suite.
+    fn within_ten_seconds(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gave up waiting for the writer to {what}"
+            );
+            thread::yield_now();
+        }
     }
 
     /// The other half of the roll story: an instrument that goes quiet across

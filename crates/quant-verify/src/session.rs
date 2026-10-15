@@ -39,12 +39,29 @@
 //! by the gaps that begin and end it. An episode with deltas needs an anchor
 //! somewhere inside it; an episode with no deltas needs nothing, which is the case
 //! a live test turned up when a connection died before delivering anything.
+//!
+//! # The account stream gets the container's checks and no others
+//!
+//! An account session -- M8's record of what the venue said about our own
+//! orders -- is held to the first and last properties: `ingest_seq` contiguous or
+//! explained by the gap record right after a hole, across its segments joined in
+//! order, and every file closed with a trailer unless it is the last. Plus the
+//! checks every session gets: headers that agree with their paths, a restart
+//! marker first, records filed under their own day. The middle two are about the
+//! market's book and do not apply. They are fed only by depth deltas and
+//! snapshots, and an account session's frames go to neither: they are counted,
+//! not read, because what they say is the translator's business. A frame of the
+//! wrong stream in either kind of session is an error, never read as its own --
+//! and that includes a `SnapshotFailed` control record in an account session:
+//! gap records are the container's and explain holes in either stream, but a
+//! failed snapshot is the market's, and the account stream has no book.
 
 use std::fs::File;
 use std::io::BufReader;
 
 use quant_core::event::GapCause;
 use quant_core::instrument::Exchange;
+use quant_recorder::CaptureStream;
 use quant_storage::{ControlRecord, FrameKind, RawFrame, RawReader, SnapshotPurpose};
 
 use crate::discover::{Segment, Session};
@@ -151,7 +168,10 @@ pub struct SegmentOutcome {
 /// Verify one session end to end, accumulating into `report`.
 pub fn verify(session: &Session, report: &mut Report) -> Vec<SegmentOutcome> {
     let venue_understood = session.exchange == Exchange::Binance;
-    if !venue_understood {
+    let is_account = session.stream == CaptureStream::Account;
+    // Only market data has checks that need the venue's dialect, so only a
+    // market session can be short of them.
+    if !venue_understood && !is_account {
         report.warn(
             code::VENUE_NOT_SUPPORTED,
             Where::session(session.session_id),
@@ -165,6 +185,9 @@ pub fn verify(session: &Session, report: &mut Report) -> Vec<SegmentOutcome> {
 
     let mut state = State::new(venue_understood);
     report.totals.sessions += 1;
+    if is_account {
+        report.totals.account_sessions += 1;
+    }
 
     let last_index = session.segments.len().saturating_sub(1);
     let mut outcomes = Vec::with_capacity(session.segments.len());
@@ -225,22 +248,30 @@ fn verify_segment(
     report.totals.segments += 1;
     let mut misfiled = 0_u64;
     let mut frames = 0_u64;
+    let mut refused = false;
 
     while let Some(frame) = reader.next_frame() {
         let frame = match frame {
             Ok(frame) => frame,
             Err(e) => {
                 // Not a torn tail: the block's checksum passed, so these are
-                // provably our bytes and the writer and reader disagree.
+                // provably our bytes and the writer and reader disagree. Placed
+                // at the frame the reader refused when it can name one, since
+                // that is the frame someone has to go and look at.
+                let seq = e.ingest_seq().or(state.last_seq).unwrap_or(0);
                 report.error(
                     code::CORRUPTION,
-                    at().at_seq(state.last_seq.unwrap_or(0)),
+                    at().at_seq(seq),
                     format!("frame decode failed: {e}"),
                 );
+                refused = true;
                 break;
             }
         };
         report.totals.frames += 1;
+        if session.stream == CaptureStream::Account {
+            report.totals.account_frames += 1;
+        }
         frames += 1;
 
         // A record whose own timestamp falls outside the partition it is filed
@@ -266,7 +297,7 @@ fn verify_segment(
         );
     }
 
-    check_closure(&reader, at(), is_last, report);
+    check_closure(&reader, at(), is_last, refused, report);
 
     Some(SegmentOutcome {
         path: segment.display(),
@@ -276,14 +307,20 @@ fn verify_segment(
 }
 
 /// Truncation and trailer: whether the file accounts for itself.
+///
+/// `refused` says the read ended at a frame that would not decode, which the
+/// caller has already reported as corruption.
 fn check_closure<R: std::io::Read>(
     reader: &RawReader<R>,
     at: Where,
     is_last: bool,
+    refused: bool,
     report: &mut Report,
 ) {
+    let mut ended_at_corruption = refused;
     if let Some(truncation) = reader.truncation() {
         if truncation.reason.is_corruption() {
+            ended_at_corruption = true;
             report.error(
                 code::CORRUPTION,
                 at.clone(),
@@ -307,6 +344,15 @@ fn check_closure<R: std::io::Read>(
         }
     }
 
+    // A read that stopped at corruption never reached the end of the file, so
+    // it cannot say whether a trailer is there -- and the file may well have
+    // one. "No trailer" about it would be a second finding, false, and in a
+    // segment before the last an error blaming a writer that moved on without
+    // closing a file it may have closed perfectly well. The corruption is the
+    // finding, and it is already made.
+    if ended_at_corruption {
+        return;
+    }
     if reader.trailer().is_none() {
         if is_last {
             report.warn(
@@ -379,12 +425,56 @@ fn check_frame(
         );
     }
 
-    match frame.kind {
-        FrameKind::Control => {
+    match (&session.stream, frame.kind) {
+        // Gap records are the container's: they explain holes in either stream.
+        (CaptureStream::Market { .. }, FrameKind::Control) => {
             check_control(control, frame, session.session_id, &at, state, report);
         }
-        FrameKind::VenueSnapshot => check_snapshot(frame, &at, state, report),
-        FrameKind::VenuePayload => check_stream_payload(frame, &at, state, report),
+        // But a snapshot failure is the market's: the account stream has no book
+        // and fetches no snapshot, so one here was written to the wrong capture,
+        // like a snapshot frame would have been. Exhaustive over the records, so
+        // the next one has to say which stream it belongs to.
+        (CaptureStream::Account, FrameKind::Control) => match control {
+            Some(ControlRecord::Gap { .. }) | None => {
+                check_control(control, frame, session.session_id, &at, state, report);
+            }
+            Some(ControlRecord::SnapshotFailed { .. }) => report.error(
+                code::FOREIGN_FRAME,
+                at(),
+                "a SnapshotFailed record in an account capture: the account stream                  has no book to anchor, so this is the market's, written to the wrong                  capture",
+            ),
+        },
+        (CaptureStream::Market { .. }, FrameKind::VenueSnapshot) => {
+            check_snapshot(frame, &at, state, report);
+        }
+        (CaptureStream::Market { .. }, FrameKind::VenuePayload) => {
+            check_stream_payload(frame, &at, state, report);
+        }
+        // Counted, not read: see the module docs.
+        (CaptureStream::Account, FrameKind::AccountPayload) => {
+            report.totals.account_messages += 1;
+        }
+        // Not read as its own stream's data, and not skipped: each stream is
+        // recorded in files of its own, so a frame of the other one means
+        // something wrote to the wrong capture -- and took this session's
+        // sequence number to do it.
+        (CaptureStream::Market { .. }, FrameKind::AccountPayload) => report.error(
+            code::FOREIGN_FRAME,
+            at(),
+            "an account-stream frame in a market capture: the account's own reports \
+             belong in a capture of their own and are never market data",
+        ),
+        (CaptureStream::Account, FrameKind::VenuePayload | FrameKind::VenueSnapshot) => {
+            report.error(
+                code::FOREIGN_FRAME,
+                at(),
+                format!(
+                    "a {:?} frame in an account capture: market data belongs under raw/, \
+                     with its own session",
+                    frame.kind
+                ),
+            );
+        }
     }
 }
 
@@ -619,7 +709,7 @@ fn check_overflow_resumption(at: &impl Fn() -> Where, state: &mut State, report:
 mod tests {
     use super::*;
     use quant_core::time::{Ts, UtcDate};
-    use quant_recorder::CaptureTarget;
+    use quant_recorder::{CaptureStream, CaptureTarget};
     use quant_storage::{ControlRecord, FileHeader, RawWriter, SnapshotFailure, WriterOptions};
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -644,10 +734,24 @@ mod tests {
 
     impl Capture {
         fn new(day_start: i64) -> Self {
+            Self::named(day_start, "BTCUSDT")
+        }
+
+        /// An account-stream capture, its header naming the stream as the
+        /// account session writes it.
+        fn account(day_start: i64) -> Self {
+            Self::named(day_start, quant_recorder::ACCOUNT_STREAM)
+        }
+
+        fn named(day_start: i64, header_symbol: &str) -> Self {
+            Self::at_venue(Exchange::Binance, day_start, header_symbol)
+        }
+
+        fn at_venue(exchange: Exchange, day_start: i64, header_symbol: &str) -> Self {
             Self {
                 writer: RawWriter::create(
                     Vec::new(),
-                    FileHeader::new(Exchange::Binance, "BTCUSDT", SESSION),
+                    FileHeader::new(exchange, header_symbol, SESSION),
                     WriterOptions::default(),
                 )
                 .expect("create"),
@@ -663,6 +767,28 @@ mod tests {
             let mut next = Self::new(day_start);
             next.seq = previous_seq;
             next
+        }
+
+        /// The account stream's next file, as [`Capture::continuing`] is the
+        /// market's.
+        fn account_continuing(previous_seq: u64, day_start: i64) -> Self {
+            let mut next = Self::account(day_start);
+            next.seq = previous_seq;
+            next
+        }
+
+        /// A frame of the account stream in the venue's own envelope -- which a
+        /// market check, were one ever run on it, would find unreadable.
+        fn account_event(mut self) -> Self {
+            let (ts, seq) = self.tick();
+            self.writer
+                .write_account_payload(
+                    ts,
+                    seq,
+                    br#"{"subscriptionId":0,"event":{"e":"executionReport","s":"BTCUSDT","x":"TRADE"}}"#,
+                )
+                .unwrap();
+            self
         }
 
         fn tick(&mut self) -> (Ts, u64) {
@@ -742,6 +868,21 @@ mod tests {
             self
         }
 
+        /// A frame from the account stream's socket. Its bytes are shaped like
+        /// a market trade on purpose: a verifier that read the account kind as
+        /// market data would then find a trade in it, and say nothing.
+        fn account_frame(mut self) -> Self {
+            let (ts, seq) = self.tick();
+            self.writer
+                .write_account_payload(
+                    ts,
+                    seq,
+                    br#"{"stream":"btcusdt@trade","data":{"e":"trade","t":9}}"#,
+                )
+                .unwrap();
+            self
+        }
+
         /// Burn `n` sequence numbers without writing them: exactly what ingress
         /// does when it drops messages.
         fn drop_messages(mut self, n: u64) -> Self {
@@ -780,7 +921,7 @@ mod tests {
     fn target(day: u8, part: u32) -> CaptureTarget {
         CaptureTarget {
             exchange: Exchange::Binance,
-            symbol: "BTCUSDT".to_owned(),
+            stream: CaptureStream::market("BTCUSDT"),
             date: UtcDate {
                 year: 2026,
                 month: 7,
@@ -788,6 +929,14 @@ mod tests {
             },
             session_id: SESSION,
             part,
+        }
+    }
+
+    /// Where the account session's file for `day` sits: its own tree.
+    fn account_target(day: u8) -> CaptureTarget {
+        CaptureTarget {
+            stream: CaptureStream::Account,
+            ..target(day, 0)
         }
     }
 
@@ -1075,6 +1224,95 @@ mod tests {
         assert!(!report.is_clean(), "{:#?}", report.findings());
     }
 
+    /// Rewrite a file's header to claim another container version, checksum
+    /// and all: what a file stamped wrong looks like, since no writer will
+    /// produce one.
+    fn restamp(bytes: &mut [u8], container_version: u16) {
+        let len = quant_storage::FILE_HEADER_LEN;
+        let mut header = FileHeader::decode(&bytes[..len].try_into().unwrap()).unwrap();
+        header.container_version = container_version;
+        bytes[..len].copy_from_slice(&header.encode().unwrap());
+    }
+
+    fn corruption_seq(report: &Report) -> Option<u64> {
+        report
+            .findings()
+            .iter()
+            .find(|f| f.code == code::CORRUPTION)
+            .expect("a corruption finding")
+            .at
+            .ingest_seq
+    }
+
+    #[test]
+    fn a_read_refused_mid_file_is_corruption_and_says_nothing_about_a_trailer() {
+        // A v1-stamped file holding a snapshot: the reader refuses the snapshot
+        // and stops there. The file has a trailer -- it was sealed -- and the
+        // read never reached it, so "no trailer" would be false, and before the
+        // last segment it would be an error blaming the writer for it.
+        let (mut first, next_seq) = Capture::new(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .snapshot(100)
+            .delta(101, 102)
+            .seal();
+        restamp(&mut first, 1);
+        let (second, _) = Capture::continuing(next_seq, DAY_30).delta(103, 104).seal();
+        let report = run(
+            "refused-mid-file",
+            &[(target(29, 0), first), (target(30, 0), second)],
+        );
+        assert_eq!(
+            report.count(code::CORRUPTION),
+            1,
+            "{:#?}",
+            report.findings()
+        );
+        assert_eq!(
+            report.count(code::NO_TRAILER),
+            0,
+            "{:#?}",
+            report.findings()
+        );
+        assert_eq!(
+            corruption_seq(&report),
+            Some(2),
+            "at the snapshot the reader refused, not the gap before it"
+        );
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn a_damaged_block_is_corruption_and_says_nothing_about_a_trailer() {
+        // The same rule for damage the reader reports as a truncation: the read
+        // stopped at a block whose checksum failed, so whether a trailer follows
+        // is unknown, not absent.
+        let (mut first, next_seq) = Capture::new(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .snapshot(100)
+            .delta(101, 102)
+            .seal();
+        let inside_the_first_block =
+            quant_storage::FILE_HEADER_LEN + quant_storage::BLOCK_HEADER_LEN + 2;
+        first[inside_the_first_block] ^= 0xff;
+        let (second, _) = Capture::continuing(next_seq, DAY_30).delta(103, 104).seal();
+        let report = run(
+            "damaged-block",
+            &[(target(29, 0), first), (target(30, 0), second)],
+        );
+        assert_eq!(
+            report.count(code::CORRUPTION),
+            1,
+            "{:#?}",
+            report.findings()
+        );
+        assert_eq!(
+            report.count(code::NO_TRAILER),
+            0,
+            "{:#?}",
+            report.findings()
+        );
+    }
+
     #[test]
     fn a_snapshot_frame_that_is_not_a_book_is_an_error() {
         // The failure this catches: a venue answering 200 with an error document.
@@ -1087,6 +1325,291 @@ mod tests {
         let report = run_one("bad-snapshot", bytes);
         assert_eq!(report.count(code::SNAPSHOT_UNREADABLE), 1);
         assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn an_account_frame_in_a_market_capture_is_an_error() {
+        // The account stream is captured apart from the market, so one of its
+        // frames here was written to the wrong capture. It is neither read as
+        // market data nor passed over in silence.
+        let (bytes, _) = Capture::new(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .snapshot(100)
+            .account_frame()
+            .delta(101, 102)
+            .seal();
+        let report = run_one("foreign-in-market", bytes);
+        assert_eq!(report.count(code::FOREIGN_FRAME), 1);
+        assert_eq!(report.totals.trades, 0, "never read as market data");
+        assert_eq!(report.totals.stream_messages, 1, "the delta, and only it");
+        assert!(!report.is_clean());
+    }
+
+    // --- The account stream ---
+
+    #[test]
+    fn an_account_session_with_an_explained_hole_verifies_clean() {
+        // The container's checks, and nothing of the market's: a hole followed
+        // by its gap record is explained, and account frames after a reconnect
+        // with no snapshot anywhere are not "unanchored deltas", because they
+        // are not deltas -- nor unreadable payloads, because nothing reads them.
+        let (bytes, _) = Capture::account(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .account_event()
+            .account_event()
+            .drop_messages(5)
+            .gap(GapCause::LocalOverflow)
+            .account_event()
+            .gap(GapCause::Disconnect)
+            .account_event()
+            .seal();
+        let report = run("account-explained", &[(account_target(29), bytes)]);
+        assert!(report.is_clean(), "{:#?}", report.findings());
+        assert_eq!(report.count(code::UNEXPLAINED_HOLE), 0);
+        assert_eq!(report.totals.missing_messages, 5);
+        assert_eq!(report.totals.account_sessions, 1);
+        assert_eq!(report.totals.account_messages, 4);
+        assert_eq!(
+            report.totals.stream_messages, 0,
+            "nothing read as market data"
+        );
+        assert_eq!(
+            report.count(code::LOCAL_OVERFLOW),
+            1,
+            "a drop is still a capacity warning"
+        );
+        assert_eq!(report.count(code::NO_RESTART_MARKER), 0);
+    }
+
+    #[test]
+    fn an_account_session_with_an_unexplained_hole_is_an_error() {
+        let (bytes, _) = Capture::account(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .account_event()
+            .drop_messages(3)
+            .account_event()
+            .seal();
+        let report = run("account-unexplained", &[(account_target(29), bytes)]);
+        assert_eq!(report.count(code::UNEXPLAINED_HOLE), 1);
+        assert_eq!(report.totals.missing_messages, 3);
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn an_account_sessions_files_are_joined_across_midnight() {
+        // Its ingest_seq spans the session as the market's does, so a hole that
+        // straddles a day boundary is a hole -- and an unsealed file before the
+        // last is an error, as it is anywhere.
+        let (first, next_seq) = Capture::account(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .account_event()
+            .abandon();
+        let (second, _) = Capture::account_continuing(next_seq, DAY_30)
+            .drop_messages(2)
+            .account_event()
+            .seal();
+        let report = run(
+            "account-midnight",
+            &[(account_target(29), first), (account_target(30), second)],
+        );
+        assert_eq!(report.totals.segments, 2);
+        assert_eq!(report.count(code::UNEXPLAINED_HOLE), 1);
+        assert_eq!(report.totals.missing_messages, 2);
+        assert_eq!(report.count(code::NO_TRAILER), 1);
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn market_data_in_an_account_capture_is_an_error() {
+        let (bytes, _) = Capture::account(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .account_event()
+            .delta(101, 102)
+            .seal();
+        let report = run("market-in-account", &[(account_target(29), bytes)]);
+        assert_eq!(report.count(code::FOREIGN_FRAME), 1);
+        assert_eq!(report.totals.depth_deltas, 0, "not read as market data");
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn a_snapshot_failure_in_an_account_capture_is_foreign() {
+        // A gap record is the container's and explains a hole in either stream,
+        // but a failed snapshot is the market's: the account stream has no book
+        // and fetches none. Read as its own it would pass as a warning about a
+        // snapshot this stream never wanted.
+        let (bytes, _) = Capture::account(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .account_event()
+            .snapshot_failed(SnapshotPurpose::Resync)
+            .account_event()
+            .seal();
+        let report = run("failure-in-account", &[(account_target(29), bytes)]);
+        assert_eq!(
+            report.count(code::FOREIGN_FRAME),
+            1,
+            "{:#?}",
+            report.findings()
+        );
+        assert_eq!(
+            report.count(code::SNAPSHOT_FAILED),
+            0,
+            "not read as its own"
+        );
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn a_venue_this_build_does_not_read_costs_an_account_session_nothing() {
+        // Only the market's checks need the venue's dialect, so only a market
+        // session can be short of them. The account session gets every check it
+        // was ever going to get, and a warning that it did not would be noise on
+        // every venue added before its market parser is.
+        let (account, _) =
+            Capture::at_venue(Exchange::Coinbase, DAY_29, quant_recorder::ACCOUNT_STREAM)
+                .gap(GapCause::RecorderRestart)
+                .account_event()
+                .seal();
+        let at = CaptureTarget {
+            exchange: Exchange::Coinbase,
+            ..account_target(29)
+        };
+        let report = run("unknown-venue-account", &[(at, account)]);
+        assert_eq!(
+            report.count(code::VENUE_NOT_SUPPORTED),
+            0,
+            "{:#?}",
+            report.findings()
+        );
+        assert!(report.is_clean(), "{:#?}", report.findings());
+
+        // The other side of the line: the same venue's market session is short.
+        let (market, _) = Capture::at_venue(Exchange::Coinbase, DAY_29, "BTCUSDT")
+            .gap(GapCause::RecorderRestart)
+            .trade(7)
+            .seal();
+        let at = CaptureTarget {
+            exchange: Exchange::Coinbase,
+            ..target(29, 0)
+        };
+        let report = run("unknown-venue-market", &[(at, market)]);
+        assert_eq!(
+            report.count(code::VENUE_NOT_SUPPORTED),
+            1,
+            "{:#?}",
+            report.findings()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_in_an_account_capture_is_foreign() {
+        // A book snapshot is market data whichever file it lands in. Read as a
+        // snapshot here it would anchor an episode the account stream does not
+        // have, and count toward the market's totals.
+        let (bytes, _) = Capture::account(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .account_event()
+            .snapshot(100)
+            .seal();
+        let report = run("snapshot-in-account", &[(account_target(29), bytes)]);
+        assert_eq!(
+            report.count(code::FOREIGN_FRAME),
+            1,
+            "{:#?}",
+            report.findings()
+        );
+        assert_eq!(report.totals.snapshots, 0, "not read as a snapshot");
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn an_account_file_whose_header_names_a_symbol_is_refused() {
+        // Filed under the account tree, but the header says it is BTCUSDT's
+        // market data: the header and the path describe different things.
+        let (bytes, _) = Capture::new(DAY_29).gap(GapCause::RecorderRestart).seal();
+        let root = temp_root("account-header");
+        let path = account_target(29).file(&root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut report = Report::default();
+        let sessions = crate::discover::discover(&root, &mut report);
+        assert!(sessions.is_empty(), "{sessions:?}");
+        assert_eq!(report.count(code::PATH_HEADER_MISMATCH), 1);
+    }
+
+    #[test]
+    fn a_run_root_is_verified_whole_market_and_account() {
+        // Pointed at a run root, the verifier walks both trees, so the account
+        // stream is checked wherever the market is -- by the same command.
+        let root = temp_root("both-trees");
+        for (at, bytes) in [
+            (
+                target(29, 0),
+                Capture::new(DAY_29)
+                    .gap(GapCause::RecorderRestart)
+                    .snapshot(100)
+                    .delta(101, 102)
+                    .seal()
+                    .0,
+            ),
+            (
+                account_target(29),
+                Capture::account(DAY_29)
+                    .gap(GapCause::RecorderRestart)
+                    .account_event()
+                    .seal()
+                    .0,
+            ),
+        ] {
+            let path = at.file(&root);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+
+        let mut report = Report::default();
+        let sessions = crate::discover::discover(&root, &mut report);
+        let streams: Vec<&CaptureStream> = sessions.iter().map(|s| &s.stream).collect();
+        assert_eq!(
+            streams,
+            vec![&CaptureStream::market("BTCUSDT"), &CaptureStream::Account]
+        );
+        for session in &sessions {
+            verify(session, &mut report);
+        }
+        assert!(report.is_clean(), "{:#?}", report.findings());
+        assert_eq!(report.totals.sessions, 2);
+        assert_eq!(report.totals.account_sessions, 1);
+        assert_eq!(report.totals.account_frames, 2);
+        assert_eq!(report.totals.market_frames(), 3);
+        assert_eq!(
+            report.verdict(),
+            "every discontinuity is explained by a record in the capture"
+        );
+    }
+
+    #[test]
+    fn account_frames_alone_are_not_a_verified_capture() {
+        // A run root whose market tree is empty and whose account tree is not.
+        // Every check passes, because there is nothing to fail -- which is the
+        // false clean bill of health the "nothing verified" verdict exists for,
+        // and counting the account's frames toward it would print a clean one.
+        let (bytes, _) = Capture::account(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .account_event()
+            .account_event()
+            .seal();
+        let report = run("account-only", &[(account_target(29), bytes)]);
+        assert!(report.is_clean(), "{:#?}", report.findings());
+        assert_eq!(report.totals.frames, 3);
+        assert_eq!(report.totals.market_frames(), 0);
+        assert!(
+            report
+                .verdict()
+                .starts_with("NOTHING VERIFIED: no market frames"),
+            "{}",
+            report.verdict()
+        );
     }
 
     #[test]

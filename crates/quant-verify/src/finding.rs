@@ -67,6 +67,9 @@ pub mod code {
     pub const PAYLOAD_UNREADABLE: &str = "payload-unreadable";
     /// A frame recorded as a snapshot does not contain a book.
     pub const SNAPSHOT_UNREADABLE: &str = "snapshot-unreadable";
+    /// A frame of a kind its stream never carries: the account stream's bytes
+    /// in a market capture, or market data in an account capture.
+    pub const FOREIGN_FRAME: &str = "foreign-frame";
     /// Bytes on disk are not the bytes we wrote.
     pub const CORRUPTION: &str = "corruption";
     /// A file was cut short.
@@ -77,7 +80,8 @@ pub mod code {
     pub const TRAILER_DISAGREES: &str = "trailer-disagrees";
     /// The file header and the path it sits under do not describe the same thing.
     pub const PATH_HEADER_MISMATCH: &str = "path-header-mismatch";
-    /// Something under `raw/` is not a capture file at the expected depth.
+    /// Something in a capture tree is not one of that tree's capture files at
+    /// the expected depth -- including the other stream's, moved there by hand.
     pub const STRAY_FILE: &str = "stray-file";
     /// A capture file could not be opened or read.
     pub const UNREADABLE_FILE: &str = "unreadable-file";
@@ -196,9 +200,17 @@ impl fmt::Display for Finding {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Totals {
     pub sessions: u64,
+    /// Of `sessions`, those of the account stream.
+    pub account_sessions: u64,
     pub segments: u64,
+    /// Every frame read, of either stream.
     pub frames: u64,
+    /// Of `frames`, those read in account sessions, control records included.
+    pub account_frames: u64,
     pub stream_messages: u64,
+    /// Frames of the account stream, in account sessions. Counted and not
+    /// read: what they say is the translator's business, not the verifier's.
+    pub account_messages: u64,
     pub depth_deltas: u64,
     pub trades: u64,
     pub snapshots: u64,
@@ -311,6 +323,44 @@ impl Report {
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.errors() == 0
+    }
+
+    /// The one line a run ends on.
+    ///
+    /// Errors first: "nothing verified" is a guard against a *false clean bill
+    /// of health*, so it must not displace the reason a run actually failed. A
+    /// capture corrupt in its first block reads zero frames, and saying "no
+    /// files found" about it would send whoever is on call looking in the wrong
+    /// place.
+    ///
+    /// The guard is keyed on market frames, not on all of them. A run root
+    /// holds both trees, and an account tree with frames in it beside a market
+    /// tree with none is not a verified capture: the market is what every run
+    /// is judged on, and its absence has to be said rather than counted over.
+    #[must_use]
+    pub fn verdict(&self) -> String {
+        let t = &self.totals;
+        if !self.is_clean() {
+            "UNEXPLAINED FINDINGS: this capture cannot be trusted as complete".to_owned()
+        } else if t.market_frames() == 0 && t.account_frames == 0 {
+            "NOTHING VERIFIED: no capture frames found under this root".to_owned()
+        } else if t.market_frames() == 0 {
+            format!(
+                "NOTHING VERIFIED: no market frames found under this root, only {} of                  the account stream",
+                t.account_frames
+            )
+        } else {
+            "every discontinuity is explained by a record in the capture".to_owned()
+        }
+    }
+}
+
+impl Totals {
+    /// Frames read in market sessions: what is left of `frames` once the
+    /// account stream's are taken out, so the two cannot disagree.
+    #[must_use]
+    pub const fn market_frames(&self) -> u64 {
+        self.frames.saturating_sub(self.account_frames)
     }
 }
 

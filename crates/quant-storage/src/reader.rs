@@ -28,8 +28,9 @@ use std::io::{self, Read};
 
 use crate::error::{StorageError, StorageResult};
 use crate::frame::{
-    FileHeader, FileTrailer, FrameHeader, RawFrame, BLOCK_HEADER_LEN, BLOCK_SYNC, FILE_HEADER_LEN,
-    FRAME_HEADER_LEN, MAX_BLOCK_UNCOMPRESSED, TRAILER_LEN, TRAILER_SYNC,
+    ControlRecord, FileHeader, FileTrailer, FrameHeader, FrameKind, RawFrame, BLOCK_HEADER_LEN,
+    BLOCK_SYNC, FILE_HEADER_LEN, FRAME_HEADER_LEN, MAX_BLOCK_UNCOMPRESSED, TRAILER_LEN,
+    TRAILER_SYNC,
 };
 
 /// Why the reader stopped before the end of the file.
@@ -219,12 +220,21 @@ impl<R: Read> RawReader<R> {
     /// damaged tail; [`RawReader::truncation`] distinguishes them. Callers that
     /// must not silently accept partial data should check it -- the offline
     /// verifier does.
+    ///
+    /// After an error the read is over, and every later call returns `None`.
     pub fn next_frame(&mut self) -> Option<StorageResult<RawFrame>> {
         loop {
             if self.cursor < self.block.len() {
                 let result = self.decode_frame();
                 if result.is_err() {
+                    // The rest of the block goes too. Being finished is checked
+                    // only once the block is used up, so a block left in place
+                    // would be decoded again from wherever the cursor stopped --
+                    // the same error forever, or the inside of a payload read as
+                    // a frame header.
                     self.finished = true;
+                    self.block.clear();
+                    self.cursor = 0;
                 }
                 return Some(result);
             }
@@ -270,6 +280,18 @@ impl<R: Read> RawReader<R> {
             .try_into()
             .expect("slice is FRAME_HEADER_LEN bytes");
         let header = FrameHeader::decode(&raw)?;
+        // A kind the file's own version did not have was not written by a writer
+        // of that version, so the file is not what it says. Checked here for the
+        // reason the ordering below is: every consumer of raw capture reads
+        // through this method, so nobody can read past it.
+        let container_version = self.header.container_version;
+        if !header.kind.admitted_in(container_version) {
+            return Err(StorageError::FrameKindNotInVersion {
+                kind: header.kind,
+                container_version,
+                ingest_seq: header.ingest_seq,
+            });
+        }
         self.cursor += FRAME_HEADER_LEN;
 
         let payload_len = usize::try_from(header.payload_len)
@@ -281,6 +303,24 @@ impl<R: Read> RawReader<R> {
         }
         let payload = self.block[self.cursor..self.cursor + payload_len].to_vec();
         self.cursor += payload_len;
+
+        // The kind check above, one level in: a control record the file's version
+        // did not have is refused the same way, here because every consumer reads
+        // through this method. A record that will not decode is passed on rather
+        // than refused -- `RawFrame::control` is where every consumer already
+        // meets that, and this check is about versions, not about JSON. Control
+        // frames are a handful a day, so parsing them twice costs nothing.
+        if header.kind == FrameKind::Control {
+            if let Ok(record) = ControlRecord::from_json(&payload) {
+                if !record.admitted_in(container_version) {
+                    return Err(StorageError::ControlRecordNotInVersion {
+                        record,
+                        container_version,
+                        ingest_seq: header.ingest_seq,
+                    });
+                }
+            }
+        }
 
         // The write path refuses to emit these out of order, so a violation in a
         // checksum-clean file points at the writer. Checked here as well because
@@ -512,7 +552,7 @@ mod tests {
     use quant_core::time::Ts;
 
     use super::*;
-    use crate::frame::{ControlRecord, FrameKind};
+    use crate::frame::{ControlRecord, FrameKind, CONTAINER_VERSION};
     use crate::writer::{RawWriter, WriterOptions};
 
     const SESSION: [u8; 16] = [7; 16];
@@ -913,6 +953,353 @@ mod tests {
             reader.read_all(),
             Err(StorageError::TrailerChecksum { .. })
         ));
+    }
+
+    // --- Files of earlier container versions ---
+
+    /// 2026-07-29T12:00:00Z, the instant the pinned fixtures below begin.
+    const T0: i64 = 1_785_326_400_000_000_000;
+
+    /// The fixtures' payloads, verbatim, shaped like the venue's.
+    const TRADE: &[u8] = br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":1785326400001,"s":"BTCUSDT","t":5123456789,"p":"64151.33000000","q":"0.00100000","T":1785326400000,"m":true,"M":true}}"#;
+    const DEPTH: &[u8] = br#"{"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":1785326400101,"s":"BTCUSDT","U":97993511625,"u":97993511642,"b":[["64151.33000000","5.95750000"]],"a":[["64151.34000000","0.00034000"]]}}"#;
+    const SNAPSHOT: &[u8] = br#"{"lastUpdateId":97993511662,"bids":[["64151.33000000","5.95750000"]],"asks":[["64151.34000000","0.00034000"]]}"#;
+    const RESTART: &[u8] = br#"{"type":"gap","cause":"recorder_restart","exchange_ts":1785326400000000000,"last_good_ts":1785326400000000000}"#;
+    const PERIODIC_FAILED: &[u8] =
+        br#"{"type":"snapshot_failed","purpose":"periodic","reason":"timeout","attempts":4}"#;
+
+    /// A whole container-v1 file, the shape M1's recorder wrote before book
+    /// snapshots existed: a restart marker, a trade and a depth delta, then the
+    /// trailer.
+    ///
+    /// Bytes, not a call to the writer. A fixture the writer builds moves with
+    /// the writer, so it proves only that this build reads what this build
+    /// writes; these were written once, on 2026-10-15, and stay put, so they
+    /// keep proving that a v1 file reads in whatever build runs them. Two real
+    /// v1 captures from 2026-07-29 sit in the development data root, and nothing
+    /// tested that they were still readable.
+    const V1_FILE: &str = concat!(
+        "5155414e5452415701000100010000000101010101010101010101010101010142544355534454000000000000000000",
+        "00000000000000000000000000000000468bb953515241421c0200003d01000044526aa528b52ffd601c019d0900b650",
+        "3a2f80a9e9f311fe080635099a0b1a5b0c4deea2660d26adec6eb611c83bb7848f5bf06e23bdd4c86e632caa248688c8",
+        "ee2e002c002c0050feb65531c9845c0ff5fcb6b36fb596add44eae6aaf36aff3b3895dbe66107d8a734ee21803141217",
+        "160415c70897bf67a8708afcec49cfaf74da969a5eedeac7e523b3dabe1100051392dbe86482597d67c3f9390fd3c406",
+        "1415b76d0be7aad9968f9cdf04df5bdee51dce6f9a0546e83c97cfce51037aa2d33030caf7f953020385301d04db5655",
+        "7fce3c57d52314a3253a1cf28f33e368e7c83c10c6268aa0489e823d6946ddc87b5082745669458081401d0033220134",
+        "00286e522e5cb3cad7f873a6b1e01dd32e804d68cf158caf73a018a4009a56b0b0c78264348fd2f5980e1829370f6279",
+        "eb8138486630ed330acce0408fc90406e651454e4403000000000000000100000000000000030000000000000003becf",
+        "cc",
+    );
+
+    /// A whole container-v2 file: v1's kinds plus a book snapshot and a failed
+    /// periodic one. Bytes for the reason [`V1_FILE`] is.
+    const V2_FILE: &str = concat!(
+        "5155414e5452415702000100010000000202020202020202020202020202020242544355534454000000000000000000",
+        "0000000000000000000000000000000072befc6c5152414203030000ab0100007cbae38928b52ffd6003020d0d008696",
+        "4c36404bdb1cc3ebb24d0d3f86d76518bede6dcbdfd5c29d25db7c0dc442ec7ebb00403118b0ee0cf46df1b666bff569",
+        "4f04cfd14da3feef3f003c0041001720ab8a5252265da1c497318d63710f8ff65e7bc2940956a009fc7d53d895e98472",
+        "a412625a29087d3f21e5ef3c29f427d65ad35a08c050b141c3008ab5080e86fa3a47d39a5b1ce7e1bc4bbe8f20782039",
+        "1031f0f7fa6dac25f89e1bc629f9c43b6c18bfaf12630d52e9c911d2b1525047fc5d824cbb6660100811e52927a5e6f7",
+        "9125220861d2b252279caa0387060a2a164c84bad4183571c104a0800305a3aa9ee78cb10663e0f779dcc3390df7fdb2",
+        "349a6b4c730888f7886f55c514ed77065fa668bf4b5f1669ef12dee7d77978348e591ccdbd37e308695b08f05458ab62",
+        "a6c4ddf0fba6244b51ff7d921532fd1e8aa20c2f20b002096a041fd8521c7a37406138dd0b7ba2eb03070180dfa9b119",
+        "8873c9ce1b72bf45ce2ba4fcb41bcb0903021d9250da651c4810852bae9787f60636386302c380f790ecbb2687785788",
+        "14d6d076348703478334c0dd7738a7f5c5219961da672098c1a00726b03b0751454e4405000000000000000100000000",
+        "0000000500000000000000d4e59dba",
+    );
+
+    fn unhex(text: &str) -> Vec<u8> {
+        assert_eq!(text.len() % 2, 0, "hex comes in pairs");
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex digits"))
+            .collect()
+    }
+
+    fn fixture_frame(kind: FrameKind, millis: i64, ingest_seq: u64, payload: &[u8]) -> RawFrame {
+        RawFrame {
+            kind,
+            local_recv_ts: Ts::from_nanos(T0 + millis * 1_000_000),
+            ingest_seq,
+            payload: payload.to_vec(),
+        }
+    }
+
+    /// Stamp a different container version on a file, re-checksumming the header
+    /// so that what is tested is the version and not the CRC. The offsets are the
+    /// ones `file_header_layout_is_pinned` pins.
+    fn restamp(bytes: &mut [u8], container_version: u16) {
+        bytes[8..10].copy_from_slice(&container_version.to_le_bytes());
+        let crc = crc32fast::hash(&bytes[..FILE_HEADER_LEN - 4]);
+        bytes[FILE_HEADER_LEN - 4..FILE_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    #[test]
+    fn a_v1_file_still_reads() {
+        // docs/data-contract.md §6: the normalizer keeps the ability to read every
+        // version it has ever written.
+        let bytes = unhex(V1_FILE);
+        let mut reader = RawReader::open(bytes.as_slice()).expect("a v1 header is accepted");
+        assert_eq!(reader.header().container_version, 1);
+        assert_eq!(reader.header().symbol, "BTCUSDT");
+        assert_eq!(reader.header().session_id, [0x01; 16]);
+
+        let (frames, truncation) = reader.read_all().expect("every v1 frame reads");
+        assert_eq!(truncation, None);
+        assert!(
+            reader.is_finalized(),
+            "and the trailer still accounts for it"
+        );
+        assert_eq!(
+            frames,
+            vec![
+                fixture_frame(FrameKind::Control, 0, 1, RESTART),
+                fixture_frame(FrameKind::VenuePayload, 1, 2, TRADE),
+                fixture_frame(FrameKind::VenuePayload, 2, 3, DEPTH),
+            ]
+        );
+        assert!(matches!(
+            frames[0].control().expect("the v1 control record decodes"),
+            Some(ControlRecord::Gap {
+                cause: GapCause::RecorderRestart,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_v2_file_still_reads() {
+        let bytes = unhex(V2_FILE);
+        let mut reader = RawReader::open(bytes.as_slice()).expect("a v2 header is accepted");
+        assert_eq!(reader.header().container_version, 2);
+        assert_eq!(reader.header().session_id, [0x02; 16]);
+
+        let (frames, truncation) = reader.read_all().expect("every v2 frame reads");
+        assert_eq!(truncation, None);
+        assert!(reader.is_finalized());
+        assert_eq!(
+            frames,
+            vec![
+                fixture_frame(FrameKind::Control, 0, 1, RESTART),
+                fixture_frame(FrameKind::VenuePayload, 1, 2, DEPTH),
+                fixture_frame(FrameKind::VenueSnapshot, 2, 3, SNAPSHOT),
+                fixture_frame(FrameKind::Control, 3, 4, PERIODIC_FAILED),
+                fixture_frame(FrameKind::VenuePayload, 4, 5, TRADE),
+            ]
+        );
+        assert!(matches!(
+            frames[3].control().expect("the v2 control record decodes"),
+            Some(ControlRecord::SnapshotFailed { attempts: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn a_v1_file_holding_a_snapshot_is_corruption_not_a_newer_feature() {
+        // No v1 writer could have written kind 2, so a v1 header over one is a
+        // file that is not what it says. The frames before it are still v1 kinds
+        // and still read, which is the torn-tail rule's spirit: keep what is good.
+        let mut bytes = unhex(V2_FILE);
+        restamp(&mut bytes, 1);
+        let mut reader = RawReader::open(bytes.as_slice()).expect("v1 is a version we read");
+
+        assert_eq!(
+            reader
+                .next_frame()
+                .map(|f| f.expect("a v1 kind").ingest_seq),
+            Some(1)
+        );
+        assert_eq!(
+            reader
+                .next_frame()
+                .map(|f| f.expect("a v1 kind").ingest_seq),
+            Some(2)
+        );
+        match reader.next_frame() {
+            Some(Err(StorageError::FrameKindNotInVersion {
+                kind: FrameKind::VenueSnapshot,
+                container_version: 1,
+                ingest_seq: 3,
+            })) => {}
+            other => panic!("expected the snapshot to be refused, got {other:?}"),
+        }
+    }
+
+    /// An account-stream frame, shaped like Binance's user-data events.
+    const ACCOUNT_EVENT: &[u8] = br#"{"subscriptionId":0,"event":{"e":"outboundAccountPosition","E":1785326400003,"u":1785326400002,"B":[{"a":"BTC","f":"0.00100000","l":"0.00000000"}]}}"#;
+
+    #[test]
+    fn account_frames_round_trip_in_a_current_file() {
+        let mut writer = RawWriter::create(Vec::new(), header(), WriterOptions::default()).unwrap();
+        let restart = ControlRecord::Gap {
+            cause: GapCause::RecorderRestart,
+            exchange_ts: Ts::from_nanos(T0),
+            last_good_ts: Ts::from_nanos(T0),
+        };
+        writer
+            .write_control(Ts::from_nanos(T0), 1, &restart)
+            .unwrap();
+        writer
+            .write_account_payload(Ts::from_nanos(T0 + 3_000_000), 2, ACCOUNT_EVENT)
+            .unwrap();
+        let bytes = writer.finish().unwrap().0;
+
+        let mut reader = RawReader::open(bytes.as_slice()).unwrap();
+        assert_eq!(reader.header().container_version, CONTAINER_VERSION);
+        let (frames, truncation) = reader.read_all().unwrap();
+        assert_eq!(truncation, None);
+        assert_eq!(
+            frames[1],
+            fixture_frame(FrameKind::AccountPayload, 3, 2, ACCOUNT_EVENT),
+            "the account's bytes, verbatim, under their own kind"
+        );
+        assert!(
+            frames[1].control().unwrap().is_none(),
+            "venue bytes, not ours"
+        );
+    }
+
+    #[test]
+    fn a_v2_file_holding_an_account_frame_is_corruption_not_a_newer_feature() {
+        // The account kind arrived in v3. A file stamped v2 that holds one was
+        // not written by any v2 writer, so it is not the v2 file it claims to be:
+        // refused at that frame, as corruption, not read as a newer feature.
+        let mut writer = RawWriter::create(Vec::new(), header(), WriterOptions::default()).unwrap();
+        writer
+            .write_venue_payload(Ts::from_nanos(T0), 1, DEPTH)
+            .unwrap();
+        writer
+            .write_account_payload(Ts::from_nanos(T0 + 1_000_000), 2, ACCOUNT_EVENT)
+            .unwrap();
+        let mut bytes = writer.finish().unwrap().0;
+        restamp(&mut bytes, 2);
+
+        let mut reader = RawReader::open(bytes.as_slice()).expect("v2 is a version we read");
+        assert!(matches!(reader.next_frame(), Some(Ok(f)) if f.kind == FrameKind::VenuePayload));
+        match reader.next_frame() {
+            Some(Err(StorageError::FrameKindNotInVersion {
+                kind: FrameKind::AccountPayload,
+                container_version: 2,
+                ingest_seq: 2,
+            })) => {}
+            other => panic!("expected the account frame to be refused, got {other:?}"),
+        }
+        assert!(reader.next_frame().is_none());
+    }
+
+    #[test]
+    fn nothing_is_read_past_a_frame_that_will_not_decode() {
+        // `None` after an error, every time. The reader used to mark itself
+        // finished and then decode the same bytes again on the next call, so a
+        // caller that went on past an error got the error forever -- or, where
+        // the cursor had already moved, the inside of a payload read as a frame
+        // header. Every caller stopped at the first error, which is why it never
+        // showed; the next one need not.
+        let mut bytes = unhex(V2_FILE);
+        restamp(&mut bytes, 1);
+        let mut reader = RawReader::open(bytes.as_slice()).expect("v1 is a version we read");
+        let mut errors = 0;
+        let mut calls = 0;
+        while let Some(frame) = reader.next_frame() {
+            calls += 1;
+            assert!(calls < 10, "the reader never stopped");
+            if frame.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(errors, 1, "one error, and then the end");
+        assert_eq!(calls, 3, "two v1 frames, then the snapshot refused");
+    }
+
+    #[test]
+    fn the_writer_will_not_write_a_kind_its_header_predates() {
+        // The reader would refuse the file, so the writer refuses the frame: the
+        // same bargain as an out-of-order ingest_seq. `FileHeader::new` stamps the
+        // current version, so only a header stamped older on purpose reaches this.
+        let mut old = header();
+        old.container_version = 1;
+        let mut writer = RawWriter::create(Vec::new(), old, WriterOptions::default()).unwrap();
+        assert!(matches!(
+            writer.write_venue_snapshot(Ts::EPOCH, 1, SNAPSHOT),
+            Err(StorageError::FrameKindNotInVersion {
+                kind: FrameKind::VenueSnapshot,
+                container_version: 1,
+                ingest_seq: 1,
+            })
+        ));
+        assert_eq!(writer.last_ingest_seq(), None, "the refusal took nothing");
+        assert_eq!(writer.pending_bytes(), 0);
+        writer.write_venue_payload(Ts::EPOCH, 1, DEPTH).unwrap();
+    }
+
+    const SNAPSHOT_FAILED: ControlRecord = ControlRecord::SnapshotFailed {
+        purpose: crate::frame::SnapshotPurpose::Resync,
+        reason: crate::frame::SnapshotFailure::Timeout,
+        attempts: 4,
+    };
+
+    #[test]
+    fn a_v1_file_holding_a_snapshot_failure_is_corruption_not_a_newer_feature() {
+        // v2 brought `SnapshotFailed` along with the snapshot kind. The kind of
+        // the frame that carries it is as old as the format, so a check on kinds
+        // alone would read this file as the v1 file it claims to be.
+        let mut writer = RawWriter::create(Vec::new(), header(), WriterOptions::default()).unwrap();
+        writer
+            .write_venue_payload(Ts::from_nanos(T0), 1, DEPTH)
+            .unwrap();
+        writer
+            .write_control(Ts::from_nanos(T0 + 1_000_000), 2, &SNAPSHOT_FAILED)
+            .unwrap();
+        let mut bytes = writer.finish().unwrap().0;
+        restamp(&mut bytes, 1);
+
+        let mut reader = RawReader::open(bytes.as_slice()).expect("v1 is a version we read");
+        assert!(matches!(reader.next_frame(), Some(Ok(f)) if f.kind == FrameKind::VenuePayload));
+        match reader.next_frame() {
+            Some(Err(StorageError::ControlRecordNotInVersion {
+                record: SNAPSHOT_FAILED,
+                container_version: 1,
+                ingest_seq: 2,
+            })) => {}
+            other => panic!("expected the snapshot failure to be refused, got {other:?}"),
+        }
+        assert!(reader.next_frame().is_none());
+
+        // The same bytes under the header they were written with read whole.
+        restamp(&mut bytes, 2);
+        let (frames, _) = RawReader::open(bytes.as_slice())
+            .unwrap()
+            .read_all()
+            .expect("a v2 file may hold one");
+        assert_eq!(frames[1].control().unwrap(), Some(SNAPSHOT_FAILED));
+    }
+
+    #[test]
+    fn the_writer_will_not_write_a_control_record_its_header_predates() {
+        let mut old = header();
+        old.container_version = 1;
+        let mut writer = RawWriter::create(Vec::new(), old, WriterOptions::default()).unwrap();
+        assert!(matches!(
+            writer.write_control(Ts::EPOCH, 1, &SNAPSHOT_FAILED),
+            Err(StorageError::ControlRecordNotInVersion {
+                record: SNAPSHOT_FAILED,
+                container_version: 1,
+                ingest_seq: 1,
+            })
+        ));
+        assert_eq!(writer.last_ingest_seq(), None, "the refusal took nothing");
+        assert_eq!(writer.pending_bytes(), 0);
+        // A gap record is as old as the format.
+        writer
+            .write_control(
+                Ts::EPOCH,
+                1,
+                &ControlRecord::Gap {
+                    cause: GapCause::RecorderRestart,
+                    exchange_ts: Ts::EPOCH,
+                    last_good_ts: Ts::EPOCH,
+                },
+            )
+            .unwrap();
     }
 
     #[test]

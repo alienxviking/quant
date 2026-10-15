@@ -153,6 +153,26 @@ impl<W: Write> RawWriter<W> {
         self.write_frame(FrameKind::VenueSnapshot, local_recv_ts, ingest_seq, payload)
     }
 
+    /// Append a frame from the account's own socket, verbatim.
+    ///
+    /// Like [`RawWriter::write_venue_snapshot`], different from
+    /// [`RawWriter::write_venue_payload`] only in the kind it stamps; see
+    /// [`FrameKind::AccountPayload`] for why that byte matters, and for which
+    /// frames may be handed here at all.
+    pub fn write_account_payload(
+        &mut self,
+        local_recv_ts: Ts,
+        ingest_seq: u64,
+        payload: &[u8],
+    ) -> StorageResult<()> {
+        self.write_frame(
+            FrameKind::AccountPayload,
+            local_recv_ts,
+            ingest_seq,
+            payload,
+        )
+    }
+
     /// Append a record we authored -- a gap, or a snapshot we failed to get.
     pub fn write_control(
         &mut self,
@@ -160,6 +180,17 @@ impl<W: Write> RawWriter<W> {
         ingest_seq: u64,
         record: &ControlRecord,
     ) -> StorageResult<()> {
+        // The record-level twin of the kind check in `write_frame`: a record the
+        // header's version did not have makes a file every reader refuses. See
+        // `ControlRecord::since`.
+        let container_version = self.header.container_version;
+        if !record.admitted_in(container_version) {
+            return Err(StorageError::ControlRecordNotInVersion {
+                record: *record,
+                container_version,
+                ingest_seq,
+            });
+        }
         let payload = record.to_json()?;
         self.write_frame(FrameKind::Control, local_recv_ts, ingest_seq, &payload)
     }
@@ -180,6 +211,20 @@ impl<W: Write> RawWriter<W> {
             return Err(StorageError::PayloadTooLarge {
                 len: payload.len(),
                 max: MAX_PAYLOAD_LEN,
+            });
+        }
+
+        // A kind the header's version did not have would make a file every reader
+        // refuses as corrupt -- see `FrameKind::since`. Only reachable by stamping
+        // an older version on purpose, since `FileHeader::new` stamps the current
+        // one, and refused here on the argument the sequence check below makes:
+        // persisting a file that cannot be verified is worse than failing a write.
+        let container_version = self.header.container_version;
+        if !kind.admitted_in(container_version) {
+            return Err(StorageError::FrameKindNotInVersion {
+                kind,
+                container_version,
+                ingest_seq,
             });
         }
 

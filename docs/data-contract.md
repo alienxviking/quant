@@ -83,7 +83,7 @@ Three independent counters, all recorded:
 
 | Counter | Whose | Answers |
 |---|---|---|
-| `ingest_seq` | Ours, per (recorder process, instrument) | "Is this file complete and in order?" |
+| `ingest_seq` | Ours, per (recorder process, stream): an instrument's market data, or the account stream (§5) | "Is this file complete and in order?" |
 | `venue_trade_id` | The venue's | "Did we double-count this trade across a reconnect?" |
 | `first_update_id` / `final_update_id` | The venue's | "Is our order book still correct?" |
 
@@ -170,6 +170,9 @@ data/
   raw/
     exchange=binance/symbol=BTCUSDT/date=2026-07-26/
       session=<uuid>/part-00000.bin.zst
+  account/
+    exchange=binance/date=2026-07-26/
+      session=<uuid>/part-00000.bin.zst
   normalized/
     exchange=binance/symbol=BTCUSDT/date=2026-07-26/
       trades/part-00000.parquet
@@ -197,6 +200,24 @@ backtester makes is "this instrument, this date range". Hive-style
 directories are readable by DuckDB, Polars, pandas, Spark and ClickHouse
 without any of them being told about our schema — which keeps the research
 side of the project free to use whatever tool fits.
+
+**The account stream has a tree of its own** (M8, `docs/live-run.md` §5). It
+is the venue's user-data stream — what happened to the account's orders —
+recorded verbatim before anything parses it, as frame kind 3 (§6). It is per
+account, not per instrument: one socket reports on every instrument the account
+trades. So its path has no `symbol=`, and its file header carries the stream's
+name, `account`, in the field where a market file names its symbol. It lives
+beside `raw/` rather than inside it, and the placement is the guarantee: every
+reader of market data — the normalizer, `explain`, and through the normalized
+tier the backtest — finds its sessions by walking `raw/`, so none of them is
+ever handed an account file, and a gap on the account's socket can never clear
+a book. In every other way an account session is an ordinary one: its own
+`ingest_seq`, rolled by the record's own timestamp, sealed with trailers, its
+gaps recorded as ordinary `ControlRecord::Gap`s (unambiguous in a file that
+holds nothing else), written by the same recorder code and checked by the same
+`verify` run, which walks both trees (§7). An M8 run root holds one account,
+so the path needs no account key; a second account under one root is when an
+`account=` key would earn itself.
 
 One file per capture session **per UTC day**, never appended across a restart, so
 a crashed process can never corrupt a file another process is reading. A session
@@ -236,7 +257,7 @@ two references now point at the paragraph above.
 
 **Two** versions are stamped in every raw file header, and they are independent.
 `CONTAINER_VERSION` versions the file format — framing, block layout, which frame
-kinds exist — and is currently **2**. `EVENT_SCHEMA_VERSION` versions the event
+kinds exist — and is currently **3**. `EVENT_SCHEMA_VERSION` versions the event
 vocabulary and is currently **1**.
 
 They are separate because a new frame kind and a new field on a `Trade` are not
@@ -245,18 +266,38 @@ older readers refuse a whole file for a change they could have read straight
 through — which is the opposite of the diagnostic argument the v1 → v2 note below
 makes.
 
-The rules apply to both:
-
 Rules:
 
 - **The normalizer must retain the ability to read every version it has ever
   written.** A migration that cannot read last year's capture is a data-loss
   event.
-- Additive changes (new optional field) bump the version but stay readable by
-  the previous reader.
+- **A reader reads every container version up to its own and refuses any later
+  one at the header**, however additive the change. And a file admits only the
+  frame kinds and control records its own version had: a v2 file holding a
+  kind-3 frame, or a v1 file holding a `SnapshotFailed`, is not using a newer
+  feature, it is a file no writer of that version could have produced, and it
+  is reported as the corruption it is.
 - Breaking changes require a written migration note in this file *and* a
   successful re-derive of the full normalized tier before the old reader is
   removed.
+
+**This list used to say additive changes "bump the version but stay readable by
+the previous reader", and for the container that was never true.**
+`FileHeader::decode` has refused every version newer than its own since M1.a,
+and the first paragraph of the v1 → v2 note below says a v1 reader refuses a v2
+file at the header. The refusal is the rule, and it is the right one. A v2 reader
+that let a v3 file through would read most of it, meet the first kind-3 frame
+and report `UnknownFrameKind` — indistinguishable from corruption, and found as
+late as possible, by whoever was reading the file for some other reason. Refused
+at the header, the file says what is wrong before a frame is read: this build is
+older than this file. The price is that a newer build's files are all unreadable
+to an older build, those holding nothing new included, since every file is
+stamped with the version of the build that wrote it. That is paid on purpose,
+and it is why the version is frozen while a judged run is in flight (below).
+
+`EVENT_SCHEMA_VERSION` is stamped and, today, compared by nothing: no reader
+checks it. The first change to the event vocabulary that an older reader could
+misread owes that check before it lands.
 
 ### Migration notes
 
@@ -287,11 +328,55 @@ striking before some later decision is taken on the strength of capture we do
 not have yet.
 
 There is a narrower rule on top of that while a judged run is in flight: the
-container version is **frozen for its duration** (`docs/paper-run.md`). Bumping
-it would not change the running recorder — that is a binary already loaded — but
-the artifacts have to stay readable by the tools that will judge the run, and two
-weeks of capture that newer tools refuse is the same data loss arriving by a
-different route.
+container version is **frozen for its duration** (`docs/paper-run.md`). Not
+because newer tools would refuse the run's capture — a reader reads every version
+up to its own, so nothing newer refuses anything older. The hazard runs the other
+way, as the rule above says: the run is judged by a build pinned to its start,
+and a recorder rebuilt at a newer version mid-run — a supervisor restart that
+execs a binary rebuilt in the run's checkout — stamps its files with a version
+that pinned build refuses at the header. Part of the run's capture is then
+unreadable by the tools that will judge it, which is the same data loss arriving
+by a different route.
+
+**Container v2 → v3** (M8.c, 2026-10-15). Adds frame kind `3 = AccountPayload`:
+the account stream's frames — what the venue says happened to the account's
+orders — recorded verbatim before anything parses them (`docs/live-run.md` §5),
+in files of their own under `account/` (§5). Inbound frames only, and never one
+that carries key material: the raw tier is kept forever. No control record is
+added, because a gap on the account's socket is an ordinary `ControlRecord::Gap`,
+unambiguous in a file that holds nothing else. A v3 reader reads v1 and v2 files
+unchanged; a v2 reader refuses a v3 file at the header — the build at `c97ff4d`
+answers *"unsupported container version 3 (this build reads up to 2)"* about one.
+
+The same change gave the version a meaning inside the file. Until then the
+reader's one check was "refuse newer", so a build read any kind it knew in a
+file of any age, and a v1 file holding a snapshot frame would have read straight
+through. A file now admits only the kinds its own version had
+(`FrameKind::since`), which makes "a v2 file holding kind 3 is corruption" a
+check rather than a hope. The rule covers control records too
+(`ControlRecord::since`): v2 brought `SnapshotFailed` in a frame kind as old as
+the format, so a check on kinds alone would read a v1 file holding one as the
+v1 file it claims to be, and a writer would write it under a v1 header. The two real v1 captures on the development machine,
+from 2026-07-29, hold only kinds 0 and 1, so the rule changes nothing already
+written.
+
+**What the procedure above was owed, and how it was paid.** The v1 → v2 note
+shut the window: the next container change owes "a migration note here, and a
+successful re-derive of the whole normalized tier before the v2 reader is
+removed". This is the note. No reader was removed — the v3 reader *is* the v2
+reader with one more kind, reading v1 and v2 files by the same code, plus the
+per-version check, which changes nothing already written — so the re-derive owed
+before a removal is not yet due. What was owed instead is proof
+that nothing already written stopped reading, and a v3 build's `verify` gave
+the v2 build's answers on both archives, frame for frame: the M5 fortnight,
+97,937,822 frames, exit 0; the acceptance week, 70,545,346 frames, exit 0 with
+its one known `snapshot-failed` warning. Pinned whole v1 and v2 files in
+`quant-storage`'s tests hold every later build to the same.
+
+The freeze on the container version while a judged run is in flight did not
+apply: none was, M5's fortnight having ended on 2026-10-02 and M8's not yet
+begun. The bump has to land before M8's run starts, because during it the
+freeze would forbid it.
 
 ---
 
@@ -447,6 +532,13 @@ data is worse than no verifier.
 Errors fail the run; warnings do not. A torn tail on a file still being written
 is the archetypal warning, and making it fail would train everyone to ignore the
 exit code.
+
+From M8 the same run walks the account stream's tree as well (§5), and holds
+an account session to the first and last rows of the table above and to none of
+the middle two: it has no depth deltas, so no update-id chain to follow and no
+book to anchor. Its frames are counted and not read — what they say is the
+translator's business — and a frame of either stream found in the other's
+capture is an error, never read as its own.
 
 `--reconcile` additionally cross-checks the metadata index, and is a flag rather
 than the default because §1 makes raw the source of truth: a capture that could

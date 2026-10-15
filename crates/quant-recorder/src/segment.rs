@@ -53,7 +53,7 @@ use quant_storage::{
     FileHeader, RawWriter, StorageError, StorageResult, WriterOptions, WriterStats,
 };
 
-use crate::layout::CaptureTarget;
+use crate::layout::{CaptureStream, CaptureTarget};
 use crate::record::CaptureRecord;
 
 /// One day, for computing a segment's upper bound.
@@ -234,11 +234,12 @@ struct Open<W: Write> {
     first_ingest_seq: Option<u64>,
 }
 
-/// One capture session: a sequence of day-partitioned segments for one instrument.
+/// One capture session: a sequence of day-partitioned segments for one stream --
+/// one instrument's market data, or the account's own.
 pub struct CaptureSession<S: SegmentStore> {
     store: S,
     exchange: Exchange,
-    symbol: String,
+    stream: CaptureStream,
     session_id: [u8; 16],
     opts: WriterOptions,
     clock: Arc<dyn Clock>,
@@ -252,7 +253,7 @@ impl<S: SegmentStore> fmt::Debug for CaptureSession<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CaptureSession")
             .field("exchange", &self.exchange)
-            .field("symbol", &self.symbol)
+            .field("stream", &self.stream)
             .field("open", &self.open.as_ref().map(|o| &o.target))
             .field("segments_sealed", &self.reports.len())
             .field("rolls", &self.rolls)
@@ -262,6 +263,7 @@ impl<S: SegmentStore> fmt::Debug for CaptureSession<S> {
 }
 
 impl<S: SegmentStore> CaptureSession<S> {
+    /// A session recording one instrument's market data.
     #[must_use]
     pub fn new(
         store: S,
@@ -271,10 +273,74 @@ impl<S: SegmentStore> CaptureSession<S> {
         clock: Arc<dyn Clock>,
         opts: WriterOptions,
     ) -> Self {
+        Self::recording(
+            store,
+            exchange,
+            CaptureStream::market(symbol),
+            session_id,
+            clock,
+            opts,
+        )
+    }
+
+    /// A session recording the account stream, into the account's own tree.
+    ///
+    /// Everything else is the market session's: the same rolling on the
+    /// record's own timestamp, the same sealing of an idle day, the same
+    /// trailers and the same session-scoped `ingest_seq`. That sameness is the
+    /// point of giving the account stream a session rather than a writer of its
+    /// own -- each of those rules was learned the hard way once already.
+    ///
+    /// # Its id is minted here, not passed in
+    ///
+    /// The one thing it must not share with a market session is its id.
+    /// `(session_id, capture_date, part)` is a file's whole identity in
+    /// `quant-meta`'s `capture_segments` and in `verify --reconcile`, and neither
+    /// has the stream in it: an account session holding the market capture's id
+    /// would make each of its files the same row as a market file of that day --
+    /// an upsert that overwrites the market's row rather than a duplicate anyone
+    /// would see. The natural way to get there is to mint one id for "the run"
+    /// and hand it to both sessions, so this constructor takes no id at all and
+    /// mints a fresh v4 UUID; [`Self::session_id`] reads it back for whoever
+    /// registers the session.
+    #[must_use]
+    pub fn account(
+        store: S,
+        exchange: Exchange,
+        clock: Arc<dyn Clock>,
+        opts: WriterOptions,
+    ) -> Self {
+        Self::recording(
+            store,
+            exchange,
+            CaptureStream::Account,
+            *uuid::Uuid::new_v4().as_bytes(),
+            clock,
+            opts,
+        )
+    }
+
+    /// The id every file of this session is stamped with.
+    #[must_use]
+    pub const fn session_id(&self) -> [u8; 16] {
+        self.session_id
+    }
+
+    /// Both constructors, once: the stream is the only thing a market session
+    /// and an account session start out differing in, and a field added later
+    /// cannot start out differently in one of them by accident.
+    fn recording(
+        store: S,
+        exchange: Exchange,
+        stream: CaptureStream,
+        session_id: [u8; 16],
+        clock: Arc<dyn Clock>,
+        opts: WriterOptions,
+    ) -> Self {
         Self {
             store,
             exchange,
-            symbol: symbol.into(),
+            stream,
             session_id,
             opts,
             clock,
@@ -286,6 +352,12 @@ impl<S: SegmentStore> CaptureSession<S> {
     }
 
     /// Write a record, rolling to a new segment first if it belongs to a later day.
+    ///
+    /// Each kind of record is written as its own kind of frame, whichever
+    /// stream the session records: nothing here rewrites what a record is. An
+    /// account record handed to a market session is written as the account
+    /// frame it is, and every reader of the file says so, rather than this
+    /// taking down a capture over a record it could still keep.
     pub fn write(&mut self, record: CaptureRecord) -> StorageResult<()> {
         let ts = record.local_recv_ts();
 
@@ -338,6 +410,13 @@ impl<S: SegmentStore> CaptureSession<S> {
             } => open
                 .writer
                 .write_venue_snapshot(local_recv_ts, ingest_seq, &payload),
+            CaptureRecord::Account {
+                local_recv_ts,
+                ingest_seq,
+                payload,
+            } => open
+                .writer
+                .write_account_payload(local_recv_ts, ingest_seq, &payload),
         }
     }
 
@@ -378,7 +457,7 @@ impl<S: SegmentStore> CaptureSession<S> {
         let day_start = ts.start_of_utc_day();
         let target = CaptureTarget {
             exchange: self.exchange,
-            symbol: self.symbol.clone(),
+            stream: self.stream.clone(),
             date: ts.utc_date(),
             session_id: self.session_id,
             // Part resets per day, because the directory is per day. Size-based
@@ -386,7 +465,7 @@ impl<S: SegmentStore> CaptureSession<S> {
             part: 0,
         };
         let sink = self.store.create(&target)?;
-        let header = FileHeader::new(self.exchange, self.symbol.clone(), self.session_id);
+        let header = FileHeader::new(self.exchange, self.stream.header_symbol(), self.session_id);
         self.open = Some(Open {
             target,
             day_start,
@@ -625,6 +704,92 @@ mod tests {
         assert_eq!(s.rolls(), 1);
         let (reports, _) = s.finish().unwrap();
         assert_eq!(reports[1].stats.frames, 1);
+    }
+
+    #[test]
+    fn an_account_session_rolls_and_seals_like_a_market_one() {
+        // The account stream reuses the session rather than having a writer of
+        // its own, so it inherits rolling on the record's timestamp, trailers and
+        // a session-scoped ingest_seq -- and lands in its own tree, with a header
+        // that names the stream rather than a symbol.
+        let clock = Arc::new(ManualClock::new(Ts::from_secs(BEFORE_MIDNIGHT)));
+        let mut s = CaptureSession::account(
+            MemoryStore::new(),
+            Exchange::Binance,
+            clock,
+            WriterOptions::default(),
+        );
+        for (offset, seq) in [(0_i64, 1_u64), (0, 2), (2, 3)] {
+            s.write(CaptureRecord::Account {
+                local_recv_ts: Ts::from_secs(BEFORE_MIDNIGHT + offset),
+                ingest_seq: seq,
+                payload: br#"{"subscriptionId":0,"event":{"e":"executionReport"}}"#.to_vec(),
+            })
+            .unwrap();
+        }
+        assert_eq!(s.rolls(), 1, "the day boundary rolls an account file too");
+
+        let (reports, store) = s.finish().unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            reports[1].first_ingest_seq,
+            Some(3),
+            "seq spans the session"
+        );
+        for (target, bytes) in &store.segments {
+            assert_eq!(target.stream, CaptureStream::Account);
+            let mut reader = RawReader::open(bytes.as_slice()).unwrap();
+            assert_eq!(reader.header().symbol, crate::layout::ACCOUNT_STREAM);
+            let (frames, truncation) = reader.read_all().unwrap();
+            assert_eq!(truncation, None);
+            assert!(reader.is_finalized(), "sealed with a trailer");
+            assert!(frames
+                .iter()
+                .all(|f| f.kind == quant_storage::FrameKind::AccountPayload));
+        }
+    }
+
+    #[test]
+    fn every_account_session_gets_an_id_of_its_own() {
+        // The constructor mints the id so that no caller can hand the account
+        // session the market capture's: the two would then share every
+        // (session_id, capture_date, part) the metadata tier keys a file by.
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Ts::from_secs(BEFORE_MIDNIGHT)));
+        let mint = || {
+            CaptureSession::account(
+                MemoryStore::new(),
+                Exchange::Binance,
+                Arc::clone(&clock),
+                WriterOptions::default(),
+            )
+            .session_id()
+        };
+        let (a, b) = (mint(), mint());
+        assert_ne!(a, b, "two account sessions, two ids");
+        assert_eq!(a[6] >> 4, 4, "a v4 UUID, the market capture's kind of id");
+        assert_ne!(
+            a,
+            session(Arc::new(ManualClock::new(Ts::EPOCH))).session_id()
+        );
+
+        // And the files carry the id the accessor reports.
+        let mut s = CaptureSession::account(
+            MemoryStore::new(),
+            Exchange::Binance,
+            Arc::clone(&clock),
+            WriterOptions::default(),
+        );
+        let id = s.session_id();
+        s.write(CaptureRecord::Account {
+            local_recv_ts: Ts::from_secs(BEFORE_MIDNIGHT),
+            ingest_seq: 1,
+            payload: b"{}".to_vec(),
+        })
+        .unwrap();
+        let (_, store) = s.finish().unwrap();
+        let reader = RawReader::open(store.segments[0].1.as_slice()).unwrap();
+        assert_eq!(reader.header().session_id, id);
+        assert_eq!(store.segments[0].0.session_id, id);
     }
 
     #[test]

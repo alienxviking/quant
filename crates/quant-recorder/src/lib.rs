@@ -93,7 +93,9 @@
 //! # One session, many files
 //!
 //! The writer does not own a file, it owns a [`CaptureSession`]: a sequence of
-//! day-partitioned segments for one instrument. Rolling to the next segment is
+//! day-partitioned segments for one stream -- one instrument's market data, or
+//! the account stream, in a tree of its own ([`layout`] says where and why).
+//! Rolling to the next segment is
 //! driven by the *record's* timestamp rather than the writer's clock, so which
 //! partition a message lands in is a property of the data and not of how busy our
 //! disk was. [`segment`] has the full argument, including why an idle stream needs
@@ -118,9 +120,12 @@ pub mod tee;
 pub mod writer;
 
 pub use backoff::{Backoff, BackoffPolicy};
-pub use catalog::{catalog, Catalog, CatalogEntry, SessionFiles};
+pub use catalog::{account_catalog, catalog, AccountFiles, Catalog, CatalogEntry, SessionFiles};
 pub use ingress::{Accepted, GapOutcome, Ingress, IngressStats, WriterGone, MAX_PENDING_GAPS};
-pub use layout::{format_session_id, parse_session_id, parse_utc_date, CaptureTarget};
+pub use layout::{
+    format_session_id, parse_session_id, parse_utc_date, CaptureStream, CaptureTarget,
+    ACCOUNT_STREAM, RAW_DIR,
+};
 pub use metrics::{
     LatencySummary, Metrics, MetricsLine, MetricsReport, MetricsReporter, MetricsSample,
 };

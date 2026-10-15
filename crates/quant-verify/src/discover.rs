@@ -13,6 +13,14 @@
 //! reading each file's header, cross-checking it against the path, and turning
 //! the leftovers into findings.
 //!
+//! # Both trees
+//!
+//! A data root holds market data under `raw/` and, from M8, the account stream
+//! under `account/`. Both are walked, each by its own catalog, so pointing the
+//! verifier at a run root checks the whole of what the run recorded -- and a
+//! stray in either tree is reported, including the other stream's files moved
+//! into it by hand.
+//!
 //! # Why a session, not a file
 //!
 //! `ingest_seq` spans a capture *session*, not a file -- `quant-recorder`'s
@@ -34,7 +42,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use quant_core::instrument::Exchange;
-use quant_recorder::{CaptureTarget, CatalogEntry};
+use quant_recorder::{CaptureStream, CaptureTarget, CatalogEntry, ACCOUNT_STREAM};
 use quant_storage::{FileHeader, RawReader};
 
 use crate::finding::{code, Report, Where};
@@ -61,26 +69,30 @@ impl Segment {
 #[derive(Debug, Clone)]
 pub struct Session {
     pub exchange: Exchange,
-    pub symbol: String,
+    /// One instrument's market data, or the account stream. Decides which
+    /// checks the session gets: see [`crate::session`].
+    pub stream: CaptureStream,
     pub session_id: [u8; 16],
     pub segments: Vec<Segment>,
 }
 
-/// Walk `root` and group every capture file into its session.
+/// Walk `root`'s market and account trees and group every capture file into its
+/// session: market sessions first, then the account stream's.
 ///
 /// Problems with individual files are reported into `report` rather than aborting:
 /// one unreadable file must not stop the other six days from being checked.
 pub fn discover(root: &Path, report: &mut Report) -> Vec<Session> {
-    let catalog = quant_recorder::catalog(root);
+    let market = quant_recorder::catalog(root);
+    let account = quant_recorder::account_catalog(root);
 
-    for path in &catalog.strays {
+    for path in market.strays.iter().chain(&account.strays) {
         report.warn(
             code::STRAY_FILE,
             Where::file(path.to_string_lossy().into_owned()),
-            "not a capture file at the expected partition depth",
+            "not a capture file of this tree at the expected partition depth",
         );
     }
-    for (path, error) in &catalog.unreadable {
+    for (path, error) in market.unreadable.iter().chain(&account.unreadable) {
         report.error(
             code::UNREADABLE_FILE,
             Where::file(path.to_string_lossy().into_owned()),
@@ -88,12 +100,26 @@ pub fn discover(root: &Path, report: &mut Report) -> Vec<Session> {
         );
     }
 
-    catalog
-        .sessions
-        .into_iter()
-        .filter_map(|files| {
-            let segments: Vec<Segment> = files
-                .segments
+    let market = market.sessions.into_iter().map(|files| {
+        (
+            files.exchange,
+            CaptureStream::market(files.symbol),
+            files.session_id,
+            files.segments,
+        )
+    });
+    let account = account.sessions.into_iter().map(|files| {
+        (
+            files.exchange,
+            CaptureStream::Account,
+            files.session_id,
+            files.segments,
+        )
+    });
+    market
+        .chain(account)
+        .filter_map(|(exchange, stream, session_id, entries)| {
+            let segments: Vec<Segment> = entries
                 .into_iter()
                 .filter_map(|entry| identify(entry, report))
                 .collect();
@@ -103,9 +129,9 @@ pub fn discover(root: &Path, report: &mut Report) -> Vec<Session> {
                 return None;
             }
             Some(Session {
-                exchange: files.exchange,
-                symbol: files.symbol,
-                session_id: files.session_id,
+                exchange,
+                stream,
+                session_id,
                 segments,
             })
         })
@@ -142,11 +168,21 @@ fn identify(entry: CatalogEntry, report: &mut Report) -> Option<Segment> {
             header.exchange, target.exchange
         ));
     }
-    if header.symbol != target.symbol {
-        mismatches.push(format!(
-            "header says symbol {} but the path says {}",
-            header.symbol, target.symbol
-        ));
+    // What the header's symbol field must say is the layout's to decide, not
+    // this module's: the venue's symbol for market data, the stream's own name
+    // for the account stream, which has no symbol.
+    if header.symbol != target.stream.header_symbol() {
+        mismatches.push(match &target.stream {
+            CaptureStream::Market { symbol } => format!(
+                "header says symbol {} but the path says {symbol}",
+                header.symbol
+            ),
+            CaptureStream::Account => format!(
+                "header says symbol {} but the path says the account stream, whose \
+                 files say {ACCOUNT_STREAM}",
+                header.symbol
+            ),
+        });
     }
     if header.session_id != target.session_id {
         mismatches.push("header and path name different sessions".to_owned());
