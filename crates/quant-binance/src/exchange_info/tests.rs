@@ -354,17 +354,39 @@ fn exchange_rule(name: &str, fields: &[(&str, &str)]) -> UnmodelledRule {
     reported(RuleScope::Exchange, name, fields)
 }
 
+/// A rate limit the answer lists, as it is reported: whole, exchange-wide,
+/// under the name of the list.
+fn rate_limit(fields: &[(&str, &str)]) -> UnmodelledRule {
+    exchange_rule("rateLimits", fields)
+}
+
+/// The documented REST answer's one rate limit. The page gives it as a
+/// placeholder holding only comments (`rest-api.md` lines 816-821), so with
+/// them removed it is an entry with no fields: reported as one, not dropped.
+fn placeholder_rate_limit() -> UnmodelledRule {
+    rate_limit(&[])
+}
+
+/// Everything an answer built on [`REST_ANSWER`] reports, given what its
+/// filters report: those, then the documented answer's own rate limit.
+fn ethbtc_reports(filter_rules: Vec<UnmodelledRule>) -> Vec<UnmodelledRule> {
+    let mut all = filter_rules;
+    all.push(placeholder_rate_limit());
+    all
+}
+
 #[test]
 fn the_documented_answer_parses_exactly() {
     // No filters at all, so no rules: every one of the three is zero, which
     // `Filters` reads as none. Not the journal's `MIN_TICK` placeholders and
     // not the literals every binary registers today -- either would be a rule
-    // the venue did not state.
+    // the venue did not state. All it reports is its one rate limit, which
+    // the page leaves as a placeholder.
     assert_eq!(
         ethbtc_from(REST_ANSWER),
         Ok(VenueInstrument {
             definition: ethbtc("0", "0", "0"),
-            unmodelled: Vec::new(),
+            unmodelled: vec![placeholder_rate_limit()],
         })
     );
 }
@@ -387,7 +409,8 @@ fn the_documented_answer_with_filters_parses_exactly() {
         }
     );
     // What the two filters say beyond the step: the bounds the model has no
-    // field for, as the venue wrote them.
+    // field for, as the venue wrote them. Then the four rate limits (lines
+    // 1538-1563), the two `ORDERS` limits among them, each whole.
     assert_eq!(
         got.unmodelled,
         vec![
@@ -399,6 +422,30 @@ fn the_documented_answer_with_filters_parses_exactly() {
                 "LOT_SIZE",
                 &[("maxQty", "100000.00000000"), ("minQty", "0.00100000")]
             ),
+            rate_limit(&[
+                ("interval", "MINUTE"),
+                ("intervalNum", "1"),
+                ("limit", "6000"),
+                ("rateLimitType", "REQUEST_WEIGHT"),
+            ]),
+            rate_limit(&[
+                ("interval", "SECOND"),
+                ("intervalNum", "10"),
+                ("limit", "50"),
+                ("rateLimitType", "ORDERS"),
+            ]),
+            rate_limit(&[
+                ("interval", "DAY"),
+                ("intervalNum", "1"),
+                ("limit", "160000"),
+                ("rateLimitType", "ORDERS"),
+            ]),
+            rate_limit(&[
+                ("interval", "MINUTE"),
+                ("intervalNum", "5"),
+                ("limit", "300"),
+                ("rateLimitType", "CONNECTIONS"),
+            ]),
         ]
     );
 }
@@ -423,7 +470,7 @@ fn every_filters_md_example_parses_exactly() {
     // in the page's order, compared exactly.
     assert_eq!(
         got.unmodelled,
-        vec![
+        ethbtc_reports(vec![
             rule(
                 "PRICE_FILTER",
                 &[("maxPrice", "100000.00000000"), ("minPrice", "0.00000100")]
@@ -506,7 +553,7 @@ fn every_filters_md_example_parses_exactly() {
                 "EXCHANGE_MAX_NUM_ORDER_LISTS",
                 &[("maxNumOrderLists", "20")]
             ),
-        ]
+        ])
     );
 }
 
@@ -525,7 +572,7 @@ fn each_rule_is_read_from_its_own_field() {
     assert_eq!(got.definition, ethbtc("0.01", "0.0001", "5"));
     assert_eq!(
         got.unmodelled,
-        vec![
+        ethbtc_reports(vec![
             rule(
                 "PRICE_FILTER",
                 &[("maxPrice", "1000000.00000000"), ("minPrice", "0.02000000")]
@@ -543,7 +590,7 @@ fn each_rule_is_read_from_its_own_field() {
                     ("maxNotional", "9000000.00000000"),
                 ]
             ),
-        ]
+        ])
     );
 }
 
@@ -607,7 +654,7 @@ fn market_lot_size_is_never_the_lot() {
     // step borrowed to fill the gap.
     let got = ethbtc_from(&with_filters(&format!("[{market}]"))).expect("parses");
     assert_eq!(got.definition.lot_size, Qty::ZERO);
-    assert_eq!(got.unmodelled, vec![market_rule]);
+    assert_eq!(got.unmodelled, ethbtc_reports(vec![market_rule]));
 }
 
 #[test]
@@ -625,7 +672,7 @@ fn a_rule_the_model_cannot_express_is_reported_not_dropped() {
     assert_eq!(got.definition.tick_size, px("0.01"));
     assert_eq!(
         got.unmodelled,
-        vec![
+        ethbtc_reports(vec![
             rule(
                 "PRICE_FILTER",
                 &[
@@ -636,7 +683,7 @@ fn a_rule_the_model_cannot_express_is_reported_not_dropped() {
             ),
             rule("FUTURE_RULE", &[("applies", "true"), ("limit", "3")]),
             rule("BARE_RULE", &[]),
-        ]
+        ])
     );
 
     // A filter the definition took all of is not reported: none of it is
@@ -646,7 +693,7 @@ fn a_rule_the_model_cannot_express_is_reported_not_dropped() {
         ethbtc_from(&with_filters(whole))
             .expect("parses")
             .unmodelled,
-        Vec::new()
+        ethbtc_reports(Vec::new())
     );
 }
 
@@ -866,7 +913,7 @@ fn a_filter_the_definition_reads_cannot_be_listed_twice() {
     let orders = r#"{"filterType": "MAX_NUM_ORDERS", "maxNumOrders": 25}"#;
     let got = ethbtc_from(&with_filters(&format!("[{orders}, {orders}]"))).expect("parses");
     let once = rule("MAX_NUM_ORDERS", &[("maxNumOrders", "25")]);
-    assert_eq!(got.unmodelled, vec![once.clone(), once]);
+    assert_eq!(got.unmodelled, ethbtc_reports(vec![once.clone(), once]));
 }
 
 /// A `MIN_NOTIONAL` filter with `floor`, as the venue would list it.
@@ -936,6 +983,57 @@ fn the_larger_notional_floor_binds_and_the_other_is_reported_whole() {
     }
 }
 
+/// Where [`REST_ANSWER`] lists its one rate limit, the placeholder.
+const PLACEHOLDER_RATE_LIMITS: &str = "\"rateLimits\": [\n        {\n        }\n    ],\n";
+
+#[test]
+fn every_rate_limit_is_reported_whole_and_orders_is_one() {
+    // `ORDERS` is the unfilled order rate limit, and this answer is where the
+    // venue states it (`faqs/order_count_decrement.md` lines 16-18): every
+    // order placed counts against it (line 37), and one past it is refused
+    // with `-1015` (`errors.md` lines 43-45). A rule about orders the model
+    // does not have, so it is reported, whole -- its values all distinct, so
+    // a field dropped or swapped shows. The other limiter is reported as well,
+    // with a field no page documents: nothing here decides which limit
+    // matters.
+    let answer = edit(
+        REST_ANSWER,
+        PLACEHOLDER_RATE_LIMITS,
+        r#""rateLimits": [
+            {"rateLimitType": "ORDERS", "interval": "SECOND", "intervalNum": 10, "limit": 50},
+            {"rateLimitType": "RAW_REQUESTS", "interval": "MINUTE", "intervalNum": 5, "limit": 61000, "futureField": "x"}
+        ],
+"#,
+    );
+    let got = ethbtc_from(&answer).expect("parses");
+    assert_eq!(
+        got.unmodelled,
+        vec![
+            rate_limit(&[
+                ("interval", "SECOND"),
+                ("intervalNum", "10"),
+                ("limit", "50"),
+                ("rateLimitType", "ORDERS"),
+            ]),
+            rate_limit(&[
+                ("futureField", "x"),
+                ("interval", "MINUTE"),
+                ("intervalNum", "5"),
+                ("limit", "61000"),
+                ("rateLimitType", "RAW_REQUESTS"),
+            ]),
+        ]
+    );
+
+    // And the other direction: absent or `null` is no rate limits, which *"All
+    // limits are optional"* allows (`rest-api.md` line 819), not an error.
+    for none in ["", "\"rateLimits\": null,\n"] {
+        let got = ethbtc_from(&edit(REST_ANSWER, PLACEHOLDER_RATE_LIMITS, none))
+            .expect("an answer without rate limits parses");
+        assert_eq!(got.unmodelled, Vec::new(), "{none:?}");
+    }
+}
+
 #[test]
 fn a_reported_rule_prints_under_the_venues_name() {
     assert_eq!(
@@ -949,6 +1047,18 @@ fn a_reported_rule_prints_under_the_venues_name() {
     assert_eq!(
         exchange_rule("EXCHANGE_MAX_NUM_ORDERS", &[("maxNumOrders", "1000")]).to_string(),
         "EXCHANGE_MAX_NUM_ORDERS (exchange-wide) maxNumOrders=1000"
+    );
+    // A rate limit is not a filter: it prints under its list's name, and says
+    // which limiter it is among its fields.
+    assert_eq!(
+        rate_limit(&[
+            ("interval", "SECOND"),
+            ("intervalNum", "10"),
+            ("limit", "50"),
+            ("rateLimitType", "ORDERS"),
+        ])
+        .to_string(),
+        "rateLimits (exchange-wide) interval=SECOND intervalNum=10 limit=50 rateLimitType=ORDERS"
     );
     assert_eq!(rule("BARE_RULE", &[]).to_string(), "BARE_RULE");
 }

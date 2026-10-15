@@ -44,7 +44,8 @@
 //! rule reads `Filter failure: MARKET_LOT_SIZE` (`errors.md` lines 425-446), so
 //! the report is what lets criterion B say *which* rule the model lacked rather
 //! than only that it lacked one. The exchange-wide filters (`filters.md` lines
-//! 330-377) are reported too: none of them fits a per-instrument model.
+//! 330-377) are reported too: none of them fits a per-instrument model. So are
+//! the answer's rate limits, which are not filters at all (below).
 //!
 //! # An absent or disabled rule is zero
 //!
@@ -113,6 +114,21 @@
 //! or an average over `avgPriceMins` minutes (lines 139-142 and 162-165), not at
 //! the touch. Those fields are reported.
 //!
+//! # Rate limits, `ORDERS` among them
+//!
+//! Each entry of the answer's `rateLimits` is reported whole and exchange-wide,
+//! under the name `rateLimits`, with its own `rateLimitType` among its fields.
+//! They are not all budgets on requests. `ORDERS` (`enums.md` lines 146-155) is
+//! the unfilled order rate limit, and this answer is where the venue states it
+//! (`faqs/order_count_decrement.md` lines 16-18): every order placed counts
+//! against it (line 37), and an order past it is refused with HTTP 429 and
+//! `-1015`, *"Too many new orders"* (line 57; `errors.md` lines 43-45). That is
+//! a rule about orders the model does not have, and criterion B names *"a rate
+//! limit we do not model"* as one way it fails (`docs/live-run.md` §3).
+//!
+//! No entry is read, only reported, so a limiter the venue adds tomorrow
+//! arrives in the report rather than being skipped as unknown.
+//!
 //! # Strict about what it reads, verbatim about the rest
 //!
 //! The fields the definition takes are decimal strings, and they go straight to
@@ -132,8 +148,6 @@
 //!   venue refuses the wrong kind loudly and by name: *"Market is closed."*,
 //!   *"Market orders are not supported for this symbol."*, *"This symbol is not
 //!   permitted for this account."* (`errors.md` lines 376, 378 and 398).
-//! - **`rateLimits`** (`rest-api.md` lines 816-821): budgets on requests, not
-//!   rules about orders.
 //! - **`MAX_ASSET`**, which only the signed `GET /api/v3/myFilters` shows
 //!   (`rest-api.md` line 4910), so it cannot appear in this answer.
 //! - **Execution rules**, from their own endpoint (`GET /api/v3/executionRules`,
@@ -171,14 +185,19 @@ const LOT_SIZE: &str = "LOT_SIZE";
 const MIN_NOTIONAL: &str = "MIN_NOTIONAL";
 const NOTIONAL: &str = "NOTIONAL";
 
+/// The name every rate limit is reported under: the answer's own name for the
+/// list, since a rate limit is not a filter and has no `filterType`.
+const RATE_LIMITS: &str = "rateLimits";
+
 /// One symbol's rules as the venue states them: the part the platform models,
 /// and every part it does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VenueInstrument {
     /// The instrument, with every rule in it taken from the venue.
     pub definition: InstrumentDef,
-    /// Every venue rule the definition does not carry, in the order the venue
-    /// listed them: the symbol's filters, then the exchange's.
+    /// Every venue rule the definition does not carry: the symbol's filters,
+    /// then the exchange's, then the answer's rate limits, each in the order
+    /// the venue listed them.
     pub unmodelled: Vec<UnmodelledRule>,
 }
 
@@ -187,11 +206,14 @@ pub struct VenueInstrument {
 /// stated it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnmodelledRule {
-    /// Whether the venue listed it for the symbol or for the whole account.
+    /// Whether the venue stated it for the symbol or for the exchange as a
+    /// whole.
     pub scope: RuleScope,
     /// The venue's name for the rule. For a filter, its `filterType`:
     /// `MARKET_LOT_SIZE`, `NOTIONAL`. An order refused under one is refused as
-    /// `Filter failure: <this>` (`errors.md` lines 425-446).
+    /// `Filter failure: <this>` (`errors.md` lines 425-446). A rate limit is
+    /// not a filter, and goes by the name of the list the venue states it in,
+    /// `rateLimits`, with its own `rateLimitType` among its fields.
     pub name: String,
     /// Every field the definition did not take, sorted by the venue's name for
     /// it, each value as the venue wrote it: a string's contents, or the JSON
@@ -217,15 +239,20 @@ impl fmt::Display for UnmodelledRule {
 pub enum RuleScope {
     /// The symbol's own `filters`.
     Symbol,
-    /// The answer's `exchangeFilters`, which bind the account across every
-    /// symbol (`filters.md` lines 330-377).
+    /// The answer's own lists rather than the symbol's: `exchangeFilters`,
+    /// which bind the account across every symbol (`filters.md` lines
+    /// 330-377), and `rateLimits`, which bind every request from one IP or,
+    /// for `ORDERS`, every order from one account (`rest-api.md` lines 152, 162
+    /// and 169).
     Exchange,
 }
 
 /// Why an `exchangeInfo` answer does not give a symbol the platform can trade.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExchangeInfoError {
-    /// Not JSON, or not an object whose `symbols` is a list of objects.
+    /// Not JSON, or not an object whose `symbols` -- and whose
+    /// `exchangeFilters` and `rateLimits`, where present -- are lists of
+    /// objects.
     NotExchangeInfo(String),
     /// The answer does not list the symbol asked for.
     SymbolAbsent(String),
@@ -425,6 +452,15 @@ pub fn parse(symbol: &str, body: &[u8]) -> Result<VenueInstrument, ExchangeInfoE
             fields: untaken(filter, None),
         });
     }
+    // Every rate limit, whole: none is read, and `ORDERS` is a rule about
+    // orders the model does not have (see the module docs).
+    for limit in answer.rate_limits.as_deref().unwrap_or_default() {
+        unmodelled.push(UnmodelledRule {
+            scope: RuleScope::Exchange,
+            name: RATE_LIMITS.to_owned(),
+            fields: as_written(limit, |_| true),
+        });
+    }
 
     Ok(VenueInstrument {
         definition: InstrumentDef {
@@ -446,13 +482,17 @@ pub fn parse(symbol: &str, body: &[u8]) -> Result<VenueInstrument, ExchangeInfoE
 type Object = BTreeMap<String, Box<RawValue>>;
 
 /// The parts of the answer read as a whole. Everything else in it -- the
-/// rate limits, the server time, `sors` -- is not looked at.
+/// server time, `sors` -- is not looked at.
 #[derive(serde::Deserialize)]
 struct Answer {
     symbols: Vec<Object>,
     /// Absent or `null` is no exchange-wide filters, which are optional too.
     #[serde(rename = "exchangeFilters", default)]
     exchange_filters: Option<Vec<Object>>,
+    /// Absent or `null` is no rate limits: *"All limits are optional"*
+    /// (`rest-api.md` line 819).
+    #[serde(rename = "rateLimits", default)]
+    rate_limits: Option<Vec<Object>>,
 }
 
 /// The three rules the definition takes, as read from the symbol's filters.
@@ -636,9 +676,15 @@ fn decimal<T: FixedRule>(
 /// Every field of a filter but its name and the one the definition took, as
 /// the venue wrote each.
 fn untaken(filter: &Object, taken: Option<&str>) -> Vec<(String, String)> {
-    filter
+    as_written(filter, |key| key != "filterType" && Some(key) != taken)
+}
+
+/// The fields of `object` that `keep` admits, sorted by the venue's name for
+/// each, every value as the venue wrote it.
+fn as_written(object: &Object, keep: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+    object
         .iter()
-        .filter(|(key, _)| key.as_str() != "filterType" && Some(key.as_str()) != taken)
+        .filter(|(key, _)| keep(key))
         .map(|(key, raw)| (key.clone(), venue_text(raw)))
         .collect()
 }

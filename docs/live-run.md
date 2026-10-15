@@ -448,9 +448,12 @@ feature.
    fixtures in which those differ. The naming is not limited to three: every
    field of every filter the definition does not take is reported under the
    venue's filter name, which is the name a rejection carries, exchange-wide
-   filters included. And nothing is persisted: criterion B's replay must judge
-   the model against the rules the run used, which a fetch at judging time need
-   not return, so how a run writes them down belongs to item 4.
+   filters included. So is every rate limit, whole: `ORDERS` is a rule about
+   orders the model does not have, and criterion B names a rate limit we do
+   not model as a way it fails. And nothing is persisted: criterion B's replay
+   must judge the model against the rules the run used, which a fetch at
+   judging time need not return, so how a run writes them down belongs to
+   item 4.
 3. **The engine seam a live venue needs.** A readiness check consulted before an
    order is journalled (§5), venue detail delivered to the observer and never to
    the strategy (§5), and a final drain at shutdown. Accepted when the simulator
