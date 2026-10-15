@@ -161,7 +161,7 @@ pub fn to_date(date: UtcDate) -> Result<Date, MetaError> {
 
 #[cfg(test)]
 mod tests {
-    use quant_recorder::CaptureTarget;
+    use quant_recorder::{CaptureStream, CaptureTarget};
     use quant_storage::WriterStats;
 
     use super::*;
@@ -170,7 +170,7 @@ mod tests {
         SegmentReport {
             target: CaptureTarget {
                 exchange: Exchange::Binance,
-                symbol: "BTCUSDT".to_owned(),
+                stream: CaptureStream::market("BTCUSDT"),
                 date: UtcDate {
                     year: 2026,
                     month: 7,

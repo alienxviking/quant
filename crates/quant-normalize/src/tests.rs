@@ -13,7 +13,7 @@ use quant_core::instrument::{
     Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };
 use quant_core::time::{Ts, UtcDate};
-use quant_recorder::{catalog, CaptureTarget, SessionFiles};
+use quant_recorder::{catalog, CaptureStream, CaptureTarget, SessionFiles};
 use quant_storage::{ControlRecord, FileHeader, RawWriter, WriterOptions};
 
 use quant_core::event::MarketEvent;
@@ -50,7 +50,7 @@ impl Tree {
     fn target_for(session_id: [u8; 16], day: u8) -> CaptureTarget {
         CaptureTarget {
             exchange: Exchange::Binance,
-            symbol: SYMBOL.to_owned(),
+            stream: CaptureStream::market(SYMBOL),
             date: UtcDate {
                 year: 2026,
                 month: 8,

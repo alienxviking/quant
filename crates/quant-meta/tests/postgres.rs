@@ -23,7 +23,7 @@ use quant_meta::{
     connect, run_metadata, MetaEvent, SegmentRow, SessionClose, SessionRow,
     DEFAULT_METADATA_CAPACITY,
 };
-use quant_recorder::{CaptureTarget, SegmentReport};
+use quant_recorder::{CaptureStream, CaptureTarget, SegmentReport};
 use quant_storage::WriterStats;
 use uuid::Uuid;
 
@@ -42,7 +42,7 @@ fn report(session_id: [u8; 16], day: u8, part: u32, frames: u64) -> SegmentRepor
     SegmentReport {
         target: CaptureTarget {
             exchange: Exchange::Binance,
-            symbol: "BTCUSDT".to_owned(),
+            stream: CaptureStream::market("BTCUSDT"),
             date: UtcDate {
                 year: 2026,
                 month: 7,

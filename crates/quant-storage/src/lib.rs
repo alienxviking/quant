@@ -16,11 +16,14 @@
 //!
 //! # Layout
 //!
-//! One file is one `(exchange, symbol, capture session)`. That matches the
-//! Hive partitioning in `docs/data-contract.md` §5, and it makes `ingest_seq`
-//! -- which is per `(recorder process, instrument)` -- strictly increasing
-//! within a single file, so completeness is checkable per file with no
-//! cross-file bookkeeping.
+//! One file is one capture session's UTC day of one stream, filed by the
+//! partitioning in `docs/data-contract.md` §5: one instrument's market data,
+//! which the header names by `(exchange, symbol)`, or the account stream, whose
+//! header carries the stream's name where a symbol would go. `ingest_seq`
+//! belongs to the session, so it is strictly increasing within a file -- the
+//! writer and the reader both hold it to that -- and carries on into the
+//! session's next file; whether anything is missing *between* files is the
+//! verifier's question, answered by joining a session's files in order.
 //!
 //! ```text
 //! file := FileHeader Block* FileTrailer?

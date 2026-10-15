@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 
 use quant_core::instrument::Exchange;
 
-use crate::layout::CaptureTarget;
+use crate::layout::{CaptureTarget, RAW_DIR};
 
 /// One capture file, and where it sits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +78,8 @@ pub struct SessionFiles {
 pub struct Catalog {
     /// Sessions, in the order their first segment was encountered.
     pub sessions: Vec<SessionFiles>,
-    /// Files under `raw/` that are not capture files at the expected depth.
+    /// Files under `raw/` that are not market capture files at the expected
+    /// depth -- including another stream's, should one ever be moved there.
     ///
     /// Not filtered out silently: something unexpected in the immutable tier is
     /// worth a line of output whatever it turns out to be. The macOS
@@ -93,7 +94,12 @@ pub struct Catalog {
     pub unreadable: Vec<(PathBuf, io::Error)>,
 }
 
-/// Walk `root/raw` and group every capture file into its session.
+/// Walk `root/raw` and group every market capture file into its session.
+///
+/// Market data only, and that is the guarantee every reader of market data
+/// leans on: the account stream's captures live in a tree of their own and are
+/// never walked here, and one found in this tree -- moved by hand, say -- is a
+/// stray like any other, reported and never handed to a replay.
 ///
 /// A missing `raw/` directory is not an error — an empty root is a legitimate
 /// state, and the caller has better words for it than this function does
@@ -101,13 +107,10 @@ pub struct Catalog {
 #[must_use]
 pub fn catalog(root: &Path) -> Catalog {
     let mut out = Catalog::default();
-    let mut paths = Vec::new();
-    collect(&root.join("raw"), &mut paths, &mut out.unreadable);
-    // Text order is write order; see the module docs.
-    paths.sort();
-
-    for path in paths {
-        let Some(target) = CaptureTarget::parse(&path) else {
+    for path in walk(&root.join(RAW_DIR), &mut out.unreadable) {
+        let parsed = CaptureTarget::parse(&path)
+            .and_then(|target| Some((target.stream.symbol()?.to_owned(), target)));
+        let Some((symbol, target)) = parsed else {
             out.strays.push(path);
             continue;
         };
@@ -115,18 +118,27 @@ pub fn catalog(root: &Path) -> Catalog {
         match out.sessions.iter_mut().find(|s| {
             s.session_id == entry.target.session_id
                 && s.exchange == entry.target.exchange
-                && s.symbol == entry.target.symbol
+                && s.symbol == symbol
         }) {
             Some(existing) => existing.segments.push(entry),
             None => out.sessions.push(SessionFiles {
                 exchange: entry.target.exchange,
-                symbol: entry.target.symbol.clone(),
+                symbol,
                 session_id: entry.target.session_id,
                 segments: vec![entry],
             }),
         }
     }
     out
+}
+
+/// Every file under one capture tree, in text order -- which is write order;
+/// see the module docs.
+fn walk(tree: &Path, unreadable: &mut Vec<(PathBuf, io::Error)>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    collect(tree, &mut paths, unreadable);
+    paths.sort();
+    paths
 }
 
 /// Recursive walk, collecting regular files.
@@ -162,7 +174,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, unreadable: &mut Vec<(PathBuf, io
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::CaptureTarget;
+    use crate::layout::{CaptureStream, CaptureTarget};
     use quant_core::time::UtcDate;
 
     /// A tree of empty files at real capture paths. Contents are irrelevant here
@@ -186,9 +198,17 @@ mod tests {
         }
 
         fn segment(&self, symbol: &str, session: u8, day: u8, part: u32) {
+            self.file_for(CaptureStream::market(symbol), session, day, part);
+        }
+
+        fn account_segment(&self, session: u8, day: u8) {
+            self.file_for(CaptureStream::Account, session, day, 0);
+        }
+
+        fn file_for(&self, stream: CaptureStream, session: u8, day: u8, part: u32) {
             let target = CaptureTarget {
                 exchange: Exchange::Binance,
-                symbol: symbol.to_owned(),
+                stream,
                 date: UtcDate {
                     year: 2026,
                     month: 8,
@@ -289,6 +309,41 @@ mod tests {
         assert_eq!(catalog.sessions.len(), 1);
         assert_eq!(catalog.sessions[0].segments.len(), 1);
         assert_eq!(catalog.strays.len(), 1);
+    }
+
+    #[test]
+    fn the_market_catalog_never_yields_the_account_stream() {
+        // What every reader of market data leans on. In its own tree the account
+        // stream is never walked at all; moved into raw/ by hand, one of its
+        // files is a stray -- said out loud, and never a session to replay.
+        let tree = Tree::new("market-only");
+        tree.segment("BTCUSDT", 1, 21, 0);
+        tree.account_segment(2, 21);
+        Tree::touch(
+            &tree
+                .root
+                .join(RAW_DIR)
+                .join("account")
+                .join("exchange=binance")
+                .join("date=2026-08-21")
+                .join("session=03030303-0303-0303-0303-030303030303")
+                .join("part-00000.bin.zst"),
+        );
+
+        let catalog = catalog(&tree.root);
+        assert_eq!(catalog.sessions.len(), 1, "{:?}", catalog.sessions);
+        assert_eq!(catalog.sessions[0].symbol, "BTCUSDT");
+        assert!(catalog.sessions.iter().flat_map(|s| &s.segments).all(|e| e
+            .target
+            .stream
+            .symbol()
+            .is_some()));
+        assert_eq!(
+            catalog.strays.len(),
+            1,
+            "only the account file moved into raw/, which is reported: {:?}",
+            catalog.strays
+        );
     }
 
     #[test]

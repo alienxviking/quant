@@ -34,7 +34,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use quant_core::instrument::Exchange;
-use quant_recorder::{CaptureTarget, CatalogEntry};
+use quant_recorder::{CaptureStream, CaptureTarget, CatalogEntry, ACCOUNT_STREAM};
 use quant_storage::{FileHeader, RawReader};
 
 use crate::finding::{code, Report, Where};
@@ -142,11 +142,21 @@ fn identify(entry: CatalogEntry, report: &mut Report) -> Option<Segment> {
             header.exchange, target.exchange
         ));
     }
-    if header.symbol != target.symbol {
-        mismatches.push(format!(
-            "header says symbol {} but the path says {}",
-            header.symbol, target.symbol
-        ));
+    // What the header's symbol field must say is the layout's to decide, not
+    // this module's: the venue's symbol for market data, the stream's own name
+    // for the account stream, which has no symbol.
+    if header.symbol != target.stream.header_symbol() {
+        mismatches.push(match &target.stream {
+            CaptureStream::Market { symbol } => format!(
+                "header says symbol {} but the path says {symbol}",
+                header.symbol
+            ),
+            CaptureStream::Account => format!(
+                "header says symbol {} but the path says the account stream, whose \
+                 files say {ACCOUNT_STREAM}",
+                header.symbol
+            ),
+        });
     }
     if header.session_id != target.session_id {
         mismatches.push("header and path name different sessions".to_owned());

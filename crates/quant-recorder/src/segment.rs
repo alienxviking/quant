@@ -53,7 +53,7 @@ use quant_storage::{
     FileHeader, RawWriter, StorageError, StorageResult, WriterOptions, WriterStats,
 };
 
-use crate::layout::CaptureTarget;
+use crate::layout::{CaptureStream, CaptureTarget};
 use crate::record::CaptureRecord;
 
 /// One day, for computing a segment's upper bound.
@@ -234,11 +234,12 @@ struct Open<W: Write> {
     first_ingest_seq: Option<u64>,
 }
 
-/// One capture session: a sequence of day-partitioned segments for one instrument.
+/// One capture session: a sequence of day-partitioned segments for one stream --
+/// one instrument's market data, or the account's own.
 pub struct CaptureSession<S: SegmentStore> {
     store: S,
     exchange: Exchange,
-    symbol: String,
+    stream: CaptureStream,
     session_id: [u8; 16],
     opts: WriterOptions,
     clock: Arc<dyn Clock>,
@@ -252,7 +253,7 @@ impl<S: SegmentStore> fmt::Debug for CaptureSession<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CaptureSession")
             .field("exchange", &self.exchange)
-            .field("symbol", &self.symbol)
+            .field("stream", &self.stream)
             .field("open", &self.open.as_ref().map(|o| &o.target))
             .field("segments_sealed", &self.reports.len())
             .field("rolls", &self.rolls)
@@ -262,6 +263,7 @@ impl<S: SegmentStore> fmt::Debug for CaptureSession<S> {
 }
 
 impl<S: SegmentStore> CaptureSession<S> {
+    /// A session recording one instrument's market data.
     #[must_use]
     pub fn new(
         store: S,
@@ -274,7 +276,7 @@ impl<S: SegmentStore> CaptureSession<S> {
         Self {
             store,
             exchange,
-            symbol: symbol.into(),
+            stream: CaptureStream::market(symbol),
             session_id,
             opts,
             clock,
@@ -378,7 +380,7 @@ impl<S: SegmentStore> CaptureSession<S> {
         let day_start = ts.start_of_utc_day();
         let target = CaptureTarget {
             exchange: self.exchange,
-            symbol: self.symbol.clone(),
+            stream: self.stream.clone(),
             date: ts.utc_date(),
             session_id: self.session_id,
             // Part resets per day, because the directory is per day. Size-based
@@ -386,7 +388,7 @@ impl<S: SegmentStore> CaptureSession<S> {
             part: 0,
         };
         let sink = self.store.create(&target)?;
-        let header = FileHeader::new(self.exchange, self.symbol.clone(), self.session_id);
+        let header = FileHeader::new(self.exchange, self.stream.header_symbol(), self.session_id);
         self.open = Some(Open {
             target,
             day_start,

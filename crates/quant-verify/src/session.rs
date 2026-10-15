@@ -629,7 +629,7 @@ fn check_overflow_resumption(at: &impl Fn() -> Where, state: &mut State, report:
 mod tests {
     use super::*;
     use quant_core::time::{Ts, UtcDate};
-    use quant_recorder::CaptureTarget;
+    use quant_recorder::{CaptureStream, CaptureTarget};
     use quant_storage::{ControlRecord, FileHeader, RawWriter, SnapshotFailure, WriterOptions};
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -802,7 +802,7 @@ mod tests {
     fn target(day: u8, part: u32) -> CaptureTarget {
         CaptureTarget {
             exchange: Exchange::Binance,
-            symbol: "BTCUSDT".to_owned(),
+            stream: CaptureStream::market("BTCUSDT"),
             date: UtcDate {
                 year: 2026,
                 month: 7,
