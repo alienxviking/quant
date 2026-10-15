@@ -1648,3 +1648,121 @@ fn a_run_with_fees_in_the_base_ends_on_dust_and_the_report_accounts_for_it() {
         curve.last().expect("valued at the end"),
     );
 }
+
+// --- M8.c: only an order the engine is working reaches the strategy ---
+
+/// Sends one order of each kind the simulator treats differently, one per
+/// event in a cycle of seven, and counts every report it is told.
+#[derive(Debug, Default)]
+struct EveryPath {
+    told: u64,
+}
+
+impl quant_engine::Strategy for EveryPath {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &mut quant_engine::Context<'_>) {
+        let instrument = event.meta().instrument;
+        let order = |qty: &str, kind, time_in_force| OrderRequest {
+            instrument,
+            side: Side::Buy,
+            qty: qty.parse().expect("qty"),
+            kind,
+            time_in_force,
+        };
+        let far = OrderKind::Limit {
+            limit: "50".parse().expect("px"),
+        };
+        match event.meta().ingest_seq % 7 {
+            // Fills at the touch on 1. On 6 it is sent just before a gap and
+            // arrives on it: no market.
+            1 | 6 => {
+                ctx.submit(order("0.1", OrderKind::Market, TimeInForce::Gtc));
+            }
+            // 1.01 of notional against a minimum of 5: a filter breach.
+            2 => {
+                ctx.submit(order("0.01", OrderKind::Market, TimeInForce::Gtc));
+            }
+            // Nothing to take at 50, so immediate-or-cancel is cancelled.
+            3 => {
+                ctx.submit(order("0.1", far, TimeInForce::Ioc));
+            }
+            // A cancel that lands with the order it cancels.
+            4 => {
+                let id = ctx.submit(order("0.1", far, TimeInForce::Gtc));
+                ctx.cancel(id);
+            }
+            // More than the book holds: part filled, the rest cancelled.
+            5 => {
+                ctx.submit(order("1.5", OrderKind::Market, TimeInForce::Gtc));
+            }
+            _ => {}
+        }
+    }
+
+    fn on_execution(
+        &mut self,
+        _event: &quant_core::execution::ExecutionEvent,
+        _ctx: &mut quant_engine::Context<'_>,
+    ) {
+        self.told += 1;
+    }
+}
+
+#[test]
+fn every_report_the_simulator_makes_is_about_an_order_the_engine_is_working() {
+    // The engine now withholds a report about an order it is not working,
+    // which must never fire against the simulator: if it did, a backtest
+    // would quietly stop telling the strategy something it used to. It cannot,
+    // by construction -- the engine enters an order in its ledger before the
+    // simulator is told of it, and the simulator reports only on orders it was
+    // given and says nothing after an order's end -- and this drives every
+    // path the simulator has, with filters and latency both ways, to show it.
+    let instrument = instrument();
+    let steps: Vec<Step> = (1..=42)
+        .map(|seq| match seq % 7 {
+            0 => Step::Gap,
+            _ => Step::Book(100),
+        })
+        .collect();
+    let venue = SimulatedVenue::with_costs(quant_sim::Costs {
+        latency: quant_sim::Latency {
+            outbound: SECOND / 2,
+            inbound: 3 * SECOND / 2,
+        },
+        ..quant_sim::Costs::NONE
+    })
+    .enforcing(
+        instrument,
+        quant_core::instrument::Filters {
+            tick_size: definition().tick_size,
+            lot_size: definition().lot_size,
+            min_notional: definition().min_notional,
+        },
+    );
+    let mut engine = Engine::new(
+        Script::new(&steps),
+        venue,
+        AllowAll,
+        EveryPath::default(),
+        CASH,
+    );
+    let stats = engine.run().expect("the script cannot fail");
+
+    // Every path was taken, or the equality below proves less than it says.
+    let sim = engine.venue().stats();
+    assert!(sim.fills > 0, "{sim:?}");
+    assert!(sim.filtered_min_notional > 0, "{sim:?}");
+    assert!(sim.cancelled > 0, "{sim:?}");
+    assert!(sim.exhausted_book > 0, "{sim:?}");
+    assert!(sim.no_market > 0, "{sim:?}");
+    assert!(
+        sim.undelivered > 0,
+        "and some were still in flight: {sim:?}"
+    );
+
+    assert_eq!(stats.withheld, 0, "nothing withheld");
+    assert_eq!(
+        engine.strategy().told,
+        stats.execution_events,
+        "every report the engine handled reached the strategy"
+    );
+}

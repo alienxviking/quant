@@ -593,6 +593,7 @@ enum Heard {
     /// The order, the size, the venue's names for it, what is left, and when.
     Filled(ClientOrderId, Qty, Option<FillIds>, Qty, Ts),
     Notice(Notice, Ts),
+    Stray(OrderReport, Ts),
     /// Not a hook: a venue that writes to the same log says it was sent this.
     Sent(ClientOrderId),
     /// Not a hook: a strategy that writes to the same log was told this, with
@@ -790,6 +791,13 @@ impl crate::RunObserver for std::sync::Arc<std::sync::Mutex<Witness>> {
             .expect("witness")
             .heard
             .push(Heard::Notice(notice.clone(), at));
+    }
+
+    fn on_stray(&mut self, report: &OrderReport, at: Ts) {
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::Stray(report.clone(), at));
     }
 }
 
@@ -2467,4 +2475,86 @@ fn the_record_hears_each_report_before_the_strategy_does() {
             Heard::Note("filled", t2),
         ]
     );
+}
+
+// --- M8.c: only an order the engine is working reaches the strategy ---
+
+#[test]
+fn a_report_about_an_order_the_engine_is_not_working_is_written_down_and_kept_from_the_strategy() {
+    // A live venue reports on the account, not on this process, and a report
+    // can name an order this engine never minted or one whose end it has
+    // already heard. Such a report used to reach the strategy: an orphaned
+    // fill was told to `on_execution` though the portfolio never booked it, so
+    // a strategy could react to a fill its own position did not contain. Now
+    // it is written down -- a fill as an orphan, anything else as a stray --
+    // and goes no further.
+    let t2 = meta(2).local_recv_ts;
+    let (c8, c9) = (ClientOrderId(8), ClientOrderId(9));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00"), trade(2, "100.00")]),
+        Says::new(vec![
+            vec![],
+            vec![
+                ExecutionEvent::Accepted {
+                    client_order_id: c9,
+                    ts: t2,
+                },
+                ExecutionEvent::Cancelled {
+                    client_order_id: c9,
+                    remaining: qty("1"),
+                    ts: t2,
+                },
+                ExecutionEvent::Filled {
+                    client_order_id: c8,
+                    fill: fill_of("1"),
+                    remaining: qty("0"),
+                    ts: t2,
+                },
+            ],
+        ]),
+        AllowAll,
+        Recorder::default(),
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    let stats = engine.run().expect("no source failure");
+
+    assert_eq!(
+        engine.strategy().executions,
+        Vec::new(),
+        "the strategy was told of none of them"
+    );
+    assert_eq!(
+        seen.lock().expect("witness").heard,
+        vec![
+            Heard::Submitted(ClientOrderId(1), meta(1).local_recv_ts),
+            Heard::Stray(
+                OrderReport::Accepted {
+                    client_order_id: c9,
+                    venue_order_id: None,
+                    ts: t2,
+                },
+                t2
+            ),
+            Heard::Stray(
+                OrderReport::Cancelled {
+                    client_order_id: c9,
+                    remaining: qty("1"),
+                    ended: None,
+                    ts: t2,
+                },
+                t2
+            ),
+            Heard::Orphaned(c8, None, t2),
+        ],
+        "each written down, as what it is"
+    );
+    assert_eq!(stats.withheld, 3);
+    assert_eq!(
+        (stats.execution_events, stats.fills),
+        (3, 1),
+        "counted as reports, and the fill as a fill: something did trade"
+    );
+    assert_eq!(engine.portfolio().fills(), 0, "but nothing was booked");
 }

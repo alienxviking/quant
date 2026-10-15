@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use quant_core::execution::{ClientOrderId, Fill, OrderRequest, RejectReason, VenueOrderId};
 use quant_core::fixed::{Px, Qty};
 use quant_core::instrument::Exchange;
-use quant_core::report::{Ended, FillIds, Notice, RejectedWhy};
+use quant_core::report::{Ended, FillIds, Notice, OrderReport, RejectedWhy};
 use quant_core::time::Ts;
 use quant_engine::journal::{InstrumentKey, Journal, JournalEntry};
 use quant_engine::risk::Bound;
@@ -360,6 +360,10 @@ impl RunObserver for JournalWriter {
 
     fn on_notice(&mut self, notice: &Notice, _at: Ts) {
         self.unwritten("a venue notice", notice);
+    }
+
+    fn on_stray(&mut self, report: &OrderReport, _at: Ts) {
+        self.unwritten("a report about an order the engine is not working", report);
     }
 }
 

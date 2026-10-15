@@ -111,6 +111,12 @@ pub struct EngineStats {
     /// Notices handled: facts a venue reported that are not events, which went
     /// to the record and never to the strategy.
     pub notices: u64,
+    /// Order reports about an order the engine is not working -- one it never
+    /// minted, or one it has already seen end -- written down and kept from
+    /// the strategy. Strays and orphaned fills together; always zero against
+    /// the simulator, which reports only on orders it was given and nothing
+    /// after an order's end.
+    pub withheld: u64,
     /// The clock's first and last readings, for reporting the period actually
     /// covered.
     ///
@@ -386,6 +392,17 @@ pub trait RunObserver {
     /// One [`Booked`] rather than its fields one by one, because they are seven
     /// and an eighth input to one method is where clippy draws the line.
     fn on_fill(&mut self, _booked: &Booked<'_>, _portfolio: &Portfolio) {}
+
+    /// A report about an order the engine is not working: one it never minted,
+    /// or one whose end it has already heard. Not a fill, which goes to
+    /// [`Self::on_orphaned`].
+    ///
+    /// Written down and kept from the strategy. A strategy told of an order it
+    /// never placed would act on it, and one told that an order it has already
+    /// seen end was accepted or cancelled again would believe it. **Required**,
+    /// for the reason [`Self::on_notice`] is: a default would make these
+    /// silent.
+    fn on_stray(&mut self, report: &OrderReport, at: Ts);
 
     /// The venue reported a fact that is not an event: an order's REST
     /// acknowledgement, an outcome that became unknown or known again, a
@@ -785,7 +802,19 @@ where
                 }
                 VenueReport::Order(report) => report.clone(),
             };
-            self.book_report(&report);
+            self.ledger.stats.execution_events += 1;
+            // Only an order the engine is working reaches the strategy. A
+            // report about any other is written down and goes no further:
+            // nothing is booked, because the engine does not know what the
+            // order was, and the strategy is not told, because it would be
+            // told of an order it never placed, or of one it has already seen
+            // end.
+            let Some(&(instrument, side)) = self.ledger.orders.get(&report.client_order_id())
+            else {
+                self.withhold(&report);
+                continue;
+            };
+            self.book_report(&report, instrument, side);
             let execution = report.event();
             if execution.is_terminal() {
                 self.ledger.orders.remove(&execution.client_order_id());
@@ -841,14 +870,13 @@ where
         }
     }
 
-    /// Book one order report and tell the record, before the strategy hears
-    /// of it.
+    /// Book one report about an order the engine is working, and tell the
+    /// record, before the strategy hears of it.
     ///
     /// A fill is booked into the portfolio, written down and shown to the risk
     /// layer, in that order; the rest of the lifecycle is written down. The
     /// venue's detail goes to the record here and nowhere else.
-    fn book_report(&mut self, report: &OrderReport) {
-        self.ledger.stats.execution_events += 1;
+    fn book_report(&mut self, report: &OrderReport, instrument: InstrumentId, side: Side) {
         let client_order_id = report.client_order_id();
         match report {
             OrderReport::Filled {
@@ -859,39 +887,28 @@ where
                 ts,
             } => {
                 self.ledger.stats.fills += 1;
-                if let Some(&(instrument, side)) = self.ledger.orders.get(&client_order_id) {
-                    self.portfolio.apply_fill(instrument, side, fill);
-                    // Written down *before* the strategy hears about it, so a
-                    // crash cannot erase a fill the strategy has already acted
-                    // on.
-                    if let Some(observer) = self.observer.as_mut() {
-                        observer.on_fill(
-                            &Booked {
-                                client_order_id,
-                                instrument,
-                                side,
-                                fill,
-                                remaining: *remaining,
-                                ids: ids.as_ref(),
-                                at: *ts,
-                            },
-                            &self.portfolio,
-                        );
-                    }
-                    // Risk keeps its own tally, so it has to see fills too. It
-                    // deliberately does not read the portfolio: a limit computed
-                    // from the accounting can only be as correct as the
-                    // accounting, and would fail in the same direction.
-                    self.risk.on_fill(instrument, side, fill, *ts);
-                } else if let Some(observer) = self.observer.as_mut() {
-                    // A fill naming an order we have no record of: counted
-                    // above, not booked, and written down rather than dropped.
-                    // Impossible with `SimulatedVenue`, which only fills what it
-                    // was given; not impossible at M8, where a venue can report
-                    // a fill for an order we lost across a restart, which is
-                    // exactly when silence costs most.
-                    observer.on_orphaned(client_order_id, fill, ids.as_ref(), *ts);
+                self.portfolio.apply_fill(instrument, side, fill);
+                // Written down *before* the strategy hears about it, so a crash
+                // cannot erase a fill the strategy has already acted on.
+                if let Some(observer) = self.observer.as_mut() {
+                    observer.on_fill(
+                        &Booked {
+                            client_order_id,
+                            instrument,
+                            side,
+                            fill,
+                            remaining: *remaining,
+                            ids: ids.as_ref(),
+                            at: *ts,
+                        },
+                        &self.portfolio,
+                    );
                 }
+                // Risk keeps its own tally, so it has to see fills too. It
+                // deliberately does not read the portfolio: a limit computed
+                // from the accounting can only be as correct as the accounting,
+                // and would fail in the same direction.
+                self.risk.on_fill(instrument, side, fill, *ts);
             }
             OrderReport::Accepted {
                 client_order_id: _,
@@ -922,6 +939,37 @@ where
                     observer.on_cancelled(client_order_id, *remaining, ended.as_ref(), *ts);
                 }
             }
+        }
+    }
+
+    /// Write down a report about an order the engine is not working, and
+    /// nothing else.
+    ///
+    /// A fill is an orphan: counted as a fill, because something did trade,
+    /// and not booked, because the engine does not know whose it was.
+    /// Impossible with `SimulatedVenue`, which only reports on what it was
+    /// given and says nothing after an order's end; not impossible at M8, where
+    /// a venue can report on an order lost across a restart, which is exactly
+    /// when silence costs most. Anything else is a stray.
+    fn withhold(&mut self, report: &OrderReport) {
+        self.ledger.stats.withheld += 1;
+        if let OrderReport::Filled { .. } = report {
+            self.ledger.stats.fills += 1;
+        }
+        let Some(observer) = self.observer.as_mut() else {
+            return;
+        };
+        match report {
+            OrderReport::Filled {
+                client_order_id,
+                fill,
+                remaining: _,
+                ids,
+                ts,
+            } => observer.on_orphaned(*client_order_id, fill, ids.as_ref(), *ts),
+            OrderReport::Accepted { ts, .. }
+            | OrderReport::Rejected { ts, .. }
+            | OrderReport::Cancelled { ts, .. } => observer.on_stray(report, *ts),
         }
     }
 
