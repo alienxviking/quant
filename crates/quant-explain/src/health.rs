@@ -71,7 +71,17 @@ pub enum NoHealth {
     /// minute was lost. "No line is recognisable" says something about *this
     /// reader*, and reporting it as the former would blame a healthy run for a
     /// parser that went stale.
-    FormatUnrecognised { log: PathBuf, lines: usize },
+    ///
+    /// `older` counts lines in the prose format the emitter wrote before
+    /// M7.5.g, so the message can say which side moved: a log from before the
+    /// change, which is every log of M5's fortnight, or an emitter that has
+    /// moved on since this reader. The prose is only recognised here, never
+    /// read: misrecognising it costs a sentence, not a number.
+    FormatUnrecognised {
+        log: PathBuf,
+        lines: usize,
+        older: usize,
+    },
     /// A line was found and could not be read. **Loud on purpose:** the emitter
     /// may have changed, and silently reporting "no metrics" would hide that
     /// until someone noticed the block had been empty for a month.
@@ -87,11 +97,22 @@ impl core::fmt::Display for NoHealth {
                 "no metrics line covers this instant -- the process may not have been \
                  running, or the line for that minute was lost"
             ),
-            Self::FormatUnrecognised { log, lines } => write!(
+            Self::FormatUnrecognised {
+                log,
+                lines,
+                older: 0,
+            } => write!(
                 f,
-                "read {lines} lines of {} and none is a metrics line. The emitter's format \
-                 has changed and this reader has not been updated -- this is not a statement \
-                 about the run",
+                "read {lines} lines of {} and none is a metrics line this build reads. Either \
+                 the log predates the emitter this reader knows, or the emitter has changed \
+                 since and this reader needs updating -- this is not a statement about the run",
+                log.display()
+            ),
+            Self::FormatUnrecognised { log, lines, older } => write!(
+                f,
+                "read {lines} lines of {} and none is a metrics line this build reads: {older} \
+                 are in the prose format the emitter wrote before M7.5.g (2026-10-06), which \
+                 this reader no longer parses -- this is not a statement about the run",
                 log.display()
             ),
             Self::Unparseable { line, why } => write!(
@@ -123,6 +144,7 @@ pub fn health_at(root: &Path, symbol: &str, at: Ts) -> Result<HealthAt, NoHealth
     // Counted so an absence can say which kind of absence it is.
     let mut lines_read = 0_usize;
     let mut candidates = 0_usize;
+    let mut older = 0_usize;
     let mut last_read: Option<PathBuf> = None;
     for log in logs {
         let Ok(text) = std::fs::read_to_string(&log) else {
@@ -137,6 +159,10 @@ pub fn health_at(root: &Path, symbol: &str, at: Ts) -> Result<HealthAt, NoHealth
             // part of a format this reader did not own -- change the emitter and
             // every line stopped matching at once.
             let Some(envelope) = metrics_envelope(line) else {
+                // Recognised, and only for the message: see `FormatUnrecognised`.
+                if line.contains("metrics symbol=") {
+                    older += 1;
+                }
                 continue;
             };
             candidates += 1;
@@ -173,6 +199,7 @@ pub fn health_at(root: &Path, symbol: &str, at: Ts) -> Result<HealthAt, NoHealth
         (None, None) if candidates == 0 && lines_read > 0 => Err(NoHealth::FormatUnrecognised {
             log: last_read.unwrap_or_default(),
             lines: lines_read,
+            older,
         }),
         (None, None) => Err(NoHealth::NotCovered),
     }
@@ -377,9 +404,48 @@ mod tests {
 
         let at = quant_core::time::Ts::parse_rfc3339("2026-09-19T13:54:52Z").expect("ts");
         match health_at(&root, "BTCUSDT", at) {
-            Err(NoHealth::FormatUnrecognised { lines, .. }) => assert_eq!(lines, 3),
+            Err(NoHealth::FormatUnrecognised { lines, older, .. }) => {
+                assert_eq!(lines, 3);
+                assert_eq!(older, 0, "nothing here is the older prose");
+            }
             other => panic!("expected FormatUnrecognised, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_log_from_before_the_json_line_is_named_as_older_not_as_a_changed_emitter() {
+        // M5's fortnight wrote its metrics as prose, and M7.5.g moved the
+        // emitter to one JSON type and removed the prose parser on purpose. A
+        // log from before that is older than this reader, not newer, and the
+        // message used to say the emitter had changed and the reader had not
+        // kept up: the wrong side, for every log of the run M7 was built for.
+        let root =
+            std::env::temp_dir().join(format!("quant-explain-format-older-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("logs")).expect("mkdir");
+        // Copied from the fortnight's last log.
+        let prose = "2026-10-02T14:47:08.551188Z  INFO quant_binance::capture: metrics \
+                     symbol=BTCUSDT msgs_per_sec=66 bytes_per_sec=25478 queue=0 queue_peak=90 \
+                     queue_capacity=4096 dropped=0 latency_p50_ms=81";
+        std::fs::write(
+            root.join("logs").join("BTCUSDT-20261002-144608.log"),
+            format!("connected\n{prose}\n{prose}\n"),
+        )
+        .expect("write");
+
+        let at = quant_core::time::Ts::parse_rfc3339("2026-10-02T14:47:00Z").expect("ts");
+        let err = health_at(&root, "BTCUSDT", at).expect_err("no line this build reads");
+        match &err {
+            NoHealth::FormatUnrecognised { lines, older, .. } => {
+                assert_eq!(*lines, 3);
+                assert_eq!(*older, 2, "both prose lines, and not the other one");
+            }
+            other => panic!("expected FormatUnrecognised, got {other:?}"),
+        }
+        let said = err.to_string();
+        assert!(said.contains("before M7.5.g"), "{said}");
+        assert!(!said.contains("needs updating"), "{said}");
         let _ = std::fs::remove_dir_all(&root);
     }
     /// Captures whatever a subscriber writes, so a test can read it back.

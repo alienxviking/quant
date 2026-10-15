@@ -387,6 +387,10 @@ fn a_window_summarises_what_happened_across_the_span() {
     assert_eq!(window.deltas, 2, "the deltas at 101 and 102");
     assert_eq!(window.snapshots, 0, "the snapshot is on the opening seam");
     assert_eq!(window.trades, 0);
+    // The snapshot on the seam anchored the book before the span opened, and
+    // nothing inside it took the book away: this one was seen whole.
+    assert!(matches!(window.on_entry, crate::Entry::Seeing));
+    assert!(window.saw_whole_span());
 }
 
 #[test]
@@ -466,4 +470,139 @@ fn a_window_that_reaches_before_the_data_summarises_what_there_is() {
     let window = answer.window.expect("a window");
     assert_eq!(window.deltas, 1);
     assert_eq!(window.snapshots, 1, "everything there is, and no more");
+    // And it claims nothing about the hour before the data began.
+    assert!(matches!(window.on_entry, crate::Entry::NotReached));
+    assert!(!window.saw_whole_span());
+}
+
+#[test]
+fn a_blindness_that_began_before_the_window_is_not_reported_as_sight() {
+    // The fortnight's twelve-hour outage, from an hour inside it: the gap was
+    // recorded before the span and nothing arrived during it, so there is no
+    // gap *inside* the span to report. Counting gaps alone said "no gaps -- we
+    // could see the whole span" about an hour in which nothing could be seen.
+    let tree = Tree::new("window-outage");
+    tree.segment(
+        21,
+        100,
+        1,
+        &[Frame::Snapshot(100), Frame::Delta(101), Frame::Gap],
+    );
+
+    let answer = market_at(
+        &tree.root,
+        Exchange::Binance,
+        SYMBOL,
+        instrument(),
+        at(21, 200),
+        10 * 1_000_000_000,
+    )
+    .expect("covered");
+
+    let window = answer.window.expect("a window");
+    assert!(
+        window.gaps.is_empty(),
+        "the gap is before the span, not in it"
+    );
+    let crate::Entry::Blind(gap) = &window.on_entry else {
+        panic!("blind as the span opened, got {:?}", window.on_entry);
+    };
+    assert_eq!(gap.at, at(21, 102), "since the gap that began it");
+    assert!(!window.saw_whole_span(), "nothing in this span was seen");
+}
+
+/// A session whose second day opens after a hole in `ingest_seq` -- the
+/// archive's own discontinuity, which blinds the book as a gap does.
+fn tree_with_a_hole(name: &str) -> Tree {
+    let tree = Tree::new(name);
+    tree.segment(21, 100, 1, &[Frame::Snapshot(100), Frame::Delta(101)]);
+    // Sequence numbers 3..=9 were never written: a hole, not a gap record.
+    tree.segment(22, 10, 10, &[Frame::Delta(102), Frame::Delta(103)]);
+    tree
+}
+
+#[test]
+fn an_archive_break_inside_the_window_is_not_reported_as_sight() {
+    let tree = tree_with_a_hole("window-break-inside");
+    // The span opens on day 21 after the snapshot, so the book is live as it
+    // opens, and the hole falls inside it.
+    let span = at(22, 11).as_nanos() - at(21, 100).as_nanos();
+    let answer = market_at(
+        &tree.root,
+        Exchange::Binance,
+        SYMBOL,
+        instrument(),
+        at(22, 11),
+        span,
+    )
+    .expect("covered");
+
+    let window = answer.window.expect("a window");
+    assert!(
+        matches!(window.on_entry, crate::Entry::Seeing),
+        "got {:?}",
+        window.on_entry
+    );
+    assert!(
+        window.gaps.is_empty(),
+        "no gap record: the hole is the evidence"
+    );
+    assert_eq!(window.breaks, 1, "the hole is inside the span");
+    assert!(!window.saw_whole_span());
+}
+
+#[test]
+fn an_archive_break_before_the_window_is_what_held_as_it_opened() {
+    let tree = tree_with_a_hole("window-break-before");
+    // The span opens on day 22 before its first delta: after the hole, so the
+    // archive was discontinuous as it opened, and nothing inside it breaks.
+    let answer = market_at(
+        &tree.root,
+        Exchange::Binance,
+        SYMBOL,
+        instrument(),
+        at(22, 11),
+        5 * 1_000_000_000,
+    )
+    .expect("covered");
+
+    let window = answer.window.expect("a window");
+    assert!(
+        matches!(window.on_entry, crate::Entry::Unreadable(_)),
+        "got {:?}",
+        window.on_entry
+    );
+    assert_eq!(window.breaks, 0, "the hole is before the span");
+    assert!(!window.saw_whole_span());
+}
+
+#[test]
+fn a_book_not_yet_anchored_as_the_window_opened_is_said() {
+    // Deltas with no snapshot before them: no gap anywhere, and still nothing
+    // seen, because the book never had a starting point.
+    let tree = Tree::new("window-unanchored");
+    tree.segment(
+        21,
+        100,
+        1,
+        &[Frame::Delta(101), Frame::Delta(102), Frame::Delta(103)],
+    );
+
+    let answer = market_at(
+        &tree.root,
+        Exchange::Binance,
+        SYMBOL,
+        instrument(),
+        at(21, 102),
+        1_000_000_000,
+    )
+    .expect("covered");
+
+    let window = answer.window.expect("a window");
+    assert!(
+        matches!(window.on_entry, crate::Entry::Unanchored),
+        "got {:?}",
+        window.on_entry
+    );
+    assert!(!window.saw_whole_span());
 }
