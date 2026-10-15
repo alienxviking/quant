@@ -1474,3 +1474,48 @@ fn under_fees_in_the_asset_received_the_venue_and_the_portfolio_agree_in_quote_v
         "the dust of base-asset fees is left: {held}"
     );
 }
+
+#[test]
+fn under_fees_in_the_asset_received_a_higher_rate_can_leave_more_held_and_more_equity() {
+    // Why `a_higher_fee_rate_never_leaves_more_equity` charges in the quote,
+    // and has to. Taken in the base, a fee changes how much is held, and the
+    // exit sells whole lots of that. One basis point of a 0.001 buy leaves
+    // 0.0009999; the down-cross sells 0.00099 and 0.0000099 -- nearly a lot
+    // -- is still held when the price doubles. With no fee the exit sold all
+    // 0.001 and nothing rides the jump. So the costlier run ends richer: not a
+    // sign error, but exposure, which can go either way as latency's can.
+    let mut steps = up_then_down();
+    steps.push(Step::Book(200));
+    let ending = |rate: &str, fee_in| {
+        let engine = run_with(
+            &steps,
+            quant_sim::Costs {
+                fees: quant_sim::FeeSchedule::flat(rate.parse().expect("rate")),
+                fee_in,
+                ..quant_sim::Costs::NONE
+            },
+        );
+        let held = engine.portfolio().position(instrument()).qty;
+        let equity = engine
+            .strategy()
+            .curve()
+            .last()
+            .expect("the path ends with a live book");
+        (held, equity)
+    };
+    let (quote, received) = (quant_sim::FeeIn::Quote, quant_sim::FeeIn::Received);
+
+    // In the quote a fee is only a cost: the same fills, less money.
+    let (held_free, free) = ending("0", quote);
+    let (held_quote, costed) = ending("0.0001", quote);
+    assert!(held_free.is_zero() && held_quote.is_zero(), "both sold all");
+    assert!(costed < free, "{costed} under fees, {free} without");
+
+    // In the asset received, the fee also left nearly a lot unsold.
+    let (held, richer) = ending("0.0001", received);
+    assert_eq!(held, qty("0.0000099"));
+    assert!(
+        richer > free,
+        "{richer} under a fee in the base, {free} without: the unsold lot rode the jump"
+    );
+}

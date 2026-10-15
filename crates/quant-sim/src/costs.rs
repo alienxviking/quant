@@ -12,7 +12,11 @@
 //! 2. **Costs must be monotonic.** For fee rates `a < b`, the result under `b`
 //!    is never better than under `a`. That is the property a sign error breaks,
 //!    and a sign error on a fee is otherwise invisible — it just looks like a
-//!    surprisingly good strategy.
+//!    surprisingly good strategy. It holds for fees taken in the quote, and
+//!    only there. Taken in the asset received ([`FeeIn::Received`]) a fee also
+//!    changes how much is held, so a strategy that sells whole lots can hold
+//!    nearly a lot more after a higher fee, and what that holding does next can
+//!    go either way, as a move during latency can.
 //!
 //! # What is a model here, and what is a knob
 //!
