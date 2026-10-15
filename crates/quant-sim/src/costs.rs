@@ -18,6 +18,13 @@
 //!    nearly a lot more after a higher fee, and what that holding does next can
 //!    go either way, as a move during latency can.
 //!
+//!    And even in the quote it holds only where no daily loss limit can bind.
+//!    Fees count against `max_daily_loss`, and a tripped switch stays tripped
+//!    for the rest of the run, so a higher fee can trip it sooner and stop a
+//!    losing strategy before the losses a cheaper run goes on to take. The
+//!    property is of the cost model, not of a run under limits: M4's test
+//!    wires a risk layer that permits everything, which is why it holds there.
+//!
 //! # What is a model here, and what is a knob
 //!
 //! **Fees are a model**: venues publish their schedules, so the number is looked
