@@ -398,6 +398,12 @@ pub enum NotReady {
     /// Which way it was not is said; what it held is not, because it holds
     /// the account's rates.
     UnreadableCommission(CommissionFault),
+    /// The venue answered a signed request with a success status, and the
+    /// body was cut short: it broke off, or did not finish arriving within the
+    /// client's timeout. The venue was reached, so this is not
+    /// [`Self::Unreachable`], and what it said is not known, because nothing
+    /// is read from part of an answer. `why` says which, without the URL.
+    AnswerCutShort { status: u16, why: String },
     /// We could not reach the venue at all.
     Unreachable(String),
 }
@@ -700,6 +706,11 @@ impl core::fmt::Display for NotReady {
                 "the venue answered 200 to the commission rates request, but {fault}. Nothing of \
                  the body is printed: it holds the account's commission rates"
             ),
+            Self::AnswerCutShort { status, why } => write!(
+                f,
+                "the venue answered HTTP {status} and the body was cut short ({why}), so what it \
+                 said is not known. The venue was reached: try again"
+            ),
             Self::Unreachable(why) => write!(f, "could not reach the venue: {why}"),
         }
     }
@@ -798,7 +809,10 @@ impl TradeClient {
     ) -> Result<Vec<u8>, SnapshotError> {
         let reply = self
             .send_signed(reqwest::Method::GET, path, params, now_millis)
-            .await?;
+            .await
+            .map_err(|failure| match failure {
+                SignedFailure::Unanswered(e) | SignedFailure::CutShort { cause: e, .. } => e,
+            })?;
         if !reply.status.is_success() {
             return Err(SnapshotError::Status(reply.status.as_u16()));
         }
@@ -836,18 +850,22 @@ impl TradeClient {
 
     /// Send a signed request and return whatever the venue answered, refusals
     /// included, so that a refusal can be read for what it says.
+    ///
+    /// A success whose body did not arrive whole is [`SignedFailure::CutShort`],
+    /// not a reply: nothing is read from part of an answer, and not
+    /// [`SignedFailure::Unanswered`] either, because the venue did answer.
     async fn send_signed(
         &self,
         method: reqwest::Method,
         path: &str,
         params: &str,
         now_millis: i64,
-    ) -> Result<SignedReply, SnapshotError> {
+    ) -> Result<SignedReply, SignedFailure> {
         let response = self
             .signed_request(method, path, params, now_millis)
             .send()
             .await
-            .map_err(transport_error)?;
+            .map_err(|e| SignedFailure::Unanswered(transport_error(e)))?;
         let status = response.status();
         let retry_after = response
             .headers()
@@ -860,8 +878,16 @@ impl TradeClient {
             // arrive: say what the status says rather than that the venue
             // could not be reached.
             Err(_) if !status.is_success() => Vec::new(),
-            Err(e) if e.is_timeout() => return Err(SnapshotError::Timeout),
-            Err(e) => return Err(SnapshotError::Body(describe(e))),
+            Err(e) => {
+                return Err(SignedFailure::CutShort {
+                    status: status.as_u16(),
+                    cause: if e.is_timeout() {
+                        SnapshotError::Timeout
+                    } else {
+                        SnapshotError::Body(describe(e))
+                    },
+                })
+            }
         };
         Ok(SignedReply {
             status,
@@ -974,7 +1000,7 @@ impl TradeClient {
         let reply = self
             .send_signed(reqwest::Method::GET, "/api/v3/account", "", now)
             .await
-            .map_err(|e| NotReady::Unreachable(e.to_string()))?;
+            .map_err(NotReady::from)?;
         if !reply.status.is_success() {
             return Err(classify_refusal(
                 reply.status.as_u16(),
@@ -1050,7 +1076,7 @@ impl TradeClient {
         let reply = self
             .send_signed(reqwest::Method::POST, ORDER_TEST_PATH, probe.query(), now)
             .await
-            .map_err(|e| NotReady::Unreachable(e.to_string()))?;
+            .map_err(NotReady::from)?;
         read_order_test(reply.status.as_u16(), reply.retry_after, &reply.body)
     }
 
@@ -1089,7 +1115,7 @@ impl TradeClient {
                 now,
             )
             .await
-            .map_err(|e| NotReady::Unreachable(e.to_string()))?;
+            .map_err(NotReady::from)?;
         if !reply.status.is_success() {
             return Err(classify_refusal(
                 reply.status.as_u16(),
@@ -1109,6 +1135,33 @@ struct SignedReply {
     status: reqwest::StatusCode,
     retry_after: Option<String>,
     body: Vec<u8>,
+}
+
+/// Why a signed request left no reply to read.
+///
+/// Two cases, because the operator should hear them differently: a request
+/// that got no answer may never have reached the venue, and one whose answer
+/// was cut short certainly did.
+enum SignedFailure {
+    /// No status came back: [`transport_error`]'s account of it.
+    Unanswered(SnapshotError),
+    /// The venue answered with a success status, and the body broke off or
+    /// timed out before it was whole. `cause` is [`SnapshotError::Timeout`]
+    /// or [`SnapshotError::Body`], so that [`TradeClient::signed_get`] can
+    /// report it in the public client's terms, as it always has.
+    CutShort { status: u16, cause: SnapshotError },
+}
+
+impl From<SignedFailure> for NotReady {
+    fn from(failure: SignedFailure) -> Self {
+        match failure {
+            SignedFailure::Unanswered(e) => Self::Unreachable(e.to_string()),
+            SignedFailure::CutShort { status, cause } => Self::AnswerCutShort {
+                status,
+                why: cause.to_string(),
+            },
+        }
+    }
 }
 
 /// What became of one order request, as the transport saw it: what an
@@ -2240,6 +2293,69 @@ mod tests {
             cause.starts_with("transport error: error sending request: "),
             "{cause}"
         );
+    }
+
+    /// One of the three checks venue-check makes, by number, against `client`.
+    async fn check_number(client: &TradeClient, which: usize) -> Result<(), NotReady> {
+        match which {
+            0 => client.check_ready(0).await,
+            1 => client.check_trade_permission(&order_on("BTCUSDT"), 0).await,
+            _ => client.check_bnb_discount_off("BTCUSDT", 0).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_success_whose_body_is_cut_short_says_the_venue_answered() {
+        // Each check's venue answers 200 with a body that would pass it, and
+        // the body is cut short: broken off under a Content-Length promising
+        // more than arrives, or held open past the client's timeout after the
+        // head. The venue was reached, so "could not reach the venue" would
+        // send the operator after a network that delivered an answer, and
+        // nothing is read from the part that arrived.
+        let passing = [
+            account("true"),
+            "{}".to_owned(),
+            commission("false", "false"),
+        ];
+        for (which, body) in passing.iter().enumerate() {
+            let broken = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len() + 64
+            );
+            let stalled = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            for (reply, cause) in [
+                (Reply::Bytes(broken), "could not read the response body: "),
+                (Reply::Stall(stalled), "request timed out"),
+            ] {
+                let venue = TestVenue::start(vec![reply]);
+                let client = TradeClient::new(
+                    venue.base.clone(),
+                    Duration::from_millis(500),
+                    fixture::example(),
+                )
+                .expect("builds");
+                let answer = check_number(&client, which).await;
+                let requests = venue.stop();
+                assert_eq!(requests.len(), 1, "check {which}: {requests:#?}");
+                let Err(NotReady::AnswerCutShort { status: 200, why }) = &answer else {
+                    panic!("check {which}: expected an answer cut short, got {answer:?}")
+                };
+                assert!(why.starts_with(cause), "check {which}: {why}");
+                let said = answer.expect_err("not ready").to_string();
+                assert!(
+                    said.starts_with("the venue answered HTTP 200 and the body was cut short ("),
+                    "check {which}: {said}"
+                );
+                assert!(said.contains("The venue was reached"), "{said}");
+                assert!(!said.contains("could not reach"), "{said}");
+                says_nothing_secret(&said, &requests[0]);
+                assert!(!said.contains("/api/v3/account"), "{said}");
+            }
+        }
     }
 
     #[tokio::test]
