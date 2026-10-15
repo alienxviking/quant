@@ -95,6 +95,6 @@ pub use connection::{ConnectionPolicy, EndReason};
 pub use decode::{decode, VenueBytes};
 pub use live::{LiveSource, LiveStats};
 pub use parse::{parse_snapshot, parse_stream_message, ParseError};
-pub use rest::{SnapshotClient, SnapshotError, DEPTH_LIMIT, SPOT_REST};
+pub use rest::{SnapshotClient, SnapshotError, DEPTH_LIMIT, SPOT_REST, SPOT_TESTNET_REST};
 pub use sequence::{classify, snapshot_last_update_id, SequenceError, StreamMessage};
 pub use stream::{StreamKind, StreamSpec, SPOT_WS};

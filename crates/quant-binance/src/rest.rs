@@ -31,6 +31,19 @@ use quant_storage::SnapshotFailure;
 /// Binance spot REST endpoint.
 pub const SPOT_REST: &str = "https://api.binance.com";
 
+/// Binance Spot Testnet's REST endpoint: for `venue-check --testnet`, and for
+/// the rehearsal `docs/live-run.md` §5 runs there, with a key pair of its own,
+/// before any real order.
+///
+/// The venue's documentation names SPOT Testnet at this address
+/// (CHANGELOG.md:548, :633) and gives its WebSocket API base on a sibling host,
+/// `wss://ws-api.testnet.binance.vision/ws-api/v3` (web-socket-api.md:104). It
+/// does not spell out a REST base for it; the paths are taken to be the live
+/// ones, `/api/v3/...`, beneath this host. A wrong guess cannot pass for a right
+/// one: `venue-check` reads the venue's clock first, and a path that is not
+/// there leaves it no readings to judge by.
+pub const SPOT_TESTNET_REST: &str = "https://testnet.binance.vision";
+
 /// Levels per side to request.
 ///
 /// The maximum the venue offers. Same reasoning as `depth@100ms` over

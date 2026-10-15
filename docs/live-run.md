@@ -345,8 +345,20 @@ closely, and `openOrders` gets the likeliest case backwards. A market order that
 landed has already filled, so it is no longer open, and recovery would record
 that a filled order never landed: an engine that believes it is flat while the
 venue holds the position. `GET /api/v3/order` is documented as *"Check an order's
-status"*, with data source *"Memory => Database"*, so it finds an order whatever
-its status.
+status"*, with data source *"Memory => Database"*, so it finds a filled order as
+readily as an open one.
+
+It does not find every order by the id it was placed with, and this paragraph
+used to say it did, so slice (d) must not rely on that sentence. Two exceptions
+are documented. A cancel replaces the cancelled order's `clientOrderId` with the
+cancel's own `newClientOrderId`, generated when none is sent, *"freeing it up
+for new orders"*: stated for the WebSocket API's `order.cancel`
+(web-socket-api.md:4142, :4181), while REST's `DELETE /api/v3/order` takes the
+same parameter and says only that it identifies the cancel (rest-api.md:2396).
+So after a cancel, ours included, the id the order was placed with may find
+nothing. And an order cancelled or expired with nothing filled is archived
+after 90 days, and asking for it then is answered `-2026 ORDER_ARCHIVED`
+(errors.md:347-348).
 
 Its "no such order" is conclusive only once the request can no longer reach the
 matching engine, and that bound is slice (d)'s question, not settled here. The
@@ -362,8 +374,8 @@ Engine"*.
 
 | | Slice | Content |
 |---|---|---|
-| a | The engine can receive what a venue says | wake on either input (`next_event_timeout`), forward-only clock. Engine side **done**; `LiveSource`'s half was missed (§1) and lands in `m8a-live-source-idles` |
-| b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c) (§5) |
+| a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
+| b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
 | c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`); the rest is the pull requests below |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
@@ -397,9 +409,30 @@ feature.
    `timeInForce` on a market order and always sends `newOrderRespType=ACK` and the
    run-tagged `newClientOrderId`; and a classifier sorting every response into
    *placed*, *refused* (with its code and message) or *unknown*. Any 5xx, `-1007`
-   and `-1006` are unknown, never refused. Accepted when Binance's documented
-   signature examples reproduce and a table test maps every documented code to
-   its class.
+   and `-1006` are unknown, never refused. Accepted when the one Ed25519
+   signature Binance publishes together with its private key reproduces byte for
+   byte, the WebSocket API's documented signature payload is rebuilt exactly,
+   and a table test maps every documented code to its class.
+
+   That signature is the FIX API's Logon example (fix-api.md:287-312), and it is
+   the only one that can be reproduced. The REST page's two Ed25519 examples are
+   not Ed25519 signatures: each is 256 bytes, an RSA-2048 signature's size where
+   an Ed25519 signature is always 64; the command beside them,
+   `openssl dgst -sha256 -sign`, is one OpenSSL refuses for an Ed25519 key; and
+   the second is byte for byte the RSA section's own (rest-api.md:477, :633,
+   :641). The WebSocket API's is a genuine 64-byte Ed25519 signature, but under
+   a private key the page names only as a file and never prints
+   (web-socket-api.md:1067, :1177), so its payload is pinned and its signature
+   can only be checked by a round trip.
+
+   The credentials half is `m8c-ed25519-credentials`: the Ed25519 key read from
+   the environment; one signer, shared by REST and the WebSocket API, that
+   reproduces the FIX vector; the REST query percent-encoded as
+   rest-api.md:644-650 shows and verified as it went over the wire; the
+   WebSocket API signer `session.logon` needs; and `venue-check` on the new key.
+   The requests half follows, and with it `POST /api/v3/order/test` (`TRADE`,
+   weight 1, rest-api.md:2321-2333), the probe that tests the key's permission
+   to trade, which `venue-check`'s `USER_DATA` request cannot.
 2. **The instrument comes from the venue.** `exchangeInfo` parsed into an
    `InstrumentDef`, naming the venue rules our `Filters` do not model
    (`MARKET_LOT_SIZE`, `applyMinToMarket`, `maxNotional`). Accepted when the
@@ -480,13 +513,23 @@ thing to find out now than on the afternoon of the run.
 3.2 GB normalized tier is rebuilt rather than copied.
 
 Slice (b) is runnable today with no money at risk: `venue-check` makes one
-signed `GET /api/v3/account`, which exercises the key, the secret, the signature,
-the header and the clock in a single round trip and places nothing. A wrong
-secret comes back HTTP 401, which is the venue's auth layer answering — proof the
-request was well formed enough to be judged on its credentials rather than its
-shape. Two caveats: until `m8b-venue-check-offset` lands its clock reading is off
-by a round trip, and the credentials pull request moves it to the Ed25519 key
-(§5).
+signed `GET /api/v3/account`, which exercises the API key, the Ed25519
+signature, the header and the clock in a single round trip, reads `canTrade`, and
+places nothing. It prints the loaded key's public half to compare with the one
+registered, names why a refusal was refused, and with `--testnet` checks a Spot
+Testnet pair instead (§5). What it does not exercise is the key's permission to
+trade. The account endpoint is `USER_DATA`, and *"by default, an API key cannot
+`TRADE`"* until trading is enabled for it in API Management, so a key without
+that permission comes back READY; and the venue never defines `canTrade`, so
+reading it settles nothing about the key. A `TRADE` request is what tests the
+permission: `POST /api/v3/order/test`, which validates an order without sending
+it to the matching engine at weight 1, comes with the requests half of slice
+(c) (§4). Under slice (b)'s HMAC secret, a wrong secret came back HTTP 401,
+which is the venue's auth layer answering — proof the request was well formed
+enough to be judged on its credentials rather than its shape. The Ed25519 key
+has not met the venue yet: on 2026-10-15 this host's clock, 2.4 s ahead of Spot
+Testnet's, stopped `venue-check` before it signed anything, so its first run
+after the clock is fixed, with a testnet pair, is the signer's first real test.
 
 Slice (a) is first and is not negotiable: it is a seam change, every slice after
 it depends on the guarantee, and it is the one thing that can be built and tested
@@ -592,7 +635,7 @@ idle wakes only, so on a market wake a later report was journalled at its own
 time while the strategy's clock stayed earlier, and the journal's timestamps
 could run backwards. `runlog`'s `decisions_at` stops at the first entry stamped
 after the instant it is asked about, so one entry out of order hides every entry
-behind it. The market-wake half lands in `m8a-live-source-idles`.
+behind it. The market-wake half landed in `m8a-live-source-idles` (#52).
 
 **The kill switch must stop a live run, and stopping is not flattening.** M6
 decided that a tripped switch refuses everything including the order that would
@@ -620,7 +663,10 @@ Ed25519 keys"*. An HMAC key has one route left,
 API Key type"* while the method's own example signature is base64, and Binance's
 key-type page says *"HMAC keys are deprecated."* So the live path signs with Ed25519, which `ring`, already linked
 for TLS, provides. The key pair is generated locally and only its public half is
-registered with Binance. Orders stay on REST, per *one authority per fact*: one
+registered with Binance. The private key reaches the process as its PEM text in
+`BINANCE_ED25519_PRIVATE_KEY` rather than as a path, which keeps slice (b)'s
+rule that key material comes from the environment and not from a file
+(`quant-binance/src/credentials.rs`). Orders stay on REST, per *one authority per fact*: one
 WebSocket carrying both would let a single disconnect blind the stream and leave
 every in-flight order's outcome unknown at the same instant.
 

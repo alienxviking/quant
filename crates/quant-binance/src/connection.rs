@@ -391,7 +391,8 @@ fn accept_and_measure<S: RecordSink>(
 /// `local_recv_ts - exchange_ts` in nanoseconds, if the payload carries one.
 ///
 /// Signed: the data contract says a negative value means clock skew and is an
-/// alert rather than something to clamp, and [`Metrics::record_latency`] counts
+/// alert rather than something to clamp, and
+/// [`Metrics::record_latency`](quant_recorder::Metrics::record_latency) counts
 /// those separately.
 fn venue_latency_nanos(payload: &[u8], local_recv_ts: Ts) -> Option<i64> {
     let millis = crate::sequence::event_time_millis(payload)?;
