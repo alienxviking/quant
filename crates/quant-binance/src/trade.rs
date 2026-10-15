@@ -220,10 +220,14 @@ pub enum NotReady {
         came_back: usize,
         usable: usize,
     },
-    /// The venue refused the credentials: HTTP 401, or under any status one of
-    /// -2014, *"API-key format invalid"*, -2015, *"Invalid API-key, IP, or
-    /// permissions for action"*, or -1022, *"Signature for this request is not
-    /// valid"* (errors.md:57-58, :338-342). A bad API key, a private key that
+    /// The venue refused the credentials: HTTP 401 whatever the body says, or
+    /// one of the venue's codes -2014, *"API-key format invalid"*, -2015,
+    /// *"Invalid API-key, IP, or permissions for action"*, or -1022,
+    /// *"Signature for this request is not valid"* (errors.md:57-58,
+    /// :338-342), under any status but 403, 418, 429 and 5xx. Those four
+    /// decide first, whatever code comes with them, as [`Self::Firewall`],
+    /// [`Self::RateLimited`] and [`Self::VenueFailure`]: each says the request
+    /// was never judged on its credentials. A bad API key, a private key that
     /// is not the registered one's, or a key restricted to other IP addresses.
     BadCredentials {
         status: u16,
@@ -1313,7 +1317,8 @@ mod tests {
 
         let cases = [
             // The credentials: 401 whatever the body says, and the three codes
-            // whatever the status.
+            // under any status that does not decide first (403, 418, 429 and
+            // 5xx, below).
             (401, None, doc(-2015, key), creds(401, read(-2015, key))),
             (401, None, none.clone(), creds(401, None)),
             (
@@ -1348,14 +1353,34 @@ mod tests {
             // The venue's own failures.
             (500, None, none.clone(), failed(500, None)),
             (503, None, doc(-1008, busy), failed(503, read(-1008, busy))),
-            // The order of the rule rather than a thing seen: a status that
+            // The order of the rule rather than a thing seen: each status that
             // says the request was never judged on its credentials decides
-            // before the code does.
+            // before the code does, whichever of the three codes comes with it.
             (
                 503,
                 None,
                 doc(-1022, signature),
                 failed(503, read(-1022, signature)),
+            ),
+            (
+                403,
+                None,
+                doc(-2015, key),
+                NotReady::Firewall {
+                    venue: read(-2015, key),
+                },
+            ),
+            (
+                429,
+                None,
+                doc(-2014, format),
+                limited(429, None, read(-2014, format)),
+            ),
+            (
+                418,
+                None,
+                doc(-1022, signature),
+                limited(418, None, read(-1022, signature)),
             ),
             // Anything else, explained by the venue or not.
             (
