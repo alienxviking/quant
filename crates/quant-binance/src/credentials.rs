@@ -84,6 +84,9 @@
 //! only the public half is registered, and the API key Binance issues for it is
 //! what goes in [`Credentials::KEY_VAR`]. Live and Spot Testnet need separate
 //! pairs (`docs/live-run.md` §5), each registered where it is used.
+//! [`Credentials::public_key_pem`] gives the public half of whatever key was
+//! loaded, in the form `openssl pkey -pubout` writes, so an operator can
+//! compare it with the registered one character for character.
 //!
 //! `openssl genpkey` writes PKCS#8 v1, which does not carry the public key, and
 //! `ring`'s `Ed25519KeyPair::from_pkcs8` accepts only v2. So this loads with
@@ -103,7 +106,7 @@
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use ring::signature::Ed25519KeyPair;
+use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 /// What went wrong before a single request was made.
 ///
@@ -308,7 +311,40 @@ impl Credentials {
     pub fn sign_ws_params(&self, params: &[(&str, &str)]) -> String {
         self.sign(ws_signature_payload(params).as_bytes())
     }
+
+    /// The public half of the loaded key, as PEM: what `openssl pkey -in key.pem
+    /// -pubout` prints, so it can be compared with the key registered with the
+    /// venue.
+    ///
+    /// Not secret: it is the half the venue is given.
+    #[must_use]
+    pub fn public_key_pem(&self) -> String {
+        format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            STANDARD.encode(self.public_key_spki())
+        )
+    }
+
+    /// The public key as DER `SubjectPublicKeyInfo` (RFC 8410 §4): the fixed
+    /// [`ED25519_SPKI_PREFIX`] and then the key's 32 bytes, 44 in all.
+    fn public_key_spki(&self) -> [u8; 44] {
+        let mut der = [0; 44];
+        let (prefix, key) = der.split_at_mut(ED25519_SPKI_PREFIX.len());
+        prefix.copy_from_slice(&ED25519_SPKI_PREFIX);
+        key.copy_from_slice(self.key_pair.public_key().as_ref());
+        der
+    }
 }
+
+/// The DER that comes before an Ed25519 public key's 32 bytes in a
+/// `SubjectPublicKeyInfo` (RFC 8410 §4).
+///
+/// `SEQUENCE` of 42 bytes; in it a `SEQUENCE` of 5 holding the algorithm's OID,
+/// 1.3.101.112 (`06 03 2b 65 70`); then a `BIT STRING` of 33 bytes, whose first
+/// says no bits of the last byte are unused, and whose other 32 are the key.
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
 
 /// The string a WebSocket API request's signature is made over.
 ///
@@ -415,8 +451,8 @@ fn parse_private_key(text: &str) -> Result<Ed25519KeyPair, CredentialError> {
 ///
 /// Not "first four characters" — a prefix is enough to confirm a guess, and the
 /// thing an operator actually needs from a log is *which* credential was in use,
-/// which `key` already answers through its own accessor when someone chooses to
-/// print it.
+/// which `key` and [`Credentials::public_key_pem`] already answer when someone
+/// chooses to print them.
 impl core::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Credentials")
@@ -536,7 +572,10 @@ mod tests {
     use super::fixture::{
         eight_char_windows, example, percent_decode, EXAMPLE_KEY_BODY, EXAMPLE_KEY_PEM,
     };
-    use super::{non_empty, private_key_text, ws_signature_payload, CredentialError, Credentials};
+    use super::{
+        non_empty, private_key_text, ws_signature_payload, CredentialError, Credentials,
+        ED25519_SPKI_PREFIX,
+    };
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     use ring::signature::{KeyPair as _, UnparsedPublicKey, ED25519};
@@ -685,6 +724,34 @@ mod tests {
         UnparsedPublicKey::new(&ED25519, creds.key_pair.public_key().as_ref())
             .verify(WS_EXAMPLE_PAYLOAD.as_bytes(), &bytes)
             .expect("the signature is over the documented payload");
+    }
+
+    #[test]
+    fn the_public_key_is_the_spki_openssl_writes_and_verifies_the_venues_vector() {
+        let creds = example();
+        let der = creds.public_key_spki();
+        assert_eq!(der.len(), 44);
+        assert_eq!(
+            der[..12],
+            [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00]
+        );
+        assert_eq!(der[..12], ED25519_SPKI_PREFIX);
+
+        // The venue's signature verifies under the key this says it holds: the
+        // public half is the right half.
+        let signature = STANDARD.decode(FIX_SIGNATURE).expect("base64");
+        UnparsedPublicKey::new(&ED25519, &der[12..])
+            .verify(FIX_PAYLOAD, &signature)
+            .expect("the published signature verifies under the derived public key");
+
+        // What `openssl pkey -in key.pem -pubout` prints for the example key
+        // (OpenSSL 3.5.5), which is what an operator registers and compares.
+        assert_eq!(
+            creds.public_key_pem(),
+            "-----BEGIN PUBLIC KEY-----\n\
+             MCowBQYDK2VwAyEAGUIKv9dSpWXBViXp2m6vAIb8QMFJYBgyFEQsFJlqgA0=\n\
+             -----END PUBLIC KEY-----\n"
+        );
     }
 
     #[test]
