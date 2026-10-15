@@ -330,6 +330,20 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
         costs.latency.inbound / 1_000_000,
         costs.adverse_per_fill,
     );
+    // The asset is a modelling choice, not a cost set to zero, so it is said
+    // here beside the rates rather than under "switched off for this run",
+    // which tells whoever judges a run that a cost was zeroed. Taken in the
+    // quote, the fee is charged in full but not where a spot venue takes it,
+    // so the reader is told that and which option models it -- the caveat
+    // the default report carried before the asset was a choice. Only where
+    // there is a fee to take: with none, the asset is not news.
+    if costs.fee_in == FeeIn::Quote && costs.fees != FeeSchedule::FREE {
+        println!(
+            "          a spot venue takes a buy's fee in the base, leaving the position a \
+             fraction smaller rather than the cash a fraction lower; \
+             --fee-asset received charges that way"
+        );
+    }
     // Same argument as the costs line above, applied to the other thing that can
     // be configured and not wired: ask the layer that did the refusing.
     println!("{}", quant_backtest::limits_line(engine.risk().limits()));

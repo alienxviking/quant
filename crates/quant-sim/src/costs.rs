@@ -22,7 +22,8 @@
 //!
 //! **Fees are a model**: venues publish their schedules, so the number is looked
 //! up rather than guessed. Which asset a fee is taken in is part of the same
-//! model, and it is switched off by default: see [`FeeIn`].
+//! model. By default every fee is taken in the quote, which is a choice of
+//! asset and not a fee set to zero: see [`FeeIn`].
 //!
 //! **Latency is a model**: it is one number, measurable against a venue, and
 //! everything downstream of it follows. Notably it is where *slippage* comes

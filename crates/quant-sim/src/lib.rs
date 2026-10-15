@@ -234,9 +234,13 @@ impl SimStats {
     /// [`Costs`] existed — and a caveat list that errs in that direction is
     /// worse than none, because it invites a reader to discount a cost that was
     /// actually charged. Those two moved to [`Self::switched_off`], which asks
-    /// the configuration instead of assuming. So, at M8, did "fees are charged
-    /// in the quote currency", once [`FeeIn`] made the asset something a run
-    /// chooses rather than something the simulator could not do.
+    /// the configuration instead of assuming.
+    ///
+    /// At M8 "fees are charged in the quote currency" left this list too, once
+    /// [`FeeIn`] made the asset something a run chooses rather than something
+    /// the simulator could not do. It did not move to [`Self::switched_off`]: a
+    /// fee taken in the quote is still charged, so nothing was set to zero. The
+    /// choice is reported where the costs are, through [`FeeIn`]'s `Display`.
     #[must_use]
     pub const fn caveats() -> &'static [&'static str] {
         &[
@@ -255,6 +259,12 @@ impl SimStats {
     /// "cannot be modelled" from "modelled, and you set it to zero". The first
     /// is a limit of the approach; the second is a decision, and only one of
     /// them is fixable by passing a flag.
+    ///
+    /// Only a cost set to *zero* belongs here, because that is what a reader is
+    /// told this section means. Which asset a fee is taken in is not one: either
+    /// way the fee is charged in full, so a run in the quote has switched
+    /// nothing off, and listing it here would tell whoever judges the run that a
+    /// cost was zeroed when none was.
     #[must_use]
     pub fn switched_off(costs: Costs) -> Vec<&'static str> {
         let mut off = Vec::new();
@@ -265,14 +275,6 @@ impl SimStats {
             off.push(
                 "no latency: an order is at the venue by the next event, and the book \
                  has not moved since the decision",
-            );
-        }
-        // Only where there are fees to take: with none, "no fees" above is the
-        // whole story, and which asset nothing was taken in is not news.
-        if costs.fee_in == FeeIn::Quote && costs.fees != FeeSchedule::FREE {
-            off.push(
-                "fees in the quote: a spot venue takes a buy's fee in the base, leaving \
-                 the position a fraction smaller rather than the cash a fraction lower",
             );
         }
         off

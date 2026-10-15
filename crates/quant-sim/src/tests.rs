@@ -1190,23 +1190,29 @@ fn which_asset_fees_are_taken_in_is_a_choice_and_the_output_says_which() {
         !SimStats::caveats().iter().any(|c| c.contains("quote")),
         "a permanent caveat list must not claim something a flag can change"
     );
-    let named = |costs| {
-        SimStats::switched_off(costs)
-            .iter()
-            .any(|c| c.contains("fees in the quote"))
-    };
-    assert!(named(crate::Costs::retail()), "said when it is so");
-    assert!(
-        !named(crate::Costs {
-            fee_in: crate::FeeIn::Received,
+    // Nor is it something switched off. That section tells whoever judges a
+    // run that a cost was set to zero (`docs/paper-run.md`), and a fee taken
+    // in the quote is charged in full. The retail costs are M5's money check:
+    // fees and latency both on, so nothing at all belongs there, whichever
+    // asset the fees are taken in.
+    for fee_in in [crate::FeeIn::Quote, crate::FeeIn::Received] {
+        let costs = crate::Costs {
+            fee_in,
             ..crate::Costs::retail()
-        }),
-        "and not when it is not"
-    );
-    assert!(
-        !named(crate::Costs::NONE),
-        "with no fees, which asset nothing was taken in is not news"
-    );
+        };
+        assert_eq!(
+            SimStats::switched_off(costs),
+            Vec::<&str>::new(),
+            "fees {fee_in} switch nothing off"
+        );
+    }
+    // And a free run lists exactly the two costs it zeroed, nothing about
+    // the asset nothing was taken in.
+    assert_eq!(SimStats::switched_off(crate::Costs::NONE).len(), 2);
+    // Where the choice is reported: after "taken" on the costs line, read
+    // back off the venue. Two settings, two different words.
+    assert_eq!(crate::FeeIn::Quote.to_string(), "in the quote");
+    assert!(crate::FeeIn::Received.to_string().contains("received"));
 }
 
 #[test]
