@@ -970,12 +970,13 @@ impl TradeClient {
     ///   (rest-api.md:186-189, 205-207), names validating the order as this
     ///   endpoint's work (rest-api.md:2326), and answers a key or signature
     ///   that fails with its own code, -2015 or -1022 (errors.md:57-58,
-    ///   341-342), not with a verdict on the order. It does not spell out the order of the venue's
-    ///   checks, so that is a reading, and the testnet run is where it is
-    ///   confirmed. A filter failure is [`TradePermission::GrantedButFiltered`]:
-    ///   the probe's numbers are the caller's, not the run's, so a filter
-    ///   refusing them says nothing about the run. Any other reason is
-    ///   [`NotReady::ProbeRefused`], because an order of the run's may meet it.
+    ///   341-342), not with a verdict on the order. It does not spell out the
+    ///   order of the venue's checks, so that is a reading, and the testnet
+    ///   run is where it is confirmed. A filter failure is
+    ///   [`TradePermission::GrantedButFiltered`]: the probe's numbers are the
+    ///   caller's, not the run's, so a filter refusing them says nothing about
+    ///   the run. Any other reason is [`NotReady::ProbeRefused`], because an
+    ///   order of the run's may meet it.
     /// - **Anything else** as [`Self::check_ready`] reports a refusal: a
     ///   firewall, a rate limit or a ban, the venue's own failure, which decide
     ///   first whatever code comes with them; a bad signature or key format;
