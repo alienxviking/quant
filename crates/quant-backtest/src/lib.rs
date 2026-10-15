@@ -52,5 +52,38 @@ pub fn limits_line(limits: quant_engine::Limits) -> String {
     )
 }
 
+/// What the run still held at the end, as one report line.
+///
+/// Without it a run that ends holding something shows a gap between `cash`
+/// and the last equity that nothing on the report accounts for. Fees taken in
+/// the asset received make that every run rather than an occasional one: an
+/// exit sells what it holds rounded down to the lot, so a few satoshi of dust
+/// are left behind and ride the price to the end.
+///
+/// The mark is the last sample's mid, the one the curve valued the run at,
+/// and it is said where there was none -- a holding with no price is not
+/// worth zero, it is not worth anything we can name, and printing a value for
+/// it would invent one. `last` is the last point of the curve, mark or not.
+#[must_use]
+pub fn position_line(position: quant_engine::Position, last: Option<&EquityPoint>) -> String {
+    if position.is_flat() {
+        return "position  flat at the end".to_owned();
+    }
+    let qty = position.qty;
+    match last.and_then(|point| point.mark) {
+        Some(mark) => match mark.notional(qty) {
+            Some(value) => format!(
+                "position  {qty} held at the end, worth {value} at the last sample's mid {mark}"
+            ),
+            None => format!(
+                "position  {qty} held at the end, too large to value at the last sample's mid {mark}"
+            ),
+        },
+        None => format!(
+            "position  {qty} held at the end, and no mark at the last sample to value it at"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests;

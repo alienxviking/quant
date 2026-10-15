@@ -45,13 +45,13 @@
 //! well as the exit, or the next up-cross would call that dust "already long"
 //! and never enter again.
 //!
-//! Where fees are charged in the quote asset, as in every backtest and all of
-//! M5, this changes nothing for a run whose entries fill in full and whose
-//! position was built at the same `qty`. The position is then exactly zero or
-//! exactly `qty`, and `qty` is a whole number of lots (a size that is not is
-//! refused at construction), so rounding it down leaves it alone and less
-//! than one lot means zero. That is what lets the fortnight's result still
-//! reproduce to the satoshi.
+//! Where fees are charged in the quote asset, as in every backtest that does
+//! not ask for them in the base and all of M5, this changes nothing for a run
+//! whose entries fill in full and whose position was built at the same `qty`.
+//! The position is then exactly zero or exactly `qty`, and `qty` is a whole
+//! number of lots (a size that is not is refused at construction), so
+//! rounding it down leaves it alone and less than one lot means zero. That is
+//! what lets the fortnight's result still reproduce to the satoshi.
 //!
 //! Two kinds of run differ even with the fee in the quote: one whose entry
 //! the book could fill only in part -- the simulator fills what is there and
@@ -67,9 +67,10 @@
 //! # Why `qty` needs more than the minimum notional
 //!
 //! Whole lots satisfy the lot rule, and a venue has others. Where the fee is
-//! taken in the base, the exit is smaller than the entry by that fee rounded
-//! up to a whole lot -- one lot wherever the fee is no bigger than a lot, as
-//! at 0.001 BTC: 0.00099 out against 0.001 in. And an exit follows a
+//! taken in the base, an exit can be smaller than the entry by that fee
+//! rounded up to a whole lot -- one lot wherever the fee is no bigger than a
+//! lot, as at 0.001 BTC: 0.00099 out against 0.001 in -- whenever no dust
+//! left by an earlier exit makes up the difference. And an exit follows a
 //! down-cross, so it is usually sold lower than the entry was bought. A `qty`
 //! that clears the venue's `min_notional` by less than those two together
 //! leaves an exit under it, which the venue refuses.

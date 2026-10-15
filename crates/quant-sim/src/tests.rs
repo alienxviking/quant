@@ -9,8 +9,10 @@
 use quant_book::Book;
 use quant_core::event::{BookSnapshot, EventMeta, Gap, GapCause, Level, MarketEvent, Side, Trade};
 use quant_core::execution::{
-    ClientOrderId, ExecutionEvent, OrderKind, OrderRequest, RejectReason, TimeInForce,
+    ClientOrderId, ExecutionEvent, FeeAsset, Fill, OrderKind, OrderRequest, RejectReason,
+    TimeInForce,
 };
+use quant_core::fixed::{Notional, Qty};
 use quant_core::instrument::{
     Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };
@@ -1018,4 +1020,214 @@ fn a_venue_given_no_filters_accepts_what_it_always_did() {
         "a dust order fills when nothing is enforcing: {events:?}"
     );
     assert_eq!(venue.stats().filtered(), 0);
+}
+
+// --- M8.c: a fee taken in the asset the fill delivered ---
+
+/// The one fill in a batch of reports.
+fn the_fill(events: &[ExecutionEvent]) -> Fill {
+    events
+        .iter()
+        .find_map(|e| match e {
+            ExecutionEvent::Filled { fill, .. } => Some(fill.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a fill: {events:?}"))
+}
+
+fn amount(s: &str) -> Notional {
+    s.parse().expect("a valid amount")
+}
+
+fn size(s: &str) -> Qty {
+    s.parse().expect("a valid quantity")
+}
+
+#[test]
+fn under_fees_in_the_asset_received_a_buy_pays_in_the_base_and_a_sell_in_the_quote() {
+    // What a spot venue does and M4's model did not. A buy's fee comes out of
+    // what was bought, so the position arrives a fraction smaller and the cash
+    // pays the gross alone; a sell's comes out of the quote it raised.
+    let instrument = instrument();
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        fees: crate::FeeSchedule::binance_spot(),
+        fee_in: crate::FeeIn::Received,
+        ..crate::Costs::NONE
+    });
+    let mut portfolio = quant_engine::Portfolio::new(amount("1000"));
+
+    // Buy 1 against asks from 101: all of it at the touch.
+    let bought = the_fill(&run(
+        &mut venue,
+        order(Side::Buy, "1", OrderKind::Market),
+        &tick(),
+        &book(),
+    ));
+    assert_eq!(
+        bought.fee_asset,
+        FeeAsset::Base,
+        "a buy pays in what it bought"
+    );
+    assert_eq!(
+        bought.fee,
+        amount("0.001"),
+        "ten basis points of 1, as a quantity of the base"
+    );
+    portfolio.apply_fill(instrument, Side::Buy, &bought);
+    assert_eq!(
+        portfolio.position(instrument).qty,
+        size("0.999"),
+        "what was bought, less the fee"
+    );
+    assert_eq!(
+        portfolio.cash(),
+        amount("899"),
+        "1000 less the gross of 101, and nothing for the fee"
+    );
+
+    // Sell 0.5 against bids from 99: all of it at the touch, raising 49.5.
+    venue.submit(
+        ClientOrderId(2),
+        &order(Side::Sell, "0.5", OrderKind::Market),
+        NOW,
+    );
+    venue.observe(&tick(), &book(), NOW);
+    let mut out = Vec::new();
+    venue.poll(NOW, &mut out);
+    let sold = the_fill(&out);
+    assert_eq!(
+        sold.fee_asset,
+        FeeAsset::Quote,
+        "a sell pays in what it received"
+    );
+    assert_eq!(sold.fee, amount("0.0495"), "ten basis points of 49.5");
+    portfolio.apply_fill(instrument, Side::Sell, &sold);
+    assert_eq!(
+        portfolio.position(instrument).qty,
+        size("0.499"),
+        "the sell's fee left the position alone"
+    );
+    assert_eq!(portfolio.cash(), amount("948.4505"), "899 + 49.5 - 0.0495");
+
+    // And the venue counts the base fee as the money it is worth at its fill:
+    // 0.001 at 101 is 0.101, plus the sell's 0.0495.
+    assert_eq!(venue.stats().fees_charged, amount("0.1505"));
+    assert_eq!(venue.stats().fees_charged, portfolio.fees());
+}
+
+#[test]
+fn a_resting_buy_the_market_comes_to_pays_the_maker_rate_in_the_base() {
+    // The passive path decides its fee in the same place the taker's does, and
+    // must reach it with the maker rate and the order's side. A buy limit at 97
+    // under a best bid of 98 cannot cross, so it rests until a print at 96
+    // trades through it.
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        fees: crate::FeeSchedule {
+            maker: "0.0002".parse().expect("rate"),
+            taker: "0.001".parse().expect("rate"),
+        },
+        fee_in: crate::FeeIn::Received,
+        ..crate::Costs::NONE
+    });
+    let mut book = Book::new();
+    book.apply_snapshot(&BookSnapshot {
+        meta: meta(),
+        last_update_id: 10,
+        bids: vec![level("98.0", "1")],
+        asks: vec![level("99.0", "1")],
+    });
+    let fill = the_fill(&run(
+        &mut venue,
+        order(Side::Buy, "1", limit("97.0")),
+        &print_at("96.0"),
+        &book,
+    ));
+    assert!(fill.is_maker, "rested below the touch, then traded through");
+    assert_eq!(fill.fee_asset, FeeAsset::Base);
+    assert_eq!(
+        fill.fee,
+        amount("0.0002"),
+        "two basis points of 1 bought, not ten"
+    );
+    assert_eq!(
+        venue.stats().fees_charged,
+        amount("0.0194"),
+        "0.0002 valued at the 97 it filled at"
+    );
+}
+
+#[test]
+fn fees_are_taken_in_the_quote_unless_a_run_asks_otherwise() {
+    // The no-op property for the asset: every published result -- M4's table,
+    // M5's money check -- was computed with fees in the quote, so that has to
+    // be what a run gets when it asks for nothing, `retail()` included.
+    assert_eq!(crate::Costs::NONE.fee_in, crate::FeeIn::Quote);
+    assert_eq!(crate::Costs::default().fee_in, crate::FeeIn::Quote);
+    assert_eq!(crate::Costs::retail().fee_in, crate::FeeIn::Quote);
+
+    let mut venue = SimulatedVenue::with_costs(crate::Costs {
+        fees: crate::FeeSchedule::binance_spot(),
+        ..crate::Costs::NONE
+    });
+    let fill = the_fill(&run(
+        &mut venue,
+        order(Side::Buy, "1", OrderKind::Market),
+        &tick(),
+        &book(),
+    ));
+    assert_eq!(fill.fee_asset, FeeAsset::Quote);
+    assert_eq!(fill.fee, amount("0.101"), "ten basis points of 101");
+}
+
+#[test]
+fn which_asset_fees_are_taken_in_is_a_choice_and_the_output_says_which() {
+    // M4's rule for the caveat list, applied to the asset. Once the simulator
+    // can take a fee in the base, "fees are charged in the quote" stops being a
+    // limit of the approach and becomes a decision a run made -- and a
+    // permanent list claiming it would be false for every run that chose
+    // otherwise.
+    assert!(
+        !SimStats::caveats().iter().any(|c| c.contains("quote")),
+        "a permanent caveat list must not claim something a flag can change"
+    );
+    // Nor is it something switched off. That section tells whoever judges a
+    // run that a cost was set to zero (`docs/paper-run.md`), and a fee taken
+    // in the quote is charged in full. The retail costs are M5's money check:
+    // fees and latency both on, so nothing at all belongs there, whichever
+    // asset the fees are taken in.
+    for fee_in in [crate::FeeIn::Quote, crate::FeeIn::Received] {
+        let costs = crate::Costs {
+            fee_in,
+            ..crate::Costs::retail()
+        };
+        assert_eq!(
+            SimStats::switched_off(costs),
+            Vec::<&str>::new(),
+            "fees {fee_in} switch nothing off"
+        );
+    }
+    // And a free run lists exactly the two costs it zeroed, nothing about
+    // the asset nothing was taken in.
+    assert_eq!(SimStats::switched_off(crate::Costs::NONE).len(), 2);
+    // Where the choice is reported: after "taken" on the costs line, read
+    // back off the venue. Two settings, two different words.
+    assert_eq!(crate::FeeIn::Quote.to_string(), "in the quote");
+    assert!(crate::FeeIn::Received.to_string().contains("received"));
+}
+
+#[test]
+fn a_free_run_is_free_whichever_asset_its_fees_would_be_taken_in() {
+    // Zero is zero in either asset. A free check that compared the whole
+    // configuration would call a run with no costs costed because of where its
+    // nothing would have been taken from.
+    assert!(crate::Costs {
+        fee_in: crate::FeeIn::Received,
+        ..crate::Costs::NONE
+    }
+    .is_free());
+    assert!(!crate::Costs {
+        fee_in: crate::FeeIn::Received,
+        ..crate::Costs::retail()
+    }
+    .is_free());
 }

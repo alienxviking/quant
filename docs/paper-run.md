@@ -427,11 +427,16 @@ a 600 s window: slow=30 never warms up, 0 crossings, 0 fills, cash 100.00000000.
 That reads as a catastrophic platform failure and is a missing flag. Diff the two
 `strategy` banner lines character for character before believing any divergence.
 
-**Pass `--realistic` and nothing else cost-related.** It assigns the cost model
-wholesale, so `--fee-rate 0.001 --realistic` silently discards the fee rate. Then
-read the `costs` line back — it is printed from `engine.venue().costs()`, not from
-the parsed flags, which is the M4 fix. If a `switched off for this run` section
-appears, a cost was zeroed.
+**Pass `--realistic` and nothing else cost-related.** It assigns the fees, the
+latency and the adverse knob together, so `--fee-rate 0.001 --realistic` silently
+discards the fee rate. The one thing it leaves alone is which asset a fee is
+taken in: `--fee-asset` is its own setting, kept wherever on the line either
+appears, and the default — every fee in the quote — is what M5's paper session
+charged. Then read the `costs` line back — it is printed from
+`engine.venue().costs()`, not from the parsed flags, which is the M4 fix — and
+check it says `taken in the quote`. If a `switched off for this run` section
+appears, a cost was zeroed; the fee asset is never listed there, because a fee
+taken in the quote is still charged.
 
 **`venue` fills may exceed `fills`, and that is not a disagreement.** This
 rehearsal ended with `venue 23 fills, charged 1.79581017` against the portfolio's

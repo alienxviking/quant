@@ -1101,16 +1101,20 @@ use quant_core::event::Side;
 use quant_core::execution::{ClientOrderId, ExecutionEvent, FeeAsset};
 use quant_engine::ExecutionVenue;
 
-/// The real simulator, with each buy's fee taken out of what was bought.
+/// The real simulator, with each buy's fee taken out of what was bought as a
+/// fixed quantity of the base.
 ///
-/// `SimulatedVenue` charges every fee in the quote -- M4's simplification, and
-/// still in its caveats -- so after a buy that fills in full, as every buy
-/// these tests make does against books a whole unit deep, the position is
-/// exactly what was ordered, and an exit that sold `qty` cannot be told from
-/// one that sold what was held. A spot venue takes a buyer's fee in the base
-/// asset. This rewrites each buy's fill that way, a fixed `fee` of the base
-/// per fill, and leaves the matching, the prices and the sells to the
-/// simulator.
+/// Written when `SimulatedVenue` charged every fee in the quote. A buy filling
+/// in full then left exactly what was ordered, so an exit that sold `qty` could
+/// not be told from one that sold what was held, and rewriting the fill was the
+/// only way to take a buy's fee out of what was bought. The simulator can now
+/// do that itself (`FeeIn::Received`), as a rate on what was bought. These
+/// tests keep stating the fee as the quantity of the base they then count in,
+/// which is how they land the holding on the boundaries they are about -- a
+/// whole lot, a lot and change, dust under one. The matching, the prices and
+/// the sells are still the simulator's. The rate itself, through the
+/// simulator's own option, is
+/// `a_crossover_under_fees_in_the_asset_received_exits_the_floored_position`.
 #[derive(Debug)]
 struct BaseFeeOnBuys {
     inner: SimulatedVenue,
@@ -1328,5 +1332,305 @@ fn exactly_one_whole_lot_held_is_a_holding_and_is_sold() {
     assert!(
         engine.portfolio().position(instrument()).qty.is_zero(),
         "and nothing is left: a whole lot is not dust"
+    );
+}
+
+// --- M8.c: the simulator's own fee in the asset received ---
+
+/// The real simulator, remembering every request it was told about and
+/// otherwise left alone.
+#[derive(Debug)]
+struct Told {
+    inner: SimulatedVenue,
+    sent: Vec<OrderRequest>,
+}
+
+impl ExecutionVenue for Told {
+    fn submit(&mut self, client_order_id: ClientOrderId, request: &OrderRequest, now: Ts) {
+        self.sent.push(*request);
+        self.inner.submit(client_order_id, request, now);
+    }
+
+    fn cancel(&mut self, client_order_id: ClientOrderId, now: Ts) {
+        self.inner.cancel(client_order_id, now);
+    }
+
+    // Forwarded explicitly, as `BaseFeeOnBuys` does and for its reason: the
+    // default does nothing, and would hide the market from the simulator.
+    fn observe(&mut self, event: &MarketEvent, book: &quant_book::Book, now: Ts) {
+        self.inner.observe(event, book, now);
+    }
+
+    fn poll(&mut self, now: Ts, out: &mut Vec<ExecutionEvent>) {
+        self.inner.poll(now, out);
+    }
+}
+
+/// Binance spot's ten basis points, taken as Binance takes them: a buy's in
+/// the base, a sell's in the quote.
+fn spot_fees() -> quant_sim::Costs {
+    quant_sim::Costs {
+        fees: quant_sim::FeeSchedule::binance_spot(),
+        fee_in: quant_sim::FeeIn::Received,
+        ..quant_sim::Costs::NONE
+    }
+}
+
+/// The suite's crossover at 0.001, against the simulator charging
+/// [`spot_fees`] and enforcing the lot, run to the end of `steps`.
+fn run_told(steps: &[Step]) -> Engine<Script, Told, AllowAll, Recorded<MaCrossover>> {
+    let instrument = instrument();
+    let rules = definition();
+    let strategy = Recorded::new(
+        MaCrossover::new(MaConfig {
+            instrument,
+            fast: 2,
+            slow: 3,
+            interval: SECOND,
+            qty: qty("0.001"),
+            lot: rules.lot_size,
+        })
+        .expect("a valid configuration"),
+        instrument,
+        SECOND,
+    );
+    let venue = Told {
+        // Enforcing the lot, so an exit the venue would not take is refused
+        // rather than filled. Not the minimum notional, for the reason
+        // `run_base_fee` gives: the script trades near 100.
+        inner: SimulatedVenue::with_costs(spot_fees()).enforcing(
+            instrument,
+            quant_core::instrument::Filters {
+                tick_size: rules.tick_size,
+                lot_size: rules.lot_size,
+                min_notional: Notional::ZERO,
+            },
+        ),
+        sent: Vec::new(),
+    };
+    let mut engine = Engine::new(Script::new(steps), venue, AllowAll, strategy, CASH);
+    engine.run().expect("the script cannot fail");
+    engine
+}
+
+#[test]
+fn a_crossover_under_fees_in_the_asset_received_exits_the_floored_position() {
+    // What slice (e)'s model replay needs, through the simulator's own option
+    // rather than a wrapper rewriting its fills. Ten basis points of a 0.001
+    // buy is 0.000001 of the base, so 0.000999 arrives. The down-cross sells
+    // the 99 whole lots of it, 0.00099 -- what live sends, where a model
+    // charging the quote would have sold 0.001 -- and leaves 0.000009 of dust,
+    // which the next up-cross treats as flat and enters over.
+    let mut steps = up_then_down();
+    // From the bottom at 85, rise far enough to cross back up.
+    for mid in [88, 95, 104] {
+        steps.push(Step::Book(mid));
+    }
+    let instrument = instrument();
+    let engine = run_told(&steps);
+
+    let ma = engine.strategy().inner().stats();
+    assert_eq!(
+        (ma.entries, ma.exits, ma.no_ops),
+        (2, 1, 0),
+        "the second up-cross is an entry, not 'already long': {ma:?}"
+    );
+    let sent = &engine.venue().sent;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!((sent[0].side, sent[0].qty), (Side::Buy, qty("0.001")));
+    assert_eq!(
+        (sent[1].side, sent[1].qty),
+        (Side::Sell, qty("0.00099")),
+        "the 0.000999 the fee left, floored to the lot of 0.00001"
+    );
+    assert_eq!(
+        (sent[2].side, sent[2].qty),
+        (Side::Buy, qty("0.001")),
+        "a full entry over the dust"
+    );
+    assert_eq!(
+        engine.venue().inner.stats().filtered(),
+        0,
+        "and a venue enforcing the lot took every one"
+    );
+    assert_eq!(engine.portfolio().fills(), 3);
+    assert_eq!(
+        engine.portfolio().position(instrument).qty,
+        qty("0.001008"),
+        "the 0.000009 of dust, plus the 0.000999 the second buy delivered"
+    );
+}
+
+#[test]
+fn under_fees_in_the_asset_received_the_venue_and_the_portfolio_agree_in_quote_value() {
+    // M4's two independent tallies, with a fee that is no longer money. A
+    // buy's fee is a quantity of the base now, and the venue and the portfolio
+    // each total it as the money it was worth at its own fill, through the one
+    // conversion both use -- so they still count one quantity, and a total
+    // that added the raw quantity would fall short by a factor of the price.
+    let engine = run_with(&choppy(), spot_fees());
+    let charged = engine.venue().stats().fees_charged;
+    assert!(charged.is_positive(), "fees were charged: {charged}");
+    assert_eq!(charged, engine.portfolio().fees());
+
+    // And not vacuously. Were the buys charged in the quote, this would be
+    // M4's comparison over again. Every exit sells whole lots of a holding a
+    // base fee has shaved, so the run ends holding dust: real, under a lot.
+    let held = engine.portfolio().position(instrument()).qty;
+    assert!(
+        held.is_positive() && held < lot(),
+        "the dust of base-asset fees is left: {held}"
+    );
+}
+
+#[test]
+fn under_fees_in_the_asset_received_the_dust_an_exit_leaves_tops_up_the_next() {
+    // Why a model charging the quote gets some exits wrong and not all of
+    // them. The first exit sells 0.00099 of the 0.000999 a base fee left and
+    // keeps 0.000009. The next buy delivers 0.000999 on top, 0.001008 in all,
+    // so that exit sells a whole 0.001 and keeps 0.000008 -- and so on, each
+    // trip spending 0.000001 of the dust, until none is left and an exit comes
+    // up a lot short again. At this size and rate that is one exit in ten,
+    // which is what replaying M5's fortnight showed: 42 of its 412.
+    let engine = run_told(&choppy());
+    let exits: Vec<Qty> = engine
+        .venue()
+        .sent
+        .iter()
+        .filter(|r| r.side == Side::Sell)
+        .map(|r| r.qty)
+        .collect();
+    let whole = qty("0.001");
+    assert_eq!(
+        exits,
+        [qty("0.00099"), whole, whole, whole, whole, whole, whole],
+        "short once, then topped up by the dust each time"
+    );
+    assert_eq!(
+        engine.portfolio().position(instrument()).qty,
+        qty("0.000003"),
+        "the 0.000009 the first exit left, less 0.000001 for each of six"
+    );
+    assert_eq!(engine.venue().inner.stats().filtered(), 0);
+}
+
+#[test]
+fn under_fees_in_the_asset_received_a_higher_rate_can_leave_more_held_and_more_equity() {
+    // Why `a_higher_fee_rate_never_leaves_more_equity` charges in the quote,
+    // and has to. Taken in the base, a fee changes how much is held, and the
+    // exit sells whole lots of that. One basis point of a 0.001 buy leaves
+    // 0.0009999; the down-cross sells 0.00099 and 0.0000099 -- nearly a lot
+    // -- is still held when the price doubles. With no fee the exit sold all
+    // 0.001 and nothing rides the jump. So the costlier run ends richer: not a
+    // sign error, but exposure, which can go either way as latency's can.
+    let mut steps = up_then_down();
+    steps.push(Step::Book(200));
+    let ending = |rate: &str, fee_in| {
+        let engine = run_with(
+            &steps,
+            quant_sim::Costs {
+                fees: quant_sim::FeeSchedule::flat(rate.parse().expect("rate")),
+                fee_in,
+                ..quant_sim::Costs::NONE
+            },
+        );
+        let held = engine.portfolio().position(instrument()).qty;
+        let equity = engine
+            .strategy()
+            .curve()
+            .last()
+            .expect("the path ends with a live book");
+        (held, equity)
+    };
+    let (quote, received) = (quant_sim::FeeIn::Quote, quant_sim::FeeIn::Received);
+
+    // In the quote a fee is only a cost: the same fills, less money.
+    let (held_free, free) = ending("0", quote);
+    let (held_quote, costed) = ending("0.0001", quote);
+    assert!(held_free.is_zero() && held_quote.is_zero(), "both sold all");
+    assert!(costed < free, "{costed} under fees, {free} without");
+
+    // In the asset received, the fee also left nearly a lot unsold.
+    let (held, richer) = ending("0.0001", received);
+    assert_eq!(held, qty("0.0000099"));
+    assert!(
+        richer > free,
+        "{richer} under a fee in the base, {free} without: the unsold lot rode the jump"
+    );
+}
+
+// --- The position the report ends on ---
+
+fn held(qty: &str) -> quant_engine::Position {
+    quant_engine::Position {
+        qty: qty.parse().expect("qty"),
+        avg_px: "100".parse().expect("px"),
+    }
+}
+
+fn sampled_at(mark: Option<&str>) -> EquityPoint {
+    EquityPoint {
+        ts: Ts::from_nanos(0),
+        equity: None,
+        cash: CASH,
+        mark: mark.map(|m| m.parse().expect("mark")),
+    }
+}
+
+#[test]
+fn the_report_says_what_was_held_at_the_end_and_at_what_mark() {
+    // Flat is said, not left to be inferred from a missing line.
+    assert_eq!(
+        crate::position_line(
+            quant_engine::Position::default(),
+            Some(&sampled_at(Some("100")))
+        ),
+        "position  flat at the end"
+    );
+    // Held and priced: the quantity, what it was worth, and the mid it was
+    // worth that at, so cash plus the value is the last equity by hand.
+    assert_eq!(
+        crate::position_line(held("0.000003"), Some(&sampled_at(Some("120000")))),
+        "position  0.000003 held at the end, worth 0.36 at the last sample's mid 120000"
+    );
+    // Held and blind at the end: no value is invented for it.
+    for last in [Some(sampled_at(None)), None] {
+        let line = crate::position_line(held("0.000003"), last.as_ref());
+        assert_eq!(
+            line,
+            "position  0.000003 held at the end, and no mark at the last sample to value it at"
+        );
+    }
+    // A value past what a notional holds is said to be, not wrapped or panicked on.
+    assert!(
+        crate::position_line(held("10000000000"), Some(&sampled_at(Some("10000000000"))))
+            .contains("too large to value")
+    );
+}
+
+#[test]
+fn a_run_with_fees_in_the_base_ends_on_dust_and_the_report_accounts_for_it() {
+    // The case the line exists for. Under fees taken in the asset received an
+    // exit sells what it holds rounded down to the lot, so a run that ends
+    // "flat" in every sense the strategy knows still holds a few satoshi, and
+    // cash alone is not the account.
+    let engine = run_with(&choppy(), spot_fees());
+    let position = engine.portfolio().position(instrument());
+    assert!(!position.is_flat(), "the base fees leave dust behind");
+    let curve = engine.strategy().curve();
+    let last = curve.points.last().expect("a sampled run");
+    let mark = last.mark.expect("the path ends with a live book");
+    let value = mark.notional(position.qty).expect("a small value");
+    assert_eq!(
+        crate::position_line(position, Some(last)),
+        format!(
+            "position  {} held at the end, worth {value} at the last sample's mid {mark}",
+            position.qty
+        )
+    );
+    // And it is the whole of the gap between the cash and the last equity.
+    assert_eq!(
+        Notional::from_raw(engine.portfolio().cash().raw() + value.raw()),
+        curve.last().expect("valued at the end"),
     );
 }
