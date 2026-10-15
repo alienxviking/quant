@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 742 tests green in debug
-and release, clippy and fmt clean, ~58,700 lines across 12 crates.
+same window exactly, on both symbols, to the satoshi. 753 tests green in debug
+and release, clippy and fmt clean, ~60,200 lines across 12 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -2350,10 +2350,17 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   minting them, `orphaned` and `cancel_requested`, stopped moving the restart
   id counter, beyond what the design asked.
 
-  **What remains in (c) is item 4's reader debts** (`m8c-journal-readers`:
-  loud orphans in `runlog check`, torn lines where an operator looks, the risk
-  tally recounted on restart) **and items 6, 7 and 8 of `docs/live-run.md`
-  §4**: listening to the account, `LiveVenue`, and the `live` binary with its
+  **Item 4's reader debts are paid** (`m8c-journal-readers`): `runlog check`
+  fails on an orphaned fill, a stray, another run's order and a doubt left
+  raised, and counts a stranger's order; a line torn before a restart rides on
+  `reconcile`'s verdict line and is a `runlog check` finding; a restart
+  recounts the risk tally from the journal (`journal::recover_risk`), so the
+  holding, the day's order count and its loss survive it and only a new UTC
+  day resets the counters; and `explain --at` reads `backtest --journal`
+  files again, which a wall-clock `started` line had stopped.
+
+  **What remains in (c) is items 6, 7 and 8 of `docs/live-run.md` §4**:
+  listening to the account, `LiveVenue`, and the `live` binary with its
   testnet rehearsal.
   Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
   shipped code, which went first, each on its own branch (#52 to #56, and see

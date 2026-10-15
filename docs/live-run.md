@@ -376,7 +376,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63) and the journal's entries (item 4, `m8c-journal-live`); item 4's reader debts and items 6, 7 and 8 below remain |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`) and item 4's readers (`m8c-journal-readers`); items 6, 7 and 8 below remain |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -498,13 +498,13 @@ feature.
    debts come due here too. The market's return after a gap must be recorded
    explicitly, because once a live venue speaks on idle wakes a fill after a
    `blind` line no longer proves the market came back, which is what `explain`
-   assumes. An `orphaned` line must be loud in `runlog check`, which today never
-   reads it. And lines torn before a restart must show where an operator looks,
-   not only in `reconcile`'s full report. Finally, a restart must bring the risk
-   layer's tally back from the journal. `RiskEngine::recover` restores the kill
-   switch and nothing else. So after a restart an addition to a real position
-   is checked as if from flat, a real exit can be refused as if it opened the
-   opposite position, and the day's loss budget starts fresh. The engine
+   assumes. An `orphaned` line must be loud in `runlog check`, which when this
+   was written never read it. And lines torn before a restart must show where
+   an operator looks, not only in `reconcile`'s full report. Finally, a restart
+   must bring the risk layer's tally back from the journal. `RiskEngine::recover`
+   restored the kill switch and nothing else. So after a restart an addition to
+   a real position was checked as if from flat, a real exit could be refused as
+   if it opened the opposite position, and the day's loss budget started fresh. The engine
    contract's own rule, that an NTP step cannot hand a stopped strategy a fresh
    budget, already argues against that last one.
 
@@ -527,14 +527,22 @@ feature.
    its first failure. Every schema-1 and schema-2 journal reads unchanged, and
    both of the fortnight's still reconcile.
 
-   Owed to the readers' pull request (`m8c-journal-readers`): an `orphaned`,
-   `stray` or other-run `foreign` line, and a doubt left raised, loud in
-   `runlog check`; torn lines shown where an operator looks; the risk tally
-   recounted on restart; and `decisions_at` filtering by stamp, because a
-   `backtest --journal` file's wall-clock `started` line stops it reading
-   anything at all. That filter must still read every `started` line whatever
-   its stamp, because the session's schema is on it: skip the wall-clock one
-   and a schema-3 backtest file is quietly read by the old rule again.
+   **The reader debts are paid** in `m8c-journal-readers`, the argument in
+   `docs/run-log.md` §9 and `docs/engine-contract.md` §10. `runlog check` fails
+   on an `orphaned` line, a `stray` line, another run's or an unparseable
+   `foreign` order and a doubt left raised, and counts a stranger's order
+   without flagging it. A line torn before a restart rides on `reconcile`'s
+   verdict line, which `ops/verify-loop.sh` copies into its log and
+   `ops/status.sh` shows, is a finding in `runlog check`, and is printed by
+   `explain`. A restart recounts the risk tally from the journal
+   (`journal::recover_risk`, which `paper` now calls): the holding, and the
+   day's order count and loss, with a new UTC day resetting the counters and
+   never the switch. And `decisions_at` filters by stamp rather than stopping
+   at the first later entry, so `explain --at` reads a `backtest --journal`
+   file again, while still reading every `started` line for its schema, so a
+   schema-3 backtest is not read by the old rule. Both fortnight journals
+   still reconcile and agree at every checkpoint, and `runlog check` still
+   finds nothing to check in them.
 5. **A frame kind for the account stream.** Container version 3, and the account
    stream under its own data root (§5), where `quant-verify` runs its container
    checks and not the update-id chain. Accepted when a v3 build reads every v1 and

@@ -220,9 +220,10 @@ steps, so ordering by it would reverse two sessions at the seam without saying
 so. The half that is not settled is **state**. The journal holds fills,
 checkpoints and the kill switch, and `Engine::resuming` replaces the portfolio
 — nothing in it carries the strategy. So a restarted `paper` process comes back
-with the right cash and position but with empty crossover windows, a zeroed
-equity sampler and a zeroed daily risk tally, while the judging backtest runs
-all three continuously across that same instant. Fill counts would then differ
+with the right cash and position but with empty crossover windows and a zeroed
+equity sampler (and, until `m8c-journal-readers` recounted it from the journal,
+a zeroed daily risk tally), while the judging backtest runs all of it
+continuously across that same instant. Fill counts would then differ
 for reasons that have nothing to do with live-versus-replay, which is the only
 thing M5 asks, and nothing at judging time can undo it. The exact comparison
 needs a fortnight with no restarts.

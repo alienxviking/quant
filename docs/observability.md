@@ -490,8 +490,9 @@ supervisor restart inside the fortnight forfeits the exact comparison outright**
 and nothing a reader does afterwards repairs it. `Engine::resuming` replaces the
 portfolio and nothing else, and `JournalEntry` has no strategy entry — so a
 restarted paper process comes back holding the right cash and position but with
-empty crossover windows, a zeroed equity sampler and a zeroed daily risk tally,
-while the judging backtest runs all three continuously across that same
+empty crossover windows and a zeroed equity sampler (and, until
+`m8c-journal-readers` recounted it from the journal, a zeroed daily risk tally),
+while the judging backtest runs all of it continuously across that same
 boundary. The fill counts then differ for a reason that has nothing to do with
 live-versus-replay, which is the only thing being asked. Where a mid-run restart
 has been discussed it has been treated as a *reader* problem about M2.e's parts;
