@@ -29,10 +29,41 @@
 //! offering to accept staler requests; the thing it protects against is an order
 //! sitting in a retry queue and arriving long after the decision that produced
 //! it, which is exactly the failure a live engine must not have.
+//!
+//! # Sending an order
+//!
+//! [`TradeClient::place_order`] and [`TradeClient::cancel_order`] are the
+//! transport [`crate::orders`] leaves to this module. They send what the
+//! encoder wrote, once, and hand what came back to its classifier, which can be
+//! no more right than the account of the attempt it is given. Four things
+//! decide that, and each is enforced here and pinned by a test rather than left
+//! to care:
+//!
+//! - **The query goes out exactly as it was encoded and signed**, with
+//!   `timestamp`, `recvWindow` and `signature` after it and the body empty
+//!   (`signed_request` says why).
+//! - **No redirect is followed**, by any request this client makes
+//!   ([`TradeClient::new`] says why). A 3xx reaches the classifier, which calls
+//!   it unknown.
+//! - **"Not sent" is claimed only when nothing left.** It is the one outcome
+//!   that proves an order was not placed, so it is claimed only for an error
+//!   `reqwest` reports as a failure to connect: a name that would not resolve,
+//!   a connection refused, a TLS handshake that failed, all before a byte of
+//!   the request was written. A timeout, and any other failure, a body that
+//!   broke off after its status arrived included, may have followed a request
+//!   the venue received, and leaves the outcome unknown.
+//! - **The client waits longer than the venue does**, so that the venue's own
+//!   answer to a slow matching engine arrives first: [`ORDER_TIMEOUT`].
+//!
+//! The timestamp is the caller's: when the strategy submitted the order, on the
+//! venue's clock. The transport does not restamp it. `recvWindow` exists to
+//! refuse an order that sat in a queue, and a stamp taken at sending would hide
+//! the queue from it.
 
 use std::time::Duration;
 
 use crate::credentials::Credentials;
+use crate::orders::{Attempt, CancelOrder, CancelReply, NewOrder, Placement, ORDER_PATH};
 use crate::rest::SnapshotError;
 
 /// The `recvWindow` sent with every signed request, in milliseconds.
@@ -47,6 +78,42 @@ use crate::rest::SnapshotError;
 /// It is not what the clock check compares against: that is
 /// [`MAX_CLOCK_SKEW_MS`].
 pub const RECV_WINDOW_MS: i64 = 5_000;
+
+/// How long the venue's API waits for its matching engine before answering
+/// `-1007`, *"Timeout waiting for response from backend server. Send status
+/// unknown; execution status unknown."* (rest-api.md:102; errors.md:30-31).
+pub const VENUE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`TradeClient::place_order`] and [`TradeClient::cancel_order`]
+/// wait for an answer, from the moment a request starts to connect.
+///
+/// Longer than the venue can take to answer, so that its `-1007` arrives
+/// before this gives up whenever the venue sends one. The outcome is unknown
+/// either way, but `-1007` says the request reached the venue, and a timeout of
+/// our own says nothing. The time an answer can take comes in three parts:
+///
+/// - **Up to [`RECV_WINDOW_MS`] on the way there.** The venue starts on a
+///   request only while it is within `recvWindow` of its `timestamp`
+///   (rest-api.md:225-241), and the timestamp is when the strategy submitted,
+///   before this starts sending. A request that took longer is refused on
+///   arrival, which is quick.
+/// - **Up to [`VENUE_TIMEOUT`] waiting on the matching engine**, after which the
+///   venue answers `-1007`.
+/// - **The answer's way back**, which has the five seconds that remain.
+///
+/// Twenty, then, against the floor of the venue's ten that `docs/live-run.md`
+/// §5 set, and a check at compile time keeps it above the first two parts.
+pub const ORDER_TIMEOUT: Duration = Duration::from_secs(20);
+
+// The point of the number, as arithmetic. At or under the venue's own ten
+// seconds, our timeout races the venue's -1007 and can throw away the one answer
+// that says the venue saw the request; under the window as well, it can do that
+// for a request the venue was still entitled to start on.
+const _: () = assert!(
+    ORDER_TIMEOUT.as_millis()
+        > VENUE_TIMEOUT.as_millis()
+            + Duration::from_millis(RECV_WINDOW_MS.unsigned_abs()).as_millis()
+);
 
 /// How far the host clock may be from the venue's before this refuses to trade.
 ///
@@ -480,6 +547,10 @@ pub struct TradeClient {
     http: reqwest::Client,
     base: String,
     credentials: Credentials,
+    /// How long an order or a cancel waits: [`ORDER_TIMEOUT`], whatever the
+    /// client was built with. Only this module's tests change it, to see a
+    /// timeout without waiting twenty seconds for one.
+    order_timeout: Duration,
 }
 
 impl TradeClient {
@@ -511,7 +582,17 @@ impl TradeClient {
             http,
             base: base.into(),
             credentials,
+            order_timeout: ORDER_TIMEOUT,
         })
+    }
+
+    /// This client, with orders and cancels waiting `timeout` instead of
+    /// [`ORDER_TIMEOUT`]: for a test that needs a timeout to happen, and only
+    /// there. Production has no way to change the number.
+    #[cfg(test)]
+    fn with_order_timeout(mut self, timeout: Duration) -> Self {
+        self.order_timeout = timeout;
+        self
     }
 
     /// The query string for a signed request: the caller's parameters, plus the
@@ -620,6 +701,63 @@ impl TradeClient {
         })
     }
 
+    /// Send `order` to `POST /api/v3/order`, stamped `stamped_at_ms`, and say
+    /// what the answer means for it.
+    ///
+    /// `stamped_at_ms` is when the strategy submitted the order, in
+    /// milliseconds on the venue's clock: the host's wall clock with the
+    /// measured offset taken off, as [`Self::check_ready`] stamps its own
+    /// request. It goes out as the order's `timestamp` unchanged, so that the
+    /// venue refuses an order that waited too long to be sent (module docs).
+    ///
+    /// Sent once, whatever comes back, and never an error: every outcome is a
+    /// [`Placement`], and only [`Placement::NotSent`] says the order certainly
+    /// was not placed. A timed-out order is looked up, never sent again
+    /// (`docs/live-run.md` §5).
+    pub async fn place_order(&self, order: &NewOrder, stamped_at_ms: i64) -> Placement {
+        let sent = self
+            .send_order(reqwest::Method::POST, order.query(), stamped_at_ms)
+            .await;
+        order.classify(sent.attempt())
+    }
+
+    /// Send `cancel` to `DELETE /api/v3/order`, stamped `stamped_at_ms`, and
+    /// say what the answer means. The stamp and the sending are as
+    /// [`Self::place_order`]'s; what an answer means is
+    /// [`CancelOrder::classify`]'s.
+    pub async fn cancel_order(&self, cancel: &CancelOrder, stamped_at_ms: i64) -> CancelReply {
+        let sent = self
+            .send_order(reqwest::Method::DELETE, cancel.query(), stamped_at_ms)
+            .await;
+        cancel.classify(sent.attempt())
+    }
+
+    /// Send a request to [`ORDER_PATH`] once, waiting no longer than
+    /// [`ORDER_TIMEOUT`] for it, and say what the transport saw.
+    async fn send_order(&self, method: reqwest::Method, params: &str, stamped_at_ms: i64) -> Sent {
+        let response = match self
+            .signed_request(method, ORDER_PATH, params, stamped_at_ms)
+            .timeout(self.order_timeout)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => return Sent::unanswered(e),
+        };
+        let status = response.status().as_u16();
+        match response.bytes().await {
+            Ok(body) => Sent::Answered {
+                status,
+                body: body.to_vec(),
+            },
+            // The status arrived, so the request had certainly left this
+            // machine, and an answer whose body broke off says nothing about
+            // what became of it: never a placement, whatever the status.
+            Err(e) if e.is_timeout() => Sent::TimedOut,
+            Err(e) => Sent::Failed(describe(e)),
+        }
+    }
+
     /// Check that the venue accepts this API key and its signature, that our
     /// clock agrees with the venue's, and that the account reports `canTrade`.
     ///
@@ -687,6 +825,59 @@ struct SignedReply {
     status: reqwest::StatusCode,
     retry_after: Option<String>,
     body: Vec<u8>,
+}
+
+/// What became of one order request, as the transport saw it: what an
+/// [`Attempt`] is borrowed from.
+///
+/// The text in [`Sent::NotConnected`] and [`Sent::Failed`] is [`describe`]'s,
+/// which leaves out the URL and with it the signature.
+enum Sent {
+    /// A status, and the whole body.
+    Answered { status: u16, body: Vec<u8> },
+    /// Not a byte of the request left this machine.
+    NotConnected(String),
+    /// No answer before [`ORDER_TIMEOUT`], once the request may have left.
+    TimedOut,
+    /// Any other failure, after the request may have left.
+    Failed(String),
+}
+
+impl Sent {
+    /// A request that got no answer, sorted by whether it can have left.
+    ///
+    /// "Not sent" only for `is_connect`. In `reqwest` 0.12 that holds when
+    /// `hyper-util`'s client failed to make a connection, or to take one from
+    /// its pool, before the request was handed to one: errors of kind
+    /// `Connect` (`hyper-util` 0.1, `client/legacy/client.rs`), which are the
+    /// connector's own failures, DNS, TCP and TLS, and the pool's. It is asked
+    /// before `is_timeout` because an error can be both: a connection timing
+    /// out inside the connector is a connect error, and never carried the
+    /// request. `reqwest`'s own timeout is not a connect error even when it
+    /// fires mid-connect, and is unknown like any other timeout. Everything
+    /// else came after the request may have been written.
+    fn unanswered(e: reqwest::Error) -> Self {
+        if e.is_connect() {
+            Self::NotConnected(describe(e))
+        } else if e.is_timeout() {
+            Self::TimedOut
+        } else {
+            Self::Failed(describe(e))
+        }
+    }
+
+    /// What [`NewOrder::classify`] and [`CancelOrder::classify`] read.
+    fn attempt(&self) -> Attempt<'_> {
+        match self {
+            Self::Answered { status, body } => Attempt::Answered {
+                status: *status,
+                body,
+            },
+            Self::NotConnected(why) => Attempt::NotConnected(why),
+            Self::TimedOut => Attempt::TimedOut,
+            Self::Failed(why) => Attempt::Failed(why),
+        }
+    }
 }
 
 /// Sort a refusal of a signed request by what it means for the operator.
@@ -814,8 +1005,15 @@ mod tests {
         ClockSample, NotReady, TradeClient, VenueError, MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
     };
     use crate::credentials::fixture;
+    use crate::orders::{CancelOrder, CancelReply, NewOrder, Placement, WhyUnknown};
+    use crate::user_data::RunTag;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
+    use quant_core::event::Side;
+    use quant_core::execution::{
+        ClientOrderId, OrderKind, OrderRequest, RejectReason, TimeInForce, VenueOrderId,
+    };
+    use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
     use ring::signature::{UnparsedPublicKey, ED25519};
     use std::time::Duration;
 
@@ -918,8 +1116,14 @@ mod tests {
     /// What [`TestVenue`] does with a request it has read.
     #[derive(Clone)]
     enum Reply {
-        /// Write these bytes and close the connection.
+        /// Write these bytes and close the connection: a whole answer, or one
+        /// cut short.
         Bytes(String),
+        /// The same, after waiting this long: a venue that takes its time.
+        Late(Duration, String),
+        /// Write nothing, and hold the connection open until the venue is
+        /// stopped: a venue that took the request and never answered it.
+        Silence,
     }
 
     /// A test venue on this machine that, unlike [`serve_once`], can be sent
@@ -953,6 +1157,8 @@ mod tests {
             let server = std::thread::spawn(move || {
                 let deadline = Instant::now() + SERVE_DEADLINE;
                 let mut requests = Vec::new();
+                // Connections answered with silence, open until the venue stops.
+                let mut held = Vec::new();
                 while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
@@ -962,6 +1168,11 @@ mod tests {
                                 Some(Reply::Bytes(bytes)) => {
                                     stream.write_all(bytes.as_bytes()).expect("write");
                                 }
+                                Some(Reply::Late(wait, bytes)) => {
+                                    std::thread::sleep(wait);
+                                    stream.write_all(bytes.as_bytes()).expect("write");
+                                }
+                                Some(Reply::Silence) => held.push(stream),
                                 // No replies at all: hang up without a word.
                                 None => {}
                             }
@@ -972,6 +1183,7 @@ mod tests {
                         Err(e) => panic!("accept: {e}"),
                     }
                 }
+                drop(held);
                 requests
             });
             Self {
@@ -1003,8 +1215,9 @@ mod tests {
     /// The payload `request` signed, once the signature it carried has been
     /// checked the way the venue reads one off the wire.
     ///
-    /// The request line's query is split at `&signature=`. What comes before
-    /// is the payload, exactly as sent (rest-api.md:555). What comes after is
+    /// The request line's query, whatever the method, is split at
+    /// `&signature=`. What comes before is the payload, exactly as sent
+    /// (rest-api.md:555). What comes after is
     /// decoded once, as a query string's values are read, `+` to a space and
     /// `%XX` to its byte, and must verify over that payload under the example
     /// key's public half as OpenSSL derives it. A signature encoded twice --
@@ -1015,10 +1228,10 @@ mod tests {
     fn signed_on_the_wire(request: &str) -> &str {
         let line = request.lines().next().unwrap_or_default();
         let (_, query) = line
-            .strip_prefix("GET ")
-            .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
+            .split_once(' ')
+            .and_then(|(_method, rest)| rest.strip_suffix(" HTTP/1.1"))
             .and_then(|target| target.split_once('?'))
-            .unwrap_or_else(|| panic!("not a GET with a query: {line}"));
+            .unwrap_or_else(|| panic!("not a request with a query: {line}"));
         let (payload, sent) = query
             .split_once("&signature=")
             .unwrap_or_else(|| panic!("no signature: {line}"));
@@ -1739,6 +1952,306 @@ mod tests {
                 status: 307,
                 venue: None
             })
+        );
+    }
+
+    /// The documentation's own non-ASCII symbol (rest-api.md:582), whose
+    /// encoded form is all `%`s (rest-api.md:618). An order on it is the one
+    /// whose query a second encoding would change.
+    const NON_ASCII: &str = "１２３４５６";
+
+    /// When the strategy submitted, on the venue's clock: years before any
+    /// run of this test, so a transport that stamped at sending could not
+    /// match it by accident.
+    const STAMP: i64 = 1_700_000_000_000;
+
+    fn on(symbol: &str) -> InstrumentDef {
+        InstrumentDef {
+            exchange: Exchange::Binance,
+            symbol: symbol.to_owned(),
+            base: "BTC".to_owned(),
+            quote: "USDT".to_owned(),
+            kind: InstrumentKind::Spot,
+            tick_size: "0.01".parse().expect("price"),
+            lot_size: "0.00001".parse().expect("quantity"),
+            min_notional: "5".parse().expect("notional"),
+        }
+    }
+
+    fn run() -> RunTag {
+        RunTag::new("r1").expect("a valid tag")
+    }
+
+    /// Our order 7 on `symbol`: a market buy of 0.001, the shape `MaCrossover`
+    /// sends.
+    fn order_on(symbol: &str) -> NewOrder {
+        let instrument = on(symbol);
+        let request = OrderRequest {
+            instrument: InstrumentRegistry::new().register(instrument.clone()),
+            side: Side::Buy,
+            qty: "0.001".parse().expect("quantity"),
+            kind: OrderKind::Market,
+            time_in_force: TimeInForce::Gtc,
+        };
+        NewOrder::encode(&request, ClientOrderId(7), &run(), &instrument).expect("encodes")
+    }
+
+    /// A cancel of our order 7 on `symbol`.
+    fn cancel_on(symbol: &str) -> CancelOrder {
+        CancelOrder::encode(ClientOrderId(7), &run(), &on(symbol)).expect("encodes")
+    }
+
+    /// The documented acknowledgement (rest-api.md:2205-2211), its comment
+    /// removed and its `clientOrderId` made our order 7's.
+    const OUR_ACK: &str = r#"{"symbol":"BTCUSDT","orderId":28,"orderListId":-1,"clientOrderId":"q-r1-7","transactTime":1507725176595}"#;
+
+    /// The documented answer to a cancel (rest-api.md:2410-2427), cut down,
+    /// its `origClientOrderId` made our order 7's.
+    const OUR_CANCEL: &str = r#"{"symbol":"BTCUSDT","origClientOrderId":"q-r1-7","orderId":28,"orderListId":-1,"clientOrderId":"cancelMyOrder1","transactTime":1684804350068,"status":"CANCELED"}"#;
+
+    /// What [`OUR_ACK`] means.
+    fn placed() -> Placement {
+        Placement::Placed {
+            order_id: VenueOrderId("28".to_owned()),
+            client_order_id: "q-r1-7".to_owned(),
+            transact_time_ms: 1_507_725_176_595,
+        }
+    }
+
+    /// Whether `request` carries nothing after its head: no body declared, and
+    /// none sent. The venue signs the query and the body together
+    /// (rest-api.md:555), so with no body the query is the whole of it.
+    fn has_no_body(request: &str) -> bool {
+        let (head, after) = request.split_once("\r\n\r\n").expect("a whole head");
+        let head = head.to_ascii_lowercase();
+        after.is_empty()
+            && !head.contains("\r\ntransfer-encoding:")
+            && !head.contains("\r\ncontent-type:")
+            && head
+                .lines()
+                .filter(|line| line.starts_with("content-length:"))
+                .all(|line| line == "content-length: 0")
+    }
+
+    /// A port on this machine that nothing listens on: bound, and let go.
+    fn closed_port() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    /// That `said` is a description fit for a log: it names neither the URL
+    /// nor anything of the signature `request` carried.
+    fn says_nothing_secret(said: &str, request: &str) {
+        for absent in ["signature", "/api/v3/order", "http://", "timestamp="] {
+            assert!(!said.contains(absent), "{absent:?} in {said}");
+        }
+        if let Some(signature) = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_once("&signature="))
+            .and_then(|(_, rest)| rest.split(' ').next())
+        {
+            for piece in fixture::eight_char_windows(signature) {
+                assert!(!said.contains(piece), "{piece} in {said}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_order_and_a_cancel_go_out_exactly_as_encoded_and_signed() {
+        // Each encoded query holds `%`s, which a second encoding would turn
+        // into `%25`s, and the venue would check the signature against bytes
+        // nobody signed. Each must arrive as encoded, followed by exactly the
+        // caller's stamp and the window, with a signature over all of that,
+        // and no body.
+        let order = order_on(NON_ASCII);
+        let cancel = cancel_on(NON_ASCII);
+        for query in [order.query(), cancel.query()] {
+            assert!(
+                query.contains("%EF%BC%91"),
+                "the fixture must exercise %: {query}"
+            );
+        }
+
+        let venue = TestVenue::start(vec![Reply::Bytes(http("200 OK", "", OUR_ACK))]);
+        let placement = client_at(&venue.base).place_order(&order, STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(
+            requests[0].starts_with("POST /api/v3/order?"),
+            "{}",
+            requests[0]
+        );
+        assert_eq!(
+            signed_on_the_wire(&requests[0]),
+            format!(
+                "{}&timestamp={STAMP}&recvWindow={RECV_WINDOW_MS}",
+                order.query()
+            )
+        );
+        assert!(has_no_body(&requests[0]), "{}", requests[0]);
+        assert_eq!(placement, placed());
+
+        let venue = TestVenue::start(vec![Reply::Bytes(http("200 OK", "", OUR_CANCEL))]);
+        let reply = client_at(&venue.base).cancel_order(&cancel, STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(
+            requests[0].starts_with("DELETE /api/v3/order?"),
+            "{}",
+            requests[0]
+        );
+        assert_eq!(
+            signed_on_the_wire(&requests[0]),
+            format!(
+                "{}&timestamp={STAMP}&recvWindow={RECV_WINDOW_MS}",
+                cancel.query()
+            )
+        );
+        assert!(has_no_body(&requests[0]), "{}", requests[0]);
+        assert_eq!(
+            reply,
+            CancelReply::Acknowledged {
+                order_id: VenueOrderId("28".to_owned())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirected_order_is_unknown_and_never_sent_again() {
+        // The venue redirects once, and would then acknowledge the order: a
+        // client that followed would have placed it, or placed it twice. The
+        // 307 is the answer instead, and settles nothing about either request.
+        let order = order_on("BTCUSDT");
+        let venue = TestVenue::start(vec![
+            Reply::Bytes(redirect("/api/v3/order/elsewhere")),
+            Reply::Bytes(http("200 OK", "", OUR_ACK)),
+        ]);
+        let placement = client_at(&venue.base).place_order(&order, STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(
+            placement,
+            Placement::Unknown {
+                why: WhyUnknown::UnexpectedStatus { http_status: 307 }
+            }
+        );
+
+        let cancel = cancel_on("BTCUSDT");
+        let venue = TestVenue::start(vec![
+            Reply::Bytes(redirect("/api/v3/order/elsewhere")),
+            Reply::Bytes(http("200 OK", "", OUR_CANCEL)),
+        ]);
+        let reply = client_at(&venue.base).cancel_order(&cancel, STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(
+            reply,
+            CancelReply::Unknown {
+                why: WhyUnknown::UnexpectedStatus { http_status: 307 }
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_that_never_connected_was_not_sent() {
+        // A connection refused: not a byte of the request left this machine,
+        // so the order certainly was not placed, and the engine may hear it
+        // as rejected. The one outcome that may say so.
+        let base = closed_port();
+        let client = client_at(&base);
+        let placement = client.place_order(&order_on("BTCUSDT"), STAMP).await;
+        let Placement::NotSent { why } = &placement else {
+            panic!("expected not sent, got {placement:?}")
+        };
+        says_nothing_secret(why, "");
+        assert_eq!(placement.reject_reason(), Some(RejectReason::Venue));
+
+        let reply = client.cancel_order(&cancel_on("BTCUSDT"), STAMP).await;
+        let CancelReply::NotSent { why } = &reply else {
+            panic!("expected not sent, got {reply:?}")
+        };
+        says_nothing_secret(why, "");
+    }
+
+    #[tokio::test]
+    async fn an_order_the_venue_took_and_never_answered_is_unknown() {
+        // The venue read the request, so the order may exist: whatever else
+        // this is, it is never "not sent". The client's own timeout ends the
+        // wait, shortened here so the test does not take twenty seconds.
+        let venue = TestVenue::start(vec![Reply::Silence]);
+        let client = client_at(&venue.base).with_order_timeout(Duration::from_millis(300));
+        let placement = client.place_order(&order_on("BTCUSDT"), STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "the venue had the order: {requests:#?}");
+        assert_eq!(
+            placement,
+            Placement::Unknown {
+                why: WhyUnknown::TimedOut
+            }
+        );
+        assert_eq!(placement.reject_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_cut_short_is_never_a_placement() {
+        // The venue's whole acknowledgement of our order, readable as it
+        // stands, under a Content-Length that promises more than arrives
+        // before the connection closes. A transport that classified what did
+        // arrive would call the order placed, on an answer that broke off.
+        let cut = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{OUR_ACK}",
+            OUR_ACK.len() + 64
+        );
+        let venue = TestVenue::start(vec![Reply::Bytes(cut)]);
+        let placement = client_at(&venue.base)
+            .place_order(&order_on("BTCUSDT"), STAMP)
+            .await;
+        let requests = venue.stop();
+        let Placement::Unknown {
+            why: WhyUnknown::Interrupted(why),
+        } = &placement
+        else {
+            panic!("expected an interrupted answer, got {placement:?}")
+        };
+        // It broke off in the body, after the status had arrived.
+        assert!(why.contains("body"), "{why}");
+        says_nothing_secret(why, &requests[0]);
+    }
+
+    #[tokio::test]
+    async fn an_order_waits_for_the_venue_longer_than_the_client_otherwise_would() {
+        // The venue answers -1007 after its own wait (rest-api.md:102) --
+        // here, after longer than this client waits for anything else. An
+        // order waits for it all the same, so the venue's answer, which says
+        // the request reached it, is what comes back rather than a timeout of
+        // ours, which says nothing. Shortened, both numbers, to keep the test
+        // quick: the order's wait is the longer, as ORDER_TIMEOUT's is.
+        let timeout = r#"{"code":-1007,"msg":"Timeout waiting for response from backend server. Send status unknown; execution status unknown."}"#;
+        let venue = TestVenue::start(vec![Reply::Late(
+            Duration::from_millis(600),
+            http("400 Bad Request", "", timeout),
+        )]);
+        let client = TradeClient::new(
+            venue.base.clone(),
+            Duration::from_millis(200),
+            fixture::example(),
+        )
+        .expect("builds")
+        .with_order_timeout(Duration::from_secs(5));
+        let placement = client.place_order(&order_on("BTCUSDT"), STAMP).await;
+        venue.stop();
+        assert!(
+            matches!(
+                &placement,
+                Placement::Unknown {
+                    why: WhyUnknown::Unsettled { code: -1007, .. }
+                }
+            ),
+            "{placement:?}"
         );
     }
 }

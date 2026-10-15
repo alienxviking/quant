@@ -5,9 +5,13 @@
 //! of `POST /api/v3/order`, and [`CancelOrder::encode`] names an order for
 //! `DELETE /api/v3/order`. Both stop short of `timestamp`, `recvWindow` and
 //! `signature`, which the signer appends, and neither sends anything: that is
-//! the transport's job, wired in a later pull request. What the transport saw
-//! comes back here as an [`Attempt`], and [`NewOrder::classify`] and
-//! [`CancelOrder::classify`] say what it means.
+//! the transport's job, [`TradeClient::place_order`] and
+//! [`TradeClient::cancel_order`]. What the transport saw comes back here as an
+//! [`Attempt`], and [`NewOrder::classify`] and [`CancelOrder::classify`] say
+//! what it means.
+//!
+//! [`TradeClient::place_order`]: crate::trade::TradeClient::place_order
+//! [`TradeClient::cancel_order`]: crate::trade::TradeClient::cancel_order
 //!
 //! Citations are `file:line` in `binance/binance-spot-api-docs` at commit
 //! `0556f1a`. Nothing here has met the real venue yet. The requests are checked
@@ -546,7 +550,9 @@ pub enum Attempt<'a> {
     /// No answer within the client's own timeout, after the request may have
     /// left. `docs/live-run.md` §5 puts that timeout above the venue's ten
     /// seconds (rest-api.md:102), so that the venue's `-1007` arrives first
-    /// when it can.
+    /// when it can: [`ORDER_TIMEOUT`] is the number.
+    ///
+    /// [`ORDER_TIMEOUT`]: crate::trade::ORDER_TIMEOUT
     TimedOut,
     /// Any other failure after the request may have left: a connection reset,
     /// a body that stopped arriving.
