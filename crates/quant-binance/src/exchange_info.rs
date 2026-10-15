@@ -154,14 +154,14 @@
 //!
 //! Everything else stays the venue's own text, never interpreted. So a field
 //! Binance adds to a filter tomorrow is reported rather than ignored, and a field
-//! nothing here uses cannot make an answer unreadable.
+//! nothing here uses cannot make an answer unreadable, whatever it holds.
 //!
-//! No object it reads may name a key twice: the answer, each symbol's entry,
-//! each filter and each rate limit. A map keeps the last of a repeated key's
-//! values and says nothing, which would have the answer choose between two
-//! values where this module refuses to choose between two filters or two
-//! entries. So an object that repeats a key is refused before anything in it
-//! is read, naming the key and neither value.
+//! What can is a key named twice in one object, used here or not: in the
+//! answer, a symbol's entry, a filter or a rate limit. A map keeps the last of
+//! a repeated key's values and says nothing, which would have the answer
+//! choose between two values where this module refuses to choose between two
+//! filters or two entries. So an object that repeats a key is refused before
+//! anything in it is read, naming the key and neither value.
 //!
 //! # What it does not read
 //!
