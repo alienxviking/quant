@@ -188,6 +188,7 @@ impl<W: Write> RawWriter<W> {
             return Err(StorageError::ControlRecordNotInVersion {
                 record: *record,
                 container_version,
+                ingest_seq,
             });
         }
         let payload = record.to_json()?;
@@ -223,6 +224,7 @@ impl<W: Write> RawWriter<W> {
             return Err(StorageError::FrameKindNotInVersion {
                 kind,
                 container_version,
+                ingest_seq,
             });
         }
 

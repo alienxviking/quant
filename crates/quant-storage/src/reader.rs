@@ -289,6 +289,7 @@ impl<R: Read> RawReader<R> {
             return Err(StorageError::FrameKindNotInVersion {
                 kind: header.kind,
                 container_version,
+                ingest_seq: header.ingest_seq,
             });
         }
         self.cursor += FRAME_HEADER_LEN;
@@ -315,6 +316,7 @@ impl<R: Read> RawReader<R> {
                     return Err(StorageError::ControlRecordNotInVersion {
                         record,
                         container_version,
+                        ingest_seq: header.ingest_seq,
                     });
                 }
             }
@@ -1116,6 +1118,7 @@ mod tests {
             Some(Err(StorageError::FrameKindNotInVersion {
                 kind: FrameKind::VenueSnapshot,
                 container_version: 1,
+                ingest_seq: 3,
             })) => {}
             other => panic!("expected the snapshot to be refused, got {other:?}"),
         }
@@ -1176,6 +1179,7 @@ mod tests {
             Some(Err(StorageError::FrameKindNotInVersion {
                 kind: FrameKind::AccountPayload,
                 container_version: 2,
+                ingest_seq: 2,
             })) => {}
             other => panic!("expected the account frame to be refused, got {other:?}"),
         }
@@ -1219,6 +1223,7 @@ mod tests {
             Err(StorageError::FrameKindNotInVersion {
                 kind: FrameKind::VenueSnapshot,
                 container_version: 1,
+                ingest_seq: 1,
             })
         ));
         assert_eq!(writer.last_ingest_seq(), None, "the refusal took nothing");
@@ -1253,6 +1258,7 @@ mod tests {
             Some(Err(StorageError::ControlRecordNotInVersion {
                 record: SNAPSHOT_FAILED,
                 container_version: 1,
+                ingest_seq: 2,
             })) => {}
             other => panic!("expected the snapshot failure to be refused, got {other:?}"),
         }
@@ -1277,6 +1283,7 @@ mod tests {
             Err(StorageError::ControlRecordNotInVersion {
                 record: SNAPSHOT_FAILED,
                 container_version: 1,
+                ingest_seq: 1,
             })
         ));
         assert_eq!(writer.last_ingest_seq(), None, "the refusal took nothing");

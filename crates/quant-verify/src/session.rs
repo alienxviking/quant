@@ -245,18 +245,23 @@ fn verify_segment(
     report.totals.segments += 1;
     let mut misfiled = 0_u64;
     let mut frames = 0_u64;
+    let mut refused = false;
 
     while let Some(frame) = reader.next_frame() {
         let frame = match frame {
             Ok(frame) => frame,
             Err(e) => {
                 // Not a torn tail: the block's checksum passed, so these are
-                // provably our bytes and the writer and reader disagree.
+                // provably our bytes and the writer and reader disagree. Placed
+                // at the frame the reader refused when it can name one, since
+                // that is the frame someone has to go and look at.
+                let seq = e.ingest_seq().or(state.last_seq).unwrap_or(0);
                 report.error(
                     code::CORRUPTION,
-                    at().at_seq(state.last_seq.unwrap_or(0)),
+                    at().at_seq(seq),
                     format!("frame decode failed: {e}"),
                 );
+                refused = true;
                 break;
             }
         };
@@ -286,7 +291,7 @@ fn verify_segment(
         );
     }
 
-    check_closure(&reader, at(), is_last, report);
+    check_closure(&reader, at(), is_last, refused, report);
 
     Some(SegmentOutcome {
         path: segment.display(),
@@ -296,14 +301,20 @@ fn verify_segment(
 }
 
 /// Truncation and trailer: whether the file accounts for itself.
+///
+/// `refused` says the read ended at a frame that would not decode, which the
+/// caller has already reported as corruption.
 fn check_closure<R: std::io::Read>(
     reader: &RawReader<R>,
     at: Where,
     is_last: bool,
+    refused: bool,
     report: &mut Report,
 ) {
+    let mut ended_at_corruption = refused;
     if let Some(truncation) = reader.truncation() {
         if truncation.reason.is_corruption() {
+            ended_at_corruption = true;
             report.error(
                 code::CORRUPTION,
                 at.clone(),
@@ -327,6 +338,15 @@ fn check_closure<R: std::io::Read>(
         }
     }
 
+    // A read that stopped at corruption never reached the end of the file, so
+    // it cannot say whether a trailer is there -- and the file may well have
+    // one. "No trailer" about it would be a second finding, false, and in a
+    // segment before the last an error blaming a writer that moved on without
+    // closing a file it may have closed perfectly well. The corruption is the
+    // finding, and it is already made.
+    if ended_at_corruption {
+        return;
+    }
     if reader.trailer().is_none() {
         if is_last {
             report.warn(
@@ -1175,6 +1195,95 @@ mod tests {
         );
         assert_eq!(report.count(code::NO_TRAILER), 1);
         assert!(!report.is_clean(), "{:#?}", report.findings());
+    }
+
+    /// Rewrite a file's header to claim another container version, checksum
+    /// and all: what a file stamped wrong looks like, since no writer will
+    /// produce one.
+    fn restamp(bytes: &mut [u8], container_version: u16) {
+        let len = quant_storage::FILE_HEADER_LEN;
+        let mut header = FileHeader::decode(&bytes[..len].try_into().unwrap()).unwrap();
+        header.container_version = container_version;
+        bytes[..len].copy_from_slice(&header.encode().unwrap());
+    }
+
+    fn corruption_seq(report: &Report) -> Option<u64> {
+        report
+            .findings()
+            .iter()
+            .find(|f| f.code == code::CORRUPTION)
+            .expect("a corruption finding")
+            .at
+            .ingest_seq
+    }
+
+    #[test]
+    fn a_read_refused_mid_file_is_corruption_and_says_nothing_about_a_trailer() {
+        // A v1-stamped file holding a snapshot: the reader refuses the snapshot
+        // and stops there. The file has a trailer -- it was sealed -- and the
+        // read never reached it, so "no trailer" would be false, and before the
+        // last segment it would be an error blaming the writer for it.
+        let (mut first, next_seq) = Capture::new(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .snapshot(100)
+            .delta(101, 102)
+            .seal();
+        restamp(&mut first, 1);
+        let (second, _) = Capture::continuing(next_seq, DAY_30).delta(103, 104).seal();
+        let report = run(
+            "refused-mid-file",
+            &[(target(29, 0), first), (target(30, 0), second)],
+        );
+        assert_eq!(
+            report.count(code::CORRUPTION),
+            1,
+            "{:#?}",
+            report.findings()
+        );
+        assert_eq!(
+            report.count(code::NO_TRAILER),
+            0,
+            "{:#?}",
+            report.findings()
+        );
+        assert_eq!(
+            corruption_seq(&report),
+            Some(2),
+            "at the snapshot the reader refused, not the gap before it"
+        );
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn a_damaged_block_is_corruption_and_says_nothing_about_a_trailer() {
+        // The same rule for damage the reader reports as a truncation: the read
+        // stopped at a block whose checksum failed, so whether a trailer follows
+        // is unknown, not absent.
+        let (mut first, next_seq) = Capture::new(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .snapshot(100)
+            .delta(101, 102)
+            .seal();
+        let inside_the_first_block =
+            quant_storage::FILE_HEADER_LEN + quant_storage::BLOCK_HEADER_LEN + 2;
+        first[inside_the_first_block] ^= 0xff;
+        let (second, _) = Capture::continuing(next_seq, DAY_30).delta(103, 104).seal();
+        let report = run(
+            "damaged-block",
+            &[(target(29, 0), first), (target(30, 0), second)],
+        );
+        assert_eq!(
+            report.count(code::CORRUPTION),
+            1,
+            "{:#?}",
+            report.findings()
+        );
+        assert_eq!(
+            report.count(code::NO_TRAILER),
+            0,
+            "{:#?}",
+            report.findings()
+        );
     }
 
     #[test]

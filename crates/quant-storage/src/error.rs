@@ -112,6 +112,8 @@ pub enum StorageError {
     FrameKindNotInVersion {
         kind: FrameKind,
         container_version: u16,
+        /// The refused frame's own number, so a report can point at it.
+        ingest_seq: u64,
     },
 
     /// A control record the file's own container version did not have.
@@ -123,6 +125,8 @@ pub enum StorageError {
     ControlRecordNotInVersion {
         record: ControlRecord,
         container_version: u16,
+        /// The refused frame's own number, so a report can point at it.
+        ingest_seq: u64,
     },
 
     /// A control frame's JSON did not parse.
@@ -194,6 +198,7 @@ impl fmt::Display for StorageError {
             Self::FrameKindNotInVersion {
                 kind,
                 container_version,
+                ..
             } => write!(
                 f,
                 "frame kind {} ({kind:?}) arrived in container v{}, but this file says it is \
@@ -204,6 +209,7 @@ impl fmt::Display for StorageError {
             Self::ControlRecordNotInVersion {
                 record,
                 container_version,
+                ..
             } => write!(
                 f,
                 "control record {} arrived in container v{}, but this file says it is \
@@ -213,6 +219,22 @@ impl fmt::Display for StorageError {
             ),
             Self::Json(e) => write!(f, "control record json error: {e}"),
             Self::Compression(msg) => write!(f, "compression error: {msg}"),
+        }
+    }
+}
+
+impl StorageError {
+    /// The sequence number of the frame this error refused, when it names one.
+    ///
+    /// For a reader that stopped mid-file, so a report can point at the frame
+    /// that ended the read rather than at the last one that did not.
+    #[must_use]
+    pub const fn ingest_seq(&self) -> Option<u64> {
+        match self {
+            Self::FrameKindNotInVersion { ingest_seq, .. }
+            | Self::ControlRecordNotInVersion { ingest_seq, .. } => Some(*ingest_seq),
+            Self::NonMonotonicIngestSeq { found, .. } => Some(*found),
+            _ => None,
         }
     }
 }
