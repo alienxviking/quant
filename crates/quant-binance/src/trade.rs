@@ -878,6 +878,7 @@ impl TradeClient {
     /// [`Placement`], and only [`Placement::NotSent`] says the order certainly
     /// was not placed. A timed-out order is looked up, never sent again
     /// (`docs/live-run.md` §5).
+    #[must_use = "an order is sent once, and this is all that says whether it was placed"]
     pub async fn place_order(&self, order: &NewOrder, stamped_at_ms: i64) -> Placement {
         let sent = self
             .send_order(reqwest::Method::POST, order.query(), stamped_at_ms)
@@ -889,6 +890,7 @@ impl TradeClient {
     /// say what the answer means. The stamp and the sending are as
     /// [`Self::place_order`]'s; what an answer means is
     /// [`CancelOrder::classify`]'s.
+    #[must_use = "a cancel is sent once, and this is all that says whether it took effect"]
     pub async fn cancel_order(&self, cancel: &CancelOrder, stamped_at_ms: i64) -> CancelReply {
         let sent = self
             .send_order(reqwest::Method::DELETE, cancel.query(), stamped_at_ms)

@@ -258,7 +258,6 @@ impl NewOrder {
     /// What `attempt`, the transport's account of sending this order, means
     /// for the order. The module docs give the rule, and why it leans the way
     /// it does.
-    #[must_use]
     pub fn classify(&self, attempt: Attempt<'_>) -> Placement {
         match heard(attempt) {
             Heard::Success { http_status, body } => self.acknowledged(http_status, body),
@@ -387,7 +386,6 @@ impl CancelOrder {
 
     /// What `attempt`, the transport's account of sending this cancel, means.
     /// See the module docs.
-    #[must_use]
     pub fn classify(&self, attempt: Attempt<'_>) -> CancelReply {
         match heard(attempt) {
             Heard::Success { http_status, body } => self.acknowledged(http_status, body),
@@ -583,6 +581,7 @@ pub enum Attempt<'a> {
 
 /// What the venue's answer to a new order means for the order.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "an order's only outcome: dropped, a placed or in-doubt order goes untracked"]
 pub enum Placement {
     /// The venue has the order: its acknowledgement (rest-api.md:2203-2212),
     /// naming the id the order was sent under.
@@ -638,6 +637,7 @@ impl Placement {
 /// Never that the order was cancelled: the stream reports how an order ended,
 /// and is the only authority for it (module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a cancel's only outcome: dropped, a cancel in doubt goes untracked"]
 pub enum CancelReply {
     /// The venue took the cancel, for the order the request named
     /// (rest-api.md:2408-2427). The stream will say how the order ended.
