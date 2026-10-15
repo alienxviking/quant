@@ -422,6 +422,25 @@ pub struct Decisions {
 /// Which rule applies is the schema of the session the entry belongs to, read
 /// off the `started` line that began it; entries before any `started` line
 /// are read the old way.
+///
+/// # Filtered by stamp, not cut at the first later one
+///
+/// An entry stamped after the instant is skipped, and reading carries on.
+/// This stopped at the first such entry, which is the same thing only in a
+/// file whose stamps never fall, and `backtest --journal` writes one whose
+/// first line is stamped on the wall clock -- the day the backtest ran, later
+/// than every event it replayed. So the loop stopped at line one, and
+/// `explain --at` over any backtest journal read nothing at all.
+///
+/// **A `started` line is read whatever its stamp**, for its schema only. The
+/// rule a session is read by is on that line, and the session's entries
+/// follow it in the file whatever it is stamped: skip the wall-clock one and
+/// a schema-3 backtest is read by the old inference again, quietly. Its stamp
+/// still decides whether it ends a blindness. A `started` line after the
+/// instant is a restart that had not happened yet, and a session that began
+/// later cannot have ended a blindness at the instant -- in a paper journal
+/// that restarted, that is the restart's own line, and taking it would
+/// report an outage before it as over.
 #[must_use]
 pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
     let from = at.saturating_sub(span);
@@ -435,7 +454,13 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
     for entry in entries {
         let stamp = entry.at().as_nanos();
         if stamp > at {
-            break;
+            // Later than the instant, so not evidence about it; but a
+            // session's schema holds for every line after its `started`,
+            // whenever that line is stamped.
+            if let JournalEntry::Started { schema, .. } = entry {
+                reads_sighted = *schema >= SIGHTED_SINCE;
+            }
+            continue;
         }
         // `Stopped` and the venue's own lines do the same thing, nothing, for
         // different reasons, and the arms are kept apart so each reason stays
@@ -949,6 +974,69 @@ mod tests {
             .blind
             .expect("the outage is on record");
         assert!(recovered, "a schema-2 session keeps the inference");
+    }
+
+    #[test]
+    fn a_started_line_stamped_after_everything_does_not_hide_the_session() {
+        // J12. `backtest --journal` stamps `started` on the wall clock, the
+        // day the backtest ran, which is later than every event it replayed.
+        // Stopping at the first entry after the instant stopped at line one,
+        // and `explain --at` read nothing from any backtest journal.
+        let wall_clock = 1_000_000;
+        let entries = vec![
+            started(wall_clock, 3),
+            submitted(1, 100),
+            disconnect(200),
+            filled_at(300),
+            submitted(2, 350),
+            submitted(3, 5_000),
+        ];
+        let d = decisions_at(&entries, 400, 1_000);
+        assert_eq!(d.within.len(), 2, "both decisions at or before 400");
+        assert!(
+            d.within[0].starts_with("100 submitted #1"),
+            "{:?}",
+            d.within
+        );
+        assert!(
+            d.within[1].starts_with("350 submitted #2"),
+            "{:?}",
+            d.within
+        );
+        let (at, _, recovered) = d.blind.expect("the outage is on record");
+        assert_eq!(at, 200);
+        // The session's schema is read off the wall-clock line though it is
+        // later than the instant: schema 3, so the fill and the submission
+        // after the gap are not the market, and only `sighted` would be.
+        assert!(!recovered, "schema 3 is read off a later-stamped `started`");
+
+        let older = vec![started(wall_clock, 2), disconnect(200), filled_at(300)];
+        let (_, _, recovered) = decisions_at(&older, 400, 1_000)
+            .blind
+            .expect("the outage is on record");
+        assert!(
+            recovered,
+            "and schema 2 by the old rule, from the same line"
+        );
+    }
+
+    #[test]
+    fn a_restart_after_the_instant_does_not_end_a_blindness_before_it() {
+        // The other side of reading every `started` line: one stamped after
+        // the instant gives its schema and nothing else. A paper journal that
+        // restarted holds the restart's line after the outage, and a session
+        // that began later cannot have ended a blindness at the instant.
+        let entries = vec![
+            started(100, 2),
+            disconnect(200),
+            started(5_000, 2),
+            submitted(1, 5_100),
+        ];
+        let (at, _, recovered) = decisions_at(&entries, 400, 100)
+            .blind
+            .expect("the outage before the restart is still the answer");
+        assert_eq!(at, 200);
+        assert!(!recovered, "nothing at or before the instant ended it");
     }
 
     #[test]
