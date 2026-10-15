@@ -139,11 +139,17 @@ impl Default for FeeSchedule {
 /// M4 charged every fee in the quote and named that a simplification. A spot
 /// venue takes its fee out of what the fill *delivered*: a buyer of BTC with
 /// USDT pays in BTC and holds a fraction less than it bought, and a seller pays
-/// in USDT. Equity comes out the same either way but for rounding, which is how
-/// the simplification went unnoticed for four milestones. Where the fee lands
-/// does not. `MaCrossover` exits by selling what it holds rounded down to the
-/// lot, so with fees taken in the base an exit can be a lot smaller than the
-/// entry, and the dust it leaves decides the size of the next. Replaying M5's
+/// in USDT. At the fill the two charge the same value, but for rounding. After
+/// it they part: a fee taken in the base is a quantity of the asset, so what it
+/// costs moves with the price until the position is sold, and any dust it
+/// leaves is worth whatever the price later says. Equity is not the same either
+/// way: over M5's fortnight it ends at 31.70996473 with fees in the asset
+/// received against 31.64743842 in the quote.
+///
+/// Where the fee lands also changes what is traded, not only what it is worth.
+/// `MaCrossover` exits by selling what it holds rounded down to the lot, so
+/// with fees taken in the base an exit can be a lot smaller than the entry, and
+/// the dust it leaves decides the size of the next. Replaying M5's
 /// fortnight that way, 42 of its 412 exits sold 0.00099 rather than 0.001. A
 /// model charging the quote sells 0.001 every time, and gets each of those
 /// wrong.
