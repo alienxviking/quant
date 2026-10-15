@@ -239,7 +239,8 @@ const fn entry_ts(entry: &JournalEntry) -> Option<Ts> {
         | JournalEntry::Foreign { at, .. }
         | JournalEntry::Account { at, .. }
         | JournalEntry::Anomaly { at, .. }
-        | JournalEntry::Stray { at, .. } => Some(*at),
+        | JournalEntry::Stray { at, .. }
+        | JournalEntry::Sighted { at } => Some(*at),
     }
 }
 

@@ -51,7 +51,7 @@ use tracing::error;
 /// strategy that trades less than five times between passes still leaves nothing
 /// new to check, and a hard kill before the fifth fill loses the lot. A
 /// time-based checkpoint would close it and needs a periodic hook the engine
-/// still does not have. `RunObserver` has thirteen methods since M8 slice (c),
+/// still does not have. `RunObserver` has fourteen methods since M8 slice (c),
 /// and every one of them is driven by an *input* -- a market event, a venue's
 /// report or notice, a strategy's decision -- so there is no tick an observer
 /// can see. Since M8 `Engine::run` does wake on a
@@ -557,6 +557,10 @@ impl RunObserver for JournalWriter {
             },
             "an orphaned fill",
         );
+    }
+
+    fn on_sighted(&mut self, at: Ts) {
+        self.record(&JournalEntry::Sighted { at }, "the market's return");
     }
 
     fn on_notice(&mut self, notice: &Notice, at: Ts) {
@@ -1076,6 +1080,20 @@ mod tests {
                 "{report:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_market_s_return_is_a_line() {
+        // The other half of `blind`, and from schema 3 the only evidence a
+        // reader takes that the market came back. A writer that inherited a
+        // silent default would leave every outage open forever.
+        let lines = lines_from("sighted", |writer| writer.on_sighted(Ts::from_nanos(71)));
+        assert_eq!(
+            lines,
+            vec![JournalEntry::Sighted {
+                at: Ts::from_nanos(71)
+            }]
+        );
     }
 
     #[test]

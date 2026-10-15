@@ -468,6 +468,15 @@ pub enum JournalEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         venue_order_id: Option<VenueOrderId>,
     },
+    /// The market came into view: a book went from meaning nothing to
+    /// meaning something, at the first snapshot of a run or the one that
+    /// anchors it again after a gap. Schema 3.
+    ///
+    /// The other half of `blind`, written rather than inferred. Before schema
+    /// 3 a reader took any later line the engine wrote as proof the market was
+    /// back, which holds only while a venue cannot speak without the market:
+    /// a live venue reports on wakes a dark market produces.
+    Sighted { at: Ts },
 }
 
 /// What a `stray` line reported: every kind of order report but a fill.
@@ -504,7 +513,8 @@ impl JournalEntry {
             | Self::Foreign { at, .. }
             | Self::Account { at, .. }
             | Self::Anomaly { at, .. }
-            | Self::Stray { at, .. } => *at,
+            | Self::Stray { at, .. }
+            | Self::Sighted { at } => *at,
         }
     }
 }
@@ -848,7 +858,10 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             | JournalEntry::Anomaly { .. }
             | JournalEntry::Stray { .. }
             // Nothing traded: the venue never had the order.
-            | JournalEntry::NeverLanded { .. } => {}
+            | JournalEntry::NeverLanded { .. }
+            // Seeing the market again is the end of an absence of input, as
+            // `blind` is the start of one.
+            | JournalEntry::Sighted { .. } => {}
             // Money, and not this run's: the `Orphaned` argument below, for an
             // order that is not even ours to lose track of. Folding a
             // stranger's trade would make the recompute disagree with a
@@ -1080,7 +1093,9 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
             | JournalEntry::Foreign { .. }
             | JournalEntry::Account { .. }
             | JournalEntry::Anomaly { .. }
-            | JournalEntry::Stray { .. } => None,
+            | JournalEntry::Stray { .. }
+            // Consumes no id: the market, not a decision.
+            | JournalEntry::Sighted { .. } => None,
         })
         .max()
         .map_or(1, |highest| highest + 1)
@@ -2627,8 +2642,9 @@ mod venue_entry_tests {
 
     const CITED: &str = r#"{"http_status":400,"code":-2011,"msg":"Unknown order sent."}"#;
 
-    /// One line of every entry schema 3 added for a venue, every value
-    /// distinct and none zero, with the JSON each must be.
+    /// One line of every entry schema 3 added as a line of its own (the
+    /// venue's, and the market's return), every value distinct and none zero,
+    /// with the JSON each must be.
     // A table, one row per variant: long because the set is.
     #[allow(clippy::too_many_lines)]
     fn every_venue_entry() -> Vec<(JournalEntry, String)> {
@@ -2747,6 +2763,12 @@ mod venue_entry_tests {
                     venue_order_id: None,
                 },
                 r#"{"type":"stray","at":41,"client_order_id":98,"kind":"rejected"}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Sighted {
+                    at: Ts::from_nanos(43),
+                },
+                r#"{"type":"sighted","at":43}"#.to_owned(),
             ),
         ]
     }

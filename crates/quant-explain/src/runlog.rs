@@ -33,6 +33,9 @@ use std::collections::BTreeMap;
 
 use quant_engine::journal::JournalEntry;
 
+/// The first journal schema whose sessions write `sighted` lines.
+const SIGHTED_SINCE: u32 = 3;
+
 /// What a run log failed to account for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Finding {
@@ -399,28 +402,35 @@ pub struct Decisions {
 /// Same shape as `market_at`'s day rule: ask the narrow question first, widen
 /// only when the narrow answer is the uninformative one.
 ///
-/// # What "seen since" rests on, and where it stops holding
+/// # What "seen since" rests on
 ///
-/// The recovery is inferred, not read: an entry the engine wrote after the
-/// `blind` line is taken to mean the market came back. That inference holds
-/// only while venue reports cannot arrive without a market event. That is
-/// true of `SimulatedVenue`, which reports only from inside `observe`, so it
-/// holds for every journal written so far — backtest and paper.
+/// **From schema 3 it is read**: the engine writes a `sighted` line when a
+/// book goes from meaning nothing to meaning something, and only that ends a
+/// blindness. Since M8.a the engine wakes on a quiet market to hear the venue,
+/// and a live venue's fill delivered during an outage is journalled at its own
+/// later time, with whatever the strategy decides on hearing of it, all after
+/// the `blind` line while the market is still dark. Inferred, that outage
+/// would read as over.
 ///
-/// It stops being true with a live venue. Since M8.a the engine wakes on a
-/// quiet market to hear the venue, and a fill delivered during an outage is
-/// journalled at its own later time, with whatever the strategy decides on
-/// hearing of it — all after the `blind` line, while the market is still dark.
-/// By this rule that outage would read as over. Nothing in the file tells
-/// those entries apart, so the fix belongs to the writer: slice (c)'s
-/// live-journal pull request owes an explicit record of the market's return,
-/// and this function should read that rather than infer it.
+/// **Before schema 3 it is inferred**, because no such line exists: an entry
+/// the engine wrote after the `blind` line is taken to mean the market came
+/// back. That holds while venue reports cannot arrive without a market event,
+/// which is true of `SimulatedVenue`, which reports only from inside
+/// `observe`, and so of every journal written before schema 3: backtest and
+/// paper. The fortnight's journals are read exactly as they always were.
+///
+/// Which rule applies is the schema of the session the entry belongs to, read
+/// off the `started` line that began it; entries before any `started` line
+/// are read the old way.
 #[must_use]
 pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
     let from = at.saturating_sub(span);
     let mut out = Decisions::default();
     let mut blind: Option<(i64, String)> = None;
     let mut seen_since = false;
+    // Whether this session writes `sighted` lines, so that only one of them
+    // is evidence the market came back.
+    let mut reads_sighted = false;
 
     for entry in entries {
         let stamp = entry.at().as_nanos();
@@ -439,9 +449,17 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
             }
             // A restart is a new session; the previous session's blindness is
             // not this one's state.
-            JournalEntry::Started { .. } => {
+            JournalEntry::Started { schema, .. } => {
                 blind = None;
                 seen_since = false;
+                reads_sighted = *schema >= SIGHTED_SINCE;
+            }
+            // The market's return, written down. Schema 3 onward; an older
+            // file has none.
+            JournalEntry::Sighted { .. } => {
+                if blind.is_some() {
+                    seen_since = true;
+                }
             }
             // `Stopped` proves nothing. It is written unconditionally at
             // shutdown and stamped with `stats.last_ts` — which, for a session
@@ -450,7 +468,10 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
             // would make every run that died in an outage report the stream as
             // seen again, which is the one case where saying so is most wrong.
             JournalEntry::Stopped { .. } => {}
-            // Every *other* entry the engine wrote before schema 3 is taken as
+            // In a session that writes `sighted`, none of these is evidence: a
+            // live venue's fill, and whatever the strategy decided on it, land
+            // while the market is dark. In one that does not, every *other*
+            // entry the engine wrote is taken as
             // proof the stream came back. Against a simulated venue the
             // engine's clock only advances on a market event, so a line
             // stamped after the gap was written while handling a later one.
@@ -478,7 +499,7 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
             | JournalEntry::Cancelled { .. }
             | JournalEntry::Orphaned { .. }
             | JournalEntry::Note { .. } => {
-                if blind.is_some() {
+                if blind.is_some() && !reads_sighted {
                     seen_since = true;
                 }
             }
@@ -525,7 +546,8 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
             | JournalEntry::Foreign { .. }
             | JournalEntry::Account { .. }
             | JournalEntry::Anomaly { .. }
-            | JournalEntry::Stray { .. } => {}
+            | JournalEntry::Stray { .. }
+            | JournalEntry::Sighted { .. } => {}
         }
     }
     out.blind = blind.map(|(stamp, cause)| (stamp, cause, seen_since));
@@ -860,6 +882,69 @@ mod tests {
             let (_, _, recovered) = d.blind.expect("the outage is still the answer");
             assert!(!recovered, "{line:?} is not the market");
         }
+    }
+
+    fn started(at: i64, schema: u32) -> JournalEntry {
+        JournalEntry::Started {
+            at: Ts::from_nanos(at),
+            cash: quant_core::Notional::from_raw(0),
+            schema,
+            run: None,
+        }
+    }
+
+    fn filled_at(at: i64) -> JournalEntry {
+        JournalEntry::Filled {
+            at: Ts::from_nanos(at),
+            client_order_id: ClientOrderId(1),
+            instrument: key(),
+            side: Side::Buy,
+            px: "100".parse().expect("px"),
+            qty: "1".parse().expect("qty"),
+            fee: "0.1".parse().expect("fee"),
+            is_maker: false,
+            fee_asset: quant_core::execution::FeeAsset::Quote,
+            remaining: Some("0".parse().expect("qty")),
+            venue_order_id: None,
+            trade_id: None,
+        }
+    }
+
+    fn disconnect(at: i64) -> JournalEntry {
+        JournalEntry::Blind {
+            at: Ts::from_nanos(at),
+            cause: quant_core::event::GapCause::Disconnect,
+            last_good_ts: Ts::from_nanos(at - 10),
+        }
+    }
+
+    #[test]
+    fn from_schema_3_only_a_sighted_line_ends_a_blindness() {
+        // J11. A live venue's fill arrives on a wake the market did not cause,
+        // so in a session that writes `sighted` it is no evidence the market
+        // is back: the inference that served every simulated journal would
+        // read a dark hour with a fill in it as over.
+        let mut entries = vec![started(100, 3), disconnect(200), filled_at(300)];
+        let (_, _, recovered) = decisions_at(&entries, 1_000, 100)
+            .blind
+            .expect("the outage is on record");
+        assert!(!recovered, "a fill is not the market, from schema 3");
+
+        entries.push(JournalEntry::Sighted {
+            at: Ts::from_nanos(400),
+        });
+        let (_, _, recovered) = decisions_at(&entries, 1_000, 100)
+            .blind
+            .expect("the outage is on record");
+        assert!(recovered, "a `sighted` line is");
+
+        // The same lines in a schema-2 session are read the old way, which is
+        // right for them: their venue could not speak without the market.
+        let older = vec![started(100, 2), disconnect(200), filled_at(300)];
+        let (_, _, recovered) = decisions_at(&older, 1_000, 100)
+            .blind
+            .expect("the outage is on record");
+        assert!(recovered, "a schema-2 session keeps the inference");
     }
 
     #[test]
