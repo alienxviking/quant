@@ -109,7 +109,10 @@
 //! A kind belongs to the container version that introduced it, and a file
 //! admits only the kinds its own version had -- see [`FrameKind::since`]. A v2
 //! file holding an account frame is not using a newer feature; no v2 writer
-//! could have written it, so it is reported as the corruption it is.
+//! could have written it, so it is reported as the corruption it is. The same
+//! holds one level in, for the control records a `Control` frame carries: a v1
+//! file holding a `SnapshotFailed` is refused too -- see
+//! [`ControlRecord::since`].
 //!
 //! ## 3. Holes in `ingest_seq` are legal, and they are evidence
 //!

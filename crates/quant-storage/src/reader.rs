@@ -28,8 +28,9 @@ use std::io::{self, Read};
 
 use crate::error::{StorageError, StorageResult};
 use crate::frame::{
-    FileHeader, FileTrailer, FrameHeader, RawFrame, BLOCK_HEADER_LEN, BLOCK_SYNC, FILE_HEADER_LEN,
-    FRAME_HEADER_LEN, MAX_BLOCK_UNCOMPRESSED, TRAILER_LEN, TRAILER_SYNC,
+    ControlRecord, FileHeader, FileTrailer, FrameHeader, FrameKind, RawFrame, BLOCK_HEADER_LEN,
+    BLOCK_SYNC, FILE_HEADER_LEN, FRAME_HEADER_LEN, MAX_BLOCK_UNCOMPRESSED, TRAILER_LEN,
+    TRAILER_SYNC,
 };
 
 /// Why the reader stopped before the end of the file.
@@ -301,6 +302,23 @@ impl<R: Read> RawReader<R> {
         }
         let payload = self.block[self.cursor..self.cursor + payload_len].to_vec();
         self.cursor += payload_len;
+
+        // The kind check above, one level in: a control record the file's version
+        // did not have is refused the same way, here because every consumer reads
+        // through this method. A record that will not decode is passed on rather
+        // than refused -- `RawFrame::control` is where every consumer already
+        // meets that, and this check is about versions, not about JSON. Control
+        // frames are a handful a day, so parsing them twice costs nothing.
+        if header.kind == FrameKind::Control {
+            if let Ok(record) = ControlRecord::from_json(&payload) {
+                if !record.admitted_in(container_version) {
+                    return Err(StorageError::ControlRecordNotInVersion {
+                        record,
+                        container_version,
+                    });
+                }
+            }
+        }
 
         // The write path refuses to emit these out of order, so a violation in a
         // checksum-clean file points at the writer. Checked here as well because
@@ -1206,6 +1224,75 @@ mod tests {
         assert_eq!(writer.last_ingest_seq(), None, "the refusal took nothing");
         assert_eq!(writer.pending_bytes(), 0);
         writer.write_venue_payload(Ts::EPOCH, 1, DEPTH).unwrap();
+    }
+
+    const SNAPSHOT_FAILED: ControlRecord = ControlRecord::SnapshotFailed {
+        purpose: crate::frame::SnapshotPurpose::Resync,
+        reason: crate::frame::SnapshotFailure::Timeout,
+        attempts: 4,
+    };
+
+    #[test]
+    fn a_v1_file_holding_a_snapshot_failure_is_corruption_not_a_newer_feature() {
+        // v2 brought `SnapshotFailed` along with the snapshot kind. The kind of
+        // the frame that carries it is as old as the format, so a check on kinds
+        // alone would read this file as the v1 file it claims to be.
+        let mut writer = RawWriter::create(Vec::new(), header(), WriterOptions::default()).unwrap();
+        writer
+            .write_venue_payload(Ts::from_nanos(T0), 1, DEPTH)
+            .unwrap();
+        writer
+            .write_control(Ts::from_nanos(T0 + 1_000_000), 2, &SNAPSHOT_FAILED)
+            .unwrap();
+        let mut bytes = writer.finish().unwrap().0;
+        restamp(&mut bytes, 1);
+
+        let mut reader = RawReader::open(bytes.as_slice()).expect("v1 is a version we read");
+        assert!(matches!(reader.next_frame(), Some(Ok(f)) if f.kind == FrameKind::VenuePayload));
+        match reader.next_frame() {
+            Some(Err(StorageError::ControlRecordNotInVersion {
+                record: SNAPSHOT_FAILED,
+                container_version: 1,
+            })) => {}
+            other => panic!("expected the snapshot failure to be refused, got {other:?}"),
+        }
+        assert!(reader.next_frame().is_none());
+
+        // The same bytes under the header they were written with read whole.
+        restamp(&mut bytes, 2);
+        let (frames, _) = RawReader::open(bytes.as_slice())
+            .unwrap()
+            .read_all()
+            .expect("a v2 file may hold one");
+        assert_eq!(frames[1].control().unwrap(), Some(SNAPSHOT_FAILED));
+    }
+
+    #[test]
+    fn the_writer_will_not_write_a_control_record_its_header_predates() {
+        let mut old = header();
+        old.container_version = 1;
+        let mut writer = RawWriter::create(Vec::new(), old, WriterOptions::default()).unwrap();
+        assert!(matches!(
+            writer.write_control(Ts::EPOCH, 1, &SNAPSHOT_FAILED),
+            Err(StorageError::ControlRecordNotInVersion {
+                record: SNAPSHOT_FAILED,
+                container_version: 1,
+            })
+        ));
+        assert_eq!(writer.last_ingest_seq(), None, "the refusal took nothing");
+        assert_eq!(writer.pending_bytes(), 0);
+        // A gap record is as old as the format.
+        writer
+            .write_control(
+                Ts::EPOCH,
+                1,
+                &ControlRecord::Gap {
+                    cause: GapCause::RecorderRestart,
+                    exchange_ts: Ts::EPOCH,
+                    last_good_ts: Ts::EPOCH,
+                },
+            )
+            .unwrap();
     }
 
     #[test]

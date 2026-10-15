@@ -40,7 +40,8 @@ pub const MAGIC: [u8; 8] = *b"QUANTRAW";
 ///   than reading most of it and then calling a good file corrupt.
 ///
 /// A reader reads every version up to this one, and a file admits only the
-/// frame kinds its own version had: see [`FrameKind::since`].
+/// frame kinds and control records its own version had: see
+/// [`FrameKind::since`] and [`ControlRecord::since`].
 pub const CONTAINER_VERSION: u16 = 3;
 
 /// Marks the start of a block: ASCII `QRAB`.
@@ -629,6 +630,39 @@ impl ControlRecord {
 
     pub fn from_json(bytes: &[u8]) -> StorageResult<Self> {
         serde_json::from_slice(bytes).map_err(StorageError::Json)
+    }
+
+    /// The record's name on disk: the `type` tag its JSON carries.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Gap { .. } => "gap",
+            Self::SnapshotFailed { .. } => "snapshot_failed",
+        }
+    }
+
+    /// The container version that introduced this record.
+    ///
+    /// The control-record twin of [`FrameKind::since`], for the same reason: a
+    /// `SnapshotFailed` in a v1 file is not a v1 file using a newer feature, it
+    /// is a file no v1 writer produced. v2 brought this record together with
+    /// [`FrameKind::VenueSnapshot`], and checking only the kind would let half
+    /// of what v2 introduced pass under a v1 header.
+    ///
+    /// Exhaustive on purpose: a new record is a compile error here until
+    /// someone says which version brought it.
+    #[must_use]
+    pub const fn since(&self) -> u16 {
+        match self {
+            Self::Gap { .. } => 1,
+            Self::SnapshotFailed { .. } => 2,
+        }
+    }
+
+    /// Whether a file whose header says `container_version` may hold this record.
+    #[must_use]
+    pub const fn admitted_in(&self, container_version: u16) -> bool {
+        self.since() <= container_version
     }
 
     /// Reattach the identity that was deliberately not persisted.

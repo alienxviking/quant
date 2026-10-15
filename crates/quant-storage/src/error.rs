@@ -13,7 +13,7 @@
 use core::fmt;
 use std::io;
 
-use crate::frame::FrameKind;
+use crate::frame::{ControlRecord, FrameKind};
 
 /// Result alias for the raw format.
 pub type StorageResult<T> = Result<T, StorageError>;
@@ -114,6 +114,17 @@ pub enum StorageError {
         container_version: u16,
     },
 
+    /// A control record the file's own container version did not have.
+    ///
+    /// [`Self::FrameKindNotInVersion`] for what is inside a `Control` frame:
+    /// the kind is as old as the format, but `SnapshotFailed` arrived in v2, so
+    /// a v1 file holding one is not what its header claims either. See
+    /// [`ControlRecord::since`].
+    ControlRecordNotInVersion {
+        record: ControlRecord,
+        container_version: u16,
+    },
+
     /// A control frame's JSON did not parse.
     Json(serde_json::Error),
 
@@ -189,6 +200,16 @@ impl fmt::Display for StorageError {
                  v{container_version}: the file is not what its header claims",
                 kind.code(),
                 kind.since()
+            ),
+            Self::ControlRecordNotInVersion {
+                record,
+                container_version,
+            } => write!(
+                f,
+                "control record {} arrived in container v{}, but this file says it is \
+                 v{container_version}: the file is not what its header claims",
+                record.name(),
+                record.since()
             ),
             Self::Json(e) => write!(f, "control record json error: {e}"),
             Self::Compression(msg) => write!(f, "compression error: {msg}"),

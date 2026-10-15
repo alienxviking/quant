@@ -273,9 +273,10 @@ Rules:
   event.
 - **A reader reads every container version up to its own and refuses any later
   one at the header**, however additive the change. And a file admits only the
-  frame kinds its own version had: a v2 file holding a kind-3 frame is not using
-  a newer feature, it is a file no v2 writer could have produced, and it is
-  reported as the corruption it is.
+  frame kinds and control records its own version had: a v2 file holding a
+  kind-3 frame, or a v1 file holding a `SnapshotFailed`, is not using a newer
+  feature, it is a file no writer of that version could have produced, and it
+  is reported as the corruption it is.
 - Breaking changes require a written migration note in this file *and* a
   successful re-derive of the full normalized tier before the old reader is
   removed.
@@ -348,7 +349,10 @@ reader's one check was "refuse newer", so a build read any kind it knew in a
 file of any age, and a v1 file holding a snapshot frame would have read straight
 through. A file now admits only the kinds its own version had
 (`FrameKind::since`), which makes "a v2 file holding kind 3 is corruption" a
-check rather than a hope. The two real v1 captures on the development machine,
+check rather than a hope. The rule covers control records too
+(`ControlRecord::since`): v2 brought `SnapshotFailed` in a frame kind as old as
+the format, so a check on kinds alone would read a v1 file holding one as the
+v1 file it claims to be, and a writer would write it under a v1 header. The two real v1 captures on the development machine,
 from 2026-07-29, hold only kinds 0 and 1, so the rule changes nothing already
 written.
 

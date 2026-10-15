@@ -180,6 +180,16 @@ impl<W: Write> RawWriter<W> {
         ingest_seq: u64,
         record: &ControlRecord,
     ) -> StorageResult<()> {
+        // The record-level twin of the kind check in `write_frame`: a record the
+        // header's version did not have makes a file every reader refuses. See
+        // `ControlRecord::since`.
+        let container_version = self.header.container_version;
+        if !record.admitted_in(container_version) {
+            return Err(StorageError::ControlRecordNotInVersion {
+                record: *record,
+                container_version,
+            });
+        }
         let payload = record.to_json()?;
         self.write_frame(FrameKind::Control, local_recv_ts, ingest_seq, &payload)
     }
