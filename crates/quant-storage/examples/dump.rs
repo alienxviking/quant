@@ -125,8 +125,6 @@ fn dump(path: &str, sample: usize) -> Result<bool, Box<dyn std::error::Error>> {
         }
     );
 
-    // `map_or`, not `is_none_or`: the latter is stable only from 1.82 and the
-    // workspace declares an MSRV of 1.75.
     Ok(explained
         && reader
             .truncation()
@@ -165,7 +163,10 @@ fn scan<R: std::io::Read>(
     sample: usize,
 ) -> Result<Scan, Box<dyn std::error::Error>> {
     let mut scan = Scan::default();
-    let mut sampled = [0_usize; 3];
+    // One count per kind, sized from the kinds rather than written as a number:
+    // a literal here compiled happily when a kind was added and would have
+    // panicked on the first file that held one.
+    let mut sampled = [0_usize; FrameKind::ALL.len()];
 
     while let Some(frame) = reader.next_frame() {
         let frame = frame?;
@@ -180,11 +181,9 @@ fn scan<R: std::io::Read>(
         scan.last_seq = Some(frame.ingest_seq);
 
         // Printed before the counters so the first of each kind is the one shown.
-        let slot = match frame.kind {
-            FrameKind::VenuePayload => 0,
-            FrameKind::VenueSnapshot => 1,
-            FrameKind::Control => 2,
-        };
+        // A kind's code is its place in `FrameKind::ALL`, which quant-storage's
+        // tests hold to every code a reader accepts.
+        let slot = usize::from(frame.kind.code());
         if sampled[slot] < sample {
             sampled[slot] += 1;
             let text = String::from_utf8_lossy(&frame.payload);

@@ -135,6 +135,14 @@ pub enum FrameKind {
 }
 
 impl FrameKind {
+    /// Every kind, in code order: `ALL[n]` is the kind whose code is `n`.
+    ///
+    /// For anything that keeps one of something per kind. Sized by hand, so a
+    /// test holds it to [`FrameKind::from_code`], which is what a reader actually
+    /// accepts: a kind missing from here would be a slot that does not exist, and
+    /// a panic the first time a file holding that kind is read.
+    pub const ALL: [Self; 3] = [Self::VenuePayload, Self::Control, Self::VenueSnapshot];
+
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
@@ -739,6 +747,26 @@ mod tests {
         assert!(FrameKind::VenuePayload.is_venue_bytes());
         assert!(FrameKind::VenueSnapshot.is_venue_bytes());
         assert!(!FrameKind::Control.is_venue_bytes());
+    }
+
+    #[test]
+    fn every_kind_is_listed_once_in_code_order() {
+        // `ALL` sizes whatever keeps one of something per kind -- `dump`'s
+        // samples, for one -- so it is held to `from_code` across every byte a
+        // frame header can hold, not to a list someone remembered to update.
+        for code in 0..=u8::MAX {
+            match FrameKind::from_code(code) {
+                Some(kind) => assert_eq!(
+                    FrameKind::ALL.get(usize::from(code)),
+                    Some(&kind),
+                    "code {code} is read but not listed in its place"
+                ),
+                None => assert!(
+                    usize::from(code) >= FrameKind::ALL.len(),
+                    "code {code} is listed but a reader refuses it"
+                ),
+            }
+        }
     }
 
     #[test]
