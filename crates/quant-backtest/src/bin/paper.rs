@@ -154,6 +154,13 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let resumed = journal::resume(&recovered.entries, &mut registry, traded, args.cash)?;
     let instrument = resumed.instrument;
     let starting = resumed.starting_cash;
+    // The risk layer's tally, recounted from the same journal on the registry
+    // `resume` just made the instrument's own, so the holding lands under the
+    // id the engine trades. Recovering the switch alone would check this
+    // session's first orders as if from flat on a fresh day: an addition to a
+    // real position against nothing, a real exit as the opposite position,
+    // and a loss budget and order count already spent today as unspent.
+    let risk = journal::recover_risk(&recovered.entries, &mut registry, args.limits);
 
     // Built before anything is written, so a size the venue would refuse stops
     // the session here rather than after the journal says one started.
@@ -170,7 +177,7 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         args.interval_secs * 1_000_000_000,
     );
 
-    print_banner(args, &journal_path, &recovered, &resumed);
+    print_banner(args, &journal_path, &recovered, &resumed, &risk);
 
     let journal = Arc::new(Mutex::new(Journal::open(&journal_path)?));
     write(
@@ -210,7 +217,7 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
             instrument,
             registry.get(instrument).expect("just registered").filters(),
         ),
-        RiskEngine::recover(args.limits, resumed.tripped),
+        risk,
         strategy,
         starting,
     )
@@ -301,6 +308,7 @@ fn print_banner(
     journal_path: &std::path::Path,
     recovered: &journal::Recovered,
     resumed: &journal::Resumption,
+    risk: &RiskEngine,
 ) {
     println!("root      {}", args.root.display());
     println!("symbol    {} on {}", args.symbol, Exchange::Binance);
@@ -340,6 +348,17 @@ fn print_banner(
             portfolio.cash(),
             portfolio.fills()
         ),
+    }
+    if resumed.portfolio.is_some() {
+        // What the limits will be judged against, said before the first
+        // order: the holding and today's count and loss the journal recounts
+        // to, by risk's own reckoning rather than the portfolio's.
+        println!(
+            "risk      holding {}, {} orders today, realized {} today",
+            risk.position(resumed.instrument),
+            risk.orders_today(),
+            risk.realized_today()
+        );
     }
     if let Some(cause) = resumed.tripped {
         // Loud, because it means this process will refuse every order until a

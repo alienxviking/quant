@@ -599,9 +599,10 @@ pub enum Divergence {
 /// An empty comparison is the obvious one. A restart is the subtle one, and it
 /// is a *state* problem rather than a reader problem: `JournalEntry` has no
 /// strategy entry and `Engine::resuming` replaces only the portfolio, so a
-/// restarted session comes back with the right cash and empty `MaCrossover`
-/// windows, a zeroed sampler and a zeroed daily risk tally. The replay runs all
-/// of that continuously across the same boundary. Different crossings, different
+/// restarted session comes back with the right cash, and the risk tally
+/// recounted from the journal (`journal::recover_risk`), but with empty
+/// `MaCrossover` windows and a zeroed sampler. The replay runs all of that
+/// continuously across the same boundary. Different crossings, different
 /// decisions, and a diff that would fail for a reason unrelated to the question
 /// being asked. Detected from the file — two `started` entries — and refused up
 /// front rather than reported as a divergence at some arbitrary line.
@@ -1064,9 +1065,9 @@ mod tests {
 
     #[test]
     fn a_restarted_live_side_is_refused_before_anything_is_compared() {
-        // A state problem, not a reader problem: `Engine::resuming` replaces only
-        // the portfolio, so a restarted session returns with empty indicator
-        // windows and a zeroed risk tally while the replay runs straight
+        // A state problem, not a reader problem: a restarted session returns
+        // with the portfolio and the risk tally the journal recounts to, and
+        // with empty indicator windows, while the replay runs straight
         // through. The comparison would fail for a reason unrelated to the
         // question, so it is refused rather than reported as a divergence.
         let started = |at: i64| JournalEntry::Started {

@@ -167,16 +167,14 @@ fn diff(live: &std::path::Path, replay: &std::path::Path) -> ExitCode {
                 "verdict   CANNOT COMPARE: the live side holds {started} `started` entries, so \
                  it restarted"
             );
+            println!("          A restart forfeits the exact match. The journal brings back the");
             println!(
-                "          A restart forfeits the exact match. `Engine::resuming` replaces only"
+                "          portfolio and the risk tally but not the strategy, so the session came"
             );
             println!(
-                "          the portfolio, so the session came back with empty indicator windows"
+                "          back with empty indicator windows while the replay ran straight through."
             );
-            println!(
-                "          and a zeroed risk tally while the replay ran straight through. Compare"
-            );
-            println!("          the segments between restarts instead.");
+            println!("          Compare the segments between restarts instead.");
             ExitCode::from(2)
         }
     }

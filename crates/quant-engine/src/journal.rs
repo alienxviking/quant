@@ -1460,6 +1460,129 @@ fn last_trip(entries: &[JournalEntry]) -> Option<crate::risk::TripCause> {
     })
 }
 
+/// The risk layer a restarted session resumes with: the switch a previous
+/// session threw, and the holdings and the day's counters it had reached.
+///
+/// [`RiskEngine::recover`] brings back the switch alone, so a restart that
+/// stopped there checked an addition to a real position as if from flat,
+/// refused a real exit as if it opened the opposite position, and handed the
+/// strategy a fresh loss budget and order count for a day it had already
+/// spent -- the fresh budget the never-backwards day rule exists to refuse an
+/// NTP step. This recounts the rest from what the earlier process wrote down,
+/// the way it counted it then:
+///
+/// - `submitted`: an order the check passed, so [`RiskEngine::recount`] rolls
+///   the day and counts it;
+/// - `refused` by the risk layer: the check ran and rolled the day, and did
+///   not count it;
+/// - `filled`: [`RiskLayer::on_fill`], which moves the holding and the day's
+///   realized P&L, fees included, as it did live.
+///
+/// Every other line does nothing, each listed by name. A new UTC day in the
+/// file resets the counters and never the switch, exactly as it did live.
+///
+/// Call it after [`resume`], on the registry `resume` registered the session's
+/// instrument in, so the holdings land under the id the engine trades: the
+/// tally is indexed by instrument id, and an instrument this registry does
+/// not hold is registered here with placeholder rules, as [`replay`] does.
+///
+/// Its limits are the caller's, today's, and not the ones the earlier process
+/// ran under, which the journal does not hold. The counts are facts about the
+/// day; whether they now bind is a question for the limits in force.
+#[must_use]
+pub fn recover_risk(
+    entries: &[JournalEntry],
+    registry: &mut InstrumentRegistry,
+    limits: crate::risk::Limits,
+) -> crate::risk::RiskEngine {
+    use crate::risk::RiskLayer as _;
+
+    let mut risk = crate::risk::RiskEngine::recover(limits, last_trip(entries));
+    for entry in entries {
+        // Exhaustive, with no `_` arm, for `replay`'s reason: a line added to
+        // the journal does not build here until somebody has decided whether
+        // the risk layer counted it. Arms that do the same thing for different
+        // reasons are kept apart so each reason stays written down.
+        #[allow(clippy::match_same_arms)]
+        match entry {
+            // The check passed it, and counted it, and rolled the day first.
+            JournalEntry::Submitted { at, .. } => risk.recount(*at, true),
+            JournalEntry::Refused { at, by, .. } => match by {
+                // The check ran, rolled the day, and turned it away uncounted.
+                RefusedBy::Risk => risk.recount(*at, false),
+                // Never reached the check: the seam is before it, and so is
+                // the venue's readiness.
+                RefusedBy::Seam | RefusedBy::Venue(_) => {}
+                // Before the check, latched; or after it, the one order whose
+                // write-ahead failed, which did spend a count. That one is
+                // never on file: the writer that withheld it writes nothing
+                // more, and a writer that keeps writing never withholds.
+                RefusedBy::Record => {}
+            },
+            // Every field named, as `replay`'s arm does, so the next field is
+            // a decision here too.
+            JournalEntry::Filled {
+                at,
+                client_order_id: _,
+                instrument,
+                side,
+                px,
+                qty,
+                fee,
+                is_maker,
+                fee_asset,
+                remaining: _,
+                venue_order_id: _,
+                trade_id: _,
+            } => {
+                let id = resolve(registry, instrument);
+                risk.on_fill(
+                    id,
+                    *side,
+                    &Fill {
+                        px: *px,
+                        qty: *qty,
+                        fee: *fee,
+                        is_maker: *is_maker,
+                        fee_asset: *fee_asset,
+                    },
+                    *at,
+                );
+            }
+            // Read above, by `last_trip`, which keeps it across every restart.
+            JournalEntry::Tripped { .. } => {}
+            // Money nobody attributed, and money that is not this run's: the
+            // engine never showed either to the risk layer, so neither is
+            // counted now. `replay` leaves them out for the same reason.
+            JournalEntry::Orphaned { .. } | JournalEntry::Foreign { .. } => {}
+            // The session's own bookkeeping, the market, the strategy talking
+            // about itself, and the venue's claim about the account: nothing
+            // the risk layer counts.
+            JournalEntry::Started { .. }
+            | JournalEntry::Checkpoint { .. }
+            | JournalEntry::Stopped { .. }
+            | JournalEntry::Blind { .. }
+            | JournalEntry::Sighted { .. }
+            | JournalEntry::Note { .. }
+            | JournalEntry::Balances { .. } => {}
+            // The lifecycle after a decision: the order was counted when it
+            // was submitted, and only its fills move what risk holds.
+            JournalEntry::Accepted { .. }
+            | JournalEntry::Rejected { .. }
+            | JournalEntry::CancelRequested { .. }
+            | JournalEntry::Cancelled { .. }
+            | JournalEntry::Placed { .. }
+            | JournalEntry::NeverLanded { .. }
+            | JournalEntry::Doubt { .. }
+            | JournalEntry::CancelRefused { .. }
+            | JournalEntry::Account { .. }
+            | JournalEntry::Anomaly { .. }
+            | JournalEntry::Stray { .. } => {}
+        }
+    }
+    risk
+}
+
 /// Find or register an instrument by its persisted identity.
 fn resolve(registry: &mut InstrumentRegistry, key: &InstrumentKey) -> InstrumentId {
     use quant_core::instrument::InstrumentKind;
@@ -2085,6 +2208,222 @@ mod tests {
             resumed.next_order_id, 3,
             "ids carry on from the journal's rather than starting again at 1"
         );
+    }
+
+    const DAY: i64 = 86_400 * 1_000_000_000;
+    /// Midnight, UTC, of an arbitrary day D.
+    const D: i64 = 20_700 * DAY;
+
+    fn at(day: i64, second: i64) -> Ts {
+        Ts::from_nanos(day + second * 1_000_000_000)
+    }
+
+    fn submitted_at(id: u64, ts: Ts) -> JournalEntry {
+        JournalEntry::Submitted {
+            at: ts,
+            client_order_id: ClientOrderId(id),
+            instrument: key(),
+            side: Side::Buy,
+            qty: "1".parse().expect("qty"),
+            limit: None,
+            mark: None,
+        }
+    }
+
+    fn fill_at(id: u64, ts: Ts, side: Side, px: &str, qty: &str) -> JournalEntry {
+        JournalEntry::Filled {
+            at: ts,
+            client_order_id: ClientOrderId(id),
+            instrument: key(),
+            side,
+            px: px.parse().expect("px"),
+            qty: qty.parse().expect("qty"),
+            fee: Notional::ZERO,
+            is_maker: false,
+            fee_asset: quant_core::execution::FeeAsset::Quote,
+            remaining: Some(Qty::ZERO),
+            venue_order_id: None,
+            trade_id: None,
+        }
+    }
+
+    /// Day D: two orders, buy 10 at 100 and sell 1 at 80. Nine held, and 20
+    /// lost on the one sold.
+    fn day_d() -> Vec<JournalEntry> {
+        vec![
+            JournalEntry::Started {
+                at: at(D, 0),
+                cash: amount("10000"),
+                schema: SCHEMA,
+                run: None,
+            },
+            submitted_at(1, at(D, 1)),
+            fill_at(1, at(D, 2), Side::Buy, "100", "10"),
+            submitted_at(2, at(D, 3)),
+            fill_at(2, at(D, 4), Side::Sell, "80", "1"),
+        ]
+    }
+
+    /// What a restarted session recovers, on the registry `resume` leaves.
+    fn recovered(
+        entries: &[JournalEntry],
+        limits: crate::risk::Limits,
+    ) -> (crate::risk::RiskEngine, InstrumentId) {
+        let mut registry = InstrumentRegistry::new();
+        let resumed = resume(entries, &mut registry, btcusdt(), amount("10000")).expect("resumes");
+        (
+            recover_risk(entries, &mut registry, limits),
+            resumed.instrument,
+        )
+    }
+
+    fn market(
+        instrument: InstrumentId,
+        side: Side,
+        qty: &str,
+    ) -> quant_core::execution::OrderRequest {
+        quant_core::execution::OrderRequest {
+            instrument,
+            side,
+            qty: qty.parse().expect("qty"),
+            kind: quant_core::execution::OrderKind::Market,
+            time_in_force: quant_core::execution::TimeInForce::Gtc,
+        }
+    }
+
+    const MARK: Option<Px> = Some(Px::from_raw(100 * quant_core::SCALE));
+
+    #[test]
+    fn a_restart_recounts_the_day_s_orders_loss_and_holding() {
+        // J10. `RiskEngine::recover` brought back the switch and nothing
+        // else, so each of these checked a restarted session as if from flat
+        // on a fresh day. Every assertion below goes the other way under it.
+        use crate::risk::{Bound, Limits, RiskLayer as _, TripCause};
+
+        let (risk, id) = recovered(&day_d(), Limits::default());
+        assert_eq!(risk.orders_today(), 2);
+        assert_eq!(risk.realized_today(), amount("-20"));
+        assert_eq!(risk.position(id), "9".parse().expect("qty"));
+        assert_eq!(risk.tripped(), None, "a recount judges nothing");
+
+        let after = at(D, 5);
+        let (mut risk, id) = recovered(
+            &day_d(),
+            Limits {
+                max_daily_loss: Some(amount("10")),
+                ..Limits::default()
+            },
+        );
+        let refused = risk.check(&market(id, Side::Buy, "1"), MARK, after);
+        assert_eq!(refused.and_then(|r| r.bound), Some(Bound::DailyLoss));
+        assert_eq!(risk.tripped(), Some(TripCause::DailyLoss));
+
+        let (mut risk, id) = recovered(
+            &day_d(),
+            Limits {
+                max_orders_per_day: Some(2),
+                ..Limits::default()
+            },
+        );
+        let refused = risk.check(&market(id, Side::Buy, "1"), MARK, after);
+        assert_eq!(refused.and_then(|r| r.bound), Some(Bound::OrderCount));
+
+        // Nine held is 900 against a limit of 500. Selling seven of them only
+        // shrinks the holding, so it is exempt; buying one more adds to it.
+        let limits = Limits {
+            max_position_notional: Some(amount("500")),
+            ..Limits::default()
+        };
+        let (mut risk, id) = recovered(&day_d(), limits);
+        assert_eq!(
+            risk.check(&market(id, Side::Sell, "7"), MARK, after),
+            None,
+            "a real exit is an exit, not a short of seven"
+        );
+        let (mut risk, id) = recovered(&day_d(), limits);
+        let refused = risk.check(&market(id, Side::Buy, "1"), MARK, after);
+        assert_eq!(
+            refused.and_then(|r| r.bound),
+            Some(Bound::PositionNotional),
+            "an addition is checked against the nine held, not against nothing"
+        );
+    }
+
+    #[test]
+    fn a_new_day_in_the_journal_resets_the_counters_and_never_the_switch() {
+        // J10 across midnight. The recount rolls the day as the live check
+        // did, never back: D's two orders and its loss are not D+1's, and a
+        // switch thrown on D is still thrown on D+1.
+        let mut entries = day_d();
+        entries.push(submitted_at(3, at(D + DAY, 1)));
+        entries.push(fill_at(3, at(D + DAY, 2), Side::Buy, "100", "1"));
+        let (risk, id) = recovered(&entries, crate::risk::Limits::default());
+        assert_eq!(risk.orders_today(), 1, "D+1's one order, not D's three");
+        assert_eq!(risk.realized_today(), Notional::ZERO, "D's loss stays on D");
+        assert_eq!(
+            risk.position(id),
+            "10".parse().expect("qty"),
+            "a holding is not daily"
+        );
+
+        // A risk refusal rolled the day too, before it turned the order away.
+        let mut entries = day_d();
+        entries.push(refused_at(
+            3,
+            at(D + DAY, 1),
+            crate::risk::Bound::OrderNotional,
+        ));
+        let (risk, _) = recovered(&entries, crate::risk::Limits::default());
+        assert_eq!(risk.orders_today(), 0, "the refusal on D+1 rolled the day");
+        assert_eq!(risk.realized_today(), Notional::ZERO);
+
+        // A refusal before the check -- the seam, the venue's readiness --
+        // never reached it, so it counted nothing and rolled nothing.
+        let mut entries = day_d();
+        for (id, by) in [
+            (3, RefusedBy::Seam),
+            (4, RefusedBy::Venue(crate::Unready::StreamDown)),
+        ] {
+            entries.push(JournalEntry::Refused {
+                at: at(D + DAY, 1),
+                client_order_id: ClientOrderId(id),
+                instrument: key(),
+                side: Side::Buy,
+                qty: "1".parse().expect("qty"),
+                reason: RejectReason::Venue,
+                bound: None,
+                by,
+            });
+        }
+        let (risk, _) = recovered(&entries, crate::risk::Limits::default());
+        assert_eq!(risk.orders_today(), 2, "still D's two: the check never ran");
+        assert_eq!(risk.realized_today(), amount("-20"));
+
+        // Thrown on D, and the new day resets the counters and not the switch.
+        let mut entries = day_d();
+        entries.push(JournalEntry::Tripped {
+            at: at(D, 5),
+            cause: crate::risk::TripCause::OrderCount,
+        });
+        entries.push(refused_at(3, at(D, 5), crate::risk::Bound::OrderCount));
+        entries.push(refused_at(4, at(D + DAY, 1), crate::risk::Bound::Tripped));
+        let (risk, _) = recovered(&entries, crate::risk::Limits::default());
+        assert_eq!(risk.tripped(), Some(crate::risk::TripCause::OrderCount));
+        assert_eq!(risk.orders_today(), 0);
+        assert_eq!(risk.realized_today(), Notional::ZERO);
+    }
+
+    fn refused_at(id: u64, ts: Ts, bound: crate::risk::Bound) -> JournalEntry {
+        JournalEntry::Refused {
+            at: ts,
+            client_order_id: ClientOrderId(id),
+            instrument: key(),
+            side: Side::Buy,
+            qty: "1".parse().expect("qty"),
+            reason: RejectReason::RiskLimit,
+            bound: Some(bound),
+            by: RefusedBy::Risk,
+        }
     }
 
     #[test]
