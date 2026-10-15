@@ -376,7 +376,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`); the rest is the pull requests below |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`); the rest is the pull requests below |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -425,14 +425,32 @@ feature.
    (web-socket-api.md:1067, :1177), so its payload is pinned and its signature
    can only be checked by a round trip.
 
-   The credentials half is `m8c-ed25519-credentials`: the Ed25519 key read from
-   the environment; one signer, shared by REST and the WebSocket API, that
-   reproduces the FIX vector; the REST query percent-encoded as
+   The credentials half is `m8c-ed25519-credentials` (#58): the Ed25519 key
+   read from the environment; one signer, shared by REST and the WebSocket API,
+   that reproduces the FIX vector; the REST query percent-encoded as
    rest-api.md:644-650 shows and verified as it went over the wire; the
    WebSocket API signer `session.logon` needs; and `venue-check` on the new key.
-   The requests half follows, and with it `POST /api/v3/order/test` (`TRADE`,
-   weight 1, rest-api.md:2321-2333), the probe that tests the key's permission
-   to trade, which `venue-check`'s `USER_DATA` request cannot.
+
+   The requests half landed in two. `m8c-order-encoding` (#59) is the encoder
+   and the classifier, `quant-binance::orders`. `m8c-order-transport` sends
+   them, `TradeClient::place_order` and `cancel_order`, and enforces four things
+   the classifier depends on, each pinned by a test seen red: the encoded query
+   goes out verbatim with an empty body, no redirect is followed, *not sent* is
+   claimed only for a connection never made, and an order waits
+   `ORDER_TIMEOUT`, 20 s, above the venue's ten plus `recvWindow`, so that the
+   venue's `-1007` arrives first. With it `venue-check` proves the key's
+   permission to trade with `POST /api/v3/order/test` (`TRADE`, weight 1,
+   rest-api.md:2321-2333), which its `USER_DATA` request could not. READY needs
+   the venue to accept that probe, the run's own order, outright: any refusal of
+   it, a filter failure included, is NOT READY, because the run's orders would
+   meet it. And it refuses READY while the account pays its fees in BNB: the
+   translator books a fee only in the pair's base or quote asset, so on a pair
+   without BNB it would refuse every fill whose fee was taken in BNB, and the
+   run procedure turns the discount off.
+
+   **The code for item 1 is done.** What remains is meeting the venue, on Spot
+   Testnet first: none of it has met Binance yet, and the testnet rehearsal
+   (§5) is its first real test, before any order on the live venue.
 2. **The instrument comes from the venue.** `exchangeInfo` parsed into an
    `InstrumentDef`, naming the venue rules our `Filters` do not model
    (`MARKET_LOT_SIZE`, `applyMinToMarket`, `maxNotional`). Accepted when the
@@ -529,24 +547,34 @@ thing to find out now than on the afternoon of the run.
 `docs/machine-move.md` covers moving the artifacts between the two, and why the
 3.2 GB normalized tier is rebuilt rather than copied.
 
-Slice (b) is runnable today with no money at risk: `venue-check` makes one
-signed `GET /api/v3/account`, which exercises the API key, the Ed25519
-signature, the header and the clock in a single round trip, reads `canTrade`, and
-places nothing. It prints the loaded key's public half to compare with the one
-registered, names why a refusal was refused, and with `--testnet` checks a Spot
-Testnet pair instead (§5). What it does not exercise is the key's permission to
-trade. The account endpoint is `USER_DATA`, and *"by default, an API key cannot
+`venue-check` is runnable today with no money at risk: it makes three signed
+requests and places nothing. `GET /api/v3/account` exercises the API key, the
+Ed25519 signature, the header and the clock in a single round trip and reads
+`canTrade`. That endpoint is `USER_DATA`, and *"by default, an API key cannot
 `TRADE`"* until trading is enabled for it in API Management, so a key without
-that permission comes back READY; and the venue never defines `canTrade`, so
-reading it settles nothing about the key. A `TRADE` request is what tests the
-permission: `POST /api/v3/order/test`, which validates an order without sending
-it to the matching engine at weight 1, comes with the requests half of slice
-(c) (§4). Under slice (b)'s HMAC secret, a wrong secret came back HTTP 401,
-which is the venue's auth layer answering — proof the request was well formed
-enough to be judged on its credentials rather than its shape. The Ed25519 key
-has not met the venue yet: on 2026-10-15 this host's clock, 2.4 s ahead of Spot
-Testnet's, stopped `venue-check` before it signed anything, so its first run
-after the clock is fixed, with a testnet pair, is the signer's first real test.
+that permission passes it, and the venue never defines `canTrade`. So
+`POST /api/v3/order/test`, a `TRADE` request at weight 1 that validates a market
+buy without sending it to the matching engine, is what proves the permission,
+and READY needs it to accept the probe outright. The probe is the run's own
+order, a market buy of the run's symbol at the run's size, and nothing else of
+`venue-check`'s reaches the request, so any refusal of it is one the run's orders
+would meet. A filter failure is NOT READY and names the filter, whether that
+filter judges the order's numbers or the account's open orders and position
+(filters.md:217-219, :253-260, :331-333). Such a refusal also suggests the key
+may trade, since the venue judged the order, but only on a reading of the
+documentation that the Spot Testnet rehearsal has to confirm
+(`TradeClient::check_trade_permission`), and READY never rests on it.
+`GET /api/v3/account/commission` then checks that the account does not pay its
+fees in BNB. READY means all three passed. It prints the loaded key's public
+half to compare with the one registered, names why a refusal was refused, and
+with `--testnet` checks a Spot Testnet pair instead (§5). Under slice (b)'s
+HMAC secret, a wrong secret came back HTTP 401, which is the venue's auth layer
+answering — proof the request was well formed enough to be judged on its
+credentials rather than its shape. The Ed25519 key has not met the venue yet:
+on 2026-10-15 this host's clock, 2.4 s ahead of Spot Testnet's, stopped
+`venue-check` before it signed anything, so its first run after the clock is
+fixed, with a testnet pair, is the first real test of the signer and of the
+probe.
 
 Slice (a) is first and is not negotiable: it is a seam change, every slice after
 it depends on the guarantee, and it is the one thing that can be built and tested
@@ -721,7 +749,8 @@ rejection is terminal and removes the order from the engine's ledger, so the rea
 fill arriving a second later would be booked as an orphan and never reach the
 portfolio. Loud and stuck is the safe failure, and recording carries on
 throughout. The client's own timeout sits above the venue's ten seconds, so the
-venue's `-1007` arrives first when it can.
+venue's `-1007` arrives first when it can: 20 s, `ORDER_TIMEOUT` in
+`quant-binance::trade`, which says why twenty.
 
 **Venue facts reach the journal and never the strategy.** Criterion A needs the
 venue's order and trade ids, orphans from other runs, other people's trades on

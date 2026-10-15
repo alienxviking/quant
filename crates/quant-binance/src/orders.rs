@@ -5,9 +5,13 @@
 //! of `POST /api/v3/order`, and [`CancelOrder::encode`] names an order for
 //! `DELETE /api/v3/order`. Both stop short of `timestamp`, `recvWindow` and
 //! `signature`, which the signer appends, and neither sends anything: that is
-//! the transport's job, wired in a later pull request. What the transport saw
-//! comes back here as an [`Attempt`], and [`NewOrder::classify`] and
-//! [`CancelOrder::classify`] say what it means.
+//! the transport's job, [`TradeClient::place_order`] and
+//! [`TradeClient::cancel_order`]. What the transport saw comes back here as an
+//! [`Attempt`], and [`NewOrder::classify`] and [`CancelOrder::classify`] say
+//! what it means.
+//!
+//! [`TradeClient::place_order`]: crate::trade::TradeClient::place_order
+//! [`TradeClient::cancel_order`]: crate::trade::TradeClient::cancel_order
 //!
 //! Citations are `file:line` in `binance/binance-spot-api-docs` at commit
 //! `0556f1a`. Nothing here has met the real venue yet. The requests are checked
@@ -163,6 +167,16 @@ use crate::user_data::RunTag;
 /// `DELETE` cancels one (rest-api.md:2380-2384).
 pub const ORDER_PATH: &str = "/api/v3/order";
 
+/// Where a new order goes to be checked and not placed: `POST` to it
+/// *"Creates and validates a new order but does not send it into the matching
+/// engine"* (rest-api.md:2321-2326). It takes every parameter
+/// `POST /api/v3/order` takes (rest-api.md:2337), so a [`NewOrder`]'s query is
+/// its query too. [`TradeClient::check_trade_permission`] sends one there, and
+/// is the one thing that sends anything there.
+///
+/// [`TradeClient::check_trade_permission`]: crate::trade::TradeClient::check_trade_permission
+pub const ORDER_TEST_PATH: &str = "/api/v3/order/test";
+
 /// A new order, written as the parameters of `POST /api/v3/order`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewOrder {
@@ -244,7 +258,6 @@ impl NewOrder {
     /// What `attempt`, the transport's account of sending this order, means
     /// for the order. The module docs give the rule, and why it leans the way
     /// it does.
-    #[must_use]
     pub fn classify(&self, attempt: Attempt<'_>) -> Placement {
         match heard(attempt) {
             Heard::Success { http_status, body } => self.acknowledged(http_status, body),
@@ -373,7 +386,6 @@ impl CancelOrder {
 
     /// What `attempt`, the transport's account of sending this cancel, means.
     /// See the module docs.
-    #[must_use]
     pub fn classify(&self, attempt: Attempt<'_>) -> CancelReply {
         match heard(attempt) {
             Heard::Success { http_status, body } => self.acknowledged(http_status, body),
@@ -503,6 +515,18 @@ impl Query {
     }
 }
 
+/// `name=value`, the value percent-encoded as every parameter here is, for a
+/// signed request that is not an order: the `symbol` that
+/// [`TradeClient::check_bnb_discount_off`] asks about. The same encoder as an
+/// order's, so a symbol goes out spelled the same way in both.
+///
+/// [`TradeClient::check_bnb_discount_off`]: crate::trade::TradeClient::check_bnb_discount_off
+pub(crate) fn param(name: &str, value: &str) -> String {
+    let mut query = Query::default();
+    query.push(name, value);
+    query.0
+}
+
 /// Append `value` to `out`, percent-encoded.
 ///
 /// RFC 3986's unreserved characters pass unchanged, which are exactly the ones
@@ -546,7 +570,9 @@ pub enum Attempt<'a> {
     /// No answer within the client's own timeout, after the request may have
     /// left. `docs/live-run.md` §5 puts that timeout above the venue's ten
     /// seconds (rest-api.md:102), so that the venue's `-1007` arrives first
-    /// when it can.
+    /// when it can: [`ORDER_TIMEOUT`] is the number.
+    ///
+    /// [`ORDER_TIMEOUT`]: crate::trade::ORDER_TIMEOUT
     TimedOut,
     /// Any other failure after the request may have left: a connection reset,
     /// a body that stopped arriving.
@@ -555,6 +581,7 @@ pub enum Attempt<'a> {
 
 /// What the venue's answer to a new order means for the order.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "an order's only outcome: dropped, a placed or in-doubt order goes untracked"]
 pub enum Placement {
     /// The venue has the order: its acknowledgement (rest-api.md:2203-2212),
     /// naming the id the order was sent under.
@@ -610,6 +637,7 @@ impl Placement {
 /// Never that the order was cancelled: the stream reports how an order ended,
 /// and is the only authority for it (module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a cancel's only outcome: dropped, a cancel in doubt goes untracked"]
 pub enum CancelReply {
     /// The venue took the cancel, for the order the request named
     /// (rest-api.md:2408-2427). The stream will say how the order ended.
@@ -791,6 +819,18 @@ impl FilterName {
             .iter()
             .find(|(_, filter)| *filter == self)
             .map(|&(spelling, _)| spelling)
+    }
+
+    /// The filter a refusal's message names when it is a *"Filter failure:
+    /// NAME"* (errors.md:425-446), and `None` for any other message. A name
+    /// the documentation does not have is still a filter failure, of
+    /// [`FilterName::Unrecognised`].
+    ///
+    /// The one reading of that message, for the order classifier and for
+    /// `venue-check`'s probe alike.
+    #[must_use]
+    pub fn in_message(msg: &str) -> Option<Self> {
+        msg.strip_prefix(FILTER_FAILURE).map(Self::parse)
     }
 }
 
@@ -1041,8 +1081,8 @@ fn names_a_duplicate(msg: &str) -> bool {
 /// by a character is still a refusal, as [`RefusalCause::Declined`], with the
 /// message kept; it just names no cause this module knows.
 fn declined_because(msg: &str) -> RefusalCause {
-    if let Some(name) = msg.strip_prefix(FILTER_FAILURE) {
-        return RefusalCause::Filter(FilterName::parse(name));
+    if let Some(filter) = FilterName::in_message(msg) {
+        return RefusalCause::Filter(filter);
     }
     match msg {
         INSUFFICIENT_BALANCE => RefusalCause::InsufficientBalance,
@@ -2252,6 +2292,33 @@ mod tests {
             placement_class(&ours().classify(answered(400, &unheard_of))),
             Class::Refused(RefusalCause::Filter(FilterName::Unrecognised))
         );
+    }
+
+    #[test]
+    fn only_a_filter_failure_names_a_filter() {
+        // The prefix decides, exactly as errors.md:428-446 writes it; what
+        // follows it is the filter, known or not.
+        assert_eq!(
+            FilterName::in_message("Filter failure: NOTIONAL"),
+            Some(FilterName::Notional)
+        );
+        assert_eq!(
+            FilterName::in_message("Filter failure: SOMETHING_NEW"),
+            Some(FilterName::Unrecognised)
+        );
+        // Every other message under the same codes (errors.md:374-413) names
+        // no filter, and nor does a near miss of the prefix.
+        for msg in [
+            "Market is closed.",
+            "Account has insufficient balance for requested action.",
+            "Duplicate order sent.",
+            "This account may not place or cancel orders.",
+            "filter failure: NOTIONAL",
+            "Filter failure NOTIONAL",
+            "",
+        ] {
+            assert_eq!(FilterName::in_message(msg), None, "{msg:?}");
+        }
     }
 
     #[test]

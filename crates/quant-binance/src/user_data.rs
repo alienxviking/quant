@@ -295,8 +295,8 @@ pub enum ReportError {
     /// orders.
     Unsupported(&'static str),
     /// A commission taken in an asset that is neither side of the pair, which
-    /// is what paying fees in BNB does. The run procedure switches that off;
-    /// this is what notices if it was not.
+    /// is what paying fees in BNB does on a pair without BNB. The run
+    /// procedure switches that off; this is what notices if it was not.
     UnknownFeeAsset { asset: String, amount: String },
     /// A commission with no asset named.
     FeeWithoutAsset(String),

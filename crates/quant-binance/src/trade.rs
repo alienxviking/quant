@@ -29,10 +29,43 @@
 //! offering to accept staler requests; the thing it protects against is an order
 //! sitting in a retry queue and arriving long after the decision that produced
 //! it, which is exactly the failure a live engine must not have.
+//!
+//! # Sending an order
+//!
+//! [`TradeClient::place_order`] and [`TradeClient::cancel_order`] are the
+//! transport [`crate::orders`] leaves to this module. They send what the
+//! encoder wrote, once, and hand what came back to its classifier, which can be
+//! no more right than the account of the attempt it is given. Four things
+//! decide that, and each is enforced here and pinned by a test rather than left
+//! to care:
+//!
+//! - **The query goes out exactly as it was encoded and signed**, with
+//!   `timestamp`, `recvWindow` and `signature` after it and the body empty
+//!   (`signed_request` says why).
+//! - **No redirect is followed**, by any request this client makes
+//!   ([`TradeClient::new`] says why). A 3xx reaches the classifier, which calls
+//!   it unknown.
+//! - **"Not sent" is claimed only when nothing left.** It is the one outcome
+//!   that proves an order was not placed, so it is claimed only for an error
+//!   `reqwest` reports as a failure to connect: a name that would not resolve,
+//!   a connection refused, a TLS handshake that failed, all before a byte of
+//!   the request was written. A timeout, and any other failure, a body that
+//!   broke off after its status arrived included, may have followed a request
+//!   the venue received, and leaves the outcome unknown.
+//! - **The client waits longer than the venue does**, so that the venue's own
+//!   answer to a slow matching engine arrives first: [`ORDER_TIMEOUT`].
+//!
+//! The timestamp is the caller's: when the strategy submitted the order, on the
+//! venue's clock. The transport does not restamp it. `recvWindow` exists to
+//! refuse an order that sat in a queue, and a stamp taken at sending would hide
+//! the queue from it.
 
 use std::time::Duration;
 
 use crate::credentials::Credentials;
+use crate::orders::{
+    Attempt, CancelOrder, CancelReply, FilterName, NewOrder, Placement, ORDER_PATH, ORDER_TEST_PATH,
+};
 use crate::rest::SnapshotError;
 
 /// The `recvWindow` sent with every signed request, in milliseconds.
@@ -47,6 +80,42 @@ use crate::rest::SnapshotError;
 /// It is not what the clock check compares against: that is
 /// [`MAX_CLOCK_SKEW_MS`].
 pub const RECV_WINDOW_MS: i64 = 5_000;
+
+/// How long the venue's API waits for its matching engine before answering
+/// `-1007`, *"Timeout waiting for response from backend server. Send status
+/// unknown; execution status unknown."* (rest-api.md:102; errors.md:30-31).
+pub const VENUE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`TradeClient::place_order`] and [`TradeClient::cancel_order`]
+/// wait for an answer, from the moment a request starts to connect.
+///
+/// Longer than the venue can take to answer, so that its `-1007` arrives
+/// before this gives up whenever the venue sends one. The outcome is unknown
+/// either way, but `-1007` says the request reached the venue, and a timeout of
+/// our own says nothing. The time an answer can take comes in three parts:
+///
+/// - **Up to [`RECV_WINDOW_MS`] on the way there.** The venue starts on a
+///   request only while it is within `recvWindow` of its `timestamp`
+///   (rest-api.md:225-241), and the timestamp is when the strategy submitted,
+///   before this starts sending. A request that took longer is refused on
+///   arrival, which is quick.
+/// - **Up to [`VENUE_TIMEOUT`] waiting on the matching engine**, after which the
+///   venue answers `-1007`.
+/// - **The answer's way back**, which has the five seconds that remain.
+///
+/// Twenty, then, against the floor of the venue's ten that `docs/live-run.md`
+/// §5 set, and a check at compile time keeps it above the first two parts.
+pub const ORDER_TIMEOUT: Duration = Duration::from_secs(20);
+
+// The point of the number, as arithmetic. At or under the venue's own ten
+// seconds, our timeout races the venue's -1007 and can throw away the one answer
+// that says the venue saw the request; under the window as well, it can do that
+// for a request the venue was still entitled to start on.
+const _: () = assert!(
+    ORDER_TIMEOUT.as_millis()
+        > VENUE_TIMEOUT.as_millis()
+            + Duration::from_millis(RECV_WINDOW_MS.unsigned_abs()).as_millis()
+);
 
 /// How far the host clock may be from the venue's before this refuses to trade.
 ///
@@ -268,17 +337,117 @@ pub enum NotReady {
     /// an order with *"This account may not place or cancel orders"*, for which
     /// the venue's remedy is its customer support (errors.md:388). A key's own
     /// permission to `TRADE` is a separate setting, in API Management
-    /// (rest-api.md:194-196), and the `USER_DATA` request this check makes
-    /// cannot test it: see [`TradeClient::check_ready`]. Either way this stops
+    /// (rest-api.md:194-196), which the `USER_DATA` request
+    /// [`TradeClient::check_ready`] makes cannot test and
+    /// [`TradeClient::check_trade_permission`] does. Either way this stops
     /// here rather than finding out from an order.
     CannotTrade,
     /// The venue answered 200, but not with the account document this reads.
     /// Which way it was not is said; what it held is not, because it lists the
     /// account's balances.
     UnreadableAccount(AccountFault),
+    /// The venue refused this API key a `TRADE` request: HTTP 401 whatever
+    /// the body says, or `-2015`, *"Invalid API-key, IP, or permissions for
+    /// action"* (errors.md:341-342), under any status but those that decide
+    /// first (see [`Self::BadCredentials`]). The key may not trade: trading is
+    /// not enabled for it in API Management, where a key cannot `TRADE` until
+    /// it is (rest-api.md:194-196), or its IP restriction leaves this address
+    /// out. From [`TradeClient::check_trade_permission`].
+    KeyCannotTrade {
+        status: u16,
+        venue: Option<VenueError>,
+    },
+    /// The venue judged the trade probe and refused it for a reason other
+    /// than a filter: `-1013` or `-2010` with any message but a filter
+    /// failure (errors.md:367-413). The venue named a reason it refuses an
+    /// order, and an order of the run's may meet it too. From
+    /// [`TradeClient::check_trade_permission`].
+    ///
+    /// That the venue judged the order at all suggests it accepted the
+    /// signature and the key's permission to trade, and the reason says so,
+    /// as a reading the Spot Testnet rehearsal must confirm.
+    ProbeRefused { status: u16, venue: VenueError },
+    /// The venue refused the trade probe on a filter: `-1013` or `-2010`
+    /// with *"Filter failure: NAME"* (errors.md:425-446). The probe is the
+    /// run's own order ([`TradeClient::check_trade_permission`]), so the
+    /// run's orders would meet the same filter, and that holds for both
+    /// kinds there are: the filters that judge an order's numbers, and those
+    /// that judge the account, its open orders on the symbol or on the
+    /// exchange and its position in the base asset (filters.md:217-219,
+    /// :253-260, :331-333; errors.md:436-446). `filter` is the one the venue
+    /// cited.
+    ///
+    /// Read for the key's permission as [`Self::ProbeRefused`] is.
+    ProbeFiltered {
+        status: u16,
+        filter: FilterName,
+        venue: VenueError,
+    },
+    /// The venue answered the trade probe with a 2xx, and not with the JSON
+    /// object documented for it (rest-api.md:2349-2353).
+    UnreadableOrderTest { status: u16 },
+    /// The account pays its fees in BNB at a discount: its commission rates
+    /// report `discount.enabledForAccount` true (rest-api.md:4841-4842). The
+    /// user-data translator books a fee only in the pair's base or quote
+    /// asset (`crate::user_data`), so on a pair without BNB it refuses a fill
+    /// whose fee was taken in BNB rather than book it as either, and the run
+    /// procedure turns the discount off. From
+    /// [`TradeClient::check_bnb_discount_off`].
+    BnbDiscountOn,
+    /// The venue answered 200, but not with the commission rates this reads.
+    /// Which way it was not is said; what it held is not, because it holds
+    /// the account's rates.
+    UnreadableCommission(CommissionFault),
+    /// The venue answered a signed request with a success status, and the
+    /// body was cut short: it broke off, or did not finish arriving within the
+    /// client's timeout. The venue was reached, so this is not
+    /// [`Self::Unreachable`], and what it said is not known, because nothing
+    /// is read from part of an answer. `why` says which, without the URL.
+    AnswerCutShort { status: u16, why: String },
     /// We could not reach the venue at all.
     Unreachable(String),
 }
+
+/// How a 200 answer to `GET /api/v3/account/commission` failed to be the
+/// document [`TradeClient::check_bnb_discount_off`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommissionFault {
+    /// The body is not JSON.
+    NotJson,
+    /// There is no `discount.enabledForAccount`.
+    NoDiscountFlag,
+    /// `discount.enabledForAccount` is neither `true` nor `false`.
+    DiscountFlagNotBool,
+}
+
+impl core::fmt::Display for CommissionFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::NotJson => "the body is not JSON",
+            Self::NoDiscountFlag => "the body has no discount.enabledForAccount field",
+            Self::DiscountFlagNotBool => "discount.enabledForAccount is neither true nor false",
+        })
+    }
+}
+
+/// Where an account's commission rates for one symbol are read:
+/// `GET /api/v3/account/commission`, `USER_DATA`, weight 20
+/// (rest-api.md:4797-4813).
+const COMMISSION_PATH: &str = "/api/v3/account/commission";
+
+/// What a refusal of the trade probe's order suggests about the signature and
+/// the key's permission to trade, and on what footing, said the same way
+/// wherever one is reported. [`TradeClient::check_trade_permission`] gives the
+/// documentation behind it.
+///
+/// A reading, and never a reason to be ready: only a probe the venue accepts
+/// outright is.
+const A_VERDICT_SUGGESTS_PERMISSION: &str = "That the venue judged the order at all suggests \
+     it accepted the signature and this key's permission to trade, because it judges an order \
+     only for a request whose signature and key it has accepted for trading, and refuses one \
+     that fails either with a code of its own, -1022 or -2015. That is a reading of its \
+     documentation, which does not state the order of its checks, and the Spot Testnet \
+     rehearsal must confirm it";
 
 /// The venue's own account of a refusal: its error document,
 /// `{"code": -2015, "msg": "..."}` (errors.md:3-10).
@@ -373,6 +542,80 @@ fn fmt_rate_limited(
     }
 }
 
+/// [`NotReady::ProbeFiltered`], said: the filter the venue cited, by its name
+/// when this knows it, and why it stops the run as well as the probe.
+fn fmt_probe_filtered(
+    f: &mut core::fmt::Formatter<'_>,
+    status: u16,
+    filter: FilterName,
+    venue: &VenueError,
+) -> core::fmt::Result {
+    match filter.as_str() {
+        Some(name) => write!(f, "the venue refused the trade probe on its {name} filter")?,
+        None => f.write_str(
+            "the venue refused the trade probe on a filter this does not know, which its message \
+             names",
+        )?,
+    }
+    write!(
+        f,
+        " (HTTP {status}{}). The probe is the run's own order, so the run's own orders would meet \
+         the same filter, whether it judges the order's numbers or the account's open orders or \
+         position. {A_VERDICT_SUGGESTS_PERMISSION}",
+        Said(Some(venue)),
+    )
+}
+
+/// [`NotReady::TooFewClockReadings`], said: how many came back, how many of
+/// those were unusable and why, and why one is not enough when one did come
+/// back.
+fn fmt_too_few_readings(
+    f: &mut core::fmt::Formatter<'_>,
+    attempts: usize,
+    came_back: usize,
+    usable: usize,
+) -> core::fmt::Result {
+    write!(
+        f,
+        "{came_back} of {attempts} readings of the venue's clock came back"
+    )?;
+    if usable < came_back {
+        write!(
+            f,
+            ", {} with a round trip that ran backwards (the host clock stepped while it was being \
+             read)",
+            came_back.saturating_sub(usable)
+        )?;
+    }
+    write!(
+        f,
+        ", and this will not judge the clock on fewer than {MIN_CLOCK_READINGS} usable ones"
+    )?;
+    if usable > 0 {
+        // Why not judge on what there is: the question a reading that did
+        // come back invites.
+        f.write_str(
+            ": a lone reading may be the cold one, its outbound leg carrying the connection's \
+             DNS, TCP and TLS, which no midpoint corrects",
+        )?;
+    }
+    Ok(())
+}
+
+/// [`NotReady::CannotTrade`], said. A constant, as [`BNB_DISCOUNT_ON`] is, to
+/// keep `NotReady`'s `fmt` within clippy's length limit.
+const CANNOT_TRADE: &str = "the venue accepted the key and the signature, and the account \
+     reports canTrade false. The venue does not define the field. If this account's trading \
+     ability is disabled, the venue's remedy is its customer support; this API key's own \
+     permission to trade is a separate setting, in Binance's API Management";
+
+/// [`NotReady::BnbDiscountOn`], said.
+const BNB_DISCOUNT_ON: &str = "the account pays its fees in BNB at a discount \
+     (discount.enabledForAccount is true). The live path's translator of the account stream books \
+     a fee only in the pair's base or quote asset, so on a pair without BNB it refuses every fill \
+     whose fee was taken in BNB, and the run procedure turns the discount off: switch paying fees \
+     in BNB off for this account before trading";
+
 impl core::fmt::Display for NotReady {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -391,34 +634,7 @@ impl core::fmt::Display for NotReady {
                 attempts,
                 came_back,
                 usable,
-            } => {
-                write!(
-                    f,
-                    "{came_back} of {attempts} readings of the venue's clock came back"
-                )?;
-                if usable < came_back {
-                    write!(
-                        f,
-                        ", {} with a round trip that ran backwards (the host clock stepped while \
-                         it was being read)",
-                        came_back.saturating_sub(*usable)
-                    )?;
-                }
-                write!(
-                    f,
-                    ", and this will not judge the clock on fewer than {MIN_CLOCK_READINGS} usable \
-                     ones"
-                )?;
-                if *usable > 0 {
-                    // Why not judge on what there is: the question a reading
-                    // that did come back invites.
-                    f.write_str(
-                        ": a lone reading may be the cold one, its outbound leg carrying the \
-                         connection's DNS, TCP and TLS, which no midpoint corrects",
-                    )?;
-                }
-                Ok(())
-            }
+            } => fmt_too_few_readings(f, *attempts, *came_back, *usable),
             Self::BadCredentials { status, venue } => write!(
                 f,
                 "the venue refused the credentials (HTTP {status}{}). The API key, the signature \
@@ -453,16 +669,47 @@ impl core::fmt::Display for NotReady {
                 "the venue refused a signed request (HTTP {status}{})",
                 Said(venue.as_ref()),
             ),
-            Self::CannotTrade => f.write_str(
-                "the venue accepted the key and the signature, and the account reports canTrade \
-                 false. The venue does not define the field. If this account's trading ability is \
-                 disabled, the venue's remedy is its customer support; this API key's own \
-                 permission to trade is a separate setting, in Binance's API Management",
-            ),
+            Self::CannotTrade => f.write_str(CANNOT_TRADE),
             Self::UnreadableAccount(fault) => write!(
                 f,
                 "the venue answered 200, but {fault}. Nothing of the body is printed: it lists \
                  the account's balances"
+            ),
+            Self::KeyCannotTrade { status, venue } => write!(
+                f,
+                "the venue refused this API key a TRADE request (HTTP {status}{}), so the key \
+                 may not trade. Either trading is not enabled for it in Binance's API \
+                 Management, where a key cannot TRADE until it is, or its IP restriction leaves \
+                 this address out",
+                Said(venue.as_ref()),
+            ),
+            Self::ProbeRefused { status, venue } => write!(
+                f,
+                "the venue refused the trade probe for a reason other than a filter (HTTP \
+                 {status}{}), and an order of the run's may meet the same refusal. \
+                 {A_VERDICT_SUGGESTS_PERMISSION}",
+                Said(Some(venue)),
+            ),
+            Self::ProbeFiltered {
+                status,
+                filter,
+                venue,
+            } => fmt_probe_filtered(f, *status, *filter, venue),
+            Self::UnreadableOrderTest { status } => write!(
+                f,
+                "the venue answered the trade probe with HTTP {status}, but not with the JSON \
+                 object documented for it, so whether this key may trade is not shown"
+            ),
+            Self::BnbDiscountOn => f.write_str(BNB_DISCOUNT_ON),
+            Self::UnreadableCommission(fault) => write!(
+                f,
+                "the venue answered 200 to the commission rates request, but {fault}. Nothing of \
+                 the body is printed: it holds the account's commission rates"
+            ),
+            Self::AnswerCutShort { status, why } => write!(
+                f,
+                "the venue answered HTTP {status} and the body was cut short ({why}), so what it \
+                 said is not known. The venue was reached: try again"
             ),
             Self::Unreachable(why) => write!(f, "could not reach the venue: {why}"),
         }
@@ -480,6 +727,10 @@ pub struct TradeClient {
     http: reqwest::Client,
     base: String,
     credentials: Credentials,
+    /// How long an order or a cancel waits: [`ORDER_TIMEOUT`], whatever the
+    /// client was built with. Only this module's tests change it, to see a
+    /// timeout without waiting twenty seconds for one.
+    order_timeout: Duration,
 }
 
 impl TradeClient {
@@ -498,6 +749,12 @@ impl TradeClient {
         let http = reqwest::Client::builder()
             .timeout(request_timeout)
             .pool_idle_timeout(Duration::from_secs(300))
+            // Never follow a redirect, for any request this client makes.
+            // `reqwest` follows up to ten by default, and following a 307 or
+            // 308 sends the same request again, to wherever the answer points:
+            // for an order, a second order. Unfollowed, the 3xx is the answer,
+            // and what reads it can only call it unknown or refused.
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("quant-live/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| SnapshotError::Transport(e.to_string()))?;
@@ -505,7 +762,17 @@ impl TradeClient {
             http,
             base: base.into(),
             credentials,
+            order_timeout: ORDER_TIMEOUT,
         })
+    }
+
+    /// This client, with orders and cancels waiting `timeout` instead of
+    /// [`ORDER_TIMEOUT`]: for a test that needs a timeout to happen, and only
+    /// there. Production has no way to change the number.
+    #[cfg(test)]
+    fn with_order_timeout(mut self, timeout: Duration) -> Self {
+        self.order_timeout = timeout;
+        self
     }
 
     /// The query string for a signed request: the caller's parameters, plus the
@@ -540,35 +807,65 @@ impl TradeClient {
         params: &str,
         now_millis: i64,
     ) -> Result<Vec<u8>, SnapshotError> {
-        let reply = self.send_signed_get(path, params, now_millis).await?;
+        let reply = self
+            .send_signed(reqwest::Method::GET, path, params, now_millis)
+            .await
+            .map_err(|failure| match failure {
+                SignedFailure::Unanswered(e) | SignedFailure::CutShort { cause: e, .. } => e,
+            })?;
         if !reply.status.is_success() {
             return Err(SnapshotError::Status(reply.status.as_u16()));
         }
         Ok(reply.body)
     }
 
-    /// Send a signed GET and return whatever the venue answered, refusals
-    /// included, so that a refusal can be read for what it says.
-    async fn send_signed_get(
+    /// A signed request to `path`, stamped `stamped_at_ms`: the caller's
+    /// parameters and the signer's, all in the URL's query, and no body.
+    ///
+    /// The one place a signed request is built, so that every one of them is
+    /// built alike. The URL is formatted with the query exactly as it was
+    /// signed. It is not built up with `reqwest`'s `.query()`, which encodes
+    /// what it is given, and given a query already encoded would turn each `%`
+    /// into `%25`. Nothing goes in the body: the venue signs the query string
+    /// and the body concatenated (rest-api.md:555), and with the body empty
+    /// those are one string, the one signed.
+    fn signed_request(
         &self,
+        method: reqwest::Method,
         path: &str,
         params: &str,
-        now_millis: i64,
-    ) -> Result<SignedReply, SnapshotError> {
+        stamped_at_ms: i64,
+    ) -> reqwest::RequestBuilder {
         let url = format!(
             "{}{path}?{}",
             self.base.trim_end_matches('/'),
-            self.signed_query(params, now_millis)
+            self.signed_query(params, stamped_at_ms)
         );
-        let response = self
-            .http
-            .get(url)
+        self.http
+            .request(method, url)
             // The API key identifies the account and travels in the header;
             // the private key never leaves `Credentials`.
             .header("X-MBX-APIKEY", self.credentials.key())
+    }
+
+    /// Send a signed request and return whatever the venue answered, refusals
+    /// included, so that a refusal can be read for what it says.
+    ///
+    /// A success whose body did not arrive whole is [`SignedFailure::CutShort`],
+    /// not a reply: nothing is read from part of an answer, and not
+    /// [`SignedFailure::Unanswered`] either, because the venue did answer.
+    async fn send_signed(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        params: &str,
+        now_millis: i64,
+    ) -> Result<SignedReply, SignedFailure> {
+        let response = self
+            .signed_request(method, path, params, now_millis)
             .send()
             .await
-            .map_err(transport_error)?;
+            .map_err(|e| SignedFailure::Unanswered(transport_error(e)))?;
         let status = response.status();
         let retry_after = response
             .headers()
@@ -581,14 +878,81 @@ impl TradeClient {
             // arrive: say what the status says rather than that the venue
             // could not be reached.
             Err(_) if !status.is_success() => Vec::new(),
-            Err(e) if e.is_timeout() => return Err(SnapshotError::Timeout),
-            Err(e) => return Err(SnapshotError::Body(describe(e))),
+            Err(e) => {
+                return Err(SignedFailure::CutShort {
+                    status: status.as_u16(),
+                    cause: if e.is_timeout() {
+                        SnapshotError::Timeout
+                    } else {
+                        SnapshotError::Body(describe(e))
+                    },
+                })
+            }
         };
         Ok(SignedReply {
             status,
             retry_after,
             body,
         })
+    }
+
+    /// Send `order` to `POST /api/v3/order`, stamped `stamped_at_ms`, and say
+    /// what the answer means for it.
+    ///
+    /// `stamped_at_ms` is when the strategy submitted the order, in
+    /// milliseconds on the venue's clock: the host's wall clock with the
+    /// measured offset taken off, as [`Self::check_ready`] stamps its own
+    /// request. It goes out as the order's `timestamp` unchanged, so that the
+    /// venue refuses an order that waited too long to be sent (module docs).
+    ///
+    /// Sent once, whatever comes back, and never an error: every outcome is a
+    /// [`Placement`], and only [`Placement::NotSent`] says the order certainly
+    /// was not placed. A timed-out order is looked up, never sent again
+    /// (`docs/live-run.md` §5).
+    #[must_use = "an order is sent once, and this is all that says whether it was placed"]
+    pub async fn place_order(&self, order: &NewOrder, stamped_at_ms: i64) -> Placement {
+        let sent = self
+            .send_order(reqwest::Method::POST, order.query(), stamped_at_ms)
+            .await;
+        order.classify(sent.attempt())
+    }
+
+    /// Send `cancel` to `DELETE /api/v3/order`, stamped `stamped_at_ms`, and
+    /// say what the answer means. The stamp and the sending are as
+    /// [`Self::place_order`]'s; what an answer means is
+    /// [`CancelOrder::classify`]'s.
+    #[must_use = "a cancel is sent once, and this is all that says whether it took effect"]
+    pub async fn cancel_order(&self, cancel: &CancelOrder, stamped_at_ms: i64) -> CancelReply {
+        let sent = self
+            .send_order(reqwest::Method::DELETE, cancel.query(), stamped_at_ms)
+            .await;
+        cancel.classify(sent.attempt())
+    }
+
+    /// Send a request to [`ORDER_PATH`] once, waiting no longer than
+    /// [`ORDER_TIMEOUT`] for it, and say what the transport saw.
+    async fn send_order(&self, method: reqwest::Method, params: &str, stamped_at_ms: i64) -> Sent {
+        let response = match self
+            .signed_request(method, ORDER_PATH, params, stamped_at_ms)
+            .timeout(self.order_timeout)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => return Sent::unanswered(e),
+        };
+        let status = response.status().as_u16();
+        match response.bytes().await {
+            Ok(body) => Sent::Answered {
+                status,
+                body: body.to_vec(),
+            },
+            // The status arrived, so the request had certainly left this
+            // machine, and an answer whose body broke off says nothing about
+            // what became of it: never a placement, whatever the status.
+            Err(e) if e.is_timeout() => Sent::TimedOut,
+            Err(e) => Sent::Failed(describe(e)),
+        }
     }
 
     /// Check that the venue accepts this API key and its signature, that our
@@ -607,9 +971,7 @@ impl TradeClient {
     /// key without that permission passes. Nor does the venue define
     /// `canTrade`: its documentation shows the field and says nothing of it.
     /// Only a request whose security type is `TRADE` tests the key's
-    /// permission, and a later pull request adds one,
-    /// `POST /api/v3/order/test`, which validates an order without sending it
-    /// to the matching engine, at weight 1 (rest-api.md:2321-2333).
+    /// permission, and [`Self::check_trade_permission`] makes one.
     ///
     /// Its body also lists the account's balances (rest-api.md:4215-4226).
     /// They are read for `canTrade` and nothing else, and nothing here ever
@@ -636,9 +998,9 @@ impl TradeClient {
         // venue's, and the offset above is what reconciles them.
         let now = chrono_millis() - offset_ms;
         let reply = self
-            .send_signed_get("/api/v3/account", "", now)
+            .send_signed(reqwest::Method::GET, "/api/v3/account", "", now)
             .await
-            .map_err(|e| NotReady::Unreachable(e.to_string()))?;
+            .map_err(NotReady::from)?;
         if !reply.status.is_success() {
             return Err(classify_refusal(
                 reply.status.as_u16(),
@@ -647,6 +1009,121 @@ impl TradeClient {
             ));
         }
         account_can_trade(&reply.body)
+    }
+
+    /// Check that this API key may trade, and that the venue would take the
+    /// run's order, by sending `probe` to `POST /api/v3/order/test`, which
+    /// *"Creates and validates a new order but does not send it into the
+    /// matching engine"* (rest-api.md:2321-2326).
+    ///
+    /// Its security type is `TRADE`, which an API key lacks until trading is
+    /// enabled for it in API Management (rest-api.md:186-196), so it tests
+    /// what [`Self::check_ready`]'s `USER_DATA` request cannot. It weighs 1
+    /// (rest-api.md:2328-2333) and places nothing. It goes to
+    /// [`ORDER_TEST_PATH`] and nowhere else: this takes no path, and the
+    /// probe's parameters are percent-encoded, so nothing in them can move the
+    /// request to `/api/v3/order`. Stamped as `check_ready` stamps, the host's
+    /// clock less `offset_ms`, and sent once.
+    ///
+    /// `probe` is the run's own order, as `venue-check`'s is: its symbol,
+    /// side, type and size, encoded as the run encodes them. The venue checks
+    /// it against its rules and the account as they stand, so whatever it
+    /// refuses the probe for, the run's orders would meet too.
+    ///
+    /// What the answer says:
+    ///
+    /// - **A 2xx with a JSON object**, `{}` as documented
+    ///   (rest-api.md:2349-2353): the key may trade, and the venue found
+    ///   nothing in the order to refuse. The only answer that is `Ok`.
+    /// - **A 401, or `-2015`**: the key may not trade
+    ///   ([`NotReady::KeyCannotTrade`]).
+    /// - **A refusal of the order itself**, under `-1013`, the API refusing a
+    ///   request before the matching engine, or `-2010`, an order refused
+    ///   (errors.md:36-38, 329-330, 367-368): not ready, because the run's
+    ///   orders would meet it. A filter failure is [`NotReady::ProbeFiltered`],
+    ///   naming the filter, and any other reason [`NotReady::ProbeRefused`].
+    ///   A filter is no more the probe's alone than any other reason: some
+    ///   judge an order's numbers, which are the run's, and some the
+    ///   account's open orders and position (filters.md:217-219, :253-260,
+    ///   :331-333; errors.md:436-446).
+    ///
+    ///   Either refusal's reason also says that the venue judged the order,
+    ///   which suggests it accepted the signature and the key's permission to
+    ///   trade. The documentation makes a valid key and signature the
+    ///   condition of a `TRADE` endpoint at all
+    ///   (rest-api.md:186-189, 205-207), names validating the order as this
+    ///   endpoint's work (rest-api.md:2326), and answers a key or signature
+    ///   that fails with its own code, -2015 or -1022 (errors.md:57-58,
+    ///   341-342), not with a verdict on the order. It does not spell out the
+    ///   order of the venue's checks, so that is a reading, which the Spot
+    ///   Testnet rehearsal must confirm, and the reason calls it one. Nothing
+    ///   is ready on it.
+    /// - **Anything else** as [`Self::check_ready`] reports a refusal: a
+    ///   firewall, a rate limit or a ban, the venue's own failure, which decide
+    ///   first whatever code comes with them; a bad signature or key format;
+    ///   or a refusal the venue explains for itself.
+    ///
+    /// # Errors
+    ///
+    /// [`NotReady`], as above. None carries the URL or the signature; the
+    /// venue's own code and message are kept.
+    pub async fn check_trade_permission(
+        &self,
+        probe: &NewOrder,
+        offset_ms: i64,
+    ) -> Result<(), NotReady> {
+        let now = chrono_millis().saturating_sub(offset_ms);
+        let reply = self
+            .send_signed(reqwest::Method::POST, ORDER_TEST_PATH, probe.query(), now)
+            .await
+            .map_err(NotReady::from)?;
+        read_order_test(reply.status.as_u16(), reply.retry_after, &reply.body)
+    }
+
+    /// Check that this account does not pay its fees in BNB at a discount, by
+    /// reading `discount.enabledForAccount` from its commission rates for
+    /// `symbol`: `GET /api/v3/account/commission` (rest-api.md:4797-4846).
+    ///
+    /// The run procedure turns it off. A spot venue takes a fee in the asset
+    /// received, which the engine books ([`quant_core::execution::FeeAsset`]);
+    /// with the discount on, it can take BNB instead, and the user-data
+    /// translator books a fee only in the pair's base or quote asset, so on a
+    /// pair without BNB it refuses such a fill loudly rather than book it as
+    /// either. This finds that out before an order does.
+    ///
+    /// `USER_DATA`, weight 20, and stamped as [`Self::check_ready`] stamps,
+    /// the host's clock less `offset_ms`. Its body holds the account's
+    /// commission rates (rest-api.md:4820-4847). It is read for the one field
+    /// and nothing else, and nothing here prints or logs it.
+    ///
+    /// # Errors
+    ///
+    /// [`NotReady::BnbDiscountOn`] when the discount is on, and otherwise
+    /// [`NotReady`] with the reason, a refusal sorted as `check_ready` sorts
+    /// one. None carries any of the body, the URL or the signature.
+    pub async fn check_bnb_discount_off(
+        &self,
+        symbol: &str,
+        offset_ms: i64,
+    ) -> Result<(), NotReady> {
+        let now = chrono_millis().saturating_sub(offset_ms);
+        let reply = self
+            .send_signed(
+                reqwest::Method::GET,
+                COMMISSION_PATH,
+                &crate::orders::param("symbol", symbol),
+                now,
+            )
+            .await
+            .map_err(NotReady::from)?;
+        if !reply.status.is_success() {
+            return Err(classify_refusal(
+                reply.status.as_u16(),
+                reply.retry_after,
+                &reply.body,
+            ));
+        }
+        bnb_discount_off(&reply.body)
     }
 }
 
@@ -658,6 +1135,86 @@ struct SignedReply {
     status: reqwest::StatusCode,
     retry_after: Option<String>,
     body: Vec<u8>,
+}
+
+/// Why a signed request left no reply to read.
+///
+/// Two cases, because the operator should hear them differently: a request
+/// that got no answer may never have reached the venue, and one whose answer
+/// was cut short certainly did.
+enum SignedFailure {
+    /// No status came back: [`transport_error`]'s account of it.
+    Unanswered(SnapshotError),
+    /// The venue answered with a success status, and the body broke off or
+    /// timed out before it was whole. `cause` is [`SnapshotError::Timeout`]
+    /// or [`SnapshotError::Body`], so that [`TradeClient::signed_get`] can
+    /// report it in the public client's terms, as it always has.
+    CutShort { status: u16, cause: SnapshotError },
+}
+
+impl From<SignedFailure> for NotReady {
+    fn from(failure: SignedFailure) -> Self {
+        match failure {
+            SignedFailure::Unanswered(e) => Self::Unreachable(e.to_string()),
+            SignedFailure::CutShort { status, cause } => Self::AnswerCutShort {
+                status,
+                why: cause.to_string(),
+            },
+        }
+    }
+}
+
+/// What became of one order request, as the transport saw it: what an
+/// [`Attempt`] is borrowed from.
+///
+/// The text in [`Sent::NotConnected`] and [`Sent::Failed`] is [`describe`]'s,
+/// which leaves out the URL and with it the signature.
+enum Sent {
+    /// A status, and the whole body.
+    Answered { status: u16, body: Vec<u8> },
+    /// Not a byte of the request left this machine.
+    NotConnected(String),
+    /// No answer before [`ORDER_TIMEOUT`], once the request may have left.
+    TimedOut,
+    /// Any other failure, after the request may have left.
+    Failed(String),
+}
+
+impl Sent {
+    /// A request that got no answer, sorted by whether it can have left.
+    ///
+    /// "Not sent" only for `is_connect`. In `reqwest` 0.12 that holds when
+    /// `hyper-util`'s client failed to make a connection, or to take one from
+    /// its pool, before the request was handed to one: errors of kind
+    /// `Connect` (`hyper-util` 0.1, `client/legacy/client.rs`), which are the
+    /// connector's own failures, DNS, TCP and TLS, and the pool's. It is asked
+    /// before `is_timeout` because an error can be both: a connection timing
+    /// out inside the connector is a connect error, and never carried the
+    /// request. `reqwest`'s own timeout is not a connect error even when it
+    /// fires mid-connect, and is unknown like any other timeout. Everything
+    /// else came after the request may have been written.
+    fn unanswered(e: reqwest::Error) -> Self {
+        if e.is_connect() {
+            Self::NotConnected(describe(e))
+        } else if e.is_timeout() {
+            Self::TimedOut
+        } else {
+            Self::Failed(describe(e))
+        }
+    }
+
+    /// What [`NewOrder::classify`] and [`CancelOrder::classify`] read.
+    fn attempt(&self) -> Attempt<'_> {
+        match self {
+            Self::Answered { status, body } => Attempt::Answered {
+                status: *status,
+                body,
+            },
+            Self::NotConnected(why) => Attempt::NotConnected(why),
+            Self::TimedOut => Attempt::TimedOut,
+            Self::Failed(why) => Attempt::Failed(why),
+        }
+    }
 }
 
 /// Sort a refusal of a signed request by what it means for the operator.
@@ -688,7 +1245,8 @@ fn classify_refusal(status: u16, retry_after: Option<String>, body: &[u8]) -> No
 ///
 /// What the account reports, which the venue does not define, and not whether
 /// this API key may trade: a `USER_DATA` request cannot test that, as
-/// [`TradeClient::check_ready`] says.
+/// [`TradeClient::check_ready`] says, and [`TradeClient::check_trade_permission`]
+/// does.
 ///
 /// The body is read as JSON for that one field. No error carries any of it: it
 /// lists the account's balances.
@@ -700,6 +1258,70 @@ fn account_can_trade(body: &[u8]) -> Result<(), NotReady> {
         Some(serde_json::Value::Bool(false)) => Err(NotReady::CannotTrade),
         Some(_) => Err(NotReady::UnreadableAccount(AccountFault::CanTradeNotBool)),
         None => Err(NotReady::UnreadableAccount(AccountFault::NoCanTrade)),
+    }
+}
+
+/// What an answer to `POST /api/v3/order/test` says, sorted as
+/// [`TradeClient::check_trade_permission`] describes: `Ok` only for the
+/// venue's acceptance of the probe outright.
+fn read_order_test(status: u16, retry_after: Option<String>, body: &[u8]) -> Result<(), NotReady> {
+    if (200..=299).contains(&status) {
+        return match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(serde_json::Value::Object(_)) => Ok(()),
+            _ => Err(NotReady::UnreadableOrderTest { status }),
+        };
+    }
+    match (status, VenueError::parse(body)) {
+        // As for any signed request: each says the request was never judged,
+        // whatever code comes with it.
+        (403 | 418 | 429 | 500..=599, _) => Err(classify_refusal(status, retry_after, body)),
+        (401, venue) => Err(NotReady::KeyCannotTrade { status, venue }),
+        (_, Some(venue)) if venue.code == -2015 => Err(NotReady::KeyCannotTrade {
+            status,
+            venue: Some(venue),
+        }),
+        // A verdict on the order, which is the run's: never ready, a filter
+        // failure included, since the run's orders would meet it too.
+        (_, Some(venue)) if matches!(venue.code, -1013 | -2010) => {
+            Err(match FilterName::in_message(&venue.msg) {
+                Some(filter) => NotReady::ProbeFiltered {
+                    status,
+                    filter,
+                    venue,
+                },
+                None => NotReady::ProbeRefused { status, venue },
+            })
+        }
+        _ => Err(classify_refusal(status, retry_after, body)),
+    }
+}
+
+/// Whether the commission rates report the BNB discount off for the account:
+/// `discount.enabledForAccount` (rest-api.md:4841-4842).
+///
+/// `enabledForSymbol` beside it is not read. The documentation shows both
+/// without defining either (rest-api.md:4841-4846). Read by their names, the
+/// account's is the setting the run procedure turns off, and it is the
+/// stricter of the two: on for the account and off for this symbol is still
+/// refused.
+///
+/// The body is read as JSON for that one field. No error carries any of it: it
+/// holds the account's commission rates.
+fn bnb_discount_off(body: &[u8]) -> Result<(), NotReady> {
+    let document: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| NotReady::UnreadableCommission(CommissionFault::NotJson))?;
+    match document
+        .get("discount")
+        .and_then(|discount| discount.get("enabledForAccount"))
+    {
+        Some(serde_json::Value::Bool(false)) => Ok(()),
+        Some(serde_json::Value::Bool(true)) => Err(NotReady::BnbDiscountOn),
+        Some(_) => Err(NotReady::UnreadableCommission(
+            CommissionFault::DiscountFlagNotBool,
+        )),
+        None => Err(NotReady::UnreadableCommission(
+            CommissionFault::NoDiscountFlag,
+        )),
     }
 }
 
@@ -781,12 +1403,23 @@ fn redact_signature(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        account_can_trade, classify_refusal, midpoint_offset_ms, redact_signature, AccountFault,
-        ClockSample, NotReady, TradeClient, VenueError, MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
+        account_can_trade, bnb_discount_off, classify_refusal, midpoint_offset_ms, read_order_test,
+        redact_signature, AccountFault, ClockSample, CommissionFault, NotReady, TradeClient,
+        VenueError, A_VERDICT_SUGGESTS_PERMISSION, MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
     };
     use crate::credentials::fixture;
+    use crate::orders::{
+        CancelOrder, CancelReply, FilterName, NewOrder, Placement, WhyUnknown, ORDER_PATH,
+        ORDER_TEST_PATH,
+    };
+    use crate::user_data::RunTag;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
+    use quant_core::event::Side;
+    use quant_core::execution::{
+        ClientOrderId, OrderKind, OrderRequest, RejectReason, TimeInForce, VenueOrderId,
+    };
+    use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
     use ring::signature::{UnparsedPublicKey, ED25519};
     use std::time::Duration;
 
@@ -832,7 +1465,7 @@ mod tests {
     /// instead, and each read of the request times out after as long. Past
     /// either, this thread panics and [`received`] fails the test.
     fn serve_once(response: String) -> (String, std::thread::JoinHandle<String>) {
-        use std::io::{ErrorKind, Read as _, Write as _};
+        use std::io::{ErrorKind, Write as _};
         use std::time::Instant;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.set_nonblocking(true).expect("a listener to poll");
@@ -853,28 +1486,135 @@ mod tests {
                     Err(e) => panic!("accept: {e}"),
                 }
             };
-            // A socket accepted from a non-blocking listener can be
-            // non-blocking itself, as it is on Windows. Reads block again, each
-            // for no longer than the deadline's length.
-            stream.set_nonblocking(false).expect("a blocking stream");
-            stream
-                .set_read_timeout(Some(SERVE_DEADLINE))
-                .expect("a read timeout");
-            let mut request = Vec::new();
-            let mut buf = [0; 4096];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = stream
-                    .read(&mut buf)
-                    .unwrap_or_else(|e| panic!("the request did not arrive in time: {e}"));
-                if n == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buf[..n]);
-            }
+            let request = read_request(&mut stream);
             stream.write_all(response.as_bytes()).expect("write");
-            String::from_utf8(request).expect("an HTTP request head is text")
+            request
         });
         (base, server)
+    }
+
+    /// Read one request's head off `stream`, through the blank line that
+    /// ends it. Each read waits no longer than [`SERVE_DEADLINE`], and past
+    /// that this panics.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+        // A socket accepted from a non-blocking listener can be non-blocking
+        // itself, as it is on Windows. Reads block again, each for no longer
+        // than the deadline's length.
+        stream.set_nonblocking(false).expect("a blocking stream");
+        stream
+            .set_read_timeout(Some(SERVE_DEADLINE))
+            .expect("a read timeout");
+        let mut request = Vec::new();
+        let mut buf = [0; 4096];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream
+                .read(&mut buf)
+                .unwrap_or_else(|e| panic!("the request did not arrive in time: {e}"));
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8(request).expect("an HTTP request head is text")
+    }
+
+    /// What [`TestVenue`] does with a request it has read.
+    #[derive(Clone)]
+    enum Reply {
+        /// Write these bytes and close the connection: a whole answer, or one
+        /// cut short.
+        Bytes(String),
+        /// The same, after waiting this long: a venue that takes its time.
+        Late(Duration, String),
+        /// Write nothing, and hold the connection open until the venue is
+        /// stopped: a venue that took the request and never answered it.
+        Silence,
+        /// Write these bytes, and then hold the connection open until the
+        /// venue is stopped: a venue that began an answer and never finished
+        /// it.
+        Stall(String),
+    }
+
+    /// A test venue on this machine that, unlike [`serve_once`], can be sent
+    /// more than one request. Each request it reads gets the next of its
+    /// replies, and the last again once they run out, and every request is
+    /// kept, in order, for [`TestVenue::stop`] to hand back.
+    ///
+    /// It runs until it is stopped, not until a request comes, so a test can
+    /// count every request the client made, a second one that should never
+    /// have been sent included. A test stops it once the client has its
+    /// answer: by then every request the client made has been read, because
+    /// each is kept before it is answered. Polled, like [`serve_once`], and
+    /// never running past [`SERVE_DEADLINE`].
+    struct TestVenue {
+        base: String,
+        stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        server: std::thread::JoinHandle<Vec<String>>,
+    }
+
+    impl TestVenue {
+        fn start(replies: Vec<Reply>) -> Self {
+            use std::io::{ErrorKind, Write as _};
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+            use std::time::Instant;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("a listener to poll");
+            let base = format!("http://{}", listener.local_addr().expect("address"));
+            let stopping = Arc::new(AtomicBool::new(false));
+            let stop = Arc::clone(&stopping);
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + SERVE_DEADLINE;
+                let mut requests = Vec::new();
+                // Connections answered with silence, open until the venue stops.
+                let mut held = Vec::new();
+                while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let reply = replies.get(requests.len()).or(replies.last()).cloned();
+                            requests.push(read_request(&mut stream));
+                            match reply {
+                                Some(Reply::Bytes(bytes)) => {
+                                    stream.write_all(bytes.as_bytes()).expect("write");
+                                }
+                                Some(Reply::Late(wait, bytes)) => {
+                                    std::thread::sleep(wait);
+                                    stream.write_all(bytes.as_bytes()).expect("write");
+                                }
+                                Some(Reply::Silence) => held.push(stream),
+                                Some(Reply::Stall(bytes)) => {
+                                    stream.write_all(bytes.as_bytes()).expect("write");
+                                    held.push(stream);
+                                }
+                                // No replies at all: hang up without a word.
+                                None => {}
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept: {e}"),
+                    }
+                }
+                drop(held);
+                requests
+            });
+            Self {
+                base,
+                stopping,
+                server,
+            }
+        }
+
+        /// Stop, and hand back every request it read, in the order they came.
+        fn stop(self) -> Vec<String> {
+            self.stopping
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.server
+                .join()
+                .unwrap_or_else(|_| panic!("the test venue failed"))
+        }
     }
 
     /// The request [`serve_once`] was sent. Fails the test when there was none
@@ -889,8 +1629,9 @@ mod tests {
     /// The payload `request` signed, once the signature it carried has been
     /// checked the way the venue reads one off the wire.
     ///
-    /// The request line's query is split at `&signature=`. What comes before
-    /// is the payload, exactly as sent (rest-api.md:555). What comes after is
+    /// The request line's query, whatever the method, is split at
+    /// `&signature=`. What comes before is the payload, exactly as sent
+    /// (rest-api.md:555). What comes after is
     /// decoded once, as a query string's values are read, `+` to a space and
     /// `%XX` to its byte, and must verify over that payload under the example
     /// key's public half as OpenSSL derives it. A signature encoded twice --
@@ -901,10 +1642,10 @@ mod tests {
     fn signed_on_the_wire(request: &str) -> &str {
         let line = request.lines().next().unwrap_or_default();
         let (_, query) = line
-            .strip_prefix("GET ")
-            .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
+            .split_once(' ')
+            .and_then(|(_method, rest)| rest.strip_suffix(" HTTP/1.1"))
             .and_then(|target| target.split_once('?'))
-            .unwrap_or_else(|| panic!("not a GET with a query: {line}"));
+            .unwrap_or_else(|| panic!("not a request with a query: {line}"));
         let (payload, sent) = query
             .split_once("&signature=")
             .unwrap_or_else(|| panic!("no signature: {line}"));
@@ -1432,6 +2173,19 @@ mod tests {
                 status: 400,
                 venue: venue.clone(),
             },
+            NotReady::KeyCannotTrade {
+                status: 401,
+                venue: venue.clone(),
+            },
+            NotReady::ProbeRefused {
+                status: 400,
+                venue: venue.clone().expect("a venue error"),
+            },
+            NotReady::ProbeFiltered {
+                status: 400,
+                filter: FilterName::Notional,
+                venue: venue.clone().expect("a venue error"),
+            },
         ]
         .iter()
         .map(ToString::to_string)
@@ -1541,6 +2295,69 @@ mod tests {
         );
     }
 
+    /// One of the three checks venue-check makes, by number, against `client`.
+    async fn check_number(client: &TradeClient, which: usize) -> Result<(), NotReady> {
+        match which {
+            0 => client.check_ready(0).await,
+            1 => client.check_trade_permission(&order_on("BTCUSDT"), 0).await,
+            _ => client.check_bnb_discount_off("BTCUSDT", 0).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_success_whose_body_is_cut_short_says_the_venue_answered() {
+        // Each check's venue answers 200 with a body that would pass it, and
+        // the body is cut short: broken off under a Content-Length promising
+        // more than arrives, or held open past the client's timeout after the
+        // head. The venue was reached, so "could not reach the venue" would
+        // send the operator after a network that delivered an answer, and
+        // nothing is read from the part that arrived.
+        let passing = [
+            account("true"),
+            "{}".to_owned(),
+            commission("false", "false"),
+        ];
+        for (which, body) in passing.iter().enumerate() {
+            let broken = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len() + 64
+            );
+            let stalled = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            for (reply, cause) in [
+                (Reply::Bytes(broken), "could not read the response body: "),
+                (Reply::Stall(stalled), "request timed out"),
+            ] {
+                let venue = TestVenue::start(vec![reply]);
+                let client = TradeClient::new(
+                    venue.base.clone(),
+                    Duration::from_millis(500),
+                    fixture::example(),
+                )
+                .expect("builds");
+                let answer = check_number(&client, which).await;
+                let requests = venue.stop();
+                assert_eq!(requests.len(), 1, "check {which}: {requests:#?}");
+                let Err(NotReady::AnswerCutShort { status: 200, why }) = &answer else {
+                    panic!("check {which}: expected an answer cut short, got {answer:?}")
+                };
+                assert!(why.starts_with(cause), "check {which}: {why}");
+                let said = answer.expect_err("not ready").to_string();
+                assert!(
+                    said.starts_with("the venue answered HTTP 200 and the body was cut short ("),
+                    "check {which}: {said}"
+                );
+                assert!(said.contains("The venue was reached"), "{said}");
+                assert!(!said.contains("could not reach"), "{said}");
+                says_nothing_secret(&said, &requests[0]);
+                assert!(!said.contains("/api/v3/account"), "{said}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_rate_limit_is_read_from_its_status_its_retry_after_and_its_body() {
         let body = r#"{"code":-1003,"msg":"Too much request weight used; current limit is 6000 request weight per 1 MINUTE."}"#;
@@ -1594,5 +2411,871 @@ mod tests {
         let (base, server) = serve_once(http("200 OK", "", &account("true")));
         assert_eq!(client_at(&base).check_ready(0).await, Ok(()));
         signed_on_the_wire(&received(server));
+    }
+
+    /// A redirect to `location` on the same venue, of the kind that keeps the
+    /// method: a client that follows it sends the same request again.
+    fn redirect(location: &str) -> String {
+        http(
+            "307 Temporary Redirect",
+            &format!("Location: {location}\r\n"),
+            "",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_the_answer_and_is_never_followed() {
+        // Followed, a 307 sends the request again, wherever it points, and for
+        // an order that is a second order. Every request this client makes is
+        // sent once, so the redirect is what it answers with. Here the venue
+        // would have said the account can trade, had the client asked again.
+        let venue = TestVenue::start(vec![
+            Reply::Bytes(redirect("/api/v3/account/elsewhere")),
+            Reply::Bytes(http("200 OK", "", &account("true"))),
+        ]);
+        let answer = client_at(&venue.base).check_ready(0).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(
+            answer,
+            Err(NotReady::Refused {
+                status: 307,
+                venue: None
+            })
+        );
+    }
+
+    /// The documentation's own non-ASCII symbol (rest-api.md:582), whose
+    /// encoded form is all `%`s (rest-api.md:618). An order on it is the one
+    /// whose query a second encoding would change.
+    const NON_ASCII: &str = "１２３４５６";
+
+    /// When the strategy submitted, on the venue's clock: years before any
+    /// run of this test, so a transport that stamped at sending could not
+    /// match it by accident.
+    const STAMP: i64 = 1_700_000_000_000;
+
+    fn on(symbol: &str) -> InstrumentDef {
+        InstrumentDef {
+            exchange: Exchange::Binance,
+            symbol: symbol.to_owned(),
+            base: "BTC".to_owned(),
+            quote: "USDT".to_owned(),
+            kind: InstrumentKind::Spot,
+            tick_size: "0.01".parse().expect("price"),
+            lot_size: "0.00001".parse().expect("quantity"),
+            min_notional: "5".parse().expect("notional"),
+        }
+    }
+
+    fn run() -> RunTag {
+        RunTag::new("r1").expect("a valid tag")
+    }
+
+    /// Our order 7 on `symbol`: a market buy of 0.001, the shape `MaCrossover`
+    /// sends.
+    fn order_on(symbol: &str) -> NewOrder {
+        let instrument = on(symbol);
+        let request = OrderRequest {
+            instrument: InstrumentRegistry::new().register(instrument.clone()),
+            side: Side::Buy,
+            qty: "0.001".parse().expect("quantity"),
+            kind: OrderKind::Market,
+            time_in_force: TimeInForce::Gtc,
+        };
+        NewOrder::encode(&request, ClientOrderId(7), &run(), &instrument).expect("encodes")
+    }
+
+    /// A cancel of our order 7 on `symbol`.
+    fn cancel_on(symbol: &str) -> CancelOrder {
+        CancelOrder::encode(ClientOrderId(7), &run(), &on(symbol)).expect("encodes")
+    }
+
+    /// The documented acknowledgement (rest-api.md:2205-2211), its comment
+    /// removed and its `clientOrderId` made our order 7's.
+    const OUR_ACK: &str = r#"{"symbol":"BTCUSDT","orderId":28,"orderListId":-1,"clientOrderId":"q-r1-7","transactTime":1507725176595}"#;
+
+    /// The documented answer to a cancel (rest-api.md:2410-2427), cut down,
+    /// its `origClientOrderId` made our order 7's.
+    const OUR_CANCEL: &str = r#"{"symbol":"BTCUSDT","origClientOrderId":"q-r1-7","orderId":28,"orderListId":-1,"clientOrderId":"cancelMyOrder1","transactTime":1684804350068,"status":"CANCELED"}"#;
+
+    /// What [`OUR_ACK`] means.
+    fn placed() -> Placement {
+        Placement::Placed {
+            order_id: VenueOrderId("28".to_owned()),
+            client_order_id: "q-r1-7".to_owned(),
+            transact_time_ms: 1_507_725_176_595,
+        }
+    }
+
+    /// Whether `request` carries nothing after its head: no body declared, and
+    /// none sent. The venue signs the query and the body together
+    /// (rest-api.md:555), so with no body the query is the whole of it.
+    fn has_no_body(request: &str) -> bool {
+        let (head, after) = request.split_once("\r\n\r\n").expect("a whole head");
+        let head = head.to_ascii_lowercase();
+        after.is_empty()
+            && !head.contains("\r\ntransfer-encoding:")
+            && !head.contains("\r\ncontent-type:")
+            && head
+                .lines()
+                .filter(|line| line.starts_with("content-length:"))
+                .all(|line| line == "content-length: 0")
+    }
+
+    /// A port on this machine that nothing listens on: bound, and let go.
+    fn closed_port() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    /// That `said` is a description fit for a log: it names neither the URL
+    /// nor anything of the signature `request` carried.
+    fn says_nothing_secret(said: &str, request: &str) {
+        for absent in ["signature", "/api/v3/order", "http://", "timestamp="] {
+            assert!(!said.contains(absent), "{absent:?} in {said}");
+        }
+        if let Some(signature) = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_once("&signature="))
+            .and_then(|(_, rest)| rest.split(' ').next())
+        {
+            for piece in fixture::eight_char_windows(signature) {
+                assert!(!said.contains(piece), "{piece} in {said}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_order_and_a_cancel_go_out_exactly_as_encoded_and_signed() {
+        // Each encoded query holds `%`s, which a second encoding would turn
+        // into `%25`s, and the venue would check the signature against bytes
+        // nobody signed. Each must arrive as encoded, followed by exactly the
+        // caller's stamp and the window, with a signature over all of that,
+        // and no body.
+        let order = order_on(NON_ASCII);
+        let cancel = cancel_on(NON_ASCII);
+        for query in [order.query(), cancel.query()] {
+            assert!(
+                query.contains("%EF%BC%91"),
+                "the fixture must exercise %: {query}"
+            );
+        }
+
+        let venue = TestVenue::start(vec![Reply::Bytes(http("200 OK", "", OUR_ACK))]);
+        let placement = client_at(&venue.base).place_order(&order, STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(
+            requests[0].starts_with("POST /api/v3/order?"),
+            "{}",
+            requests[0]
+        );
+        assert_eq!(
+            signed_on_the_wire(&requests[0]),
+            format!(
+                "{}&timestamp={STAMP}&recvWindow={RECV_WINDOW_MS}",
+                order.query()
+            )
+        );
+        assert!(has_no_body(&requests[0]), "{}", requests[0]);
+        assert_eq!(placement, placed());
+
+        let venue = TestVenue::start(vec![Reply::Bytes(http("200 OK", "", OUR_CANCEL))]);
+        let reply = client_at(&venue.base).cancel_order(&cancel, STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(
+            requests[0].starts_with("DELETE /api/v3/order?"),
+            "{}",
+            requests[0]
+        );
+        assert_eq!(
+            signed_on_the_wire(&requests[0]),
+            format!(
+                "{}&timestamp={STAMP}&recvWindow={RECV_WINDOW_MS}",
+                cancel.query()
+            )
+        );
+        assert!(has_no_body(&requests[0]), "{}", requests[0]);
+        assert_eq!(
+            reply,
+            CancelReply::Acknowledged {
+                order_id: VenueOrderId("28".to_owned())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirected_order_is_unknown_and_never_sent_again() {
+        // The venue redirects once, and would then acknowledge the order: a
+        // client that followed would have placed it, or placed it twice. The
+        // 307 is the answer instead, and settles nothing about either request.
+        let order = order_on("BTCUSDT");
+        let venue = TestVenue::start(vec![
+            Reply::Bytes(redirect("/api/v3/order/elsewhere")),
+            Reply::Bytes(http("200 OK", "", OUR_ACK)),
+        ]);
+        let placement = client_at(&venue.base).place_order(&order, STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(
+            placement,
+            Placement::Unknown {
+                why: WhyUnknown::UnexpectedStatus { http_status: 307 }
+            }
+        );
+
+        let cancel = cancel_on("BTCUSDT");
+        let venue = TestVenue::start(vec![
+            Reply::Bytes(redirect("/api/v3/order/elsewhere")),
+            Reply::Bytes(http("200 OK", "", OUR_CANCEL)),
+        ]);
+        let reply = client_at(&venue.base).cancel_order(&cancel, STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(
+            reply,
+            CancelReply::Unknown {
+                why: WhyUnknown::UnexpectedStatus { http_status: 307 }
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_that_never_connected_was_not_sent() {
+        // A connection refused: not a byte of the request left this machine,
+        // so the order certainly was not placed, and the engine may hear it
+        // as rejected. The one outcome that may say so.
+        let base = closed_port();
+        let client = client_at(&base);
+        let placement = client.place_order(&order_on("BTCUSDT"), STAMP).await;
+        let Placement::NotSent { why } = &placement else {
+            panic!("expected not sent, got {placement:?}")
+        };
+        says_nothing_secret(why, "");
+        assert_eq!(placement.reject_reason(), Some(RejectReason::Venue));
+
+        let reply = client.cancel_order(&cancel_on("BTCUSDT"), STAMP).await;
+        let CancelReply::NotSent { why } = &reply else {
+            panic!("expected not sent, got {reply:?}")
+        };
+        says_nothing_secret(why, "");
+    }
+
+    #[tokio::test]
+    async fn an_order_the_venue_took_and_never_answered_is_unknown() {
+        // The venue read the request, so the order may exist: whatever else
+        // this is, it is never "not sent". The client's own timeout ends the
+        // wait, shortened here so the test does not take twenty seconds.
+        let venue = TestVenue::start(vec![Reply::Silence]);
+        let client = client_at(&venue.base).with_order_timeout(Duration::from_millis(300));
+        let placement = client.place_order(&order_on("BTCUSDT"), STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "the venue had the order: {requests:#?}");
+        assert_eq!(
+            placement,
+            Placement::Unknown {
+                why: WhyUnknown::TimedOut
+            }
+        );
+        assert_eq!(placement.reject_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_cut_short_is_never_a_placement() {
+        // The venue's whole acknowledgement of our order, readable as it
+        // stands, under a Content-Length that promises more than arrives
+        // before the connection closes. A transport that classified what did
+        // arrive would call the order placed, on an answer that broke off.
+        let cut = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{OUR_ACK}",
+            OUR_ACK.len() + 64
+        );
+        let venue = TestVenue::start(vec![Reply::Bytes(cut)]);
+        let placement = client_at(&venue.base)
+            .place_order(&order_on("BTCUSDT"), STAMP)
+            .await;
+        let requests = venue.stop();
+        let Placement::Unknown {
+            why: WhyUnknown::Interrupted(why),
+        } = &placement
+        else {
+            panic!("expected an interrupted answer, got {placement:?}")
+        };
+        // It broke off in the body, after the status had arrived.
+        assert!(why.contains("body"), "{why}");
+        says_nothing_secret(why, &requests[0]);
+    }
+
+    #[tokio::test]
+    async fn an_order_or_a_cancel_the_venue_read_and_hung_up_on_is_unknown_never_not_sent() {
+        // The venue read the whole request and closed the connection without
+        // a word. The request had left this machine, so the order may exist
+        // and the cancel may have taken effect: the outcome is unknown, and
+        // the one thing it must never be is "not sent", which the engine
+        // would hear as a rejection. Nor is it sent again.
+        let venue = TestVenue::start(Vec::new());
+        let placement = client_at(&venue.base)
+            .place_order(&order_on("BTCUSDT"), STAMP)
+            .await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "the venue had the order: {requests:#?}");
+        let Placement::Unknown {
+            why: WhyUnknown::Interrupted(why),
+        } = &placement
+        else {
+            panic!("expected an interrupted answer, got {placement:?}")
+        };
+        says_nothing_secret(why, &requests[0]);
+        assert_eq!(placement.reject_reason(), None);
+
+        let venue = TestVenue::start(Vec::new());
+        let reply = client_at(&venue.base)
+            .cancel_order(&cancel_on("BTCUSDT"), STAMP)
+            .await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "the venue had the cancel: {requests:#?}");
+        let CancelReply::Unknown {
+            why: WhyUnknown::Interrupted(why),
+        } = &reply
+        else {
+            panic!("expected an interrupted answer, got {reply:?}")
+        };
+        says_nothing_secret(why, &requests[0]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_whose_body_never_finishes_arriving_is_a_timeout_never_not_sent() {
+        // The venue sent its status line and headers, promising a body, and
+        // then held the connection open without sending it. The status says
+        // the request reached the venue; the wait ends on the client's own
+        // timeout, shortened here, and the outcome is unknown, never "not
+        // sent".
+        let head = format!(
+            "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+
+",
+            OUR_ACK.len()
+        );
+        let venue = TestVenue::start(vec![Reply::Stall(head.clone())]);
+        let client = client_at(&venue.base).with_order_timeout(Duration::from_millis(300));
+        let placement = client.place_order(&order_on("BTCUSDT"), STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "the venue had the order: {requests:#?}");
+        assert_eq!(
+            placement,
+            Placement::Unknown {
+                why: WhyUnknown::TimedOut
+            }
+        );
+        assert_eq!(placement.reject_reason(), None);
+
+        let venue = TestVenue::start(vec![Reply::Stall(head)]);
+        let client = client_at(&venue.base).with_order_timeout(Duration::from_millis(300));
+        let reply = client.cancel_order(&cancel_on("BTCUSDT"), STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "the venue had the cancel: {requests:#?}");
+        assert_eq!(
+            reply,
+            CancelReply::Unknown {
+                why: WhyUnknown::TimedOut
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_waits_for_the_venue_longer_than_the_client_otherwise_would() {
+        // The venue answers -1007 after its own wait (rest-api.md:102) --
+        // here, after longer than this client waits for anything else. An
+        // order waits for it all the same, so the venue's answer, which says
+        // the request reached it, is what comes back rather than a timeout of
+        // ours, which says nothing. Shortened, both numbers, to keep the test
+        // quick: the order's wait is the longer, as ORDER_TIMEOUT's is.
+        let timeout = r#"{"code":-1007,"msg":"Timeout waiting for response from backend server. Send status unknown; execution status unknown."}"#;
+        let venue = TestVenue::start(vec![Reply::Late(
+            Duration::from_millis(600),
+            http("400 Bad Request", "", timeout),
+        )]);
+        let client = TradeClient::new(
+            venue.base.clone(),
+            Duration::from_millis(200),
+            fixture::example(),
+        )
+        .expect("builds")
+        .with_order_timeout(Duration::from_secs(5));
+        let placement = client.place_order(&order_on("BTCUSDT"), STAMP).await;
+        venue.stop();
+        assert!(
+            matches!(
+                &placement,
+                Placement::Unknown {
+                    why: WhyUnknown::Unsettled { code: -1007, .. }
+                }
+            ),
+            "{placement:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_trade_probe_goes_to_the_test_endpoint_and_nowhere_else() {
+        // It must place nothing. The path is pinned as written out here
+        // (rest-api.md:2323), not read back from the constant, and it is not
+        // the path that places an order.
+        assert_eq!(ORDER_TEST_PATH, "/api/v3/order/test");
+        assert_ne!(ORDER_TEST_PATH, ORDER_PATH);
+        // And on the wire, whatever the base's spelling and whatever the
+        // probe's symbol holds: the method takes no path, and the symbol is
+        // percent-encoded, so neither can move the probe to /api/v3/order.
+        for (suffix, symbol) in [
+            ("", "BTCUSDT"),
+            ("/", "BTCUSDT"),
+            ("//", "BTCUSDT"),
+            ("", "/../../../api/v3/order?symbol=BTCUSDT#"),
+        ] {
+            let probe = order_on(symbol);
+            let venue = TestVenue::start(vec![Reply::Bytes(http("200 OK", "", "{}"))]);
+            let answer = client_at(&format!("{}{suffix}", venue.base))
+                .check_trade_permission(&probe, 0)
+                .await;
+            let requests = venue.stop();
+            assert_eq!(requests.len(), 1, "{requests:#?}");
+            let line = requests[0].lines().next().unwrap_or_default();
+            let path = line
+                .strip_prefix("POST ")
+                .and_then(|rest| rest.split_once('?'))
+                .map(|(path, _)| path);
+            assert_eq!(path, Some("/api/v3/order/test"), "{suffix:?} {symbol:?}");
+            let payload = signed_on_the_wire(&requests[0]);
+            assert!(
+                payload.starts_with(&format!("{}&timestamp=", probe.query())),
+                "{payload}"
+            );
+            assert_eq!(answer, Ok(()), "{symbol:?}");
+        }
+    }
+
+    /// The venue's error document, as sent.
+    fn error_doc(code: i64, msg: &str) -> String {
+        format!(r#"{{"code":{code},"msg":"{msg}"}}"#)
+    }
+
+    /// The venue's error document, as read back.
+    fn error_read(code: i64, msg: &str) -> VenueError {
+        VenueError {
+            code,
+            msg: msg.to_owned(),
+        }
+    }
+
+    /// -2015's message (errors.md:342).
+    const KEY_REFUSED: &str = "Invalid API-key, IP, or permissions for action.";
+
+    /// A filter failure's (errors.md:433).
+    const NOTIONAL: &str = "Filter failure: NOTIONAL";
+
+    #[test]
+    fn the_trade_probe_reads_the_keys_permission_off_the_answer() {
+        let (doc, read, key, notional) = (error_doc, error_read, KEY_REFUSED, NOTIONAL);
+        // The venue's own messages for these codes.
+        let lot = "Filter failure: LOT_SIZE"; // errors.md:431
+        let closed = "Market is closed."; // errors.md:376
+        let disabled = "This account may not place or cancel orders."; // errors.md:388
+        let duplicate = "Duplicate order sent."; // errors.md:375
+
+        let cannot = |status, venue| Err(NotReady::KeyCannotTrade { status, venue });
+        let filtered = |filter, code, msg| {
+            Err(NotReady::ProbeFiltered {
+                status: 400,
+                filter,
+                venue: read(code, msg),
+            })
+        };
+        let probe_refused = |code, msg| {
+            Err(NotReady::ProbeRefused {
+                status: 400,
+                venue: read(code, msg),
+            })
+        };
+        let unreadable = Err(NotReady::UnreadableOrderTest { status: 200 });
+        let cases: [(u16, String, Result<(), NotReady>); 11] = [
+            // Validated, and nothing to refuse (rest-api.md:2349-2353): the
+            // one answer that is ready.
+            (200, "{}".to_owned(), Ok(())),
+            // A 2xx that is not the venue's answer shows nothing either way.
+            (200, "<html>Sign in".to_owned(), unreadable.clone()),
+            (200, "[]".to_owned(), unreadable),
+            // The key may not trade: 401 whatever the body says, and -2015
+            // under any status that does not decide first.
+            (401, doc(-2015, key), cannot(401, Some(read(-2015, key)))),
+            (401, String::new(), cannot(401, None)),
+            (400, doc(-2015, key), cannot(400, Some(read(-2015, key)))),
+            // A filter failure, under either code: not ready, and the filter
+            // the venue cited is kept.
+            (
+                400,
+                doc(-1013, notional),
+                filtered(FilterName::Notional, -1013, notional),
+            ),
+            (
+                400,
+                doc(-2010, lot),
+                filtered(FilterName::LotSize, -2010, lot),
+            ),
+            // A verdict for any other reason: not ready either, since the run
+            // may meet the same refusal.
+            (400, doc(-1013, closed), probe_refused(-1013, closed)),
+            (400, doc(-2010, disabled), probe_refused(-2010, disabled)),
+            (400, doc(-1013, duplicate), probe_refused(-1013, duplicate)),
+        ];
+        for (status, body, expected) in cases {
+            assert_eq!(
+                read_order_test(status, None, body.as_bytes()),
+                expected,
+                "{status} {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trade_probe_answer_that_settles_nothing_is_reported_as_check_ready_reports_it() {
+        let (doc, read, key, notional) = (error_doc, error_read, KEY_REFUSED, NOTIONAL);
+        let signature = "Signature for this request is not valid."; // -1022, errors.md:58
+        let stale = "Timestamp for this request is outside of the recvWindow."; // -1021, errors.md:54
+        let missing = "Mandatory parameter 'quantity' was not sent, was empty/null, or malformed."; // -1102, errors.md:83
+        let cases: [(u16, String, NotReady); 6] = [
+            // Never judged at all, whatever code comes with it: a -2015 or a
+            // filter failure here says nothing about the key.
+            (
+                403,
+                doc(-2015, key),
+                NotReady::Firewall {
+                    venue: Some(read(-2015, key)),
+                },
+            ),
+            (
+                429,
+                doc(-1013, notional),
+                NotReady::RateLimited {
+                    status: 429,
+                    retry_after: None,
+                    venue: Some(read(-1013, notional)),
+                },
+            ),
+            (
+                503,
+                String::new(),
+                NotReady::VenueFailure {
+                    status: 503,
+                    venue: None,
+                },
+            ),
+            // The rest, as check_ready reports a refusal: a bad signature,
+            // a stale stamp, and a request the venue could not read, which
+            // here would mean the encoder's order is not one it takes.
+            (
+                400,
+                doc(-1022, signature),
+                NotReady::BadCredentials {
+                    status: 400,
+                    venue: Some(read(-1022, signature)),
+                },
+            ),
+            (
+                400,
+                doc(-1021, stale),
+                NotReady::Refused {
+                    status: 400,
+                    venue: Some(read(-1021, stale)),
+                },
+            ),
+            (
+                400,
+                doc(-1102, missing),
+                NotReady::Refused {
+                    status: 400,
+                    venue: Some(read(-1102, missing)),
+                },
+            ),
+        ];
+        for (status, body, expected) in cases {
+            assert_eq!(
+                read_order_test(status, None, body.as_bytes()),
+                Err(expected),
+                "{status} {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_trade_probe_is_read_with_its_status_header_and_body() {
+        // Through the client, not only the reader: the 401 with -2015 the venue
+        // pairs (web-socket-api.md:1324-1327), and a rate limit's Retry-After.
+        let key = r#"{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}"#;
+        let venue = TestVenue::start(vec![Reply::Bytes(http("401 Unauthorized", "", key))]);
+        let answer = client_at(&venue.base)
+            .check_trade_permission(&order_on("BTCUSDT"), 0)
+            .await;
+        venue.stop();
+        assert_eq!(
+            answer,
+            Err(NotReady::KeyCannotTrade {
+                status: 401,
+                venue: Some(VenueError {
+                    code: -2015,
+                    msg: "Invalid API-key, IP, or permissions for action.".to_owned(),
+                }),
+            })
+        );
+
+        let venue = TestVenue::start(vec![Reply::Bytes(http(
+            "429 Too Many Requests",
+            "Retry-After: 37\r\n",
+            "",
+        ))]);
+        let answer = client_at(&venue.base)
+            .check_trade_permission(&order_on("BTCUSDT"), 0)
+            .await;
+        venue.stop();
+        assert_eq!(
+            answer,
+            Err(NotReady::RateLimited {
+                status: 429,
+                retry_after: Some("37".to_owned()),
+                venue: None,
+            })
+        );
+    }
+
+    #[test]
+    fn what_the_trade_probe_says_names_the_remedy_and_calls_a_refusal_a_reading_of_permission() {
+        let said = NotReady::KeyCannotTrade {
+            status: 401,
+            venue: Some(VenueError {
+                code: -2015,
+                msg: "Invalid API-key, IP, or permissions for action.".to_owned(),
+            }),
+        }
+        .to_string();
+        for needle in [
+            "refused this API key a TRADE request",
+            "(HTTP 401, code -2015: Invalid API-key, IP, or permissions for action.)",
+            "API Management",
+            "IP restriction",
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
+        let said = NotReady::ProbeRefused {
+            status: 400,
+            venue: VenueError {
+                code: -1013,
+                msg: "Market is closed.".to_owned(),
+            },
+        }
+        .to_string();
+        for needle in [
+            "(HTTP 400, code -1013: Market is closed.)",
+            "an order of the run's may meet the same refusal",
+            // What the refusal suggests about the key, and that it is a
+            // reading of the documentation, not a proof: nothing in it states
+            // the order of the venue's checks.
+            "suggests it accepted the signature and this key's permission to trade",
+            "does not state the order of its checks",
+            "the Spot Testnet rehearsal must confirm it",
+            A_VERDICT_SUGGESTS_PERMISSION,
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
+        assert!(!said.contains("prove"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_filter_failure_on_the_trade_probe_is_not_ready_and_names_the_filter() {
+        // The probe is the run's own order, and nothing else of the caller's
+        // reaches the request, so a filter that refuses it refuses the run's
+        // orders too: one that judges the order's numbers, NOTIONAL
+        // (errors.md:433), and one that judges the account, MAX_NUM_ORDERS,
+        // too many orders open on the symbol (errors.md:437;
+        // filters.md:217-219), which no change to the probe would pass.
+        // Through the client, as venue-check meets it.
+        for (name, filter) in [
+            ("NOTIONAL", FilterName::Notional),
+            ("MAX_NUM_ORDERS", FilterName::MaxNumOrders),
+        ] {
+            let msg = format!("Filter failure: {name}");
+            let venue = TestVenue::start(vec![Reply::Bytes(http(
+                "400 Bad Request",
+                "",
+                &error_doc(-1013, &msg),
+            ))]);
+            let answer = client_at(&venue.base)
+                .check_trade_permission(&order_on("BTCUSDT"), 0)
+                .await;
+            assert_eq!(venue.stop().len(), 1, "{name}");
+            let Err(why) = answer else {
+                panic!("a failure of {name} was taken for ready")
+            };
+            assert_eq!(
+                why,
+                NotReady::ProbeFiltered {
+                    status: 400,
+                    filter,
+                    venue: error_read(-1013, &msg),
+                },
+                "{name}"
+            );
+            // The reason names the filter the venue cited, and why it stops
+            // the run and not only the probe.
+            let said = why.to_string();
+            for needle in [
+                format!("the venue refused the trade probe on its {name} filter (HTTP 400, "),
+                format!("code -1013: Filter failure: {name})"),
+                "The probe is the run's own order, so the run's own orders would meet the same \
+                 filter"
+                    .to_owned(),
+                "the Spot Testnet rehearsal must confirm it".to_owned(),
+            ] {
+                assert!(said.contains(&needle), "{needle:?} missing from: {said}");
+            }
+        }
+
+        // A filter this does not know is a filter failure all the same, and
+        // its reason does not pretend to a name: the venue's message has it.
+        let msg = "Filter failure: SOMETHING_NEW";
+        let why =
+            read_order_test(400, None, error_doc(-1013, msg).as_bytes()).expect_err("not ready");
+        assert_eq!(
+            why,
+            NotReady::ProbeFiltered {
+                status: 400,
+                filter: FilterName::Unrecognised,
+                venue: error_read(-1013, msg),
+            }
+        );
+        let said = why.to_string();
+        assert!(
+            said.starts_with(
+                "the venue refused the trade probe on a filter this does not know, which its \
+                 message names (HTTP 400, code -1013: Filter failure: SOMETHING_NEW)"
+            ),
+            "{said}"
+        );
+    }
+
+    /// A rate in the commission fixture distinctive enough that a reason which
+    /// quoted the body would show it.
+    const RATE: &str = "0.00071234";
+
+    /// The documented commission rates (rest-api.md:4820-4847), their
+    /// comments removed, one rate made [`RATE`], and the two discount flags as
+    /// given.
+    fn commission(for_account: &str, for_symbol: &str) -> String {
+        format!(
+            r#"{{"symbol":"BTCUSDT","standardCommission":{{"maker":"{RATE}","taker":"0.00000020","buyer":"0.00000030","seller":"0.00000040"}},"specialCommission":{{"maker":"0.01000000","taker":"0.02000000","buyer":"0.03000000","seller":"0.04000000"}},"taxCommission":{{"maker":"0.00000112","taker":"0.00000114","buyer":"0.00000118","seller":"0.00000116"}},"discount":{{"enabledForAccount":{for_account},"enabledForSymbol":{for_symbol},"discountAsset":"BNB","discount":"0.75000000"}}}}"#
+        )
+    }
+
+    #[test]
+    fn the_bnb_discount_is_read_off_the_account_flag_and_nothing_of_the_body_is_said() {
+        // The account's flag decides, and in every case the symbol's says the
+        // opposite, so a reader of the wrong one is caught either way.
+        assert_eq!(
+            bnb_discount_off(commission("false", "true").as_bytes()),
+            Ok(())
+        );
+        let refusals = [
+            (commission("true", "false"), NotReady::BnbDiscountOn),
+            (
+                commission("\"false\"", "false"),
+                NotReady::UnreadableCommission(CommissionFault::DiscountFlagNotBool),
+            ),
+            (
+                format!(r#"{{"symbol":"BTCUSDT","standardCommission":{{"maker":"{RATE}"}}}}"#),
+                NotReady::UnreadableCommission(CommissionFault::NoDiscountFlag),
+            ),
+            (
+                format!(r#"{{"discount":{{"enabledForSymbol":false,"discount":"{RATE}"}}}}"#),
+                NotReady::UnreadableCommission(CommissionFault::NoDiscountFlag),
+            ),
+            (
+                format!("<html>{RATE}</html>"),
+                NotReady::UnreadableCommission(CommissionFault::NotJson),
+            ),
+        ];
+        for (body, expected) in refusals {
+            let why = bnb_discount_off(body.as_bytes()).expect_err("not ready");
+            assert_eq!(why, expected, "{body}");
+            assert!(!why.to_string().contains(RATE), "{why}");
+            assert!(!format!("{why:?}").contains(RATE), "{why:?}");
+        }
+        // The reason names the setting, and why the run needs it off.
+        let said = NotReady::BnbDiscountOn.to_string();
+        for needle in [
+            "pays its fees in BNB",
+            "discount.enabledForAccount is true",
+            // What the translator does, and so on which pairs it bites: a fee
+            // in BNB on a BNB pair is in one of the pair's assets.
+            "books a fee only in the pair's base or quote asset",
+            "on a pair without BNB it refuses every fill whose fee was taken in BNB",
+            "the run procedure turns the discount off",
+            "switch paying fees in BNB off",
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
+        // Not "in neither asset of the pair", which is false on BNBUSDT.
+        assert!(!said.contains("neither asset"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn the_commission_rates_are_asked_for_the_symbol_checked() {
+        // The symbol goes out encoded as an order's would be, and the
+        // documentation's own non-ASCII symbol is the one that shows a second
+        // encoding, or none: either way the signature stops verifying.
+        let venue = TestVenue::start(vec![Reply::Bytes(http(
+            "200 OK",
+            "",
+            &commission("false", "false"),
+        ))]);
+        let answer = client_at(&venue.base)
+            .check_bnb_discount_off(NON_ASCII, 0)
+            .await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(
+            requests[0].starts_with(
+                "GET /api/v3/account/commission?symbol=%EF%BC%91%EF%BC%92%EF%BC%93%EF%BC%94%EF%BC%95\
+                 %EF%BC%96&timestamp="
+            ),
+            "{}",
+            requests[0]
+        );
+        signed_on_the_wire(&requests[0]);
+        assert_eq!(answer, Ok(()));
+
+        // A refusal is sorted as check_ready sorts one. On a USER_DATA
+        // request -2015 is the key, its address or its permission to read,
+        // which is the credentials, not the key's permission to trade.
+        let key = r#"{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}"#;
+        let venue = TestVenue::start(vec![Reply::Bytes(http("401 Unauthorized", "", key))]);
+        let answer = client_at(&venue.base)
+            .check_bnb_discount_off("BTCUSDT", 0)
+            .await;
+        venue.stop();
+        assert_eq!(
+            answer,
+            Err(NotReady::BadCredentials {
+                status: 401,
+                venue: Some(VenueError {
+                    code: -2015,
+                    msg: "Invalid API-key, IP, or permissions for action.".to_owned(),
+                }),
+            })
+        );
     }
 }

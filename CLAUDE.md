@@ -2198,8 +2198,9 @@ again, and it would refuse every order. The fix needs an Administrator
 PowerShell: `Set-Service w32time -StartupType Automatic`, `Start-Service
 w32time`, `w32tm /resync /force`. Then measure again before trusting it.
 
-`venue-check` places no order. It makes one signed `GET /api/v3/account` and
-prints the round-trip-corrected offset, which is the quantity that matters —
+`venue-check` places no order. It makes three signed requests, none of which
+places anything, and prints the round-trip-corrected offset, which is the
+quantity that matters —
 measuring `now - serverTime` naively folds one-way latency into the offset and
 would block a run over a clock that is fine. **Its correction had the wrong
 sign**, putting the reading off by a full round trip, until
@@ -2220,15 +2221,20 @@ a relative path would put the key in a public repository and leave `*.pem` in
 and the private key is loaded into `BINANCE_ED25519_PRIVATE_KEY` as above.
 `venue-check` prints the public half of whatever key it loaded, to compare with
 the registered one. Spot Testnet keeps its own pairs; `--testnet` checks one
-there. **READY is not permission to trade**: it
-says the key, the signature and the clock work and the account reports
-`canTrade`, a field the venue never defines. The probe is a `USER_DATA`
-request, and a key cannot `TRADE` until trading is enabled for it in API
-Management, so a key without that permission passes. `POST /api/v3/order/test`,
-a `TRADE` request at weight 1, tests it, and comes with the requests half of
-slice (c). Its first run here, with Binance's published example key against
-Spot Testnet, read the host **2409 ms ahead** and stopped before signing
-anything, which agrees with the 2.1 s above.
+there. **READY now covers permission to trade** (`m8c-order-transport`). The
+account request is `USER_DATA`, which a key that cannot `TRADE` passes, and its
+`canTrade` is a field the venue never defines; so READY also needs
+`POST /api/v3/order/test`, a `TRADE` request at weight 1 that validates a
+market buy and sends nothing to the matching engine, to accept the run's own
+order outright, which shows the key may trade, and the account not to pay its
+fees in BNB, which the translator refuses. Any refusal of the probe is NOT
+READY, a filter failure included: the probe is the run's size on the run's
+symbol, and filters such as `MAX_NUM_ORDERS` and `MAX_POSITION` judge the
+account, so the run's orders would meet them too.
+`--symbol` sets the symbol both are asked about, `BTCUSDT` by default. Its
+first run here, with Binance's published example key against Spot Testnet,
+read the host **2409 ms ahead** and stopped before signing anything, which
+agrees with the 2.1 s above.
 
 **`ops/*.ps1` is record-only, and there is no live mode in either half.** The
 paper mode exists in the bash half alone, deliberately, and the bash half has
@@ -2258,10 +2264,11 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   Ed25519 key in `BINANCE_ED25519_PRIVATE_KEY`, pinned against Binance's own
   published Ed25519 signature (the FIX API's example) rather than RFC 4231, and
   added the WebSocket API signer `session.logon` needs. `venue-check` now reads
-  `canTrade` and names why a refusal was refused; its READY does not cover the
-  key's permission to trade, which its `USER_DATA` probe cannot test. The
-  Ed25519 signer has **not met the venue yet**: this host's clock stops
-  `venue-check` before it signs.
+  `canTrade` and names why a refusal was refused, and since
+  `m8c-order-transport` its READY covers the key's permission to trade, which
+  the `USER_DATA` account request cannot test, and the BNB fee discount being
+  off. The Ed25519 signer has **not met the venue yet**: this host's clock
+  stops `venue-check` before it signs.
 - **(c) part done.** `FeeAsset` shipped: a spot venue takes its fee in the
   asset you received, and modelling it turned out to need one field rather than
   the two balances M4 predicted. PR #50 then fixed what consuming a base-asset
@@ -2282,13 +2289,26 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   ours, an orphan (our `q-` prefix, not this run) and not ours. A cancel is
   matched on `C`, the order, not `c`, the cancel request. A fee in neither side
   of the pair, which is what the BNB discount produces, is refused loudly, so
-  the run procedure must turn the discount off. Written against the venue's
-  documented example rather than a capture; criterion D's recorded reports have
-  to confirm it.
+  the run procedure must turn the discount off, and `venue-check` now refuses
+  READY until it is. Written against the venue's documented example rather than
+  a capture; criterion D's recorded reports have to confirm it.
 
-  **What remains in (c) is about ten pull requests**, listed with their
-  acceptance criteria in `docs/live-run.md` §4. Mapping what `LiveVenue` has to
-  fit (2026-10-14/15) found seven defects in shipped code, which go first (see
+  **Orders can be written and sent.** `quant-binance::orders` (#59) encodes an
+  `OrderRequest` for `POST /api/v3/order` and a cancel for `DELETE`, and sorts
+  every answer into placed, refused (with the venue's code and message) or
+  unknown, lopsided so that nothing ambiguous is ever a refusal.
+  `TradeClient::place_order` and `cancel_order` (`m8c-order-transport`) send
+  them: the encoded query verbatim with an empty body, no redirect followed,
+  *not sent* claimed only for a connection never made, and `ORDER_TIMEOUT`,
+  20 s, above the venue's ten plus `recvWindow`, each pinned by a test seen red.
+  Nothing calls them until `LiveVenue`, and none of it has met the venue: the
+  testnet rehearsal is its first real test, and its answers belong beside the
+  fixtures.
+
+  **What remains in (c) is items 2 to 8 of `docs/live-run.md` §4**, each with
+  its acceptance criterion; item 1, the credentials and the requests, is done.
+  Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
+  shipped code, which went first, each on its own branch (#52 to #56, and see
   *Still open*), and eighteen design questions. The ones that block code are
   settled in §5; the rest are settled in the pull request that meets them.
   Three were the owner's, on 2026-10-15:
