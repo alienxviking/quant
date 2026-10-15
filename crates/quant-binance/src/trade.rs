@@ -437,17 +437,34 @@ fn chrono_millis() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// Strip a signature out of anything about to be logged.
+/// Strip every signature out of anything about to be logged.
+///
+/// The whole value goes, whatever its alphabet: everything after `signature=`
+/// up to the next `&`, whitespace, quote or closing parenthesis, or the end of
+/// the text. This used to strip hex digits only, which was the whole of an HMAC
+/// signature. An Ed25519 signature is base64, and percent-encoded in a query
+/// (rest-api.md:644-650), so a hex-only rule would stop at its first `+`, `%`
+/// or letter past `f` and let the rest of it into the log.
+///
+/// The parenthesis is there because `reqwest` writes a URL inside one, and none
+/// of the alphabets a signature comes in — hex, base64, percent-encoding — has
+/// one to cut a value short.
 fn redact_signature(text: &str) -> String {
-    let Some(at) = text.find("signature=") else {
-        return text.to_owned();
-    };
-    let head = &text[..at + "signature=".len()];
-    let tail = &text[at + "signature=".len()..];
-    let end = tail
-        .find(|c: char| !c.is_ascii_hexdigit())
-        .unwrap_or(tail.len());
-    format!("{head}<redacted>{}", &tail[end..])
+    const MARK: &str = "signature=";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(MARK) {
+        let value = at + MARK.len();
+        out.push_str(&rest[..value]);
+        out.push_str("<redacted>");
+        let tail = &rest[value..];
+        let end = tail
+            .find(|c: char| matches!(c, '&' | '"' | '\'' | ')') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -766,6 +783,52 @@ mod tests {
             clean.contains("connection closed"),
             "the rest survives: {clean}"
         );
+    }
+
+    #[test]
+    fn a_whole_base64_signature_is_stripped_not_only_a_hex_prefix() {
+        // What an Ed25519 signer sends for `GET /api/v3/account` at this
+        // instant under Binance's published example key (fix-api.md:297-306),
+        // percent-encoded as a query carries it: OpenSSL 3.5.5's signature over
+        // `timestamp=1700000000000&recvWindow=5000`. It begins with `x`, which
+        // is not hex, so a hex-only rule redacts none of it.
+        let signature = "xmyZz90mk%2FQlhtKo1XqnpC4Lki2UdcSWKZE1omVY2mESFPRE%2FwpzlWcQo%2Bv5TVF1a\
+                         N7lHdICZKEI%2FHWpEVI4Dg%3D%3D";
+        let noisy = format!(
+            "error sending request for url (https://api.binance.com/api/v3/account?\
+             timestamp=1700000000000&recvWindow=5000&signature={signature})"
+        );
+        let clean = redact_signature(&noisy);
+        for i in 0..=signature.len() - 8 {
+            let piece = &signature[i..i + 8];
+            assert!(!clean.contains(piece), "{piece} survived: {clean}");
+        }
+        assert_eq!(
+            clean,
+            "error sending request for url (https://api.binance.com/api/v3/account?\
+             timestamp=1700000000000&recvWindow=5000&signature=<redacted>)"
+        );
+    }
+
+    #[test]
+    fn a_signature_runs_to_the_next_separator_and_every_one_is_stripped() {
+        // Raw base64 as well as encoded, ended by each thing that can follow a
+        // value in a log line, and more than one in a line.
+        for (text, expected) in [
+            ("a?signature=Ab+/9=&b=1", "a?signature=<redacted>&b=1"),
+            ("signature=Ab+/9= next", "signature=<redacted> next"),
+            ("signature=Ab+/9=\tnext", "signature=<redacted>\tnext"),
+            ("\"signature=Ab+/9=\" x", "\"signature=<redacted>\" x"),
+            ("'signature=Ab%2B9%3D' x", "'signature=<redacted>' x"),
+            ("(signature=Ab+/9=) x", "(signature=<redacted>) x"),
+            ("ends signature=Ab+/9=", "ends signature=<redacted>"),
+            (
+                "signature=AAAA&x=1, then signature=BBBB",
+                "signature=<redacted>&x=1, then signature=<redacted>",
+            ),
+        ] {
+            assert_eq!(redact_signature(text), expected, "{text}");
+        }
     }
 
     #[test]
