@@ -146,6 +146,22 @@ impl SnapshotClient {
         )
     }
 
+    /// The URL one symbol's trading rules come from. Public so a test can check
+    /// it without a network.
+    ///
+    /// The symbol is named rather than searched for in the whole exchange's
+    /// list: the documented weight is 20 either way, and a symbol the venue does
+    /// not know is then refused outright (`rest-api.md` line 794 at commit
+    /// `0556f1a`) instead of being merely absent from a long answer.
+    #[must_use]
+    pub fn exchange_info_url(&self, symbol: &str) -> String {
+        format!(
+            "{}/api/v3/exchangeInfo?symbol={}",
+            self.base.trim_end_matches('/'),
+            symbol
+        )
+    }
+
     /// How far our clock is from the venue's, in milliseconds. Positive means we
     /// are ahead.
     ///
@@ -213,18 +229,39 @@ impl SnapshotClient {
     /// mistake in our understanding of the payload is a normalizer bug we can fix
     /// rather than a capture we have to discard.
     pub async fn depth(&self, symbol: &str) -> Result<Vec<u8>, SnapshotError> {
-        let response = self
-            .http
-            .get(self.depth_url(symbol))
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    SnapshotError::Timeout
-                } else {
-                    SnapshotError::Transport(e.to_string())
-                }
-            })?;
+        self.get_verbatim(self.depth_url(symbol)).await
+    }
+
+    /// Fetch one symbol's trading rules, returning the response body verbatim.
+    ///
+    /// `GET /api/v3/exchangeInfo`, weight 20 and unsigned (`rest-api.md` lines
+    /// 776-781 at commit `0556f1a`), so it needs no credentials and belongs on
+    /// this client rather than the one that can spend money. The bytes are not
+    /// looked at here: reading them, and fetching and reading in one call, are
+    /// `exchange_info`'s.
+    ///
+    /// # Errors
+    ///
+    /// [`SnapshotError`] for transport, status and body failures. A symbol the
+    /// venue does not list is one of those: the venue refuses the request
+    /// rather than answering without it, and this client keeps the status.
+    pub async fn exchange_info(&self, symbol: &str) -> Result<Vec<u8>, SnapshotError> {
+        self.get_verbatim(self.exchange_info_url(symbol)).await
+    }
+
+    /// One `GET`, returning the body exactly as it arrived.
+    ///
+    /// Shared rather than copied per endpoint: the order below -- status before
+    /// body -- is the part that matters, and a second copy is a second place to
+    /// get it backwards.
+    async fn get_verbatim(&self, url: String) -> Result<Vec<u8>, SnapshotError> {
+        let response = self.http.get(url).send().await.map_err(|e| {
+            if e.is_timeout() {
+                SnapshotError::Timeout
+            } else {
+                SnapshotError::Transport(e.to_string())
+            }
+        })?;
 
         // Status before body: a 429 body is an error document, and writing it into
         // the capture as though it were a book is exactly the sort of silent
@@ -274,6 +311,20 @@ mod tests {
         let with = SnapshotClient::new("https://example.test/", Duration::from_secs(1)).unwrap();
         let without = SnapshotClient::new("https://example.test", Duration::from_secs(1)).unwrap();
         assert_eq!(with.depth_url("ETHUSDT"), without.depth_url("ETHUSDT"));
+        assert_eq!(
+            with.exchange_info_url("ETHUSDT"),
+            without.exchange_info_url("ETHUSDT")
+        );
+    }
+
+    #[test]
+    fn the_exchange_info_url_names_one_symbol() {
+        // The path and the parameter are the documented ones (`rest-api.md`
+        // lines 776 and 787 at commit `0556f1a`).
+        assert_eq!(
+            client().exchange_info_url("BTCUSDT"),
+            "https://api.binance.com/api/v3/exchangeInfo?symbol=BTCUSDT"
+        );
     }
 
     #[test]
