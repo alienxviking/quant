@@ -764,13 +764,22 @@ mod tests {
         // The accident this type exists to prevent. A `#[derive(Debug)]` three
         // levels up, an `anyhow` context, a `tracing` field — all of them reach
         // `Debug`, and none of them would fail a test.
+        //
+        // Pinned whole, not searched for what must be absent. A search finds
+        // only the forms it was written for: a `Debug` that printed the API
+        // key's first four characters, or the private key's bytes as hex or as
+        // decimal, holds no run of either key as it was given, and passed the
+        // search this replaced.
         let creds = Credentials::new("AKIAEXAMPLEKEY".to_owned(), EXAMPLE_KEY_PEM).expect("loads");
-        let shown = format!("{creds:?}");
-        assert!(!shown.contains("AKIAEXAMPLEKEY"), "{shown}");
-        for window in eight_char_windows(EXAMPLE_KEY_BODY) {
-            assert!(!shown.contains(window), "{window} in {shown}");
-        }
-        assert!(shown.contains("redacted"), "{shown}");
+        assert_eq!(
+            format!("{creds:?}"),
+            r#"Credentials { key: "<redacted>", private_key: "<redacted>" }"#
+        );
+        // And the multi-line form, which `{:#?}` and pretty loggers print.
+        assert_eq!(
+            format!("{creds:#?}"),
+            "Credentials {\n    key: \"<redacted>\",\n    private_key: \"<redacted>\",\n}"
+        );
     }
 
     #[test]
