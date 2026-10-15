@@ -219,12 +219,21 @@ impl<R: Read> RawReader<R> {
     /// damaged tail; [`RawReader::truncation`] distinguishes them. Callers that
     /// must not silently accept partial data should check it -- the offline
     /// verifier does.
+    ///
+    /// After an error the read is over, and every later call returns `None`.
     pub fn next_frame(&mut self) -> Option<StorageResult<RawFrame>> {
         loop {
             if self.cursor < self.block.len() {
                 let result = self.decode_frame();
                 if result.is_err() {
+                    // The rest of the block goes too. Being finished is checked
+                    // only once the block is used up, so a block left in place
+                    // would be decoded again from wherever the cursor stopped --
+                    // the same error forever, or the inside of a payload read as
+                    // a frame header.
                     self.finished = true;
+                    self.block.clear();
+                    self.cursor = 0;
                 }
                 return Some(result);
             }
@@ -1092,6 +1101,30 @@ mod tests {
             })) => {}
             other => panic!("expected the snapshot to be refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nothing_is_read_past_a_frame_that_will_not_decode() {
+        // `None` after an error, every time. The reader used to mark itself
+        // finished and then decode the same bytes again on the next call, so a
+        // caller that went on past an error got the error forever -- or, where
+        // the cursor had already moved, the inside of a payload read as a frame
+        // header. Every caller stopped at the first error, which is why it never
+        // showed; the next one need not.
+        let mut bytes = unhex(V2_FILE);
+        restamp(&mut bytes, 1);
+        let mut reader = RawReader::open(bytes.as_slice()).expect("v1 is a version we read");
+        let mut errors = 0;
+        let mut calls = 0;
+        while let Some(frame) = reader.next_frame() {
+            calls += 1;
+            assert!(calls < 10, "the reader never stopped");
+            if frame.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(errors, 1, "one error, and then the end");
+        assert_eq!(calls, 3, "two v1 frames, then the snapshot refused");
     }
 
     #[test]
