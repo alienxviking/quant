@@ -189,10 +189,10 @@ pub struct VenueInstrument {
 pub struct UnmodelledRule {
     /// Whether the venue listed it for the symbol or for the whole account.
     pub scope: RuleScope,
-    /// The venue's name for the filter: `MARKET_LOT_SIZE`, `NOTIONAL`. An order
-    /// refused under it is refused as `Filter failure: <this>` (`errors.md`
-    /// lines 425-446).
-    pub filter_type: String,
+    /// The venue's name for the rule. For a filter, its `filterType`:
+    /// `MARKET_LOT_SIZE`, `NOTIONAL`. An order refused under one is refused as
+    /// `Filter failure: <this>` (`errors.md` lines 425-446).
+    pub name: String,
     /// Every field the definition did not take, sorted by the venue's name for
     /// it, each value as the venue wrote it: a string's contents, or the JSON
     /// text of anything else.
@@ -201,12 +201,12 @@ pub struct UnmodelledRule {
 
 impl fmt::Display for UnmodelledRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.filter_type)?;
+        f.write_str(&self.name)?;
         if self.scope == RuleScope::Exchange {
             f.write_str(" (exchange-wide)")?;
         }
-        for (name, value) in &self.fields {
-            write!(f, " {name}={value}")?;
+        for (key, value) in &self.fields {
+            write!(f, " {key}={value}")?;
         }
         Ok(())
     }
@@ -413,7 +413,7 @@ pub fn parse(symbol: &str, body: &[u8]) -> Result<VenueInstrument, ExchangeInfoE
         if taken.is_none() || !fields.is_empty() {
             unmodelled.push(UnmodelledRule {
                 scope: RuleScope::Symbol,
-                filter_type: filter_type.clone(),
+                name: filter_type.clone(),
                 fields,
             });
         }
@@ -421,7 +421,7 @@ pub fn parse(symbol: &str, body: &[u8]) -> Result<VenueInstrument, ExchangeInfoE
     for (filter_type, filter) in &exchange_filters {
         unmodelled.push(UnmodelledRule {
             scope: RuleScope::Exchange,
-            filter_type: filter_type.clone(),
+            name: filter_type.clone(),
             fields: untaken(filter, None),
         });
     }

@@ -333,25 +333,25 @@ fn ethbtc(tick: &str, lot: &str, floor: &str) -> InstrumentDef {
     }
 }
 
-fn reported(scope: RuleScope, filter_type: &str, fields: &[(&str, &str)]) -> UnmodelledRule {
+fn reported(scope: RuleScope, name: &str, fields: &[(&str, &str)]) -> UnmodelledRule {
     UnmodelledRule {
         scope,
-        filter_type: filter_type.to_owned(),
+        name: name.to_owned(),
         fields: fields
             .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect(),
     }
 }
 
 /// A symbol rule the definition does not carry, fields in the venue's names'
 /// sort order.
-fn rule(filter_type: &str, fields: &[(&str, &str)]) -> UnmodelledRule {
-    reported(RuleScope::Symbol, filter_type, fields)
+fn rule(name: &str, fields: &[(&str, &str)]) -> UnmodelledRule {
+    reported(RuleScope::Symbol, name, fields)
 }
 
-fn exchange_rule(filter_type: &str, fields: &[(&str, &str)]) -> UnmodelledRule {
-    reported(RuleScope::Exchange, filter_type, fields)
+fn exchange_rule(name: &str, fields: &[(&str, &str)]) -> UnmodelledRule {
+    reported(RuleScope::Exchange, name, fields)
 }
 
 #[test]
