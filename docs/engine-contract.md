@@ -747,7 +747,14 @@ nothing has moved, so a report still in flight stays undelivered.
       through a venue with nothing beside its events and one that says
       everything a live venue says, give the strategy the same events, clock,
       position, cash and `take_notes` count, and only the second's record heard
-      the ids and notices.
+      the ids and notices. The clock is the same only because the talkative
+      venue's notices are stamped no later than the order reports beside them
+      on the same wake. A notice moves the clock like any report (§6): one
+      stamped later than everything else on its wake carries the clock, and
+      what the strategy reads on that wake, forward to its own time, and one on
+      a wake of its own moves the clock with no strategy call at all. That is
+      by design, and it is how a stream lost during a silent market is dated
+      when it was heard.
 - [x] Readiness refuses before anything is written and spends nothing of risk's
       count; a record that withholds once withholds for good; strays and orphans
       never reach the strategy; `settle` books a late fill and tells nobody.
