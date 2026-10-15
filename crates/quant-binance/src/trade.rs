@@ -863,6 +863,38 @@ mod tests {
             .unwrap_or_else(|_| panic!("the test server did not get its request"))
     }
 
+    /// The payload `request` signed, once the signature it carried has been
+    /// checked the way the venue reads one off the wire.
+    ///
+    /// The request line's query is split at `&signature=`. What comes before
+    /// is the payload, exactly as sent (rest-api.md:555). What comes after is
+    /// decoded once, as a query string's values are read, `+` to a space and
+    /// `%XX` to its byte, and must verify over that payload under the example
+    /// key's public half as OpenSSL derives it. A signature encoded twice --
+    /// what `reqwest`'s `.query()` would make of one this crate had already
+    /// encoded -- still holds a `%` after one decoding, and in one sent raw
+    /// any `+` is read back as a space: neither is base64, here or at the
+    /// venue.
+    fn signed_on_the_wire(request: &str) -> &str {
+        let line = request.lines().next().unwrap_or_default();
+        let (_, query) = line
+            .strip_prefix("GET ")
+            .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
+            .and_then(|target| target.split_once('?'))
+            .unwrap_or_else(|| panic!("not a GET with a query: {line}"));
+        let (payload, sent) = query
+            .split_once("&signature=")
+            .unwrap_or_else(|| panic!("no signature: {line}"));
+        let decoded = fixture::percent_decode(&sent.replace('+', " "));
+        let signature = STANDARD.decode(&decoded).unwrap_or_else(|e| {
+            panic!("one decoding of the signature sent, {sent}, is not base64: {decoded}: {e}")
+        });
+        UnparsedPublicKey::new(&ED25519, fixture::EXAMPLE_PUBLIC_KEY)
+            .verify(payload.as_bytes(), &signature)
+            .unwrap_or_else(|_| panic!("the signature sent does not verify over {payload}"));
+        payload
+    }
+
     /// The account document from the venue's documentation
     /// (rest-api.md:4196-4229), cut down, with `canTrade` as given. Its
     /// balance is distinctive, so a reason that quoted the body would show it.
@@ -1431,6 +1463,7 @@ mod tests {
             .await
             .expect_err("no answer is not ready");
         let request = received(server);
+        signed_on_the_wire(&request);
         let request_line = request.lines().next().unwrap_or_default();
         let signature = request_line
             .split_once("&signature=")
@@ -1460,7 +1493,7 @@ mod tests {
         let body = r#"{"code":-1003,"msg":"Too much request weight used; current limit is 6000 request weight per 1 MINUTE."}"#;
         let (base, server) = serve_once(http("429 Too Many Requests", "Retry-After: 37\r\n", body));
         let why = client_at(&base).check_ready(0).await.expect_err("refused");
-        received(server);
+        signed_on_the_wire(&received(server));
         assert_eq!(
             why,
             NotReady::RateLimited {
@@ -1487,7 +1520,8 @@ mod tests {
         let request = received(server);
         assert_eq!(why, NotReady::CannotTrade);
         assert!(!why.to_string().contains(BALANCE), "{why}");
-        // The request it answered was the signed account probe, with its key.
+        // The request it answered was the signed account probe, with its key,
+        // and with a signature that verifies over the query it arrived with.
         assert!(
             request.starts_with("GET /api/v3/account?timestamp="),
             "{request}"
@@ -1498,9 +1532,14 @@ mod tests {
                 .contains("x-mbx-apikey: the-api-key\r\n"),
             "{request}"
         );
+        let payload = signed_on_the_wire(&request);
+        assert!(
+            payload.starts_with("timestamp=") && payload.ends_with("&recvWindow=5000"),
+            "{payload}"
+        );
 
         let (base, server) = serve_once(http("200 OK", "", &account("true")));
         assert_eq!(client_at(&base).check_ready(0).await, Ok(()));
-        received(server);
+        signed_on_the_wire(&received(server));
     }
 }
