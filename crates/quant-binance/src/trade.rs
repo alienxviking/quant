@@ -498,6 +498,12 @@ impl TradeClient {
         let http = reqwest::Client::builder()
             .timeout(request_timeout)
             .pool_idle_timeout(Duration::from_secs(300))
+            // Never follow a redirect, for any request this client makes.
+            // `reqwest` follows up to ten by default, and following a 307 or
+            // 308 sends the same request again, to wherever the answer points:
+            // for an order, a second order. Unfollowed, the 3xx is the answer,
+            // and what reads it can only call it unknown or refused.
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("quant-live/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| SnapshotError::Transport(e.to_string()))?;
@@ -855,7 +861,7 @@ mod tests {
     /// instead, and each read of the request times out after as long. Past
     /// either, this thread panics and [`received`] fails the test.
     fn serve_once(response: String) -> (String, std::thread::JoinHandle<String>) {
-        use std::io::{ErrorKind, Read as _, Write as _};
+        use std::io::{ErrorKind, Write as _};
         use std::time::Instant;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.set_nonblocking(true).expect("a listener to poll");
@@ -876,28 +882,113 @@ mod tests {
                     Err(e) => panic!("accept: {e}"),
                 }
             };
-            // A socket accepted from a non-blocking listener can be
-            // non-blocking itself, as it is on Windows. Reads block again, each
-            // for no longer than the deadline's length.
-            stream.set_nonblocking(false).expect("a blocking stream");
-            stream
-                .set_read_timeout(Some(SERVE_DEADLINE))
-                .expect("a read timeout");
-            let mut request = Vec::new();
-            let mut buf = [0; 4096];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = stream
-                    .read(&mut buf)
-                    .unwrap_or_else(|e| panic!("the request did not arrive in time: {e}"));
-                if n == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buf[..n]);
-            }
+            let request = read_request(&mut stream);
             stream.write_all(response.as_bytes()).expect("write");
-            String::from_utf8(request).expect("an HTTP request head is text")
+            request
         });
         (base, server)
+    }
+
+    /// Read one request's head off `stream`, through the blank line that
+    /// ends it. Each read waits no longer than [`SERVE_DEADLINE`], and past
+    /// that this panics.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+        // A socket accepted from a non-blocking listener can be non-blocking
+        // itself, as it is on Windows. Reads block again, each for no longer
+        // than the deadline's length.
+        stream.set_nonblocking(false).expect("a blocking stream");
+        stream
+            .set_read_timeout(Some(SERVE_DEADLINE))
+            .expect("a read timeout");
+        let mut request = Vec::new();
+        let mut buf = [0; 4096];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream
+                .read(&mut buf)
+                .unwrap_or_else(|e| panic!("the request did not arrive in time: {e}"));
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8(request).expect("an HTTP request head is text")
+    }
+
+    /// What [`TestVenue`] does with a request it has read.
+    #[derive(Clone)]
+    enum Reply {
+        /// Write these bytes and close the connection.
+        Bytes(String),
+    }
+
+    /// A test venue on this machine that, unlike [`serve_once`], can be sent
+    /// more than one request. Each request it reads gets the next of its
+    /// replies, and the last again once they run out, and every request is
+    /// kept, in order, for [`TestVenue::stop`] to hand back.
+    ///
+    /// It runs until it is stopped, not until a request comes, so a test can
+    /// count every request the client made, a second one that should never
+    /// have been sent included. A test stops it once the client has its
+    /// answer: by then every request the client made has been read, because
+    /// each is kept before it is answered. Polled, like [`serve_once`], and
+    /// never running past [`SERVE_DEADLINE`].
+    struct TestVenue {
+        base: String,
+        stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        server: std::thread::JoinHandle<Vec<String>>,
+    }
+
+    impl TestVenue {
+        fn start(replies: Vec<Reply>) -> Self {
+            use std::io::{ErrorKind, Write as _};
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+            use std::time::Instant;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("a listener to poll");
+            let base = format!("http://{}", listener.local_addr().expect("address"));
+            let stopping = Arc::new(AtomicBool::new(false));
+            let stop = Arc::clone(&stopping);
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + SERVE_DEADLINE;
+                let mut requests = Vec::new();
+                while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let reply = replies.get(requests.len()).or(replies.last()).cloned();
+                            requests.push(read_request(&mut stream));
+                            match reply {
+                                Some(Reply::Bytes(bytes)) => {
+                                    stream.write_all(bytes.as_bytes()).expect("write");
+                                }
+                                // No replies at all: hang up without a word.
+                                None => {}
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept: {e}"),
+                    }
+                }
+                requests
+            });
+            Self {
+                base,
+                stopping,
+                server,
+            }
+        }
+
+        /// Stop, and hand back every request it read, in the order they came.
+        fn stop(self) -> Vec<String> {
+            self.stopping
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.server
+                .join()
+                .unwrap_or_else(|_| panic!("the test venue failed"))
+        }
     }
 
     /// The request [`serve_once`] was sent. Fails the test when there was none
@@ -1617,5 +1708,37 @@ mod tests {
         let (base, server) = serve_once(http("200 OK", "", &account("true")));
         assert_eq!(client_at(&base).check_ready(0).await, Ok(()));
         signed_on_the_wire(&received(server));
+    }
+
+    /// A redirect to `location` on the same venue, of the kind that keeps the
+    /// method: a client that follows it sends the same request again.
+    fn redirect(location: &str) -> String {
+        http(
+            "307 Temporary Redirect",
+            &format!("Location: {location}\r\n"),
+            "",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_the_answer_and_is_never_followed() {
+        // Followed, a 307 sends the request again, wherever it points, and for
+        // an order that is a second order. Every request this client makes is
+        // sent once, so the redirect is what it answers with. Here the venue
+        // would have said the account can trade, had the client asked again.
+        let venue = TestVenue::start(vec![
+            Reply::Bytes(redirect("/api/v3/account/elsewhere")),
+            Reply::Bytes(http("200 OK", "", &account("true"))),
+        ]);
+        let answer = client_at(&venue.base).check_ready(0).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert_eq!(
+            answer,
+            Err(NotReady::Refused {
+                status: 307,
+                venue: None
+            })
+        );
     }
 }
