@@ -74,8 +74,18 @@
 //! `-----END PRIVATE KEY-----`, with LF or CRLF line ends (PowerShell's
 //! `Get-Content -Raw` keeps CRLF) and any whitespace around it. The other is the
 //! bare base64 body on one line, for a shell that handles multi-line values
-//! badly. Anything else is refused, loudly, by an error that names the variable
-//! and quotes no part of its value: an encrypted key, any other PEM label,
+//! badly, and it too is read out of the file rather than typed:
+//!
+//! ```text
+//! export BINANCE_ED25519_PRIVATE_KEY="$(grep -v -- ----- "$HOME/.binance/ed25519.pem" | tr -d '\r\n')"
+//! $env:BINANCE_ED25519_PRIVATE_KEY = ((Get-Content "$env:USERPROFILE\.binance\ed25519.pem" | Where-Object { $_ -notmatch '-----' }) -join '')
+//! ```
+//!
+//! **Never paste key text into a shell**, in either form: a shell's history
+//! keeps what was typed, which is the same reason the key is not a flag.
+//!
+//! Anything else is refused, loudly, by an error that names the variable and
+//! quotes no part of its value: an encrypted key, any other PEM label,
 //! malformed base64, or a document `ring` will not take as an Ed25519 private
 //! key.
 //!
@@ -215,7 +225,8 @@ impl core::fmt::Display for CredentialError {
             Self::NotBase64 => write!(
                 f,
                 "{var} is not base64. It must be the PEM text of the key, or the base64 body \
-                 between its BEGIN and END lines on its own."
+                 between its BEGIN and END lines on its own, read out of the key's file: never \
+                 paste key text into a shell, whose history keeps it."
             ),
             Self::NotEd25519 { reason } => write!(
                 f,
@@ -1026,6 +1037,20 @@ mod tests {
             assert!(said.contains(needle), "{needle:?} missing from: {said}");
         }
         assert!(!said.contains("key.pem"), "{said}");
+    }
+
+    #[test]
+    fn a_body_that_is_not_base64_says_to_read_it_from_the_file_not_paste_it() {
+        // A one-line body that is not base64 was most likely typed or pasted
+        // in, which is how a key ends up in a shell's history.
+        let said = CredentialError::NotBase64.to_string();
+        for needle in [
+            "BINANCE_ED25519_PRIVATE_KEY is not base64",
+            "read out of the key's file",
+            "never paste key text into a shell",
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
     }
 
     #[test]

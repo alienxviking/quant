@@ -89,7 +89,9 @@ variables, which the shell that runs it must export:
                $env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw "$env:USERPROFILE\.binance\ed25519.pem"
 
 The private key is an Ed25519 key in a file at that absolute path, outside this
-repository. Never create it inside the repository, which is public. To make one:
+repository. Never create it inside the repository, which is public, and never
+paste key text into a shell, whose history keeps it: read it from the file, as
+above. To make one:
 
   bash:        mkdir -p "$HOME/.binance"
                openssl genpkey -algorithm ed25519 -out "$HOME/.binance/ed25519.pem"
@@ -424,6 +426,7 @@ mod tests {
             r#"openssl genpkey -algorithm ed25519 -out "$env:USERPROFILE\.binance\ed25519.pem""#,
             r#"openssl pkey -in "$env:USERPROFILE\.binance\ed25519.pem" -pubout"#,
             "Never create it inside the repository",
+            "never\npaste key text into a shell",
             "--testnet",
             "https://testnet.binance.vision",
             "A testnet key pair is separate from the live one",
