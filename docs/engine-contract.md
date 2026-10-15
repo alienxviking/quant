@@ -434,7 +434,9 @@ windows and a zeroed equity sampler**. When this was written it came back with
 a zeroed daily risk tally too, because `RiskEngine::recover` carried the
 switch across and nothing else; since `m8c-journal-readers` the tally is
 recounted from the journal (`journal::recover_risk`, §10), so the risk layer
-is one thing a restart no longer changes.
+comes back as far as the journal holds it. §10 lists where that stops: an order
+in flight at the cut, a schema-1 journal's order count, a withheld order's
+count, and the refusal total.
 
 The judging backtest has no such boundary. It runs the indicator and the sampler
 continuously across the same instant, so after a restart the two
@@ -616,7 +618,12 @@ would be the most dangerous thing in the system. A flip is not a reduction: the 
 other. The exemption is from that one limit. A reducing order still meets the
 per-order limit (a fat finger on the way out is still a fat finger, and an exit can
 be split), the no-price refusal and the daily limits, and a tripped switch refuses
-even a flattening order, as below.
+even a flattening order, as below. "Never" is about the position risk has been
+told of. An orphaned fill moves real exposure that neither the portfolio nor
+the tally holds, so live the limit can misjudge a position an orphan changed;
+that is why a single orphan fails criterion A and `runlog check`, and why an
+order in flight at a restart is slice (d)'s to recover (criterion E) rather
+than an orphan to live with.
 
 **Fees count against the daily loss budget.** A limit ignoring them would be
 reached late by exactly the amount a high-turnover strategy pays — which §8 showed
@@ -651,6 +658,17 @@ fresh budget, and a restart could. A new UTC day in the file still resets the
 counters and never the switch, because the recount rolls the day exactly where
 the live check did. The limits are the restarted process's own; the counts
 are facts about the day.
+
+The recount is as complete as the journal and no more, and four things fall
+outside it. An order in flight at the cut: in paper its fill never comes,
+because the new `SimulatedVenue` never heard of the order, and live it arrives
+as an orphan, which risk is never told of; the uninterrupted tally would hold
+it, and recovering it is criterion E's lookup in slice (d)
+(`docs/live-run.md` §3). A schema-1 journal, the fortnight's, has no
+`submitted` lines, so its order count recounts to zero. An order a strict
+writer withheld after its first failed append did spend a count in the
+earlier process, and the file does not hold it. And `refusals()`, a reporting
+total rather than a limit, starts again at zero.
 
 **A tripped switch refuses everything, including a flattening order.** A real
 trade-off, written down: closing out becomes a manual act, which is the right

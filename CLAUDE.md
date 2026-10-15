@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 753 tests green in debug
-and release, clippy and fmt clean, ~60,200 lines across 12 crates.
+same window exactly, on both symbols, to the satoshi. 756 tests green in debug
+and release, clippy and fmt clean, ~60,400 lines across 12 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -2351,13 +2351,20 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   id counter, beyond what the design asked.
 
   **Item 4's reader debts are paid** (`m8c-journal-readers`): `runlog check`
-  fails on an orphaned fill, a stray, another run's order and a doubt left
-  raised, and counts a stranger's order; a line torn before a restart rides on
-  `reconcile`'s verdict line and is a `runlog check` finding; a restart
-  recounts the risk tally from the journal (`journal::recover_risk`), so the
-  holding, the day's order count and its loss survive it and only a new UTC
-  day resets the counters; and `explain --at` reads `backtest --journal`
-  files again, which a wall-clock `started` line had stopped.
+  fails on an orphaned fill, a stray, another run's order, a doubt left raised
+  about an order never seen to end, and an anomaly, and counts a stranger's
+  order; a line torn before a restart rides on `reconcile`'s verdict line and
+  is a `runlog check` finding; a restart recounts the risk tally from the
+  journal (`journal::recover_risk`), so the holding, the day's order count and
+  its loss come back as far as the journal holds them, and only a new UTC day
+  resets the counters; and `explain --at` reads `backtest --journal` files
+  again, which a wall-clock `started` line had stopped. The journal's reach is
+  the limit: an order in flight at the cut is criterion E's to recover in
+  slice (d), and a schema-1 journal has no `submitted` lines to count
+  (`docs/engine-contract.md` §10). An anomaly is flagged rather than trusted
+  to a doubt beside it, because no venue code has that duty; the one an
+  `account` line rests on, a doubt on every order working when the stream is
+  lost, is now item 7's acceptance criterion.
 
   **What remains in (c) is items 6, 7 and 8 of `docs/live-run.md` §4**:
   listening to the account, `LiveVenue`, and the `live` binary with its
