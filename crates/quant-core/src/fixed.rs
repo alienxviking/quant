@@ -385,11 +385,20 @@ impl Notional {
     /// never rounded *up* into money the venue did not charge.
     #[must_use]
     pub fn scaled_by(self, rate: Rate) -> Option<Self> {
-        let product = i128::from(self.raw()).checked_mul(i128::from(rate.raw()))?;
-        i64::try_from(product / i128::from(SCALE))
-            .ok()
-            .map(Self::from_raw)
+        times_rate(self.raw(), rate).map(Self::from_raw)
     }
+}
+
+/// `raw * rate`, in 128 bits, truncated toward zero; `None` if it does not fit.
+///
+/// The one multiplication by a [`Rate`], behind [`Notional::scaled_by`] and
+/// [`Qty::scaled_by`] both. A fee charged on a value and a fee charged on a
+/// quantity are the same arithmetic on different units, and two copies of it
+/// would be two things that have to round alike forever -- M4's lesson, where
+/// `Px::notional` was written out twice more before anyone saw it existed.
+fn times_rate(raw: i64, rate: Rate) -> Option<i64> {
+    let product = i128::from(raw).checked_mul(i128::from(rate.raw()))?;
+    i64::try_from(product / i128::from(SCALE)).ok()
 }
 
 impl Px {
@@ -411,6 +420,18 @@ impl Px {
 }
 
 impl Qty {
+    /// `quantity * rate`: a fee taken out of what was bought, in the asset
+    /// bought.
+    ///
+    /// What a spot venue charges a buyer -- the rate on the quantity received,
+    /// as a quantity of it -- where [`Notional::scaled_by`] is the rate on a
+    /// value. The same arithmetic, so it truncates toward zero for the same
+    /// reason: a fee is never rounded *up* into coins the venue did not take.
+    #[must_use]
+    pub fn scaled_by(self, rate: Rate) -> Option<Self> {
+        times_rate(self.raw(), rate).map(Self::from_raw)
+    }
+
     /// Round toward zero to a whole number of `lot`s.
     ///
     /// The largest size a venue with this lot would accept that is no bigger
@@ -541,6 +562,39 @@ mod tests {
     fn no_lot_leaves_a_quantity_alone() {
         let q: Qty = "0.000999".parse().unwrap();
         assert_eq!(q.round_to_lot(Qty::ZERO), q);
+    }
+
+    #[test]
+    fn a_fee_on_a_quantity_truncates_toward_zero_as_a_fee_on_a_value_does() {
+        let fee = |q: &str, r: &str| {
+            q.parse::<Qty>()
+                .unwrap()
+                .scaled_by(r.parse().unwrap())
+                .unwrap()
+                .to_string()
+        };
+        // Ten basis points of 0.001 BTC: exactly the 0.000001 a spot venue
+        // takes from a buyer of M5's size, which leaves 0.000999 held.
+        assert_eq!(fee("0.001", "0.001"), "0.000001");
+        // 1.999 satoshi: truncated to one, where rounding to nearest or up
+        // would take two -- a satoshi the rate never charged.
+        assert_eq!(fee("0.00001999", "0.001"), "0.00000001");
+        // A rebate truncates toward zero too: the smaller rebate, not the
+        // larger, so a rebate is never rounded into coins nobody paid out.
+        assert_eq!(fee("0.00001999", "-0.001"), "-0.00000001");
+
+        // And it is a value's arithmetic on a different unit, not a second
+        // rounding rule: the same raw in gives the same raw out.
+        for raw in [1, 999, 1_999, 100_000, 99_999_999, -1_999] {
+            for rate in ["0.001", "0.00075", "-0.0001", "1"] {
+                let rate: Rate = rate.parse().unwrap();
+                assert_eq!(
+                    Qty::from_raw(raw).scaled_by(rate).map(Qty::raw),
+                    Notional::from_raw(raw).scaled_by(rate).map(Notional::raw),
+                    "{raw} at {rate}"
+                );
+            }
+        }
     }
 
     #[test]
