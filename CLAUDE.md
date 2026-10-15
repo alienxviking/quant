@@ -1775,9 +1775,12 @@ every document says it is.** Every one of them frames a mid-run restart as a
 *reader* problem, which is what M2.e was for. It is a **state** problem.
 `JournalEntry` has no strategy entry and `Engine::resuming` replaces only the
 portfolio, so a restarted `paper` process comes back with the right cash and
-position and with **empty `MaCrossover` windows, a zeroed `Recorded` sampler and
-a zeroed daily risk tally**. The judging backtest runs all of that *continuously*
-across the same boundary: different crossings, different fill counts, and the
+position and with **empty `MaCrossover` windows and a zeroed `Recorded`
+sampler**. It also came back with a zeroed daily risk tally until
+`m8c-journal-readers`, which recounts the tally from the journal as far as the
+journal holds it (`docs/engine-contract.md` §10 lists what it cannot); the
+strategy's windows and the sampler are still lost. The judging backtest runs all
+of that *continuously* across the same boundary: different crossings, different fill counts, and the
 exact comparison fails for reasons unrelated to live-versus-replay. It cannot be
 repaired after the fact, and the fallback — compare per-segment *between*
 restarts rather than end to end — is written down now, before there is a number
