@@ -277,6 +277,7 @@ mod tests {
                 at: Ts::from_nanos(0),
                 cash: "100".parse().expect("cash"),
                 schema: SCHEMA,
+                run: None,
             },
             filled(1_000, 1, "0.000001", FeeAsset::Base),
             filled(3_000, 2, "0.07665", FeeAsset::Quote),

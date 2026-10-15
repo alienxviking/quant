@@ -279,6 +279,9 @@ fn start_journal(journal: &Arc<Mutex<Journal>>, args: &Args) -> std::io::Result<
             at: quant_core::time::Clock::now(&quant_core::time::SystemClock),
             cash: args.cash,
             schema: quant_engine::journal::SCHEMA,
+            // No run tag: nothing here is sent to a venue, so there are no
+            // client ids at the venue to tell apart.
+            run: None,
         },
     )
 }

@@ -185,6 +185,9 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
             at: quant_core::time::Clock::now(&quant_core::time::SystemClock),
             cash: starting,
             schema: quant_engine::journal::SCHEMA,
+            // No run tag: nothing here is sent to a venue, so there are no
+            // client ids at the venue to tell apart.
+            run: None,
         },
     )?;
 

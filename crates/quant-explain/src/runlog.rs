@@ -648,6 +648,7 @@ mod tests {
             at: Ts::from_nanos(at),
             cash: quant_core::Notional::from_raw(0),
             schema: quant_engine::journal::SCHEMA,
+            run: None,
         };
         let live = vec![started(1), submitted(1, 2), started(3), submitted(2, 4)];
         assert_eq!(
@@ -742,6 +743,7 @@ mod tests {
                 at: Ts::from_nanos(300),
                 cash: quant_core::Notional::from_raw(0),
                 schema: quant_engine::journal::SCHEMA,
+                run: None,
             },
         ];
         let d = decisions_at(&entries, 10_000, 1_000);

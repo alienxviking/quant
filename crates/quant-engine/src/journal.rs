@@ -130,6 +130,21 @@ pub enum JournalEntry {
         /// both numbers.
         #[serde(default = "schema_v1")]
         schema: u32,
+        /// The run tag a live session sends its orders under, as
+        /// `q-<run>-<id>`.
+        ///
+        /// What tells this run's orders from an earlier run's at the venue,
+        /// where the client order ids of every run share one namespace: an
+        /// earlier run's order 5 and this run's order 5 differ only in the
+        /// tag. Like the capital, the **first** `started` line's tag is the
+        /// session's ([`run_tag`]); a restart carries the same one on.
+        ///
+        /// `None` for a backtest and for paper, which send nothing to a venue
+        /// and so have nothing to tell apart. Absent from every journal
+        /// written before schema 3, and written only when present, so a run
+        /// without one writes the line it always wrote.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<String>,
     },
     /// Something traded.
     Filled {
@@ -789,6 +804,25 @@ pub fn agrees(entries: &[JournalEntry]) -> Agreement {
 /// [`read`] refuses a session begun in a schema above this one, naming both.
 pub const SCHEMA: u32 = 3;
 
+/// The run tag of the session a journal records: the first `started` line's,
+/// or `None` when that line has none, or the journal has no `started` line.
+///
+/// The first and not the latest, as with the capital in [`replay`]: a restart
+/// continues a session rather than beginning one, and a restart that wrote a
+/// different tag would otherwise rename every order the session already sent.
+/// A later line that disagrees is not reconciled here; it is evidence, and the
+/// first line is the authority.
+#[must_use]
+pub fn run_tag(entries: &[JournalEntry]) -> Option<&str> {
+    entries.iter().find_map(|e| {
+        if let JournalEntry::Started { run, .. } = e {
+            Some(run.as_deref())
+        } else {
+            None
+        }
+    })?
+}
+
 /// What a journal with no `schema` field was: everything before M7.5.
 const fn schema_v1() -> u32 {
     1
@@ -1125,6 +1159,7 @@ mod tests {
                 at: Ts::from_nanos(0),
                 cash: amount("100"),
                 schema: SCHEMA,
+                run: None,
             },
             filled(1, Side::Buy, "76650", "0.001", "0.0766"),
             filled(2, Side::Sell, "76700", "0.001", "0.0767"),
@@ -1170,6 +1205,7 @@ mod tests {
                 at: Ts::from_nanos(10),
                 cash: amount("64"),
                 schema: SCHEMA,
+                run: None,
             }],
         );
         let recovered = read(&scratch.path).expect("read");
@@ -1186,6 +1222,7 @@ mod tests {
             at: Ts::from_nanos(10),
             cash: amount("64"),
             schema: SCHEMA,
+            run: None,
         });
         let mut registry = InstrumentRegistry::new();
         let portfolio = replay(&restarted, &mut registry);
@@ -1260,6 +1297,7 @@ mod tests {
                 at: Ts::from_nanos(0),
                 cash: amount("100"),
                 schema: SCHEMA,
+                run: None,
             },
             JournalEntry::Filled {
                 at: Ts::from_nanos(1),
@@ -1339,6 +1377,7 @@ mod tests {
             at: Ts::from_nanos(10),
             cash: amount("100"),
             schema: SCHEMA,
+            run: None,
         };
         let after = filled(11, Side::Buy, "76800", "0.001", "0.0768");
         write_all(&scratch.path, &[restarted.clone(), after.clone()]);
@@ -1402,6 +1441,7 @@ mod tests {
             at: Ts::from_nanos(10),
             cash: amount("100"),
             schema: SCHEMA,
+            run: None,
         };
         write_all(&scratch.path, std::slice::from_ref(&restarted));
         let recovered = read(&scratch.path).expect("a restart after it is not damage");
@@ -1454,6 +1494,7 @@ mod tests {
             at: Ts::from_nanos(10),
             cash: amount("100"),
             schema: SCHEMA,
+            run: None,
         };
         write_all(path, std::slice::from_ref(&started));
         started
@@ -1626,6 +1667,7 @@ mod tests {
             at: Ts::from_nanos(10),
             cash: amount("64"),
             schema: SCHEMA,
+            run: None,
         });
         let mut registry = InstrumentRegistry::new();
         let resumed = resume(&restarted, &mut registry, btcusdt(), amount("50")).expect("resumes");
@@ -1650,6 +1692,7 @@ mod tests {
             at: Ts::from_nanos(5),
             cash: amount("99"),
             schema: SCHEMA,
+            run: None,
         });
         let mut registry = InstrumentRegistry::new();
         let resumed = resume(&entries, &mut registry, btcusdt(), amount("100")).expect("resumes");
@@ -1964,6 +2007,75 @@ mod m75a_tests {
     }
 
     #[test]
+    fn the_run_tag_is_the_first_session_s_and_an_empty_journal_has_none() {
+        // J9. The tag names this run's orders at the venue, where every run's
+        // client ids share one namespace, so a restart must not rename them:
+        // the first `started` is the authority, as it is for the capital.
+        let started = |at: i64, run: Option<&str>| JournalEntry::Started {
+            at: Ts::from_nanos(at),
+            cash: "100".parse().expect("amount"),
+            schema: SCHEMA,
+            run: run.map(str::to_owned),
+        };
+        let entries = vec![
+            started(1, Some("r7")),
+            filled(1),
+            started(5, Some("r8")),
+            filled(2),
+        ];
+        assert_eq!(
+            super::run_tag(&entries),
+            Some("r7"),
+            "the first, not the last"
+        );
+        assert_eq!(super::run_tag(&[]), None, "an empty journal has no tag");
+        assert_eq!(
+            super::run_tag(&[filled(1)]),
+            None,
+            "nor does one with no `started` line"
+        );
+        // The first line is the authority even when it has no tag: a later
+        // one does not supply what the session never had.
+        assert_eq!(
+            super::run_tag(&[started(1, None), started(5, Some("r8"))]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_run_tag_is_written_only_when_there_is_one() {
+        // Old files read, and a run without a tag writes the line it always
+        // wrote: the tag is an addition, not a change to the line.
+        let untagged = JournalEntry::Started {
+            at: Ts::from_nanos(5),
+            cash: "100".parse().expect("amount"),
+            schema: SCHEMA,
+            run: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&untagged).expect("serialize"),
+            format!(r#"{{"type":"started","at":5,"cash":10000000000,"schema":{SCHEMA}}}"#)
+        );
+        let tagged = JournalEntry::Started {
+            at: Ts::from_nanos(5),
+            cash: "100".parse().expect("amount"),
+            schema: SCHEMA,
+            run: Some("r7".to_owned()),
+        };
+        let line = serde_json::to_string(&tagged).expect("serialize");
+        assert_eq!(
+            line,
+            format!(
+                r#"{{"type":"started","at":5,"cash":10000000000,"schema":{SCHEMA},"run":"r7"}}"#
+            )
+        );
+        assert_eq!(
+            serde_json::from_str::<JournalEntry>(&line).expect("reads back"),
+            tagged
+        );
+    }
+
+    #[test]
     fn the_schema_this_build_writes_is_not_the_one_it_defaults_to() {
         // Otherwise the field is decoration: every journal would report the
         // same number whether or not the writer knew about it, and the next
@@ -1983,6 +2095,7 @@ mod m75a_tests {
                 at: Ts::from_nanos(1),
                 cash: "100".parse().expect("amount"),
                 schema: SCHEMA,
+                run: None,
             },
             filled(7),
             filled(9),
