@@ -96,12 +96,80 @@ pub struct WindowSummary {
     /// Gaps inside the window, with their causes -- the question a span is
     /// usually asked in order to answer.
     pub gaps: Vec<GapAt>,
+    /// Archive breaks inside the window: a segment that would not open, a torn
+    /// tail, a hole in `ingest_seq`. Each blinds the book as a gap does.
+    pub breaks: u64,
+    /// What could be seen as the span opened.
+    ///
+    /// Gaps inside the span are not enough to say it was all seen: a blindness
+    /// that began before the span and had not ended is a span with no gap in it
+    /// and nothing seen, which is what a twelve-hour outage looks like from any
+    /// hour inside it. Reporting that as "no gaps" is the confabulation every
+    /// absence here is built to avoid.
+    pub on_entry: Entry,
     /// The extremes of the traded price across the span. `None` if nothing
     /// traded, which is a fact rather than a zero.
     pub low: Option<quant_core::fixed::Px>,
     pub high: Option<quant_core::fixed::Px>,
     /// Traded volume, in base units.
     pub volume: quant_core::fixed::Qty,
+}
+
+impl WindowSummary {
+    /// Fold one event read at or before the instant, and say whether it fell
+    /// inside the span.
+    ///
+    /// Half-open: `(at - span, at]`. Inclusive at both ends would put an event
+    /// exactly on the seam into two adjacent windows, so walking a run in
+    /// five-minute steps would count it twice and the steps would not sum to
+    /// the whole. An event before the span sets what held as it opened, until a
+    /// later one says otherwise.
+    fn step(&mut self, at: Ts, ts: Ts, event: &MarketEvent, seen: impl FnOnce() -> Entry) -> bool {
+        if ts.as_nanos() > at.as_nanos() - self.span_nanos {
+            accumulate(self, event, ts);
+            true
+        } else {
+            self.on_entry = seen();
+            false
+        }
+    }
+
+    /// An archive break: inside the span once an event inside it has been
+    /// read, and otherwise part of what held as it opened. A break before any
+    /// event leaves the start unreached rather than inventing a state for it.
+    fn on_break(&mut self, opened: bool, read_any: bool, seen: impl FnOnce() -> Entry) {
+        if opened {
+            self.breaks += 1;
+        } else if read_any {
+            self.on_entry = seen();
+        }
+    }
+
+    /// Whether the whole span was seen: the book was live as it opened, and
+    /// nothing inside it took the book away.
+    #[must_use]
+    pub fn saw_whole_span(&self) -> bool {
+        matches!(self.on_entry, Entry::Seeing) && self.gaps.is_empty() && self.breaks == 0
+    }
+}
+
+/// What could be seen at the moment a window opened.
+#[derive(Debug, Clone, Default)]
+pub enum Entry {
+    /// No event at or before the span's start was read, so its start is not
+    /// shown either way. A window reaching before the data, or before the day
+    /// that was read, is an ordinary request; the honest answer covers what was
+    /// read and claims nothing about the rest.
+    #[default]
+    NotReached,
+    /// The book was live.
+    Seeing,
+    /// Blind since this gap, and no snapshot had re-anchored the book.
+    Blind(GapAt),
+    /// No gap, and the book had not been anchored yet.
+    Unanchored,
+    /// The archive was discontinuous, of this kind.
+    Unreadable(String),
 }
 
 /// The touch, and how deep the book was.
@@ -311,6 +379,8 @@ fn scan(
 
     let mut book = Book::new();
     let mut unreadable: Option<String> = None;
+    // Whether an event inside the window has been read.
+    let mut opened = false;
     for item in SessionReplay::open(&subset, instrument) {
         match item {
             ReplayItem::Break(brk) => {
@@ -320,6 +390,11 @@ fn scan(
                 // not read.
                 book.invalidate();
                 unreadable = Some(format!("{:?}", brk.kind));
+                if let Some(window) = out.window.as_mut() {
+                    window.on_break(opened, out.events_read > 0, || {
+                        entry(&book, out.gap_before.as_ref(), unreadable.as_deref())
+                    });
+                }
             }
             ReplayItem::Event(event) => {
                 let ts = event.meta().local_recv_ts;
@@ -342,15 +417,6 @@ fn scan(
                 out.events_read += 1;
                 out.last_event_ts = Some(ts);
                 book.apply(&event);
-                if let Some(window) = out.window.as_mut() {
-                    // Half-open: `(at - span, at]`. Inclusive at both ends would
-                    // put an event exactly on the seam into two adjacent
-                    // windows, so walking a run in five-minute steps would count
-                    // it twice and the steps would not sum to the whole.
-                    if ts.as_nanos() > at.as_nanos() - window.span_nanos {
-                        accumulate(window, &event, ts);
-                    }
-                }
                 match &event {
                     MarketEvent::Trade(trade) => {
                         out.last_trade = Some(TradeAt {
@@ -367,6 +433,11 @@ fn scan(
                         });
                     }
                     MarketEvent::BookDelta(_) | MarketEvent::BookSnapshot(_) => {}
+                }
+                if let Some(window) = out.window.as_mut() {
+                    opened |= window.step(at, ts, &event, || {
+                        entry(&book, out.gap_before.as_ref(), unreadable.as_deref())
+                    });
                 }
             }
         }
@@ -412,6 +483,20 @@ fn settle_book(out: &mut MarketAt, book: &Book, unreadable: Option<&str>) {
              stretch arrives later"
             .to_owned(),
     });
+}
+
+/// What could be seen after the events read so far, in the order
+/// [`settle_book`] gives its reasons.
+fn entry(book: &Book, gap: Option<&GapAt>, unreadable: Option<&str>) -> Entry {
+    if book.is_live() {
+        Entry::Seeing
+    } else if let Some(kind) = unreadable {
+        Entry::Unreadable(kind.to_owned())
+    } else if let Some(gap) = gap {
+        Entry::Blind(gap.clone())
+    } else {
+        Entry::Unanchored
+    }
 }
 
 /// Fold one event into the window summary.
