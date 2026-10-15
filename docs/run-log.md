@@ -368,3 +368,106 @@ discarded the only evidence.
 
 All six checks ship with the sabotage that reddens them, and each sabotage
 reddens its own tests and nothing else.
+---
+
+## 8. Schema 3: what a live run writes (M8 slice (c))
+
+M7.5 widened the journal from money to decisions. A live venue widens it again,
+to what only a real venue knows: its own names for orders and trades, what it
+cited when it declined, and facts that are not events at all. Built in
+`m8c-journal-live`, from the seam `docs/engine-contract.md` §11 describes; the
+reasoning for each decision is in `docs/live-run.md` §5.
+
+**The rule that keeps every old file readable:** every field added to an
+existing line is defaulted on read and written only when it holds something.
+So the fortnight's schema-1 journals and every schema-2 journal read unchanged,
+and a line that carries none of the new fields is byte for byte the line schema 2
+wrote. `read` refuses a session begun in a schema newer than its own, naming both
+numbers, rather than reporting a readable file as damage at its first unfamiliar
+line.
+
+### Fields on lines that already existed
+
+| line | gains | why |
+|---|---|---|
+| `started` | `run` | the tag every order is sent under; the first line's is the session's |
+| `filled` | `remaining`, `venue_order_id`, `trade_id` | one line is one `myTrades` row (criterion A) |
+| `accepted` | `venue_order_id` | |
+| `rejected` | `cited`, `breach` | the only durable copy of a REST answer; the rule criterion B compares |
+| `cancelled` | `venue_order_id`, `ended` | cancelled, expired or self-trade prevention |
+| `orphaned` | `venue_order_id`, `trade_id` | the one handle on an unattributable fill |
+| `stopped` | `working` | the orders still live at a stop: stopping is not flattening |
+
+`rejected` keeps its meaning: the venue had the request and declined it. A
+request that never reached the venue is not a rejection, and has a line of its
+own. `filled.remaining` is written on every fill, so it is text that changes in
+every new backtest and paper journal; no number does.
+
+### Lines of their own
+
+| line | what it records |
+|---|---|
+| `placed` | the venue's REST acknowledgement and its order id, which finds the order after a cancel replaced its client id (criterion E) |
+| `never_landed` | a request that never became an order the venue had |
+| `doubt` | an order's outcome becoming unknown, or known again, explicitly both ways |
+| `cancel_refused` | a cancel the venue did not carry out, or whose fate is unknown |
+| `foreign` | a report about an order this run did not send; a trade kept whole, commission asset verbatim |
+| `account` | the account stream lost or regained |
+| `anomaly` | a report that could not be read, or contradicts what came before it |
+| `stray` | a report, other than a fill, about an order the engine is not working |
+| `sighted` | the market came into view: a book went from meaning nothing to meaning something |
+| `balances` | the account's two balances, at start and stop, on the wall clock (criterion A's baseline) |
+
+The writer maps every `Notice` through one exhaustive `match` with no `_` arm, so
+a fact a venue learns to report later does not build until it has a line. A
+doubt raised, a stranger's trade, the account stream lost, an anomaly and a
+request that never landed are logged as errors as well as written, as an orphan
+always was.
+
+### What each reader decided
+
+Every site that matches journal entries without a `_` arm had to decide each
+new line, and the compiler would not let one be skipped.
+
+| | `replay` | `next_order_id` | `explain`'s instant | evidence the market came back |
+|---|---|---|---|---|
+| `placed`, `doubt`, `cancel_refused`, `account`, `anomaly`, `stray`, `never_landed` | not money | no id | its stamp | no |
+| `foreign` | **its own arm, not folded**: money, and not this run's | no id: text never becomes a `ClientOrderId` | its stamp | no |
+| `balances` | **its own arm, not folded**: folding the venue's claim would make criterion A compare the venue with itself | no id | **none**: the wall clock, like `started` | no |
+| `sighted` | nothing | no id | its stamp | **yes**, from schema 3 |
+
+No new line moves the id counter: every id this engine minted is already on a
+`submitted` or `refused` line, and an id the venue named must never move it.
+
+**The market's return is read, not inferred, from schema 3.** Before it, a line
+the engine wrote after `blind` was taken to mean the market came back, which
+holds while a venue cannot speak without the market: true of the simulator, and
+so of every journal written before. A live venue reports on idle wakes, so a fill
+during an outage, and whatever the strategy decided on it, would read the outage
+as over. `explain` now reads the schema of each session off its `started` line:
+in a schema-3 session only `sighted` ends a blindness, and an older one is read
+exactly as it always was.
+
+### The strict writer
+
+`JournalWriter::new` is lenient, for paper and backtests: a line it cannot write
+is counted and logged, and the run goes on. `JournalWriter::strict` is the live
+run's. From its first failed append it writes nothing more and answers every
+submission `Withhold`, which the engine turns into `RefusedBy::Record` for that
+order and every later one. Nothing more written, because a line appended after a
+torn one sits in the middle of the file, where `read` refuses the whole journal.
+
+### Checked against the real artifacts
+
+On 2026-10-15, with the schema-3 build, against the fortnight's two journals
+(schema 1): `reconcile` AGREES on both (BTCUSDT 824 fills, cash 31.64743842;
+ETHUSDT 822 fills, cash 97.65757574), and `explain --check-journal` finds all
+166 checkpoints agreeing in each. `runlog check` exits 2, *nothing to check*,
+as it always has on them: they predate M7.5 and hold no decisions and no claims.
+
+A `backtest --journal` over the same window writes a schema-3 journal of 3,862
+lines: §7's 3,845 and one `sighted` line for each of the 17 `blind` ones. Its
+money is the backtest's to the satoshi (824 fills, cash 31.64743842), `reconcile`
+AGREES, `runlog check` is COMPLETE over 824 decisions and 337 claims, and all 165
+checkpoints agree. The text of a new journal changes (`schema`, `remaining`,
+`sighted`); no number does.

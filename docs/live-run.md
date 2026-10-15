@@ -507,6 +507,32 @@ feature.
    opposite position, and the day's loss budget starts fresh. The engine
    contract's own rule, that an NTP step cannot hand a stopped strategy a fresh
    budget, already argues against that last one.
+
+   **The entries are built** as `m8c-journal-live`, the list in
+   `docs/run-log.md` §8. Journal schema 3, and `read` refusing a session begun
+   in a newer one, naming both numbers. The run tag on `started`, the first
+   line's being the session's. The venue's names and words on the lines of the
+   events they describe: `filled` carries `remaining`, the venue order id and
+   the trade id, so one line is one `myTrades` row; `rejected` carries what the
+   venue cited and the filter it named; `accepted`, `cancelled` and `orphaned`
+   carry the venue's ids, and `cancelled` how the order ended. `stopped`
+   carries the orders still working. Eight entries for what a venue says on
+   its own (`placed`, `never_landed`, `doubt`, `cancel_refused`, `foreign`,
+   `account`, `anomaly`, `stray`), mapped from every `Notice` by one
+   exhaustive match in the writer. The market's return as a `sighted` line,
+   which `explain` reads in place of its inference from schema 3 on, so the
+   first of the three reader debts is paid. The account's `balances` and the
+   constructor the live binary calls at start and stop. And
+   `JournalWriter::strict`, which stops writing and withholds every order from
+   its first failure. Every schema-1 and schema-2 journal reads unchanged, and
+   both of the fortnight's still reconcile.
+
+   Owed to the readers' pull request (`m8c-journal-readers`): an `orphaned`,
+   `stray` or other-run `foreign` line, and a doubt left raised, loud in
+   `runlog check`; torn lines shown where an operator looks; the risk tally
+   recounted on restart; and `decisions_at` filtering by stamp, because a
+   `backtest --journal` file's wall-clock `started` line stops it reading
+   anything at all.
 5. **A frame kind for the account stream.** Container version 3, and the account
    stream under its own data root (§5), where `quant-verify` runs its container
    checks and not the update-id chain. Accepted when a v3 build reads every v1 and
