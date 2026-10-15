@@ -351,14 +351,21 @@ fn print_banner(
     }
     if resumed.portfolio.is_some() {
         // What the limits will be judged against, said before the first
-        // order: the holding and today's count and loss the journal recounts
-        // to, by risk's own reckoning rather than the portfolio's.
-        println!(
-            "risk      holding {}, {} orders today, realized {} today",
-            risk.position(resumed.instrument),
-            risk.orders_today(),
-            risk.realized_today()
-        );
+        // order: the holding and the day's count and loss the journal
+        // recounts to, by risk's own reckoning rather than the portfolio's.
+        // Named by the day they belong to, which is the journal's last and
+        // may be yesterday: the first check today rolls them to zero, so
+        // calling them "today" would overstate what is spent.
+        let holding = risk.position(resumed.instrument);
+        match risk.counted_day() {
+            Some(day) => println!(
+                "risk      holding {holding}, and on {day}, the last day the journal \
+                 counted: {} orders, realized {}",
+                risk.orders_today(),
+                risk.realized_today()
+            ),
+            None => println!("risk      holding {holding}, and no order or fill counted yet"),
+        }
     }
     if let Some(cause) = resumed.tripped {
         // Loud, because it means this process will refuse every order until a

@@ -350,6 +350,16 @@ impl RiskEngine {
         self.today.orders
     }
 
+    /// The UTC day [`Self::orders_today`] and [`Self::realized_today`]
+    /// belong to: the last one an order or a fill rolled to, never the
+    /// clock's. After a restart that is the journal's last day, which may be
+    /// yesterday; the first check today rolls both to zero. `None` before
+    /// anything was counted.
+    #[must_use]
+    pub const fn counted_day(&self) -> Option<UtcDate> {
+        self.today.date
+    }
+
     /// Throw the switch by hand.
     ///
     /// There is no matching automatic un-trip: every condition that trips it is
@@ -1062,6 +1072,28 @@ mod tests {
             "the switch is still thrown, and says so by name"
         );
         assert_eq!(risk.realized_today(), Notional::ZERO, "but the day rolled");
+    }
+
+    #[test]
+    fn the_counts_say_which_day_they_belong_to() {
+        // A restarted `paper` prints the recounted tally before its first
+        // order, and a journal that ended yesterday leaves yesterday's counts
+        // in place until a check rolls them. So the counts carry their day,
+        // and the day moves only when they do: forward, never back.
+        let mut risk = RiskEngine::new(Limits::default());
+        assert_eq!(risk.counted_day(), None, "nothing counted yet");
+        risk.recount(NOW, true);
+        assert_eq!(risk.counted_day(), Some(NOW.utc_date()));
+        risk.recount(Ts::from_nanos(NOW.as_nanos() - DAY), true);
+        assert_eq!(
+            risk.counted_day(),
+            Some(NOW.utc_date()),
+            "an order stamped yesterday is counted on the day it rolled to"
+        );
+        let tomorrow = Ts::from_nanos(NOW.as_nanos() + DAY);
+        risk.recount(tomorrow, false);
+        assert_eq!(risk.counted_day(), Some(tomorrow.utc_date()));
+        assert_eq!(risk.orders_today(), 0, "tomorrow's count starts at zero");
     }
 
     #[test]
