@@ -104,12 +104,25 @@
 //!   placed ours;
 //! - a timeout, or a failure after the request may have left.
 //!
-//! **The code decides, not the status.** The documentation gives a status for
-//! almost none of its codes (the exceptions are `429` with `-1015`,
-//! `faqs/order_count_decrement.md:57`, and one example of `400` with `-2010`,
-//! web-socket-api.md:232-235), and none at all for `-1007`, so "a 4xx was not
-//! placed" is not a rule it supports. A 4xx is a refusal only when its code
-//! says so, and a 5xx never is.
+//! **The code decides, not the status.** The documentation pairs a code with a
+//! status only a handful of times, in one FAQ and in the WebSocket API's
+//! examples, which share the REST API's statuses and codes
+//! (CHANGELOG.md:2015): `400` with `-2010`, `-2043` and `-2022`
+//! (web-socket-api.md:232-235, 3328-3332, 4847-4850), `401` with `-2015`
+//! (1324-1327), `409` with `-2021` (4894-4897), `418` with `-1003` (551-554),
+//! and `429` with `-1015` (5065-5068; `faqs/order_count_decrement.md:57`). It
+//! gives no status for `-1007` or `-1006`. Of a status alone, it says a 4xx is
+//! the sender's doing: *"HTTP `4XX` return codes are used for malformed
+//! requests; the issue is on the sender's side"* (rest-api.md:111), and
+//! *"`400` – your request failed, see `error` for the reason"*
+//! (web-socket-api.md:314-315). That comes close to "a 4xx was not placed",
+//! and the module still wants a documented code before it calls anything
+//! refused. The same lists count among the 4xx a `409`, a request that
+//! *"partially failed but also partially succeeded"* (web-socket-api.md:317;
+//! rest-api.md:113). And a rule by status would call a `-1007` or `-1006`
+//! under a `400` refused, though each says the execution status is unknown
+//! (errors.md:27-31) and nothing ties either to a status. So a 4xx is a
+//! refusal only when its code says so, and a 5xx never is.
 //!
 //! Only a request that never left is certainly not placed, and only the
 //! transport can know that it never left: [`Attempt::NotConnected`].
@@ -979,8 +992,18 @@ fn request_refusal(http_status: u16, code: i64) -> Option<RefusalCause> {
     match code {
         -1021 => Some(RefusalCause::Timestamp),
         -1022 | -2014 | -2015 => Some(RefusalCause::Credentials),
-        // Documented with these two statuses and no others. Any other pairing
-        // is not one the documentation describes, so it settles nothing.
+        // A rate limit, under either status that says one turned the request
+        // away. Requests *"fail"* with a 429 when a request rate limit or the
+        // unfilled order count is broken (web-socket-api.md:398;
+        // rest-api.md:114, 153), and with a 418 from an address auto-banned
+        // for carrying on after 429s (web-socket-api.md:523; rest-api.md:115).
+        // The documentation shows -1003 with a 418 (web-socket-api.md:551-554)
+        // and -1015 with a 429 (5065-5068; faqs/order_count_decrement.md:57),
+        // and neither other pairing. -1015 under a 418 is refused for what the
+        // 418 itself means, a ban the request ran into whatever it asked, and
+        // -1003 under a 429 because -1003 is the request rate limit
+        // (errors.md:22-24) that a 429 reports. Under any other status neither
+        // code is the documented failure, so it settles nothing.
         -1003 | -1015 if matches!(http_status, 418 | 429) => Some(RefusalCause::RateLimited),
         code if REQUEST_ISSUES.contains(&code) => Some(RefusalCause::Malformed),
         _ => None,
@@ -1726,7 +1749,7 @@ mod tests {
                  Streams for live updates to avoid bans.",
             418,
             Class::Refused(RefusalCause::RateLimited),
-            "errors.md:25; rest-api.md:115, 159",
+            "errors.md:25; rest-api.md:115, 159; web-socket-api.md:551-554",
         ),
         (
             -1003,
@@ -1814,7 +1837,7 @@ mod tests {
             "Too many new orders; current limit is %s orders per %s.",
             429,
             Class::Refused(RefusalCause::RateLimited),
-            "errors.md:43-45; faqs/order_count_decrement.md:57",
+            "errors.md:43-45; faqs/order_count_decrement.md:57; web-socket-api.md:5065-5068",
         ),
         (
             -1016,
@@ -2304,7 +2327,7 @@ mod tests {
              for live updates to avoid bans.",
             418,
             Class::Refused(RefusalCause::RateLimited),
-            "errors.md:25; rest-api.md:115, 159",
+            "errors.md:25; rest-api.md:115, 159; web-socket-api.md:551-554",
         ),
         (
             -1006,
