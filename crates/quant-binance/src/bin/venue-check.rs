@@ -3,17 +3,18 @@
 //! The preflight `docs/live-run.md` slice (b) names, and the only part of M8
 //! that can be run end to end before any money is at risk. It makes exactly one
 //! signed request, `GET /api/v3/account`, which is the cheapest there is: it
-//! exercises the key, the secret, the signature construction, the header and the
-//! clock in one round trip and places nothing.
+//! exercises the API key, the Ed25519 signature, the header and the clock in
+//! one round trip and places nothing.
 //!
 //! ```text
-//! export BINANCE_API_KEY=...  BINANCE_API_SECRET=...
+//! export BINANCE_API_KEY=...
+//! export BINANCE_ED25519_PRIVATE_KEY="$(cat key.pem)"
 //! cargo run -p quant-binance --bin venue-check
 //! ```
 //!
-//! Exit 0 ready, 1 not. Nothing it prints contains any part of the secret: see
-//! `credentials.rs` for why that is a property of the type rather than of this
-//! file's care.
+//! Exit 0 ready, 1 not. Nothing it prints contains any part of the private key:
+//! see `credentials.rs` for why that is a property of the type rather than of
+//! this file's care, and for how to make the key.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -52,8 +53,9 @@ async fn main() -> ExitCode {
         }
     };
     println!(
-        "credentials  {} is set, and so is the secret",
-        Credentials::KEY_VAR
+        "credentials  {} is set, and {} reads as an Ed25519 key",
+        Credentials::KEY_VAR,
+        Credentials::PRIVATE_KEY_VAR
     );
 
     // The venue's clock, read the way NTP reads one: the host's clock either
@@ -131,7 +133,7 @@ async fn main() -> ExitCode {
         Ok(()) => {
             println!("venue        a signed request was accepted");
             println!();
-            println!("verdict      READY: the key, the secret and the clock all work.");
+            println!("verdict      READY: the API key, the Ed25519 key and the clock all work.");
             println!("             Nothing was ordered, and this proves nothing about balances.");
             ExitCode::SUCCESS
         }

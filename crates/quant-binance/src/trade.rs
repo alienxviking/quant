@@ -2,8 +2,8 @@
 //!
 //! Separate from [`crate::rest::SnapshotClient`] on purpose, and the separation
 //! is the design rather than tidiness: that client fetches depth and server time
-//! for a recorder that places no orders, and giving it a secret would put one in
-//! the address space of a seven-day capture that has no use for it. A type that
+//! for a recorder that places no orders, and giving it a private key would put
+//! one in the address space of a seven-day capture that has no use for it. A type that
 //! can sign is a type that can spend money, and it is held only by the thing
 //! that trades.
 //!
@@ -220,8 +220,9 @@ pub enum NotReady {
         came_back: usize,
         usable: usize,
     },
-    /// The venue would not answer a signed request. Almost always a bad key, a
-    /// bad secret, or a key without trading permission.
+    /// The venue would not answer a signed request. Almost always a bad API
+    /// key, a private key that is not the registered one's, or a key without
+    /// trading permission.
     Rejected { status: u16 },
     /// We could not reach the venue at all.
     Unreachable(String),
@@ -275,9 +276,9 @@ impl core::fmt::Display for NotReady {
             }
             Self::Rejected { status } => write!(
                 f,
-                "the venue refused a signed request with HTTP {status}. The key, the secret, or \
-                 the key's trading permission is wrong -- note that a key restricted by IP fails \
-                 this way from a new address"
+                "the venue refused a signed request with HTTP {status}. The API key, the private \
+                 key, or the key's trading permission is wrong -- note that a key restricted by IP \
+                 fails this way from a new address"
             ),
             Self::Unreachable(why) => write!(f, "could not reach the venue: {why}"),
         }
@@ -362,8 +363,8 @@ impl TradeClient {
         let response = self
             .http
             .get(url)
-            // The key identifies the account and travels in the header; the
-            // secret never leaves `Credentials`.
+            // The API key identifies the account and travels in the header;
+            // the private key never leaves `Credentials`.
             .header("X-MBX-APIKEY", self.credentials.key())
             .send()
             .await
@@ -372,8 +373,8 @@ impl TradeClient {
                     SnapshotError::Timeout
                 } else {
                     // `reqwest`'s error Display includes the URL, and the URL
-                    // carries the signature. A signature is not the secret and
-                    // cannot be reversed to it, but it is per-request
+                    // carries the signature. A signature is not the private key
+                    // and cannot be reversed to it, but it is per-request
                     // authentication material and has no business in a log that
                     // survives the request.
                     SnapshotError::Transport(redact_signature(&e.to_string()))
@@ -394,7 +395,7 @@ impl TradeClient {
     /// agrees with its own.
     ///
     /// `GET /api/v3/account` is the cheapest signed call there is, which makes
-    /// it the right probe: it proves the key, the secret, the signature
+    /// it the right probe: it proves the API key, the private key, the signature
     /// construction and the clock in one round trip, and it places no order.
     ///
     /// # Errors
@@ -473,14 +474,17 @@ mod tests {
         midpoint_offset_ms, redact_signature, ClockSample, NotReady, TradeClient,
         MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
     };
-    use crate::credentials::Credentials;
+    use crate::credentials::fixture;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use ring::signature::{UnparsedPublicKey, ED25519};
     use std::time::Duration;
 
     fn client() -> TradeClient {
         TradeClient::new(
             "https://example.invalid",
             Duration::from_secs(5),
-            Credentials::new("the-key".to_owned(), "the-secret"),
+            fixture::example(),
         )
         .expect("builds")
     }
@@ -682,8 +686,7 @@ mod tests {
         // with an error naming neither cause: sign the caller's parameters, then
         // append `timestamp`. The signature then covers a different string than
         // the one sent.
-        let c = client();
-        let q = c.signed_query("symbol=BTCUSDT", 1_700_000_000_000);
+        let q = client().signed_query("symbol=BTCUSDT", 1_700_000_000_000);
         let signature_at = q.find("&signature=").expect("signed");
         let signed_part = &q[..signature_at];
         assert!(signed_part.contains("timestamp=1700000000000"), "{q}");
@@ -691,14 +694,16 @@ mod tests {
             signed_part.contains(&format!("recvWindow={RECV_WINDOW_MS}")),
             "{q}"
         );
-        assert_eq!(
-            c.signed_query("symbol=BTCUSDT", 1_700_000_000_000),
-            format!(
-                "{signed_part}&signature={}",
-                Credentials::new("the-key".to_owned(), "the-secret").sign(signed_part)
-            ),
-            "the signature must be over exactly what precedes it"
-        );
+        // The signature must be over exactly what precedes it: checked by
+        // verifying it there, under the example key's public half as OpenSSL
+        // derives it, rather than by signing again with the code under test.
+        let sent = &q[signature_at + "&signature=".len()..];
+        let signature = STANDARD
+            .decode(fixture::percent_decode(sent))
+            .unwrap_or_else(|e| panic!("{sent}: {e}"));
+        UnparsedPublicKey::new(&ED25519, fixture::EXAMPLE_PUBLIC_KEY)
+            .verify(signed_part.as_bytes(), &signature)
+            .expect("the signature covers exactly what precedes it");
     }
 
     #[test]
@@ -771,8 +776,9 @@ mod tests {
     #[test]
     fn a_signature_is_stripped_from_anything_that_might_be_logged() {
         // `reqwest`'s error Display carries the URL, and the URL carries the
-        // signature. Not the secret and not reversible to it, but per-request
-        // authentication material with no business outliving the request.
+        // signature. Not the private key and not reversible to it, but
+        // per-request authentication material with no business outliving the
+        // request.
         let noisy = "error sending request for url \
                      (https://api.binance.com/api/v3/account?timestamp=1&signature=deadbeef1234): \
                      connection closed";
@@ -787,20 +793,21 @@ mod tests {
 
     #[test]
     fn a_whole_base64_signature_is_stripped_not_only_a_hex_prefix() {
-        // What an Ed25519 signer sends for `GET /api/v3/account` at this
-        // instant under Binance's published example key (fix-api.md:297-306),
-        // percent-encoded as a query carries it: OpenSSL 3.5.5's signature over
-        // `timestamp=1700000000000&recvWindow=5000`. It begins with `x`, which
-        // is not hex, so a hex-only rule redacts none of it.
-        let signature = "xmyZz90mk%2FQlhtKo1XqnpC4Lki2UdcSWKZE1omVY2mESFPRE%2FwpzlWcQo%2Bv5TVF1a\
-                         N7lHdICZKEI%2FHWpEVI4Dg%3D%3D";
+        // A real signed query: what this client sends for `GET /api/v3/account`
+        // at this instant under Binance's published example key. Its signature
+        // is percent-encoded base64 beginning with `x`, which is not hex, so a
+        // hex-only rule redacts none of it.
+        let query = client().signed_query("", 1_700_000_000_000);
+        let signature = query
+            .split_once("&signature=")
+            .map(|(_, s)| s)
+            .expect("signed");
+        assert!(signature.starts_with("xmyZ"), "{signature}");
         let noisy = format!(
-            "error sending request for url (https://api.binance.com/api/v3/account?\
-             timestamp=1700000000000&recvWindow=5000&signature={signature})"
+            "error sending request for url (https://api.binance.com/api/v3/account?{query})"
         );
         let clean = redact_signature(&noisy);
-        for i in 0..=signature.len() - 8 {
-            let piece = &signature[i..i + 8];
+        for piece in fixture::eight_char_windows(signature) {
             assert!(!clean.contains(piece), "{piece} survived: {clean}");
         }
         assert_eq!(

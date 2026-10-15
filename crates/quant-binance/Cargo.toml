@@ -37,16 +37,22 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
 #
 # `ring` rather than `aws-lc-rs` because aws-lc-rs needs cmake and nasm on
 # Windows and this has to build on a stock developer machine.
-# Already in the graph via rustls' `ring` backend, so signing adds no new build
-# surface -- which is the whole reason this crate chose `ring` over `aws-lc-rs`
-# in the first place. `hmac` + `sha2` would be two more crates to do what is
-# already linked. See `credentials.rs`.
+# Already in the graph via rustls' `ring` backend, so Ed25519 signing adds no new
+# build surface -- which is the whole reason this crate chose `ring` over
+# `aws-lc-rs` in the first place. `ed25519-dalek` would be several more crates to
+# do what is already linked. See `credentials.rs`.
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
     "tls12",
 ] }
+
+# The signature goes to the venue as base64, and the private key arrives as PEM,
+# which is base64 too. 0.22, because 0.22.1 is already in Cargo.lock through
+# reqwest's hyper-util, with the same default features: naming it here adds no
+# crate to the build. Do not let this drift to a version nothing else uses.
+base64 = "0.22"
 
 # REST, for the one thing the WebSocket cannot give us: an order-book snapshot to
 # anchor the depth deltas against. See `rest.rs`.
