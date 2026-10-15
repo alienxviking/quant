@@ -266,6 +266,9 @@ fn verify_segment(
             }
         };
         report.totals.frames += 1;
+        if session.stream == CaptureStream::Account {
+            report.totals.account_frames += 1;
+        }
         frames += 1;
 
         // A record whose own timestamp falls outside the partition it is filed
@@ -1463,6 +1466,36 @@ mod tests {
         assert!(report.is_clean(), "{:#?}", report.findings());
         assert_eq!(report.totals.sessions, 2);
         assert_eq!(report.totals.account_sessions, 1);
+        assert_eq!(report.totals.account_frames, 2);
+        assert_eq!(report.totals.market_frames(), 3);
+        assert_eq!(
+            report.verdict(),
+            "every discontinuity is explained by a record in the capture"
+        );
+    }
+
+    #[test]
+    fn account_frames_alone_are_not_a_verified_capture() {
+        // A run root whose market tree is empty and whose account tree is not.
+        // Every check passes, because there is nothing to fail -- which is the
+        // false clean bill of health the "nothing verified" verdict exists for,
+        // and counting the account's frames toward it would print a clean one.
+        let (bytes, _) = Capture::account(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .account_event()
+            .account_event()
+            .seal();
+        let report = run("account-only", &[(account_target(29), bytes)]);
+        assert!(report.is_clean(), "{:#?}", report.findings());
+        assert_eq!(report.totals.frames, 3);
+        assert_eq!(report.totals.market_frames(), 0);
+        assert!(
+            report
+                .verdict()
+                .starts_with("NOTHING VERIFIED: no market frames"),
+            "{}",
+            report.verdict()
+        );
     }
 
     #[test]

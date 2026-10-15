@@ -135,18 +135,6 @@ fn print_report(report: &Report, root: &std::path::Path, reconciled: bool) {
         }
     }
 
-    // Errors first: "nothing verified" is a guard against a *false clean bill of
-    // health*, so it must not displace the reason a run actually failed. A capture
-    // corrupt in its first block reads zero frames, and saying "no files found"
-    // about it would send whoever is on call looking in the wrong place.
-    println!(
-        "verdict   {}",
-        if !report.is_clean() {
-            "UNEXPLAINED FINDINGS: this capture cannot be trusted as complete"
-        } else if t.frames == 0 {
-            "NOTHING VERIFIED: no capture frames found under this root"
-        } else {
-            "every discontinuity is explained by a record in the capture"
-        }
-    );
+    // In the library, where a test can hold it: see `Report::verdict`.
+    println!("verdict   {}", report.verdict());
 }
