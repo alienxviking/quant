@@ -615,8 +615,9 @@ enum Heard {
 /// One log for every hook rather than a list per hook, because the order is
 /// most of what there is to check: a fill written down after the strategy
 /// acted on it is the defect the write-ahead rule exists to stop, and three
-/// separate lists could not show it. It heard three of the eleven hooks until
-/// the venue seam needed the rest.
+/// separate lists could not show it. It heard three hooks of the eleven there
+/// were until the venue seam needed the rest, and the seam added `on_notice`
+/// and `on_stray` to make thirteen.
 #[derive(Debug, Default)]
 struct Witness {
     heard: Vec<Heard>,
@@ -904,13 +905,40 @@ impl Strategy for EveryHook {
 
 /// What the venue says to [`EveryHook`]: nothing on the first event; on the
 /// second, order 1 accepted, part filled and cancelled; on the third, order 3
-/// declined, and a fill for order 99, which this engine never minted.
+/// declined, a fill for order 99 and a cancellation of order 98, neither of
+/// which this engine minted, and the account stream lost.
+///
+/// The stream loss is stamped with the third event, no later than the order
+/// reports beside it, so it is heard on that wake without moving the clock
+/// past them.
 fn every_hook_venue() -> Says {
     let (t2, t3) = (meta(2).local_recv_ts, meta(3).local_recv_ts);
     let qty = |s: &str| -> Qty { s.parse().expect("qty") };
-    Says::new(vec![
+    let plain = |events: Vec<ExecutionEvent>| -> Vec<VenueReport> {
+        events.into_iter().map(VenueReport::from).collect()
+    };
+    let mut third = plain(vec![
+        ExecutionEvent::Rejected {
+            client_order_id: ClientOrderId(3),
+            reason: RejectReason::Venue,
+            ts: t3,
+        },
+        ExecutionEvent::Filled {
+            client_order_id: ClientOrderId(99),
+            fill: fill_of("1"),
+            remaining: qty("0"),
+            ts: t3,
+        },
+        ExecutionEvent::Cancelled {
+            client_order_id: ClientOrderId(98),
+            remaining: qty("1"),
+            ts: t3,
+        },
+    ]);
+    third.push(VenueReport::Notice(stream_lost(t3)));
+    Says::reporting(vec![
         vec![],
-        vec![
+        plain(vec![
             ExecutionEvent::Accepted {
                 client_order_id: ClientOrderId(1),
                 ts: t2,
@@ -926,27 +954,15 @@ fn every_hook_venue() -> Says {
                 remaining: qty("0.6"),
                 ts: t2,
             },
-        ],
-        vec![
-            ExecutionEvent::Rejected {
-                client_order_id: ClientOrderId(3),
-                reason: RejectReason::Venue,
-                ts: t3,
-            },
-            ExecutionEvent::Filled {
-                client_order_id: ClientOrderId(99),
-                fill: fill_of("1"),
-                remaining: qty("0"),
-                ts: t3,
-            },
-        ],
+        ]),
+        third,
     ])
 }
 
 #[test]
 fn an_observer_hears_every_hook_in_the_order_the_engine_calls_them() {
     // The witness's own proof, and the order every later seam test reads it
-    // in: one run that reaches all eleven hooks, each once.
+    // in: one run that reaches all thirteen hooks, each once.
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
     let mut engine = Engine::new(
         Scripted::new(vec![snapshot(1), trade(2, "100.75"), gap(3)]),
@@ -984,6 +1000,16 @@ fn an_observer_hears_every_hook_in_the_order_the_engine_calls_them() {
             Heard::Blind(GapCause::Disconnect, Ts::from_nanos(1), t3),
             Heard::Rejected(c(3), RejectReason::Venue, None, t3),
             Heard::Orphaned(c(99), None, t3),
+            Heard::Stray(
+                OrderReport::Cancelled {
+                    client_order_id: c(98),
+                    remaining: qty("1"),
+                    ended: None,
+                    ts: t3,
+                },
+                t3
+            ),
+            Heard::Notice(stream_lost(t3), t3),
         ],
         "every hook, each once, in the order the engine reached it"
     );
