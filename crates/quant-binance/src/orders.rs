@@ -92,6 +92,10 @@
 //!   (errors.md:27-31), and `-1000`, `-1001` and `-1008`, an unknown error, an
 //!   internal one and an overload, which the documentation does not tie to a
 //!   request left undone (errors.md:13-17, 33-34);
+//! - *"Duplicate order sent."*, under `-2010` or `-1013` alike: the request
+//!   was refused because an open order already holds the id this order was
+//!   sent under (errors.md:375; rest-api.md:2153), and that order may be this
+//!   one, sent before;
 //! - any other code outside the ones that are, among them a code the endpoint
 //!   is not expected to return, and a 4xx whose body is not a Binance error at
 //!   all;
@@ -229,10 +233,32 @@ impl NewOrder {
     pub fn classify(&self, attempt: Attempt<'_>) -> Placement {
         match heard(attempt) {
             Heard::Success { http_status, body } => self.acknowledged(http_status, body),
-            Heard::Error { http_status, error } => match placement_refusal(http_status, &error) {
-                Some(cause) => Placement::Refused(Refusal::new(http_status, error, cause)),
-                None => Placement::Unknown {
-                    why: WhyUnknown::unsettled(http_status, error),
+            Heard::Error { http_status, error } => match error.code {
+                // An open order holds this order's id, and may be this order:
+                // never a refusal, whichever code it comes under (module docs).
+                -1013 | -2010 if error.msg == DUPLICATE_ORDER => Placement::Unknown {
+                    why: WhyUnknown::IdInUse {
+                        id: self.client_order_id.clone(),
+                        http_status,
+                        code: error.code,
+                        msg: error.msg,
+                    },
+                },
+                // The two codes whose message names the reason: the API
+                // refusing the request before the matching engine
+                // (errors.md:36-38), and the matching engine refusing it
+                // (errors.md:367-368). The message, not the code, says which
+                // reason, because -1013's messages are drawn from both of the
+                // documentation's tables (errors.md:38).
+                -1013 | -2010 => {
+                    let cause = declined_because(&error.msg);
+                    Placement::Refused(Refusal::new(http_status, error, cause))
+                }
+                code => match request_refusal(http_status, code) {
+                    Some(cause) => Placement::Refused(Refusal::new(http_status, error, cause)),
+                    None => Placement::Unknown {
+                        why: WhyUnknown::unsettled(http_status, error),
+                    },
                 },
             },
             Heard::Unknown(why) => Placement::Unknown { why },
@@ -626,12 +652,6 @@ pub enum RefusalCause {
     /// (errors.md:377): criterion D7's refusal, and one the simulator never
     /// makes.
     InsufficientBalance,
-    /// *"Duplicate order sent."*: the id is already in use (errors.md:375),
-    /// meaning an open order already has this `newClientOrderId`
-    /// (rest-api.md:2153). Its own cause because it is news about our ids
-    /// rather than about the order: some order is open under a name
-    /// [`RunTag`] exists to keep unique, and that needs a person.
-    DuplicateClientOrderId,
     /// Any other refusal, named only in its message: the matching engine's
     /// (`-2010`, *"This code is sent when an error has been returned by the
     /// matching engine"*, errors.md:367-368), or the API's before it
@@ -665,11 +685,9 @@ impl RefusalCause {
         match self {
             Self::Filter(_) | Self::Malformed => RejectReason::Malformed,
             Self::InsufficientBalance => RejectReason::InsufficientFunds,
-            Self::DuplicateClientOrderId
-            | Self::Declined
-            | Self::Timestamp
-            | Self::Credentials
-            | Self::RateLimited => RejectReason::Venue,
+            Self::Declined | Self::Timestamp | Self::Credentials | Self::RateLimited => {
+                RejectReason::Venue
+            }
         }
     }
 }
@@ -780,6 +798,21 @@ pub enum WhyUnknown {
         code: i64,
         msg: String,
     },
+    /// *"Duplicate order sent."*, under `-2010` or `-1013`: the id is
+    /// *"already in use"* (errors.md:375), which means an open order holds
+    /// `id`, the id this order was sent under (rest-api.md:2153). The request
+    /// was refused and the order may exist all the same, because the order
+    /// holding the id may be this one, sent before: by an HTTP client that
+    /// resends a request, say, or by a slip that submitted it twice. Or it is
+    /// another order under the same id, which [`RunTag`] exists to prevent.
+    /// Either way some order is open under a name of ours that should mean
+    /// one order, and that needs a person.
+    IdInUse {
+        id: String,
+        http_status: u16,
+        code: i64,
+        msg: String,
+    },
     /// A body that is not the answer expected: a 2xx that is not the
     /// acknowledgement, or a 4xx that is not a Binance error.
     UnreadableBody { http_status: u16, detail: String },
@@ -830,6 +863,16 @@ impl fmt::Display for WhyUnknown {
                 f,
                 "HTTP {http_status} with code {code} ({msg}), which does not say the request \
                  was refused"
+            ),
+            Self::IdInUse {
+                id,
+                http_status,
+                code,
+                msg,
+            } => write!(
+                f,
+                "HTTP {http_status} with code {code} ({msg}): an open order already holds \
+                 {id}, the id this order was sent under, and it may be this order"
             ),
             Self::UnreadableBody {
                 http_status,
@@ -930,19 +973,6 @@ struct CancelAck {
     orig_client_order_id: String,
 }
 
-/// Why a new order was refused, when its code says it was.
-fn placement_refusal(http_status: u16, error: &VenueError) -> Option<RefusalCause> {
-    match error.code {
-        // The two codes whose message names the reason: the API refusing the
-        // request before the matching engine (errors.md:36-38), and the
-        // matching engine refusing it (errors.md:367-368). The message, not
-        // the code, says which reason, because -1013's messages are drawn from
-        // both of the documentation's tables (errors.md:38).
-        -1013 | -2010 => Some(declined_because(&error.msg)),
-        code => request_refusal(http_status, code),
-    }
-}
-
 /// A refusal that a signed request to this endpoint can meet whatever it asks
 /// for, or `None` when the code is not one.
 fn request_refusal(http_status: u16, code: i64) -> Option<RefusalCause> {
@@ -957,7 +987,9 @@ fn request_refusal(http_status: u16, code: i64) -> Option<RefusalCause> {
     }
 }
 
-/// The cause a `-1013` or `-2010` message names.
+/// The cause a `-1013` or `-2010` message names, for every message but
+/// [`DUPLICATE_ORDER`], which is not a refusal of the order at all and which
+/// [`NewOrder::classify`] reads before this.
 ///
 /// Matched exactly as the documentation writes each message. One that differs
 /// by a character is still a refusal, as [`RefusalCause::Declined`], with the
@@ -968,7 +1000,6 @@ fn declined_because(msg: &str) -> RefusalCause {
     }
     match msg {
         INSUFFICIENT_BALANCE => RefusalCause::InsufficientBalance,
-        DUPLICATE_ORDER => RefusalCause::DuplicateClientOrderId,
         _ => RefusalCause::Declined,
     }
 }
@@ -1572,6 +1603,31 @@ mod tests {
     }
 
     #[test]
+    fn an_id_an_open_order_holds_may_be_this_order_so_it_is_never_refused() {
+        // Both codes refuse the request, and the message says why: an open
+        // order already holds its id (errors.md:375; rest-api.md:2153). That
+        // order may be this one, sent before, so this one stays in doubt
+        // rather than leaving the books while the venue fills it.
+        for code in [-2010, -1013] {
+            let duplicate = venue_error(code, "Duplicate order sent.");
+            let placement = ours().classify(answered(400, &duplicate));
+            assert_eq!(
+                placement,
+                Placement::Unknown {
+                    why: WhyUnknown::IdInUse {
+                        id: "q-r1-7".to_owned(),
+                        http_status: 400,
+                        code,
+                        msg: "Duplicate order sent.".to_owned(),
+                    }
+                },
+                "{code}"
+            );
+            assert_eq!(placement.reject_reason(), None, "{code}");
+        }
+    }
+
+    #[test]
     fn a_client_error_that_is_not_a_binance_error_settles_nothing() {
         // A firewall's page (rest-api.md:112), a bare rate-limit reply, and
         // JSON that is not the venue's error shape (errors.md:3-10): none of
@@ -1738,6 +1794,13 @@ mod tests {
             400,
             Class::Refused(RefusalCause::InsufficientBalance),
             "errors.md:36-38, 377",
+        ),
+        (
+            -1013,
+            "Duplicate order sent.",
+            400,
+            Class::Unknown,
+            "errors.md:36-38, 375; rest-api.md:2153, held by an order that may be this one",
         ),
         (
             -1014,
@@ -1912,8 +1975,8 @@ mod tests {
             -2010,
             "Duplicate order sent.",
             400,
-            Class::Refused(RefusalCause::DuplicateClientOrderId),
-            "errors.md:375; rest-api.md:2153",
+            Class::Unknown,
+            "errors.md:367-368, 375; rest-api.md:2153, held by an order that may be this one",
         ),
         (
             -2010,
@@ -2120,7 +2183,6 @@ mod tests {
                 RefusalCause::InsufficientBalance,
                 RejectReason::InsufficientFunds,
             ),
-            (RefusalCause::DuplicateClientOrderId, RejectReason::Venue),
             (RefusalCause::Declined, RejectReason::Venue),
             (RefusalCause::Timestamp, RejectReason::Venue),
             (RefusalCause::Credentials, RejectReason::Venue),
@@ -2147,6 +2209,12 @@ mod tests {
             WhyUnknown::ServerError {
                 http_status: 503,
                 said: None,
+            },
+            WhyUnknown::IdInUse {
+                id: "q-r1-7".to_owned(),
+                http_status: 400,
+                code: -2010,
+                msg: "Duplicate order sent.".to_owned(),
             },
         ] {
             assert_eq!(Placement::Unknown { why }.reject_reason(), None);
@@ -2604,5 +2672,20 @@ mod tests {
         }
         .to_string();
         assert!(said.contains("400 with code -1007 (Timeout)"), "{said}");
+        let said = WhyUnknown::IdInUse {
+            id: "q-r1-7".to_owned(),
+            http_status: 400,
+            code: -2010,
+            msg: "Duplicate order sent.".to_owned(),
+        }
+        .to_string();
+        assert!(
+            said.contains("400 with code -2010 (Duplicate order sent.)"),
+            "{said}"
+        );
+        assert!(
+            said.contains("an open order already holds q-r1-7"),
+            "{said}"
+        );
     }
 }
