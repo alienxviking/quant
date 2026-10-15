@@ -357,7 +357,7 @@ if [ "${live:-0}" = 1 ]; then
     done
     unset value retired_secret
     report 'credentials' advisory \
-        'presence is not proof -- run `cargo run -p quant-binance --bin venue-check` to make one signed request'
+        'presence is not proof -- run `cargo run -p quant-binance --bin venue-check`, whose signed requests prove the key, its permission to trade and the clock'
 fi
 
 echo ""
