@@ -273,18 +273,14 @@ impl<S: SegmentStore> CaptureSession<S> {
         clock: Arc<dyn Clock>,
         opts: WriterOptions,
     ) -> Self {
-        Self {
+        Self::recording(
             store,
             exchange,
-            stream: CaptureStream::market(symbol),
+            CaptureStream::market(symbol),
             session_id,
-            opts,
             clock,
-            open: None,
-            reports: Vec::new(),
-            rolls: 0,
-            backdated: 0,
-        }
+            opts,
+        )
     }
 
     /// A session recording the account stream, into the account's own tree.
@@ -302,10 +298,31 @@ impl<S: SegmentStore> CaptureSession<S> {
         clock: Arc<dyn Clock>,
         opts: WriterOptions,
     ) -> Self {
+        Self::recording(
+            store,
+            exchange,
+            CaptureStream::Account,
+            session_id,
+            clock,
+            opts,
+        )
+    }
+
+    /// Both constructors, once: the stream is the only thing a market session
+    /// and an account session start out differing in, and a field added later
+    /// cannot start out differently in one of them by accident.
+    fn recording(
+        store: S,
+        exchange: Exchange,
+        stream: CaptureStream,
+        session_id: [u8; 16],
+        clock: Arc<dyn Clock>,
+        opts: WriterOptions,
+    ) -> Self {
         Self {
             store,
             exchange,
-            stream: CaptureStream::Account,
+            stream,
             session_id,
             opts,
             clock,
