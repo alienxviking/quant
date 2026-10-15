@@ -124,6 +124,10 @@ pub enum JournalEntry {
         ///
         /// Defaulted on read so every journal written before it existed still
         /// parses, and reports as schema 1.
+        ///
+        /// Schema 3 is the first change it was there for, and [`read`] now
+        /// refuses a session begun in a schema newer than [`SCHEMA`], naming
+        /// both numbers.
         #[serde(default = "schema_v1")]
         schema: u32,
     },
@@ -490,6 +494,20 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
         .peekable();
     while let Some((number, line)) = parsed.next() {
         let e = match line {
+            // A session a newer build began. Refused at its `started` line,
+            // which is the first thing that session wrote, so the error names
+            // what is actually wrong -- a file this build is too old for --
+            // rather than the first entry type it has never heard of, which
+            // would read as damage. Refused even where every line happens to
+            // parse: a newer schema may have changed what an old field means,
+            // and a reader that guessed would fold money it does not
+            // understand.
+            Ok(JournalEntry::Started { schema, .. }) if schema > SCHEMA => {
+                return Err(std::io::Error::other(format!(
+                    "journal line {number} begins a session written in journal schema {schema}, \
+                     and this build reads schema {SCHEMA} and older: read it with a newer build"
+                )))
+            }
             Ok(entry) => {
                 out.entries.push(entry);
                 continue;
@@ -761,7 +779,15 @@ pub fn agrees(entries: &[JournalEntry]) -> Agreement {
 }
 
 /// The shape this build writes.
-pub const SCHEMA: u32 = 2;
+///
+/// - **1**, everything before M7.5: no `schema` field at all.
+/// - **2**, M7.5: decisions, refusals, the lifecycle, blindness and notes.
+/// - **3**, M8 slice (c): what a live venue says beside an event and on its
+///   own, the run tag, the orders still working at a stop, the market's
+///   return after blindness, and the account's balances.
+///
+/// [`read`] refuses a session begun in a schema above this one, naming both.
+pub const SCHEMA: u32 = 3;
 
 /// What a journal with no `schema` field was: everything before M7.5.
 const fn schema_v1() -> u32 {
@@ -1868,6 +1894,73 @@ mod m75a_tests {
         };
         assert_eq!(*schema, 1, "absent means the shape before M7.5");
         assert_eq!(cash.to_string(), "100");
+    }
+
+    /// The fortnight's shape: schema 1, money and marks only.
+    const M5_SHAPED: &str = concat!(
+        r#"{"type":"started","at":0,"cash":10000000000}"#,
+        "\n",
+        r#"{"type":"filled","at":1789744915849764000,"client_order_id":1,"instrument":{"exchange":"binance","symbol":"BTCUSDT"},"side":"buy","px":8085625000000,"qty":100000,"fee":8085625,"is_maker":false}"#,
+        "\n",
+        r#"{"type":"checkpoint","at":1789744915849764000,"cash":9991906290,"realized":0,"fees":8085625,"fills":1}"#,
+        "\n",
+        r#"{"type":"stopped","at":1789744915849764000}"#,
+        "\n",
+    );
+
+    /// A session of schema `n`, which writes nothing a schema-2 build could
+    /// not read: the refusal must come from the number, not from a line.
+    fn begun_in(n: u32) -> String {
+        format!(
+            "{{\"type\":\"started\",\"at\":5,\"cash\":10000000000,\"schema\":{n}}}\n\
+             {{\"type\":\"stopped\",\"at\":6}}\n"
+        )
+    }
+
+    #[test]
+    fn a_session_begun_in_a_newer_schema_is_refused_naming_both_numbers() {
+        // What the field was added for at M7.5. Without the refusal, a schema-4
+        // file whose lines all happen to parse would be read as though this
+        // build understood them, and one whose lines do not would be reported
+        // as damage at the first unfamiliar entry, which says the wrong thing.
+        let err = read(&temp("schema-4", &begun_in(SCHEMA + 1)))
+            .expect_err("a newer schema is refused, not guessed at");
+        let message = err.to_string();
+        assert!(message.contains("journal line 1 "), "{message}");
+        assert!(
+            message.contains(&format!("schema {}", SCHEMA + 1)),
+            "names the file's schema: {message}"
+        );
+        assert!(
+            message.contains(&format!("schema {SCHEMA} and older")),
+            "and this build's: {message}"
+        );
+
+        // A restart under a newer build, after sessions this build wrote, is
+        // refused at that restart's line.
+        let mixed = format!("{}{}", begun_in(SCHEMA), begun_in(SCHEMA + 1));
+        let err = read(&temp("schema-mixed", &mixed)).expect_err("still refused");
+        assert!(err.to_string().contains("journal line 3 "), "{err}");
+    }
+
+    #[test]
+    fn every_schema_up_to_this_one_still_reads() {
+        // The other side of the boundary. The fortnight's journals are schema
+        // 1, and M7.5's are schema 2, and both are evidence that must stay
+        // readable for as long as the result they support is quoted.
+        let pre = read(&temp("still-pre-m75", PRE_M75)).expect("schema 1, pre-M7.5");
+        assert_eq!(pre.entries.len(), 2);
+        let m5 = read(&temp("still-m5", M5_SHAPED)).expect("schema 1, M5's shape");
+        assert_eq!(m5.entries.len(), 4);
+        for n in 2..=SCHEMA {
+            let file = read(&temp(&format!("still-{n}"), &begun_in(n)))
+                .unwrap_or_else(|e| panic!("schema {n} reads: {e}"));
+            assert!(
+                matches!(file.entries[0], JournalEntry::Started { schema, .. } if schema == n),
+                "{:?}",
+                file.entries
+            );
+        }
     }
 
     #[test]
