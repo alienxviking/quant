@@ -1196,16 +1196,17 @@ mod tests {
         };
         let failed = |status, venue| NotReady::VenueFailure { status, venue };
         let refused = |status, venue| NotReady::Refused { status, venue };
-        // The venue's own messages for these codes (errors.md).
-        let key = "Invalid API-key, IP, or permissions for action.";
-        let format = "API-key format invalid.";
-        let signature = "Signature for this request is not valid.";
+        // The venue's own messages for these codes, the -1003 one with its
+        // placeholders filled in.
+        let key = "Invalid API-key, IP, or permissions for action."; // -2015, errors.md:342
+        let format = "API-key format invalid."; // -2014, errors.md:339
+        let signature = "Signature for this request is not valid."; // -1022, errors.md:58
         let weight = "Too much request weight used; current limit is 6000 request weight per 1 \
                       MINUTE. Please use WebSocket Streams for live updates to avoid polling the \
-                      API.";
+                      API."; // -1003, errors.md:24
         let busy = "Server is currently overloaded with other requests. Please try again in a few \
-                    minutes.";
-        let stale = "Timestamp for this request is outside of the recvWindow.";
+                    minutes."; // -1008, errors.md:34
+        let stale = "Timestamp for this request is outside of the recvWindow."; // -1021, errors.md:54
         let html = "<html><body>403 Forbidden</body></html>".to_owned();
         let none = String::new();
 

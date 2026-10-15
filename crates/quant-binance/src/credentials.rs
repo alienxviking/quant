@@ -717,8 +717,10 @@ mod tests {
 
         // The signature goes into JSON as plain base64, and verifies over that
         // payload under the loaded key's public half. Binance did not publish
-        // the private key behind its own example signature, so this is a round
-        // trip rather than a pinned value; the FIX vector pins the arithmetic.
+        // the private key behind its own example signature -- the page names
+        // only the file it is kept in (web-socket-api.md:1067) -- so this is a
+        // round trip rather than a pinned value; the FIX vector pins the
+        // arithmetic.
         let creds = example();
         let signature = creds.sign_ws_params(&scrambled);
         let bytes = STANDARD
