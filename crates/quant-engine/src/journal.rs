@@ -1125,8 +1125,9 @@ const fn schema_v1() -> u32 {
 
 /// The next client order id a resumed run should mint.
 ///
-/// `max(id) + 1` over every entry that carries one, or 1 for a journal that has
-/// none. Derived from the ids rather than stored beside them, so there is
+/// `max(id) + 1` over the entries that record a mint or the outcome of one
+/// for an order the engine was working, or 1 for a journal that has none.
+/// An id that could have been named without being minted is left out. Derived from the ids rather than stored beside them, so there is
 /// nothing that can disagree with the record.
 ///
 /// Returns 1 for an empty journal, which is what a fresh run uses anyway — so a
@@ -1136,10 +1137,10 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
     entries
         .iter()
         .filter_map(|e| match e {
-            // Every entry that carries an id contributes, not only fills: a
-            // refused order consumed an id without ever producing one, and a
-            // resumed run that reused it would make the hole check report holes
-            // where there are none.
+            // Not only fills: a refused order consumed an id without ever
+            // producing one, and a resumed run that reused it would make the
+            // hole check report holes where there are none. Fills count
+            // because before M7.5 they were the only lines with an id.
             JournalEntry::Filled {
                 client_order_id, ..
             }
@@ -1155,16 +1156,20 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
             | JournalEntry::Rejected {
                 client_order_id, ..
             }
-            | JournalEntry::CancelRequested {
-                client_order_id, ..
-            }
             | JournalEntry::Cancelled {
                 client_order_id, ..
-            }
-            | JournalEntry::Orphaned {
-                client_order_id, ..
             } => Some(client_order_id.0),
-            JournalEntry::Started { .. }
+            // Before schema 3 these two fed the counter, and neither should
+            // have: each can carry an id no `submitted` or `refused` line
+            // holds, and the next session would then mint past it and leave
+            // the runlog hole check a hole it could not explain.
+            // `Context::cancel` writes whatever id the strategy passes, minted
+            // or not. And an orphan is the fill twin of a `stray`, the engine
+            // withholding a report on an order it is not working, which the
+            // reason below already keeps off the counter.
+            JournalEntry::CancelRequested { .. }
+            | JournalEntry::Orphaned { .. }
+            | JournalEntry::Started { .. }
             | JournalEntry::Checkpoint { .. }
             | JournalEntry::Tripped { .. }
             // Consumes no id: nothing was decided, we simply could not see.
@@ -3004,6 +3009,35 @@ mod venue_entry_tests {
                 "{json} moved the counter"
             );
         }
+    }
+
+    #[test]
+    fn an_id_named_but_never_minted_does_not_move_the_counter() {
+        // The two lines from before schema 3 that can carry such an id.
+        // `Context::cancel` journals whatever id the strategy passes, and an
+        // orphan is a fill for an order the engine is not working: the fill
+        // twin of a stray. Either feeding the counter would make the next
+        // session mint 100 here, and runlog's hole check would then report
+        // ids 3 to 99 as decisions nobody wrote down.
+        let mut entries: Vec<JournalEntry> = (1..=2).map(submitted).collect();
+        entries.push(JournalEntry::CancelRequested {
+            at: Ts::from_nanos(3),
+            client_order_id: ClientOrderId(99),
+        });
+        assert_eq!(next_order_id(&entries), 3, "a cancel of an id never minted");
+
+        let mut entries: Vec<JournalEntry> = (1..=2).map(submitted).collect();
+        entries.push(JournalEntry::Orphaned {
+            at: Ts::from_nanos(3),
+            client_order_id: ClientOrderId(99),
+            px: "76652".parse().expect("px"),
+            qty: "0.001".parse().expect("qty"),
+            fee: "0.0766".parse().expect("fee"),
+            fee_asset: FeeAsset::Quote,
+            venue_order_id: None,
+            trade_id: None,
+        });
+        assert_eq!(next_order_id(&entries), 3, "a fill for an order not ours");
     }
 
     fn filled(id: u64, side: Side, px: &str) -> JournalEntry {

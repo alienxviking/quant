@@ -438,6 +438,11 @@ new line, and the compiler would not let one be skipped.
 
 No new line moves the id counter: every id this engine minted is already on a
 `submitted` or `refused` line, and an id the venue named must never move it.
+Two older lines stopped moving it too, for the same reason: `cancel_requested`,
+because `Context::cancel` journals whatever id the strategy passes, and
+`orphaned`, the fill twin of a `stray`. Either could name an id never minted,
+and the next session would mint past it and leave the hole check holes it
+could not explain.
 
 **The market's return is read, not inferred, from schema 3.** Before it, a line
 the engine wrote after `blind` was taken to mean the market came back, which
