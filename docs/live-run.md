@@ -376,7 +376,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`); the rest is the pull requests below |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65) and the account stream's frame kind (#63); items 4, 6, 7 and 8 below remain |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -512,6 +512,16 @@ feature.
    checks and not the update-id chain. Accepted when a v3 build reads every v1 and
    v2 file on disk and `quant-verify` still exits 0 on `data/paper` and
    `data/acceptance`.
+
+   **Built** as `m8c-account-frames` (#63), the argument in
+   `docs/data-contract.md` §6. Frame kind 3 is admitted only in a v3 container,
+   and each control record only in the version that introduced it, so a v2 file
+   holding one is corruption rather than an account frame. Account sessions
+   live under `<root>/account/`, which `catalog` reads on its own; the session
+   mints its own id; `quant-verify` runs the container's checks there and says
+   it skipped the update-id chain; and `normalize` refuses an account session
+   outright. Met: under the v3 reader `quant-verify` exits 0 on both captures
+   with the same frame counts as before, 97,937,822 and 70,545,346.
 6. **Listening to the account.** `session.logon`, then `userDataStream.subscribe`,
    over the WebSocket API; resubscribing on every reconnect and on
    `serverShutdown`; every recordable frame written to raw before it is
@@ -532,10 +542,12 @@ feature.
 
 Outside slice (c): resolving an in-doubt order by lookup is slice (d), criteria
 A, B and C as a binary are slice (e), and the run with criteria D and E is slice
-(f). Slice (e) needs one model change first: `SimulatedVenue` taking a buy's fee
-in the base asset when configured to (§2). It is off by default, so every
-backtest and M5 still reproduce; the model replay for criteria B and C runs with
-it on, or every exit it predicts is a lot bigger than the one live sends.
+(f). Slice (e) needed one model change first, and it has landed (#64):
+`SimulatedVenue` takes a buy's fee in the asset bought when configured to
+(`backtest --fee-asset received`, §2). It is off by default, so every backtest
+and M5 still reproduce. The model replay for criteria B and C runs with it on,
+or it predicts some exits a lot bigger than the ones live sends: not every exit,
+because one trip's dust tops up the next buy, but over M5's fortnight 42 of 412.
 
 ### Where it runs, which is not yet settled
 
@@ -794,9 +806,12 @@ market capture, an account gap would become a market `Gap` and clear the order
 book over a socket that has nothing to do with it, and account frames would
 compete for the market's channel. A session under `raw/` would be handed to every
 market reader. A second root, `<run-root>/account/`, reuses `Ingress`, `TeeSink`,
-`CaptureSession`, `FileStore` and `quant-verify` unchanged, so day rolling,
-trailers and holes as evidence come for free, and no market tool ever sees the
-files. **No frame carrying key material is recorded**, because raw is kept
+`CaptureSession`, `FileStore` and `quant-verify`, so day rolling, trailers and
+holes as evidence come for free, and no market tool ever sees the files. Reuse
+is not "unchanged", which this said before #63 built it: `CaptureTarget` names
+a stream rather than a symbol, `CaptureSession::account` mints the session's
+id, ingress takes account frames through `accept_account_at`, and
+`quant-verify` checks an account session with the container's checks alone. **No frame carrying key material is recorded**, because raw is kept
 forever. Every outbound request is out; so are the responses to `session.logon`
 and `session.status`, which echo the API key in their `result`. Those are our
 session's bookkeeping rather than facts about the account. Everything else

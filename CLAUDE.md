@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 509 tests green in debug
-and release, clippy and fmt clean, ~37,300 lines across 12 crates.
+same window exactly, on both symbols, to the satoshi. 720 tests green in debug
+and release, clippy and fmt clean, ~56,400 lines across 12 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -2099,6 +2099,24 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   the slice stayed green** under the sabotage that reddened the new ones. That
   last one is the warning: a fixture that fixes the order of an input whose order
   is the thing under test proves much less than it appears to.
+- **A fix-up is folded into the commit it repairs before the branch is
+  pushed.** (Set 2026-10-15.) "Every commit green" is a property of each
+  commit, not of the tip: two M8.c branches each carried a commit that failed
+  clippy alone, followed by a later one that put it right, which leaves a red
+  commit in `git bisect` for ever. On an unpushed branch, rewriting is the
+  fix, and the rule above about not rewriting history is about merged commits
+  on `main`. Check with clippy at **every** commit (`git rev-list --reverse
+  main..HEAD`), not only at the tip, and confirm the folded tree is
+  byte-identical to the old tip.
+- **A test fixture's path must be unique across processes, not only inside
+  one.** (Set 2026-10-15, #61.) Every worktree on a machine shares one temp
+  directory, so names unique by test or by thread still collided when two
+  worktrees tested at once: quant-normalize failed in 30 of 30 concurrent
+  processes, in tests with nothing wrong with them. Put
+  `std::process::id()` in every fixture path. It was found the way such
+  things are, by one unexplained red run that passed alone five times. **An
+  intermittent failure is a finding until it is explained**, which is the
+  queue-depth race's lesson from M1.e arriving in the test suite.
 - Warnings are errors in CI (`RUSTFLAGS: -D warnings`). Run before committing:
 
   ```bash
@@ -2288,8 +2306,9 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   it is read: another symbol is set aside first, then the id decides between
   ours, an orphan (our `q-` prefix, not this run) and not ours. A cancel is
   matched on `C`, the order, not `c`, the cancel request. A fee in neither side
-  of the pair, which is what the BNB discount produces, is refused loudly, so
-  the run procedure must turn the discount off, and `venue-check` now refuses
+  of the pair, which is what the BNB discount produces on a pair without BNB,
+  is refused loudly (on BNBUSDT a BNB fee is the base, and books), so the run
+  procedure must turn the discount off, and `venue-check` now refuses
   READY until it is. Written against the venue's documented example rather than
   a capture; criterion D's recorded reports have to confirm it.
 
@@ -2305,8 +2324,26 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   testnet rehearsal is its first real test, and its answers belong beside the
   fixtures.
 
-  **What remains in (c) is items 2 to 8 of `docs/live-run.md` §4**, each with
-  its acceptance criterion; item 1, the credentials and the requests, is done.
+  **Four more items landed on 2026-10-15**, each green at every commit and
+  gated together before any merged (720 tests in debug and release, the money
+  check exact, `verify` and `reconcile` clean). Item 2, the instrument from
+  `exchangeInfo` with every rule the model lacks named (#60). Item 5, the
+  account stream's frame kind in container v3 under its own root (#63):
+  `verify` reads both existing captures to the same frame counts. Item 3, the
+  engine seam (#65): a required `ready`, a write-ahead answer from the record,
+  `poll` handing back reports so the venue's detail reaches the journal and
+  never the strategy, `Accepted` without a venue order id, and
+  `Engine::settle`. And slice (e)'s one model change, the simulator taking a
+  buy's fee in the asset bought (#64), off by default. Its first measurement
+  over M5's fortnight: equity 31.70996473 against 31.64743842 in the quote,
+  0.000008 BTC of dust held at the end, and 42 of 412 exits a lot short,
+  because one trip's dust tops up the next buy. So a quote-fee model is wrong
+  about one exit in ten at this size, not every exit, as #64's first draft
+  claimed.
+
+  **What remains in (c) is items 4, 6, 7 and 8 of `docs/live-run.md` §4**: what
+  a live run writes down (journal schema 3), listening to the account,
+  `LiveVenue`, and the `live` binary with its testnet rehearsal.
   Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
   shipped code, which went first, each on its own branch (#52 to #56, and see
   *Still open*), and eighteen design questions. The ones that block code are
