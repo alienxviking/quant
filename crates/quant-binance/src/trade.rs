@@ -784,24 +784,65 @@ mod tests {
         )
     }
 
+    /// How long [`serve_once`] waits for its request, and then for each read
+    /// of it, before it fails the test.
+    ///
+    /// A request to this machine takes milliseconds, so this is generous; it
+    /// is short so that a request which never comes fails the run instead of
+    /// hanging it. Two ways that happens: `check_ready` erring before it
+    /// sends, and `reqwest` sending it to a proxy named in `HTTP_PROXY` or
+    /// `ALL_PROXY` instead of here.
+    const SERVE_DEADLINE: Duration = Duration::from_secs(10);
+
     /// A one-shot HTTP server on this machine. It reads the first request,
     /// answers it with `response` — or, when that is empty, hangs up without a
-    /// word — and hands back the request it was sent.
+    /// word — and hands back the request it was sent, through [`received`].
     ///
     /// The venue, as far as the client can tell, minus the network: what
     /// `check_ready` makes of a status, a header and a body is tested on the
     /// path it takes in production, with no credentials and nothing sent
     /// beyond this machine.
+    ///
+    /// Nothing in it waits without a bound. A blocking `accept` would wait
+    /// forever for a request that is not coming, and the test's join on this
+    /// thread with it, so the listener is polled until [`SERVE_DEADLINE`]
+    /// instead, and each read of the request times out after as long. Past
+    /// either, this thread panics and [`received`] fails the test.
     fn serve_once(response: String) -> (String, std::thread::JoinHandle<String>) {
-        use std::io::{Read as _, Write as _};
+        use std::io::{ErrorKind, Read as _, Write as _};
+        use std::time::Instant;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("a listener to poll");
         let base = format!("http://{}", listener.local_addr().expect("address"));
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
+            let deadline = Instant::now() + SERVE_DEADLINE;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "no request reached the test server in {SERVE_DEADLINE:?}: the client \
+                             failed before sending, or sent it to a proxy (HTTP_PROXY, ALL_PROXY)"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            };
+            // A socket accepted from a non-blocking listener can be
+            // non-blocking itself, as it is on Windows. Reads block again, each
+            // for no longer than the deadline's length.
+            stream.set_nonblocking(false).expect("a blocking stream");
+            stream
+                .set_read_timeout(Some(SERVE_DEADLINE))
+                .expect("a read timeout");
             let mut request = Vec::new();
             let mut buf = [0; 4096];
             while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = stream.read(&mut buf).expect("read");
+                let n = stream
+                    .read(&mut buf)
+                    .unwrap_or_else(|e| panic!("the request did not arrive in time: {e}"));
                 if n == 0 {
                     break;
                 }
@@ -811,6 +852,15 @@ mod tests {
             String::from_utf8(request).expect("an HTTP request head is text")
         });
         (base, server)
+    }
+
+    /// The request [`serve_once`] was sent. Fails the test when there was none
+    /// by the deadline: the server thread's own panic, printed above this
+    /// one, says which wait ran out.
+    fn received(server: std::thread::JoinHandle<String>) -> String {
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("the test server did not get its request"))
     }
 
     /// The account document from the venue's documentation
@@ -1380,7 +1430,7 @@ mod tests {
             .check_ready(0)
             .await
             .expect_err("no answer is not ready");
-        let request = server.join().expect("the server ran");
+        let request = received(server);
         let request_line = request.lines().next().unwrap_or_default();
         let signature = request_line
             .split_once("&signature=")
@@ -1410,7 +1460,7 @@ mod tests {
         let body = r#"{"code":-1003,"msg":"Too much request weight used; current limit is 6000 request weight per 1 MINUTE."}"#;
         let (base, server) = serve_once(http("429 Too Many Requests", "Retry-After: 37\r\n", body));
         let why = client_at(&base).check_ready(0).await.expect_err("refused");
-        server.join().expect("the server ran");
+        received(server);
         assert_eq!(
             why,
             NotReady::RateLimited {
@@ -1434,7 +1484,7 @@ mod tests {
             .check_ready(0)
             .await
             .expect_err("cannot trade");
-        let request = server.join().expect("the server ran");
+        let request = received(server);
         assert_eq!(why, NotReady::CannotTrade);
         assert!(!why.to_string().contains(BALANCE), "{why}");
         // The request it answered was the signed account probe, with its key.
@@ -1451,6 +1501,6 @@ mod tests {
 
         let (base, server) = serve_once(http("200 OK", "", &account("true")));
         assert_eq!(client_at(&base).check_ready(0).await, Ok(()));
-        server.join().expect("the server ran");
+        received(server);
     }
 }
