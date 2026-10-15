@@ -3,12 +3,19 @@
 //!
 //! Citations are to `binance/binance-spot-api-docs` at commit `0556f1a`.
 
+use core::time::Duration;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread::{self, JoinHandle};
+
 use quant_core::fixed::{Notional, ParseFixedError, Px, Qty};
 use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind};
 
 use super::{
-    parse, ExchangeInfoError, RuleScope, UnmodelledRule, VenueInstrument, MIN_NOTIONAL, NOTIONAL,
+    fetch, parse, ExchangeInfoError, FetchError, RuleScope, UnmodelledRule, VenueInstrument,
+    MIN_NOTIONAL, NOTIONAL,
 };
+use crate::rest::{SnapshotClient, SnapshotError};
 
 /// `rest-api.md` lines 812-876: the documented answer to
 /// `GET /api/v3/exchangeInfo`, with its `//` comments and the blank lines they
@@ -943,4 +950,98 @@ fn a_reported_rule_prints_under_the_venues_name() {
         "EXCHANGE_MAX_NUM_ORDERS (exchange-wide) maxNumOrders=1000"
     );
     assert_eq!(rule("BARE_RULE", &[]).to_string(), "BARE_RULE");
+}
+
+/// Answer one HTTP request on a loopback port with `status_line` and `body`,
+/// and hand back the request line that arrived.
+///
+/// No test reaches the real venue, and none should. This stands in for it so
+/// the request the client sends and what [`fetch`] makes of each kind of answer
+/// can both be pinned.
+fn serve_once(status_line: &'static str, body: String) -> (String, JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let base = format!("http://{}", listener.local_addr().expect("its address"));
+    let served = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("one connection");
+        let mut head = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).expect("the request");
+            if read == 0 {
+                break;
+            }
+            head.extend_from_slice(&chunk[..read]);
+        }
+        let response = format!(
+            "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).expect("the response");
+        String::from_utf8_lossy(&head)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    });
+    (base, served)
+}
+
+fn client(base: &str) -> SnapshotClient {
+    SnapshotClient::new(base, Duration::from_secs(10)).expect("a client")
+}
+
+#[tokio::test]
+async fn fetch_asks_for_one_symbol_and_reads_the_answer() {
+    let (base, served) = serve_once("HTTP/1.1 200 OK", WS_ANSWER.to_owned());
+    let got = fetch(&client(&base), "BNBBTC").await;
+    assert_eq!(
+        served.join().expect("the stand-in venue"),
+        "GET /api/v3/exchangeInfo?symbol=BNBBTC HTTP/1.1"
+    );
+    assert_eq!(
+        got,
+        Ok(parse("BNBBTC", WS_ANSWER.as_bytes()).expect("parses"))
+    );
+}
+
+#[tokio::test]
+async fn a_failed_fetch_is_a_value_and_never_a_definition() {
+    // The venue's refusal of a symbol it does not list (`rest-api.md` line
+    // 794), with its documented body (`errors.md` lines 6-9). It arrives as
+    // the request failing, with the status -- not as an answer that failed to
+    // parse, which is what reading the error document would have made of it.
+    let (base, served) = serve_once(
+        "HTTP/1.1 400 Bad Request",
+        r#"{"code": -1121, "msg": "Invalid symbol."}"#.to_owned(),
+    );
+    assert_eq!(
+        fetch(&client(&base), "BTCUSTD").await,
+        Err(FetchError::Request(SnapshotError::Status(400)))
+    );
+    served.join().expect("the stand-in venue");
+
+    // Something that is not an answer at all.
+    let (base, served) = serve_once("HTTP/1.1 200 OK", "<html>maintenance</html>".to_owned());
+    assert!(matches!(
+        fetch(&client(&base), "ETHBTC").await,
+        Err(FetchError::Answer(ExchangeInfoError::NotExchangeInfo(_)))
+    ));
+    served.join().expect("the stand-in venue");
+
+    // An answer naming a symbol that is not trading.
+    let halted = edit(
+        REST_ANSWER,
+        "\"status\": \"TRADING\"",
+        "\"status\": \"HALT\"",
+    );
+    let (base, served) = serve_once("HTTP/1.1 200 OK", halted);
+    assert_eq!(
+        fetch(&client(&base), "ETHBTC").await,
+        Err(FetchError::Answer(ExchangeInfoError::NotTrading {
+            symbol: "ETHBTC".to_owned(),
+            status: "HALT".to_owned(),
+        }))
+    );
+    served.join().expect("the stand-in venue");
 }
