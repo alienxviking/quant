@@ -1098,7 +1098,7 @@ fn windows_that_cannot_cross_are_refused_rather_than_panicking() {
 // --- M8.c: an exit sells what a base-asset fee left behind ---
 
 use quant_core::event::Side;
-use quant_core::execution::{ClientOrderId, ExecutionEvent, FeeAsset};
+use quant_core::execution::{ClientOrderId, FeeAsset};
 use quant_engine::ExecutionVenue;
 
 /// The real simulator, with each buy's fee taken out of what was bought as a
@@ -1149,15 +1149,17 @@ impl ExecutionVenue for BaseFeeOnBuys {
         self.inner.observe(event, book, now);
     }
 
-    fn poll(&mut self, now: Ts, out: &mut Vec<ExecutionEvent>) {
+    fn poll(&mut self, now: Ts, out: &mut Vec<quant_core::report::VenueReport>) {
         let from = out.len();
         self.inner.poll(now, out);
-        for event in &mut out[from..] {
-            if let ExecutionEvent::Filled {
-                client_order_id,
-                fill,
-                ..
-            } = event
+        for report in &mut out[from..] {
+            if let quant_core::report::VenueReport::Order(
+                quant_core::report::OrderReport::Filled {
+                    client_order_id,
+                    fill,
+                    ..
+                },
+            ) = report
             {
                 if self.buys.contains(client_order_id) {
                     // With a `Base` asset, `fee` holds a quantity of the base.
@@ -1373,7 +1375,7 @@ impl ExecutionVenue for Told {
         self.inner.observe(event, book, now);
     }
 
-    fn poll(&mut self, now: Ts, out: &mut Vec<ExecutionEvent>) {
+    fn poll(&mut self, now: Ts, out: &mut Vec<quant_core::report::VenueReport>) {
         self.inner.poll(now, out);
     }
 }

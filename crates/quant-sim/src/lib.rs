@@ -727,13 +727,13 @@ impl ExecutionVenue for SimulatedVenue {
         self.resting = orders;
     }
 
-    fn poll(&mut self, now: Ts, out: &mut Vec<ExecutionEvent>) {
+    fn poll(&mut self, now: Ts, out: &mut Vec<quant_core::report::VenueReport>) {
         // Only what has arrived. Anything still in flight stays put, which is
         // what makes inbound latency mean something rather than being a field.
         let mut still_flying = Vec::new();
         for pending in core::mem::take(&mut self.out) {
             if pending.deliver_at <= now {
-                out.push(pending.event);
+                out.push(pending.event.into());
             } else {
                 still_flying.push(pending);
             }

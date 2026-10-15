@@ -13,14 +13,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use quant_core::event::Side;
-use quant_core::execution::{ClientOrderId, Fill, OrderRequest, RejectReason};
+use quant_core::execution::{ClientOrderId, Fill, OrderRequest, RejectReason, VenueOrderId};
 use quant_core::fixed::{Px, Qty};
-use quant_core::instrument::{Exchange, InstrumentId};
+use quant_core::instrument::Exchange;
+use quant_core::report::{Ended, FillIds, Notice, RejectedWhy};
 use quant_core::time::Ts;
 use quant_engine::journal::{InstrumentKey, Journal, JournalEntry};
 use quant_engine::risk::Bound;
-use quant_engine::{RefusedBy, RunObserver, WriteAhead};
+use quant_engine::{Booked, RefusedBy, RunObserver, WriteAhead};
 use tracing::error;
 
 /// How often the engine writes down what it believes.
@@ -114,6 +114,25 @@ impl JournalWriter {
             symbol: self.symbol.clone(),
         }
     }
+
+    /// Say, loudly, that the venue reported something this journal has no line
+    /// for yet.
+    ///
+    /// A bridge, and a deliberately noisy one. The engine now hands the record
+    /// what only a real venue knows (its ids, what it cited, the facts that are
+    /// not events), and the journal entries that hold them are the next pull
+    /// request's, with a schema change of their own. Until then nothing
+    /// produces any of it: the simulator's reports carry none, and no live
+    /// venue exists. Should one arrive first, it is an `error!` rather than a
+    /// silence, so a record that lost it says so where an operator looks.
+    fn unwritten(&self, what: &str, detail: &dyn core::fmt::Debug) {
+        error!(
+            symbol = %self.symbol,
+            what,
+            detail = ?detail,
+            "the venue reported something this journal cannot yet write"
+        );
+    }
 }
 
 impl RunObserver for JournalWriter {
@@ -149,15 +168,20 @@ impl RunObserver for JournalWriter {
         );
     }
 
-    fn on_fill(
-        &mut self,
-        client_order_id: ClientOrderId,
-        _instrument: InstrumentId,
-        side: Side,
-        fill: &Fill,
-        at: Ts,
-        portfolio: &quant_engine::Portfolio,
-    ) {
+    fn on_fill(&mut self, booked: &Booked<'_>, portfolio: &quant_engine::Portfolio) {
+        // Every field named, so one added to `Booked` has to be decided here.
+        let Booked {
+            client_order_id,
+            instrument: _,
+            side,
+            fill,
+            remaining: _,
+            ids,
+            at,
+        } = *booked;
+        if let Some(ids) = ids {
+            self.unwritten("a fill's venue ids", ids);
+        }
         self.fills += 1;
         self.record(
             &JournalEntry::Filled {
@@ -235,7 +259,15 @@ impl RunObserver for JournalWriter {
         );
     }
 
-    fn on_accepted(&mut self, client_order_id: ClientOrderId, at: Ts) {
+    fn on_accepted(
+        &mut self,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<&VenueOrderId>,
+        at: Ts,
+    ) {
+        if let Some(venue_order_id) = venue_order_id {
+            self.unwritten("an acceptance's venue order id", venue_order_id);
+        }
         self.record(
             &JournalEntry::Accepted {
                 at,
@@ -245,7 +277,16 @@ impl RunObserver for JournalWriter {
         );
     }
 
-    fn on_rejected(&mut self, client_order_id: ClientOrderId, reason: RejectReason, at: Ts) {
+    fn on_rejected(
+        &mut self,
+        client_order_id: ClientOrderId,
+        reason: RejectReason,
+        why: Option<&RejectedWhy>,
+        at: Ts,
+    ) {
+        if let Some(why) = why {
+            self.unwritten("why the venue rejected an order", why);
+        }
         self.record(
             &JournalEntry::Rejected {
                 at,
@@ -266,7 +307,16 @@ impl RunObserver for JournalWriter {
         );
     }
 
-    fn on_cancelled(&mut self, client_order_id: ClientOrderId, remaining: Qty, at: Ts) {
+    fn on_cancelled(
+        &mut self,
+        client_order_id: ClientOrderId,
+        remaining: Qty,
+        ended: Option<&Ended>,
+        at: Ts,
+    ) {
+        if let Some(ended) = ended {
+            self.unwritten("how the venue ended an order", ended);
+        }
         self.record(
             &JournalEntry::Cancelled {
                 at,
@@ -277,7 +327,16 @@ impl RunObserver for JournalWriter {
         );
     }
 
-    fn on_orphaned(&mut self, client_order_id: ClientOrderId, fill: &Fill, at: Ts) {
+    fn on_orphaned(
+        &mut self,
+        client_order_id: ClientOrderId,
+        fill: &Fill,
+        ids: Option<&FillIds>,
+        at: Ts,
+    ) {
+        if let Some(ids) = ids {
+            self.unwritten("an orphaned fill's venue ids", ids);
+        }
         // Loud as well as recorded: an unattributable fill means the venue and
         // our books disagree about what we own, and that is the one condition
         // where carrying on quietly is worse than the noise.
@@ -298,6 +357,10 @@ impl RunObserver for JournalWriter {
             "an orphaned fill",
         );
     }
+
+    fn on_notice(&mut self, notice: &Notice, _at: Ts) {
+        self.unwritten("a venue notice", notice);
+    }
 }
 
 /// Append one entry to the shared journal.
@@ -315,6 +378,7 @@ pub fn write(journal: &Arc<Mutex<Journal>>, entry: &JournalEntry) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quant_core::event::Side;
     use quant_core::execution::FeeAsset;
     use quant_core::fixed::Notional;
     use quant_engine::portfolio::Portfolio;
@@ -351,11 +415,15 @@ mod tests {
         let mut writer = JournalWriter::new(journal, "BTCUSDT".to_owned(), 0);
         let portfolio = Portfolio::new(Notional::from_raw(1_000 * quant_core::SCALE));
         writer.on_fill(
-            ClientOrderId(1),
-            InstrumentId::from_index(0),
-            Side::Buy,
-            &base_fee_fill(),
-            Ts::from_nanos(1),
+            &Booked {
+                client_order_id: ClientOrderId(1),
+                instrument: quant_core::instrument::InstrumentId::from_index(0),
+                side: Side::Buy,
+                fill: &base_fee_fill(),
+                remaining: Qty::ZERO,
+                ids: None,
+                at: Ts::from_nanos(1),
+            },
             &portfolio,
         );
         let entries = quant_engine::journal::read(&path).expect("read").entries;
@@ -372,7 +440,7 @@ mod tests {
         // the venue's own record. Its fee is half a fact without the asset.
         let (path, journal) = journal("orphaned");
         let mut writer = JournalWriter::new(journal, "BTCUSDT".to_owned(), 0);
-        writer.on_orphaned(ClientOrderId(7), &base_fee_fill(), Ts::from_nanos(1));
+        writer.on_orphaned(ClientOrderId(7), &base_fee_fill(), None, Ts::from_nanos(1));
         let entries = quant_engine::journal::read(&path).expect("read").entries;
         let asset = entries.iter().find_map(|e| match e {
             JournalEntry::Orphaned { fee_asset, .. } => Some(*fee_asset),

@@ -19,7 +19,8 @@
 
 use quant_book::Book;
 use quant_core::event::MarketEvent;
-use quant_core::execution::{ClientOrderId, ExecutionEvent, OrderRequest};
+use quant_core::execution::{ClientOrderId, OrderRequest};
+use quant_core::report::VenueReport;
 use quant_core::time::Ts;
 
 /// Why a venue will not take an order now.
@@ -140,7 +141,26 @@ pub trait ExecutionVenue {
     /// events until their delivery time; a live venue ignores it and hands over
     /// whatever arrived.
     ///
-    /// Appends rather than returning, so a busy venue does not allocate a vector
-    /// per event on the hot path.
-    fn poll(&mut self, now: Ts, out: &mut Vec<ExecutionEvent>);
+    /// Each report is either something that happened to an order, with what
+    /// only a real venue knows typed beside it, or a notice: a fact the record
+    /// must hold that is not an event at all. The engine tells the strategy an
+    /// order report's event and nothing beside it, and tells it nothing of a
+    /// notice. What an implementation owes the engine:
+    ///
+    /// - **Append, and never block.** Appends rather than returning, so a busy
+    ///   venue does not allocate a vector per event on the hot path; never
+    ///   blocks, because the engine's only other input is waiting behind it.
+    /// - **Arrival order, stamped by the clock that stamps `local_recv_ts`.**
+    ///   Every report moves the engine clock when it is later, notices
+    ///   included, so a stamp from any other clock would date what the engine
+    ///   does next by that clock.
+    /// - **At most one terminal report per order, and none before its last
+    ///   fill.** The engine forgets an order on its terminal report, and a fill
+    ///   after that could not be booked.
+    /// - **[`VenueReport::Order`] only for this run's orders.** Anything about an
+    ///   order this run did not send is a notice.
+    /// - **Never drop a report silently.** One that cannot be read becomes an
+    ///   anomaly notice, and the order it might concern is in doubt, because
+    ///   what it said may have been a fill.
+    fn poll(&mut self, now: Ts, out: &mut Vec<VenueReport>);
 }

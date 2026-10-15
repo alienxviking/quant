@@ -115,9 +115,10 @@ pub enum OrderReport {
 impl OrderReport {
     /// The report of `event` with nothing beside it.
     ///
-    /// `ExecutionEvent::Accepted` still carries a venue order id of its own,
-    /// which is carried across as it is: it is the event's, not detail this
-    /// adds.
+    /// `ExecutionEvent::Accepted` still carries a venue order id, the one field
+    /// by which a strategy could tell which venue it was wired to, and on its
+    /// way out. One found there is venue detail, so it is carried across as
+    /// detail, and [`Self::event`] does not hand it back.
     #[must_use]
     pub fn plain(event: ExecutionEvent) -> Self {
         match event {
@@ -175,11 +176,13 @@ impl OrderReport {
         match self {
             Self::Accepted {
                 client_order_id,
-                venue_order_id,
+                venue_order_id: _,
                 ts,
             } => ExecutionEvent::Accepted {
                 client_order_id: *client_order_id,
-                venue_order_id: venue_order_id.clone(),
+                // Detail, which stops here. The event's own field for it is
+                // the leak this projection closes.
+                venue_order_id: None,
                 ts: *ts,
             },
             Self::Rejected {
@@ -645,7 +648,7 @@ mod tests {
         [
             ExecutionEvent::Accepted {
                 client_order_id: ClientOrderId(11),
-                venue_order_id: Some(VenueOrderId("4293153".to_owned())),
+                venue_order_id: None,
                 ts: Ts::from_nanos(101),
             },
             ExecutionEvent::Rejected {
@@ -694,18 +697,25 @@ mod tests {
 
     #[test]
     fn nothing_beside_an_event_is_plain_and_anything_beside_it_is_not() {
-        let [accepted, rejected, filled, cancelled] = events();
-        for event in [rejected, filled, cancelled] {
+        for event in events() {
             assert!(OrderReport::plain(event).is_plain());
         }
-        // The one field an event still carries of its own.
-        assert!(!OrderReport::plain(accepted).is_plain());
-        assert!(OrderReport::plain(ExecutionEvent::Accepted {
+        // The venue order id an acceptance still carries is detail: kept
+        // beside the event, and not handed back to the strategy.
+        let leaked = OrderReport::plain(ExecutionEvent::Accepted {
             client_order_id: ClientOrderId(11),
-            venue_order_id: None,
+            venue_order_id: Some(VenueOrderId("4293153".to_owned())),
             ts: Ts::from_nanos(101),
-        })
-        .is_plain());
+        });
+        assert!(!leaked.is_plain());
+        assert_eq!(
+            leaked.event(),
+            ExecutionEvent::Accepted {
+                client_order_id: ClientOrderId(11),
+                venue_order_id: None,
+                ts: Ts::from_nanos(101),
+            }
+        );
 
         let ids = FillIds {
             venue_order_id: VenueOrderId("4293153".to_owned()),

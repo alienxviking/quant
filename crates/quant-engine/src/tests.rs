@@ -10,10 +10,12 @@ use quant_book::Book;
 use quant_core::event::{BookDelta, EventMeta, Gap, GapCause, Level, MarketEvent, Side, Trade};
 use quant_core::execution::{
     ClientOrderId, ExecutionEvent, Fill, OrderKind, OrderRequest, RejectReason, TimeInForce,
+    VenueOrderId,
 };
 use quant_core::instrument::{
     Exchange, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };
+use quant_core::report::{Ended, FillIds, Notice, OrderReport, RejectedWhy, VenueReport};
 use quant_core::source::{EventSource, SourceError};
 use quant_core::time::Ts;
 use quant_core::{Notional, Qty};
@@ -186,8 +188,8 @@ impl ExecutionVenue for RecordingVenue {
         }
     }
 
-    fn poll(&mut self, _now: Ts, out: &mut Vec<ExecutionEvent>) {
-        out.append(&mut self.out);
+    fn poll(&mut self, _now: Ts, out: &mut Vec<VenueReport>) {
+        out.extend(self.out.drain(..).map(VenueReport::from));
     }
 }
 
@@ -434,8 +436,8 @@ fn the_same_strategy_value_runs_against_two_different_wirings() {
             });
         }
         fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
-        fn poll(&mut self, _now: Ts, out: &mut Vec<ExecutionEvent>) {
-            out.append(&mut self.out);
+        fn poll(&mut self, _now: Ts, out: &mut Vec<VenueReport>) {
+            out.extend(self.out.drain(..).map(VenueReport::from));
         }
     }
 
@@ -581,15 +583,25 @@ fn client_order_ids_are_unique_even_across_refusals() {
 enum Heard {
     Submitted(ClientOrderId, Ts),
     Refused(ClientOrderId, RejectReason, crate::RefusedBy, Ts),
-    Accepted(ClientOrderId, Ts),
-    Rejected(ClientOrderId, RejectReason, Ts),
+    Accepted(ClientOrderId, Option<VenueOrderId>, Ts),
+    Rejected(ClientOrderId, RejectReason, Option<RejectedWhy>, Ts),
     CancelRequested(ClientOrderId, Ts),
-    Cancelled(ClientOrderId, Qty, Ts),
+    Cancelled(ClientOrderId, Qty, Option<Ended>, Ts),
     Tripped(crate::risk::TripCause, Ts),
     Blind(GapCause, Ts, Ts),
     Note(&'static str, Ts),
-    Orphaned(ClientOrderId, Ts),
-    Filled(ClientOrderId, Qty, Ts),
+    Orphaned(ClientOrderId, Option<FillIds>, Ts),
+    /// The order, the size, the venue's names for it, what is left, and when.
+    Filled(ClientOrderId, Qty, Option<FillIds>, Qty, Ts),
+    Notice(Notice, Ts),
+    /// Not a hook: a venue that writes to the same log says it was sent this.
+    Sent(ClientOrderId),
+    /// Not a hook: a strategy that writes to the same log was told this, with
+    /// its clock.
+    Told(ExecutionEvent, Ts),
+    /// Not a hook: a strategy that writes to the same log saw this market
+    /// event, with its clock.
+    Saw(u64, Ts),
 }
 
 /// Everything the engine told an observer, in the order it was told.
@@ -679,18 +691,32 @@ impl crate::RunObserver for std::sync::Arc<std::sync::Mutex<Witness>> {
             .push(Heard::Refused(client_order_id, reason, by, at));
     }
 
-    fn on_accepted(&mut self, client_order_id: ClientOrderId, at: Ts) {
-        self.lock()
-            .expect("witness")
-            .heard
-            .push(Heard::Accepted(client_order_id, at));
+    fn on_accepted(
+        &mut self,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<&VenueOrderId>,
+        at: Ts,
+    ) {
+        self.lock().expect("witness").heard.push(Heard::Accepted(
+            client_order_id,
+            venue_order_id.cloned(),
+            at,
+        ));
     }
 
-    fn on_rejected(&mut self, client_order_id: ClientOrderId, reason: RejectReason, at: Ts) {
-        self.lock()
-            .expect("witness")
-            .heard
-            .push(Heard::Rejected(client_order_id, reason, at));
+    fn on_rejected(
+        &mut self,
+        client_order_id: ClientOrderId,
+        reason: RejectReason,
+        why: Option<&RejectedWhy>,
+        at: Ts,
+    ) {
+        self.lock().expect("witness").heard.push(Heard::Rejected(
+            client_order_id,
+            reason,
+            why.cloned(),
+            at,
+        ));
     }
 
     fn on_cancel_requested(&mut self, client_order_id: ClientOrderId, at: Ts) {
@@ -700,11 +726,19 @@ impl crate::RunObserver for std::sync::Arc<std::sync::Mutex<Witness>> {
             .push(Heard::CancelRequested(client_order_id, at));
     }
 
-    fn on_cancelled(&mut self, client_order_id: ClientOrderId, remaining: Qty, at: Ts) {
-        self.lock()
-            .expect("witness")
-            .heard
-            .push(Heard::Cancelled(client_order_id, remaining, at));
+    fn on_cancelled(
+        &mut self,
+        client_order_id: ClientOrderId,
+        remaining: Qty,
+        ended: Option<&Ended>,
+        at: Ts,
+    ) {
+        self.lock().expect("witness").heard.push(Heard::Cancelled(
+            client_order_id,
+            remaining,
+            ended.cloned(),
+            at,
+        ));
     }
 
     fn on_tripped(&mut self, cause: crate::risk::TripCause, at: Ts) {
@@ -728,26 +762,35 @@ impl crate::RunObserver for std::sync::Arc<std::sync::Mutex<Witness>> {
             .push(Heard::Note(note.kind, at));
     }
 
-    fn on_orphaned(&mut self, client_order_id: ClientOrderId, _fill: &Fill, at: Ts) {
-        self.lock()
-            .expect("witness")
-            .heard
-            .push(Heard::Orphaned(client_order_id, at));
-    }
-
-    fn on_fill(
+    fn on_orphaned(
         &mut self,
         client_order_id: ClientOrderId,
-        _instrument: InstrumentId,
-        _side: Side,
-        fill: &Fill,
+        _fill: &Fill,
+        ids: Option<&FillIds>,
         at: Ts,
-        _portfolio: &crate::Portfolio,
     ) {
+        self.lock().expect("witness").heard.push(Heard::Orphaned(
+            client_order_id,
+            ids.cloned(),
+            at,
+        ));
+    }
+
+    fn on_fill(&mut self, booked: &crate::Booked<'_>, _portfolio: &crate::Portfolio) {
+        self.lock().expect("witness").heard.push(Heard::Filled(
+            booked.client_order_id,
+            booked.fill.qty,
+            booked.ids.cloned(),
+            booked.remaining,
+            booked.at,
+        ));
+    }
+
+    fn on_notice(&mut self, notice: &Notice, at: Ts) {
         self.lock()
             .expect("witness")
             .heard
-            .push(Heard::Filled(client_order_id, fill.qty, at));
+            .push(Heard::Notice(notice.clone(), at));
     }
 }
 
@@ -769,11 +812,22 @@ impl Strategy for Greedy {
 /// under test.
 #[derive(Debug, Default)]
 struct Says {
-    batches: std::collections::VecDeque<Vec<ExecutionEvent>>,
+    batches: std::collections::VecDeque<Vec<VenueReport>>,
 }
 
 impl Says {
+    /// Events with nothing beside them, which is what a simulator says.
     fn new(batches: Vec<Vec<ExecutionEvent>>) -> Self {
+        Self::reporting(
+            batches
+                .into_iter()
+                .map(|batch| batch.into_iter().map(VenueReport::from).collect())
+                .collect(),
+        )
+    }
+
+    /// Anything a venue can say, detail and notices included.
+    fn reporting(batches: Vec<Vec<VenueReport>>) -> Self {
         Self {
             batches: batches.into(),
         }
@@ -789,7 +843,7 @@ impl ExecutionVenue for Says {
 
     fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
 
-    fn poll(&mut self, _now: Ts, out: &mut Vec<ExecutionEvent>) {
+    fn poll(&mut self, _now: Ts, out: &mut Vec<VenueReport>) {
         out.extend(self.batches.pop_front().unwrap_or_default());
     }
 }
@@ -915,15 +969,15 @@ fn an_observer_hears_every_hook_in_the_order_the_engine_calls_them() {
             Heard::Refused(c(2), RejectReason::Malformed, crate::RefusedBy::Seam, t1),
             Heard::CancelRequested(c(1), t1),
             Heard::Note("decided", t1),
-            Heard::Accepted(c(1), t2),
-            Heard::Filled(c(1), qty("0.4"), t2),
-            Heard::Cancelled(c(1), qty("0.6"), t2),
+            Heard::Accepted(c(1), None, t2),
+            Heard::Filled(c(1), qty("0.4"), None, qty("0.6"), t2),
+            Heard::Cancelled(c(1), qty("0.6"), None, t2),
             Heard::Submitted(c(3), t2),
             Heard::Tripped(crate::risk::TripCause::OrderCount, t2),
             Heard::Refused(c(4), RejectReason::RiskLimit, crate::RefusedBy::Risk, t2),
             Heard::Blind(GapCause::Disconnect, Ts::from_nanos(1), t3),
-            Heard::Rejected(c(3), RejectReason::Venue, t3),
-            Heard::Orphaned(c(99), t3),
+            Heard::Rejected(c(3), RejectReason::Venue, None, t3),
+            Heard::Orphaned(c(99), None, t3),
         ],
         "every hook, each once, in the order the engine reached it"
     );
@@ -1160,7 +1214,7 @@ fn notes_cannot_reveal_which_venue_the_strategy_was_wired_to() {
         }
         fn submit(&mut self, _id: ClientOrderId, _r: &OrderRequest, _now: Ts) {}
         fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
-        fn poll(&mut self, _now: Ts, _out: &mut Vec<ExecutionEvent>) {}
+        fn poll(&mut self, _now: Ts, _out: &mut Vec<VenueReport>) {}
     }
 
     let filling = notes_against(RecordingVenue::default());
@@ -1344,11 +1398,11 @@ impl ExecutionVenue for SpeaksLater {
 
     fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
 
-    fn poll(&mut self, _now: Ts, out: &mut Vec<ExecutionEvent>) {
+    fn poll(&mut self, _now: Ts, out: &mut Vec<VenueReport>) {
         // On whichever wake comes next, market or idle. The engine polls before
         // the strategy sees an event, so an order placed on one event cannot be
         // reported on that same wake -- nothing is held yet when it polls.
-        out.extend(self.held.take());
+        out.extend(self.held.take().map(VenueReport::from));
     }
 }
 
@@ -1644,7 +1698,7 @@ impl ExecutionVenue for Readiness {
 
     fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
 
-    fn poll(&mut self, _now: Ts, _out: &mut Vec<ExecutionEvent>) {}
+    fn poll(&mut self, _now: Ts, _out: &mut Vec<VenueReport>) {}
 }
 
 #[test]
@@ -1827,4 +1881,595 @@ fn a_submission_the_record_could_not_hold_is_never_sent_and_nothing_after_it_is(
         "the withheld order had passed the risk layer; the two after it never reached it"
     );
     assert_eq!((stats.submitted, stats.refused), (1, 3));
+}
+
+// --- M8.c: a venue hands back reports, and the record hears what the strategy does not ---
+
+/// What a strategy saw, in order: a market event or a report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Seen {
+    Market(u64),
+    Told(ExecutionEvent),
+}
+
+/// Drives one lifecycle and writes down everything it could read: each thing
+/// it saw, with the clock, the position and the cash it read at that moment.
+///
+/// Order 1 on the first event; order 2 and a cancel of order 1 on the second;
+/// order 3 and a cancel of it on the third.
+#[derive(Debug, Default)]
+struct Lifecycle {
+    log: Vec<(Seen, Ts, Qty, Notional)>,
+    notes_taken: usize,
+}
+
+impl Strategy for Lifecycle {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &mut Context<'_>) {
+        let seq = event.meta().ingest_seq;
+        self.log.push((
+            Seen::Market(seq),
+            ctx.now(),
+            ctx.position(instrument()).qty,
+            ctx.cash(),
+        ));
+        match seq {
+            1 => {
+                ctx.submit(buy());
+            }
+            2 => {
+                ctx.submit(buy());
+                ctx.cancel(ClientOrderId(1));
+            }
+            3 => {
+                let third = ctx.submit(buy());
+                ctx.cancel(third);
+            }
+            _ => {}
+        }
+    }
+
+    fn on_execution(&mut self, event: &ExecutionEvent, ctx: &mut Context<'_>) {
+        self.log.push((
+            Seen::Told(event.clone()),
+            ctx.now(),
+            ctx.position(instrument()).qty,
+            ctx.cash(),
+        ));
+    }
+
+    fn take_notes(&mut self, _out: &mut Vec<crate::strategy::Note>) {
+        self.notes_taken += 1;
+    }
+}
+
+fn qty(s: &str) -> Qty {
+    s.parse().expect("qty")
+}
+
+fn vid(n: u64) -> VenueOrderId {
+    VenueOrderId(n.to_string())
+}
+
+fn fill_ids(order: u64, trade: u64) -> FillIds {
+    FillIds {
+        venue_order_id: vid(order),
+        trade_id: quant_core::execution::VenueTradeId(trade.to_string()),
+    }
+}
+
+fn cited(code: i64, msg: &str) -> quant_core::report::Cited {
+    quant_core::report::Cited {
+        http_status: Some(400),
+        code,
+        msg: quant_core::report::VenueText::new(msg),
+    }
+}
+
+/// When the account stream is lost in [`talkative_lifecycle`]: after every
+/// market event, on the idle wake that follows them.
+const LOST_AT: Ts = Ts::from_nanos(2_500_000_000);
+
+fn stream_lost(at: Ts) -> Notice {
+    Notice::Account {
+        change: quant_core::report::AccountChange::Lost {
+            cause: quant_core::report::AccountCause::SocketClosed,
+        },
+        ts: at,
+    }
+}
+
+/// The lifecycle [`Lifecycle`] drives, as a venue with nothing to say beside
+/// an event would report it: order 1 accepted and filled in two parts, order 2
+/// declined, order 3 accepted and cancelled. One batch per wake: four market
+/// events, then one idle wake on which this venue has nothing to say.
+fn plain_lifecycle() -> Says {
+    let t = |n| meta(n).local_recv_ts;
+    let c = ClientOrderId;
+    Says::new(vec![
+        vec![],
+        vec![
+            ExecutionEvent::Accepted {
+                client_order_id: c(1),
+                venue_order_id: None,
+                ts: t(2),
+            },
+            ExecutionEvent::Filled {
+                client_order_id: c(1),
+                fill: fill_of("0.4"),
+                remaining: qty("0.6"),
+                ts: t(2),
+            },
+        ],
+        vec![
+            ExecutionEvent::Filled {
+                client_order_id: c(1),
+                fill: fill_of("0.6"),
+                remaining: qty("0"),
+                ts: t(3),
+            },
+            ExecutionEvent::Rejected {
+                client_order_id: c(2),
+                reason: RejectReason::Venue,
+                ts: t(3),
+            },
+        ],
+        vec![
+            ExecutionEvent::Accepted {
+                client_order_id: c(3),
+                venue_order_id: None,
+                ts: t(4),
+            },
+            ExecutionEvent::Cancelled {
+                client_order_id: c(3),
+                remaining: qty("1"),
+                ts: t(4),
+            },
+        ],
+        vec![],
+    ])
+}
+
+/// The same lifecycle as a live venue would report it: every kind of detail
+/// beside the events, notices among them stamped no later than their batch's
+/// latest order report, and the account stream lost on the idle wake.
+fn talkative_lifecycle() -> Says {
+    let t = |n| meta(n).local_recv_ts;
+    let c = ClientOrderId;
+    let order = VenueReport::Order;
+    let notice = VenueReport::Notice;
+    Says::reporting(vec![
+        vec![],
+        vec![
+            notice(Notice::Placed {
+                client_order_id: c(1),
+                venue_order_id: vid(8001),
+                transact_ms: 1_789_742_815_743,
+                ts: Ts::from_nanos(t(2).as_nanos() - 1),
+            }),
+            order(OrderReport::Accepted {
+                client_order_id: c(1),
+                venue_order_id: Some(vid(8001)),
+                ts: t(2),
+            }),
+            order(OrderReport::Filled {
+                client_order_id: c(1),
+                fill: fill_of("0.4"),
+                remaining: qty("0.6"),
+                ids: Some(fill_ids(8001, 50001)),
+                ts: t(2),
+            }),
+        ],
+        vec![
+            order(OrderReport::Filled {
+                client_order_id: c(1),
+                fill: fill_of("0.6"),
+                remaining: qty("0"),
+                ids: Some(fill_ids(8001, 50002)),
+                ts: t(3),
+            }),
+            // The cancel of order 1 lost the race to its last fill.
+            notice(Notice::CancelRefused {
+                client_order_id: c(1),
+                why: quant_core::report::CancelRefusal::NotOpen(cited(
+                    -2011,
+                    "Unknown order sent.",
+                )),
+                ts: t(3),
+            }),
+            order(OrderReport::Rejected {
+                client_order_id: c(2),
+                reason: RejectReason::Venue,
+                why: Some(RejectedWhy::Declined {
+                    cited: cited(-1013, "Filter failure: NOTIONAL"),
+                    breach: Some(quant_core::instrument::FilterBreach::MinNotional),
+                }),
+                ts: t(3),
+            }),
+        ],
+        vec![
+            notice(Notice::Placed {
+                client_order_id: c(3),
+                venue_order_id: vid(8003),
+                transact_ms: 1_789_742_815_744,
+                ts: Ts::from_nanos(t(4).as_nanos() - 1),
+            }),
+            order(OrderReport::Accepted {
+                client_order_id: c(3),
+                venue_order_id: Some(vid(8003)),
+                ts: t(4),
+            }),
+            order(OrderReport::Cancelled {
+                client_order_id: c(3),
+                remaining: qty("1"),
+                ended: Some(Ended {
+                    venue_order_id: vid(8003),
+                    how: quant_core::report::EndedBy::Cancelled,
+                }),
+                ts: t(4),
+            }),
+        ],
+        vec![notice(stream_lost(LOST_AT))],
+    ])
+}
+
+fn lifecycle_against(venue: Says) -> (Lifecycle, Vec<Heard>, crate::EngineStats) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        GoesQuiet::new(
+            vec![
+                trade(1, "100.00"),
+                trade(2, "100.00"),
+                trade(3, "100.00"),
+                trade(4, "100.00"),
+            ],
+            1,
+        ),
+        venue,
+        AllowAll,
+        Lifecycle::default(),
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    let stats = engine.run().expect("no source failure");
+    let strategy = std::mem::take(&mut engine.strategy);
+    let heard = std::mem::take(&mut seen.lock().expect("witness").heard);
+    (strategy, heard, stats)
+}
+
+/// Everything in `heard` that only a real venue could have said: the detail
+/// beside each report, and every notice.
+fn venue_detail(heard: &[Heard]) -> Vec<Heard> {
+    heard
+        .iter()
+        .filter(|h| match h {
+            Heard::Accepted(_, venue_order_id, _) => venue_order_id.is_some(),
+            Heard::Rejected(_, _, why, _) => why.is_some(),
+            Heard::Cancelled(_, _, ended, _) => ended.is_some(),
+            Heard::Orphaned(_, ids, _) | Heard::Filled(_, _, ids, _, _) => ids.is_some(),
+            Heard::Notice(..) => true,
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_strategy_sees_the_same_lifecycle_whichever_venue_reported_it() {
+    // The seam's acceptance criterion. A live venue knows its own ids, the
+    // trade ids, the codes it cited, that a cancel lost, that its stream
+    // dropped, and the record needs every one of them -- while a strategy that
+    // could read any of them could tell which venue it was wired to, which is a
+    // bug. So the same lifecycle, reported by a venue with nothing beside its
+    // events and by one that says everything a live venue says, must look
+    // identical from inside the strategy: every event, the clock it read, its
+    // position and cash at each moment, and how often it was asked for notes.
+    let (plain, plain_heard, plain_stats) = lifecycle_against(plain_lifecycle());
+    let (talkative, talkative_heard, talkative_stats) = lifecycle_against(talkative_lifecycle());
+
+    // Non-vacuous first: four market events and six reports, the last fill
+    // leaving the strategy holding the whole first order.
+    assert_eq!(plain.log.len(), 10, "{:#?}", plain.log);
+    assert_eq!(
+        plain.log.last().map(|(_, _, held, _)| *held),
+        Some(qty("1"))
+    );
+    assert_eq!(
+        plain.notes_taken, 4,
+        "once per market event, and not on the idle wake"
+    );
+
+    assert_eq!(talkative.log, plain.log, "what the strategy saw, and when");
+    assert_eq!(
+        talkative.notes_taken, plain.notes_taken,
+        "and how often it was asked what it wrote down"
+    );
+
+    // And the record heard all of it from the one and none of it from the
+    // other.
+    let t = |n| meta(n).local_recv_ts;
+    let c = ClientOrderId;
+    let placed = |id, order: u64, ms, at| {
+        Heard::Notice(
+            Notice::Placed {
+                client_order_id: c(id),
+                venue_order_id: vid(order),
+                transact_ms: ms,
+                ts: at,
+            },
+            at,
+        )
+    };
+    let early = |n| Ts::from_nanos(t(n).as_nanos() - 1);
+    assert_eq!(venue_detail(&plain_heard), Vec::new());
+    assert_eq!(
+        venue_detail(&talkative_heard),
+        vec![
+            placed(1, 8001, 1_789_742_815_743, early(2)),
+            Heard::Accepted(c(1), Some(vid(8001)), t(2)),
+            Heard::Filled(
+                c(1),
+                qty("0.4"),
+                Some(fill_ids(8001, 50001)),
+                qty("0.6"),
+                t(2)
+            ),
+            Heard::Filled(
+                c(1),
+                qty("0.6"),
+                Some(fill_ids(8001, 50002)),
+                qty("0"),
+                t(3)
+            ),
+            Heard::Notice(
+                Notice::CancelRefused {
+                    client_order_id: c(1),
+                    why: quant_core::report::CancelRefusal::NotOpen(cited(
+                        -2011,
+                        "Unknown order sent."
+                    )),
+                    ts: t(3),
+                },
+                t(3)
+            ),
+            Heard::Rejected(
+                c(2),
+                RejectReason::Venue,
+                Some(RejectedWhy::Declined {
+                    cited: cited(-1013, "Filter failure: NOTIONAL"),
+                    breach: Some(quant_core::instrument::FilterBreach::MinNotional),
+                }),
+                t(3)
+            ),
+            placed(3, 8003, 1_789_742_815_744, early(4)),
+            Heard::Accepted(c(3), Some(vid(8003)), t(4)),
+            Heard::Cancelled(
+                c(3),
+                qty("1"),
+                Some(Ended {
+                    venue_order_id: vid(8003),
+                    how: quant_core::report::EndedBy::Cancelled,
+                }),
+                t(4)
+            ),
+            Heard::Notice(stream_lost(LOST_AT), LOST_AT),
+        ]
+    );
+    assert_eq!((plain_stats.notices, talkative_stats.notices), (0, 4));
+    assert_eq!(
+        talkative_stats.execution_events, plain_stats.execution_events,
+        "a notice is not an execution event"
+    );
+}
+
+/// Counts every call the engine makes into it.
+#[derive(Debug, Default)]
+struct Calls {
+    markets: usize,
+    executions: usize,
+    notes: usize,
+}
+
+impl Strategy for Calls {
+    fn on_market_event(&mut self, _event: &MarketEvent, _ctx: &mut Context<'_>) {
+        self.markets += 1;
+    }
+
+    fn on_execution(&mut self, _event: &ExecutionEvent, _ctx: &mut Context<'_>) {
+        self.executions += 1;
+    }
+
+    fn take_notes(&mut self, _out: &mut Vec<crate::strategy::Note>) {
+        self.notes += 1;
+    }
+}
+
+#[test]
+fn a_notice_on_a_silent_market_is_recorded_when_heard_and_tells_the_strategy_nothing() {
+    // The account stream drops while the market is quiet. Nothing happened to
+    // any order, so the strategy has nothing to be told -- but the record must
+    // hold the loss, dated when it was heard rather than at the last market
+    // event, which during a silence could be minutes earlier. So a notice moves
+    // the clock like any report, and a wake that brought only notices calls no
+    // strategy method at all.
+    let at = Ts::from_nanos(3_000_000_000);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        GoesQuiet::new(vec![trade(1, "100.00")], 1),
+        Says::reporting(vec![vec![], vec![VenueReport::Notice(stream_lost(at))]]),
+        AllowAll,
+        Calls::default(),
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    let stats = engine.run().expect("no source failure");
+
+    assert_eq!(stats.idle_wakes, 1, "the notice came on an idle wake");
+    assert_eq!(
+        seen.lock().expect("witness").heard,
+        vec![Heard::Notice(stream_lost(at), at)],
+        "recorded, at the instant it was heard"
+    );
+    assert_eq!(stats.notices, 1);
+    assert_eq!(
+        stats.last_ts,
+        Some(at),
+        "and the period covered runs to it, so a closing line cannot land before it"
+    );
+    let calls = engine.strategy();
+    assert_eq!(
+        (calls.markets, calls.executions, calls.notes),
+        (1, 0, 1),
+        "the market wake called the strategy; the notice's wake did not"
+    );
+}
+
+/// Writes what it sees and is told into the log the observer writes to,
+/// submits on the first event, and writes a note when told of a fill.
+#[derive(Debug)]
+struct Tells {
+    log: std::sync::Arc<std::sync::Mutex<Witness>>,
+    pending: Vec<crate::strategy::Note>,
+}
+
+impl Strategy for Tells {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &mut Context<'_>) {
+        let seq = event.meta().ingest_seq;
+        self.log
+            .lock()
+            .expect("log")
+            .heard
+            .push(Heard::Saw(seq, ctx.now()));
+        if seq == 1 {
+            ctx.submit(buy());
+        }
+    }
+
+    fn on_execution(&mut self, event: &ExecutionEvent, ctx: &mut Context<'_>) {
+        self.log
+            .lock()
+            .expect("log")
+            .heard
+            .push(Heard::Told(event.clone(), ctx.now()));
+        if matches!(event, ExecutionEvent::Filled { .. }) {
+            self.pending.push(crate::strategy::Note::new(
+                "filled",
+                serde_json::Value::Null,
+            ));
+        }
+    }
+
+    fn take_notes(&mut self, out: &mut Vec<crate::strategy::Note>) {
+        out.append(&mut self.pending);
+    }
+}
+
+/// A scripted venue that writes into the same log when it is sent an order.
+#[derive(Debug)]
+struct Hears {
+    log: std::sync::Arc<std::sync::Mutex<Witness>>,
+    says: Says,
+}
+
+impl ExecutionVenue for Hears {
+    fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+        Ok(())
+    }
+
+    fn submit(&mut self, client_order_id: ClientOrderId, _r: &OrderRequest, _now: Ts) {
+        self.log
+            .lock()
+            .expect("log")
+            .heard
+            .push(Heard::Sent(client_order_id));
+    }
+
+    fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
+
+    fn poll(&mut self, now: Ts, out: &mut Vec<VenueReport>) {
+        self.says.poll(now, out);
+    }
+}
+
+#[test]
+fn the_record_hears_each_report_before_the_strategy_does() {
+    // The write-ahead rule across every party, in one log: an order is written
+    // down before the venue is sent it, a venue's fact is written down where it
+    // arrived, and each report is written down -- with its detail -- before the
+    // strategy is told the event, so a crash cannot erase something the
+    // strategy has already acted on. The note the strategy wrote on hearing of
+    // the fill comes last, at the end of the wake.
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let t2 = meta(2).local_recv_ts;
+    let c1 = ClientOrderId(1);
+    let placed = Notice::Placed {
+        client_order_id: c1,
+        venue_order_id: vid(8001),
+        transact_ms: 1_789_742_815_743,
+        ts: t2,
+    };
+    let says = Says::reporting(vec![
+        vec![],
+        vec![
+            VenueReport::Notice(placed.clone()),
+            VenueReport::Order(OrderReport::Accepted {
+                client_order_id: c1,
+                venue_order_id: Some(vid(8001)),
+                ts: t2,
+            }),
+            VenueReport::Order(OrderReport::Filled {
+                client_order_id: c1,
+                fill: fill_of("1"),
+                remaining: qty("0"),
+                ids: Some(fill_ids(8001, 50001)),
+                ts: t2,
+            }),
+        ],
+    ]);
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00"), trade(2, "100.00")]),
+        Hears {
+            log: std::sync::Arc::clone(&log),
+            says,
+        },
+        AllowAll,
+        Tells {
+            log: std::sync::Arc::clone(&log),
+            pending: Vec::new(),
+        },
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&log)));
+    engine.run().expect("no source failure");
+
+    let t1 = meta(1).local_recv_ts;
+    assert_eq!(
+        log.lock().expect("log").heard,
+        vec![
+            Heard::Saw(1, t1),
+            Heard::Submitted(c1, t1),
+            Heard::Sent(c1),
+            Heard::Notice(placed, t2),
+            Heard::Accepted(c1, Some(vid(8001)), t2),
+            Heard::Told(
+                ExecutionEvent::Accepted {
+                    client_order_id: c1,
+                    venue_order_id: None,
+                    ts: t2,
+                },
+                t2
+            ),
+            Heard::Filled(c1, qty("1"), Some(fill_ids(8001, 50001)), qty("0"), t2),
+            Heard::Told(
+                ExecutionEvent::Filled {
+                    client_order_id: c1,
+                    fill: fill_of("1"),
+                    remaining: qty("0"),
+                    ts: t2,
+                },
+                t2
+            ),
+            Heard::Saw(2, t2),
+            Heard::Note("filled", t2),
+        ]
+    );
 }
