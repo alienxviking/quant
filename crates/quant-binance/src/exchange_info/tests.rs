@@ -367,10 +367,27 @@ fn placeholder_rate_limit() -> UnmodelledRule {
     rate_limit(&[])
 }
 
+/// The precisions the documented REST answer gives ETHBTC (`rest-api.md` lines
+/// 831-836), reported under its name.
+fn ethbtc_precisions() -> UnmodelledRule {
+    rule(
+        "ETHBTC",
+        &[
+            ("baseAssetPrecision", "8"),
+            ("baseCommissionPrecision", "8"),
+            ("quoteAssetPrecision", "8"),
+            ("quoteCommissionPrecision", "8"),
+            ("quotePrecision", "8"),
+        ],
+    )
+}
+
 /// Everything an answer built on [`REST_ANSWER`] reports, given what its
-/// filters report: those, then the documented answer's own rate limit.
+/// filters report: ETHBTC's precisions, then those, then the documented
+/// answer's own rate limit.
 fn ethbtc_reports(filter_rules: Vec<UnmodelledRule>) -> Vec<UnmodelledRule> {
-    let mut all = filter_rules;
+    let mut all = vec![ethbtc_precisions()];
+    all.extend(filter_rules);
     all.push(placeholder_rate_limit());
     all
 }
@@ -380,13 +397,13 @@ fn the_documented_answer_parses_exactly() {
     // No filters at all, so no rules: every one of the three is zero, which
     // `Filters` reads as none. Not the journal's `MIN_TICK` placeholders and
     // not the literals every binary registers today -- either would be a rule
-    // the venue did not state. All it reports is its one rate limit, which
-    // the page leaves as a placeholder.
+    // the venue did not state. All it reports is ETHBTC's precisions and its
+    // one rate limit, which the page leaves as a placeholder.
     assert_eq!(
         ethbtc_from(REST_ANSWER),
         Ok(VenueInstrument {
             definition: ethbtc("0", "0", "0"),
-            unmodelled: vec![placeholder_rate_limit()],
+            unmodelled: vec![ethbtc_precisions(), placeholder_rate_limit()],
         })
     );
 }
@@ -408,12 +425,23 @@ fn the_documented_answer_with_filters_parses_exactly() {
             min_notional: Notional::ZERO,
         }
     );
-    // What the two filters say beyond the step: the bounds the model has no
-    // field for, as the venue wrote them. Then the four rate limits (lines
-    // 1538-1563), the two `ORDERS` limits among them, each whole.
+    // BNBBTC's precisions (lines 1573-1578), then what the two filters say
+    // beyond the step: the bounds the model has no field for, as the venue
+    // wrote them. Then the four rate limits (lines 1538-1563), the two
+    // `ORDERS` limits among them, each whole.
     assert_eq!(
         got.unmodelled,
         vec![
+            rule(
+                "BNBBTC",
+                &[
+                    ("baseAssetPrecision", "8"),
+                    ("baseCommissionPrecision", "8"),
+                    ("quoteAssetPrecision", "8"),
+                    ("quoteCommissionPrecision", "8"),
+                    ("quotePrecision", "8"),
+                ]
+            ),
             rule(
                 "PRICE_FILTER",
                 &[("maxPrice", "100000.00000000"), ("minPrice", "0.00000100")]
@@ -1009,6 +1037,7 @@ fn every_rate_limit_is_reported_whole_and_orders_is_one() {
     assert_eq!(
         got.unmodelled,
         vec![
+            ethbtc_precisions(),
             rate_limit(&[
                 ("interval", "SECOND"),
                 ("intervalNum", "10"),
@@ -1030,8 +1059,72 @@ fn every_rate_limit_is_reported_whole_and_orders_is_one() {
     for none in ["", "\"rateLimits\": null,\n"] {
         let got = ethbtc_from(&edit(REST_ANSWER, PLACEHOLDER_RATE_LIMITS, none))
             .expect("an answer without rate limits parses");
-        assert_eq!(got.unmodelled, Vec::new(), "{none:?}");
+        assert_eq!(got.unmodelled, vec![ethbtc_precisions()], "{none:?}");
     }
+}
+
+#[test]
+fn the_precisions_are_reported_under_the_symbol() {
+    // Rules about values the model has none of: the decimals an amount of
+    // each asset may carry, refused past them as `-1111` (`errors.md` lines
+    // 109-110), and the decimals a commission in each is calculated to
+    // (`faqs/spot_glossary.md` lines 41-45 and 312-316). Every documented
+    // answer gives all five the same value (`rest-api.md` lines 831-836), so
+    // a field reported under another's name would pass it; here each differs.
+    let mut answer = REST_ANSWER.to_owned();
+    for (field, value) in [
+        ("baseAssetPrecision", "2"),
+        ("quotePrecision", "3"),
+        ("quoteAssetPrecision", "4"),
+        ("baseCommissionPrecision", "5"),
+        ("quoteCommissionPrecision", "6"),
+    ] {
+        answer = edit(
+            &answer,
+            &format!("\"{field}\": 8,"),
+            &format!("\"{field}\": {value},"),
+        );
+    }
+    let got = ethbtc_from(&answer).expect("parses");
+    assert_eq!(
+        got.unmodelled,
+        vec![
+            rule(
+                "ETHBTC",
+                &[
+                    ("baseAssetPrecision", "2"),
+                    ("baseCommissionPrecision", "5"),
+                    ("quoteAssetPrecision", "4"),
+                    ("quoteCommissionPrecision", "6"),
+                    ("quotePrecision", "3"),
+                ]
+            ),
+            placeholder_rate_limit(),
+        ]
+    );
+    assert_eq!(
+        got.unmodelled[0].to_string(),
+        "ETHBTC baseAssetPrecision=2 baseCommissionPrecision=5 quoteAssetPrecision=4 \
+         quoteCommissionPrecision=6 quotePrecision=3"
+    );
+
+    // And the other direction: an entry that states none reports none -- not
+    // an empty rule under the symbol's name, since an entry is not a rule by
+    // being present, as a filter is.
+    let mut without = REST_ANSWER.to_owned();
+    for field in [
+        "baseAssetPrecision",
+        "quotePrecision",
+        "quoteAssetPrecision",
+        "baseCommissionPrecision",
+        "quoteCommissionPrecision",
+    ] {
+        without = edit(&without, &format!("\"{field}\": 8,"), "");
+    }
+    assert_eq!(
+        ethbtc_from(&without).expect("parses").unmodelled,
+        vec![placeholder_rate_limit()]
+    );
 }
 
 #[test]

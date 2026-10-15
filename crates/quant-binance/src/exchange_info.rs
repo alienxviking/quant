@@ -45,7 +45,8 @@
 //! the report is what lets criterion B say *which* rule the model lacked rather
 //! than only that it lacked one. The exchange-wide filters (`filters.md` lines
 //! 330-377) are reported too: none of them fits a per-instrument model. So are
-//! the answer's rate limits, which are not filters at all (below).
+//! two kinds of rule that are not filters at all, the symbol's precisions and
+//! the answer's rate limits (below).
 //!
 //! # An absent or disabled rule is zero
 //!
@@ -114,6 +115,21 @@
 //! or an average over `avgPriceMins` minutes (lines 139-142 and 162-165), not at
 //! the touch. Those fields are reported.
 //!
+//! # The symbol's precisions
+//!
+//! The precisions in the symbol's own entry are rules about values, and are
+//! reported together, under the symbol's name. `baseAssetPrecision` and
+//! `quoteAssetPrecision` are the decimals allowed on an amount of each asset
+//! (`faqs/spot_glossary.md` lines 41-42 and 312-313), and a parameter past them
+//! is refused as `-1111`, *"Parameter '%s' has too much precision."*
+//! (`errors.md` lines 109-110). `baseCommissionPrecision` and
+//! `quoteCommissionPrecision` are the decimals a commission in each asset is
+//! calculated to (`spot_glossary.md` lines 44-45 and 315-316): part of how the
+//! venue computes a fee the model computes too. `quotePrecision` is reported
+//! beside them, as written: `quoteAssetPrecision` was added as its duplicate,
+//! and it is to be removed in a later API version (`CHANGELOG.md` line 2471;
+//! `rest-api.md` line 833).
+//!
 //! # Rate limits, `ORDERS` among them
 //!
 //! Each entry of the answer's `rateLimits` is reported whole and exchange-wide,
@@ -142,12 +158,13 @@
 //!
 //! # What it does not read
 //!
-//! - **The symbol's other fields** -- `orderTypes`, the `…Allowed` flags,
-//!   `permissionSets`, the precisions (`rest-api.md` lines 827-864). They say
-//!   which *kinds* of request the venue takes rather than which values, and the
-//!   venue refuses the wrong kind loudly and by name: *"Market is closed."*,
-//!   *"Market orders are not supported for this symbol."*, *"This symbol is not
-//!   permitted for this account."* (`errors.md` lines 376, 378 and 398).
+//! - **The rest of the symbol's entry** -- `orderTypes`, the `…Allowed` flags,
+//!   `permissionSets` (`rest-api.md` lines 827-864). Unlike the precisions,
+//!   they say which *kinds* of request the venue takes rather than which
+//!   values, and the venue refuses the wrong kind loudly and by name: *"Market
+//!   is closed."*, *"Market orders are not supported for this symbol."*,
+//!   *"This symbol is not permitted for this account."* (`errors.md` lines 376,
+//!   378 and 398).
 //! - **`MAX_ASSET`**, which only the signed `GET /api/v3/myFilters` shows
 //!   (`rest-api.md` line 4910), so it cannot appear in this answer.
 //! - **Execution rules**, from their own endpoint (`GET /api/v3/executionRules`,
@@ -189,15 +206,26 @@ const NOTIONAL: &str = "NOTIONAL";
 /// list, since a rate limit is not a filter and has no `filterType`.
 const RATE_LIMITS: &str = "rateLimits";
 
+/// The fields of the symbol's own entry that are rules about values rather
+/// than about which kinds of request the venue takes (see the module docs), in
+/// the order the documented answer lists them (`rest-api.md` lines 831-836).
+const PRECISIONS: [&str; 5] = [
+    "baseAssetPrecision",
+    "quotePrecision",
+    "quoteAssetPrecision",
+    "baseCommissionPrecision",
+    "quoteCommissionPrecision",
+];
+
 /// One symbol's rules as the venue states them: the part the platform models,
 /// and every part it does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VenueInstrument {
     /// The instrument, with every rule in it taken from the venue.
     pub definition: InstrumentDef,
-    /// Every venue rule the definition does not carry: the symbol's filters,
-    /// then the exchange's, then the answer's rate limits, each in the order
-    /// the venue listed them.
+    /// Every venue rule the definition does not carry: the symbol's
+    /// precisions, then its filters, then the exchange's filters, then the
+    /// answer's rate limits, each in the order the venue listed them.
     pub unmodelled: Vec<UnmodelledRule>,
 }
 
@@ -213,11 +241,15 @@ pub struct UnmodelledRule {
     /// `MARKET_LOT_SIZE`, `NOTIONAL`. An order refused under one is refused as
     /// `Filter failure: <this>` (`errors.md` lines 425-446). A rate limit is
     /// not a filter, and goes by the name of the list the venue states it in,
-    /// `rateLimits`, with its own `rateLimitType` among its fields.
+    /// `rateLimits`, with its own `rateLimitType` among its fields. Nor are
+    /// the symbol's precisions, which go by the symbol, the name of the entry
+    /// that states them.
     pub name: String,
-    /// Every field the definition did not take, sorted by the venue's name for
-    /// it, each value as the venue wrote it: a string's contents, or the JSON
-    /// text of anything else.
+    /// What the rule says, sorted by the venue's name for each field, every
+    /// value as the venue wrote it: a string's contents, or the JSON text of
+    /// anything else. For a filter, every field but its `filterType` and the
+    /// one the definition took; for a rate limit, every field; for the symbol,
+    /// its precisions.
     pub fields: Vec<(String, String)>,
 }
 
@@ -237,7 +269,7 @@ impl fmt::Display for UnmodelledRule {
 /// Where the venue listed a rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleScope {
-    /// The symbol's own `filters`.
+    /// The symbol's own entry: its `filters`, and its precisions.
     Symbol,
     /// The answer's own lists rather than the symbol's: `exchangeFilters`,
     /// which bind the account across every symbol (`filters.md` lines
@@ -431,6 +463,16 @@ pub fn parse(symbol: &str, body: &[u8]) -> Result<VenueInstrument, ExchangeInfoE
     let rules = Rules::read(&filters)?;
 
     let mut unmodelled = Vec::new();
+    // The symbol's own value rules, under its name. Only those it states: an
+    // entry is not a rule by being present, as a filter is.
+    let precisions = as_written(entry, |key| PRECISIONS.contains(&key));
+    if !precisions.is_empty() {
+        unmodelled.push(UnmodelledRule {
+            scope: RuleScope::Symbol,
+            name: symbol.to_owned(),
+            fields: precisions,
+        });
+    }
     for (filter_type, filter) in &filters {
         let taken = rules.taken_from(filter_type);
         let fields = untaken(filter, taken);
