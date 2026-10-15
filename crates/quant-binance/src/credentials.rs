@@ -7,20 +7,25 @@
 //!
 //! # Why Ed25519, and not the HMAC secret this began with
 //!
-//! Slice (b) signed with an HMAC secret. Since then the venue has closed every
-//! route the live run needs to that key type but one, and deprecated the key
-//! type itself. Three facts from its documentation at commit `0556f1a`, quoted
-//! in `docs/live-run.md` §5:
+//! Slice (b) signed with an HMAC secret, and for REST it still could: the venue
+//! takes HMAC, RSA and Ed25519 keys alike for a signed REST request
+//! (rest-api.md:98, :215). The account stream is where an HMAC key falls short:
+//! of the routes to it, an HMAC key can take one. Three facts from the venue's
+//! documentation at commit `0556f1a`, quoted in `docs/live-run.md` §5, give the
+//! reasons; slice (b) never needed the account stream, so it never met them:
 //!
 //! - **Listen keys are gone.** `POST /api/v3/userDataStream` and the WebSocket
 //!   API's `userDataStream.start` stopped answering on 2026-02-20
-//!   (CHANGELOG.md:405-418), so the account stream is `session.logon` and then
-//!   `userDataStream.subscribe`.
-//! - **Session logon is Ed25519 only**: *"Only _Ed25519_ keys are supported for
-//!   this feature"* (web-socket-api.md:1299, :3371), and
-//!   `userDataStream.subscribe` needs a connection authenticated that way
-//!   (web-socket-api.md:8212).
-//! - **HMAC keys are deprecated** (`faqs/api_key_types.md:49`).
+//!   (CHANGELOG.md:405-418), months before slice (b), so the account stream is
+//!   a subscription made over the WebSocket API.
+//! - **Every route to a subscription but one takes Ed25519 only.**
+//!   `session.logon` does, *"Only _Ed25519_ keys are supported for this
+//!   feature"* (web-socket-api.md:1299, :3371), and `userDataStream.subscribe`
+//!   needs a connection authenticated that way (web-socket-api.md:8212). The
+//!   one left to other key types is `userDataStream.subscribe.signature`,
+//!   which *"can work with any API Key type"* (CHANGELOG.md:733-734).
+//! - **HMAC keys are deprecated** (`faqs/api_key_types.md:49`), so that one
+//!   route is a route for a key type on its way out.
 //!
 //! So one key type signs both the REST orders and the account stream's logon,
 //! and there is one signing path: this one. The HMAC path was removed rather
