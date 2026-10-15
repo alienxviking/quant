@@ -1125,6 +1125,12 @@ struct BaseFeeOnBuys {
 }
 
 impl ExecutionVenue for BaseFeeOnBuys {
+    // Forwarded, and required to be: a wrapper that answered for the venue it
+    // wraps would send orders that venue could not take.
+    fn ready(&self, request: &OrderRequest) -> Result<(), quant_engine::Unready> {
+        self.inner.ready(request)
+    }
+
     fn submit(&mut self, client_order_id: ClientOrderId, request: &OrderRequest, now: Ts) {
         if request.side == Side::Buy {
             self.buys.insert(client_order_id);
@@ -1346,6 +1352,12 @@ struct Told {
 }
 
 impl ExecutionVenue for Told {
+    // Forwarded, as `BaseFeeOnBuys` does: a wrapper that answered for the
+    // venue it wraps would send orders that venue could not take.
+    fn ready(&self, request: &OrderRequest) -> Result<(), quant_engine::Unready> {
+        self.inner.ready(request)
+    }
+
     fn submit(&mut self, client_order_id: ClientOrderId, request: &OrderRequest, now: Ts) {
         self.sent.push(*request);
         self.inner.submit(client_order_id, request, now);

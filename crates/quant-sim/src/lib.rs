@@ -84,7 +84,7 @@ use quant_core::execution::{
 use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::{FilterBreach, Filters, InstrumentId};
 use quant_core::time::Ts;
-use quant_engine::ExecutionVenue;
+use quant_engine::{ExecutionVenue, Unready};
 
 pub use costs::{Costs, FeeIn, FeeSchedule, Latency};
 
@@ -594,6 +594,16 @@ impl SimulatedVenue {
 }
 
 impl ExecutionVenue for SimulatedVenue {
+    /// Always. A simulator has no connection to lose, no account stream and no
+    /// order in doubt, and its own rules are not a question of readiness: they
+    /// are judged where a real venue judges them, on receipt, answered with a
+    /// `Rejected` and counted by the rule broken. Judged here instead, a filter
+    /// breach would turn from the venue's rejection into our refusal, and every
+    /// backtest run with filters would move.
+    fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+        Ok(())
+    }
+
     fn submit(&mut self, client_order_id: ClientOrderId, request: &OrderRequest, now: Ts) {
         // Accepted, filled or rejected -- all of it waits for `observe`. See the
         // module docs: filling here would let the order trade against the event

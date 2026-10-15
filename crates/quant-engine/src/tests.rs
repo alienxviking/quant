@@ -18,7 +18,7 @@ use quant_core::source::{EventSource, SourceError};
 use quant_core::time::Ts;
 use quant_core::{Notional, Qty};
 
-use crate::{AllowAll, Context, Engine, ExecutionVenue, Refusal, RiskLayer, Strategy};
+use crate::{AllowAll, Context, Engine, ExecutionVenue, Refusal, RiskLayer, Strategy, Unready};
 
 /// Starting capital for the wiring tests. Any positive number; these tests are
 /// about the seam, and the accounting has its own.
@@ -155,6 +155,10 @@ struct RecordingVenue {
 }
 
 impl ExecutionVenue for RecordingVenue {
+    fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+        Ok(())
+    }
+
     fn submit(&mut self, client_order_id: ClientOrderId, request: &OrderRequest, _now: Ts) {
         self.received.push((client_order_id, *request));
         self.pending.push(client_order_id);
@@ -419,6 +423,9 @@ fn the_same_strategy_value_runs_against_two_different_wirings() {
         out: Vec<ExecutionEvent>,
     }
     impl ExecutionVenue for AcceptOnly {
+        fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+            Ok(())
+        }
         fn submit(&mut self, client_order_id: ClientOrderId, _r: &OrderRequest, now: Ts) {
             self.out.push(ExecutionEvent::Accepted {
                 client_order_id,
@@ -766,6 +773,10 @@ impl Says {
 }
 
 impl ExecutionVenue for Says {
+    fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+        Ok(())
+    }
+
     fn submit(&mut self, _id: ClientOrderId, _r: &OrderRequest, _now: Ts) {}
 
     fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
@@ -1136,6 +1147,9 @@ fn notes_cannot_reveal_which_venue_the_strategy_was_wired_to() {
     #[derive(Debug, Default)]
     struct FillsNothing;
     impl ExecutionVenue for FillsNothing {
+        fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+            Ok(())
+        }
         fn submit(&mut self, _id: ClientOrderId, _r: &OrderRequest, _now: Ts) {}
         fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
         fn poll(&mut self, _now: Ts, _out: &mut Vec<ExecutionEvent>) {}
@@ -1301,6 +1315,10 @@ impl Default for SpeaksLater {
 }
 
 impl ExecutionVenue for SpeaksLater {
+    fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+        Ok(())
+    }
+
     fn submit(&mut self, client_order_id: ClientOrderId, _r: &OrderRequest, _now: Ts) {
         self.held = Some(ExecutionEvent::Filled {
             client_order_id,
@@ -1569,4 +1587,172 @@ fn a_report_stamped_before_the_clock_on_an_idle_wake_neither_moves_it_nor_counts
         "an earlier report is not a clamp on an idle wake either"
     );
     assert_eq!(stats.last_ts, Some(meta(1).local_recv_ts));
+}
+
+// --- M8.c: a venue can say it is not ready ---
+
+/// A venue that is not ready for its first `refusals` questions, saying why
+/// with `said`, and ready after that. Counts the questions and keeps what it was
+/// sent, so a test can tell "refused" from "sent and declined".
+#[derive(Debug)]
+struct Readiness {
+    said: Unready,
+    refusals: std::cell::Cell<usize>,
+    asked: std::cell::Cell<usize>,
+    received: Vec<ClientOrderId>,
+}
+
+impl Readiness {
+    /// Not ready for the first `refusals` questions.
+    fn refusing(said: Unready, refusals: usize) -> Self {
+        Self {
+            said,
+            refusals: std::cell::Cell::new(refusals),
+            asked: std::cell::Cell::new(0),
+            received: Vec::new(),
+        }
+    }
+
+    /// Not ready, ever, as far as any test can ask.
+    fn never(said: Unready) -> Self {
+        Self::refusing(said, usize::MAX)
+    }
+}
+
+impl ExecutionVenue for Readiness {
+    fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+        self.asked.set(self.asked.get() + 1);
+        let left = self.refusals.get();
+        if left == 0 {
+            return Ok(());
+        }
+        self.refusals.set(left - 1);
+        Err(self.said)
+    }
+
+    fn submit(&mut self, client_order_id: ClientOrderId, _r: &OrderRequest, _now: Ts) {
+        self.received.push(client_order_id);
+    }
+
+    fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
+
+    fn poll(&mut self, _now: Ts, _out: &mut Vec<ExecutionEvent>) {}
+}
+
+#[test]
+fn an_order_the_venue_cannot_take_is_refused_and_never_written_down_as_sent() {
+    // The defect this seam exists for, found by reading before a live venue was
+    // written. By the time `ExecutionVenue::submit` runs, `on_submitted` has
+    // journalled the order and the ledger holds it, so an adapter that refused
+    // there could only answer with a `Rejected` -- which the journal records as
+    // the venue declining an order it had been told about. For an order that
+    // never left, that line is false. Asked first, the venue's "not now" is a
+    // refusal, written as one, and nothing claims the order went anywhere.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00")]),
+        Readiness::never(Unready::StreamDown),
+        AllowAll,
+        Recorder::default(),
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    let stats = engine.run().expect("no source failure");
+
+    let t1 = meta(1).local_recv_ts;
+    assert_eq!(
+        seen.lock().expect("witness").heard,
+        vec![Heard::Refused(
+            ClientOrderId(1),
+            RejectReason::Venue,
+            crate::RefusedBy::Venue(Unready::StreamDown),
+            t1
+        )],
+        "refused, saying why, and never written down as submitted"
+    );
+    assert!(
+        engine.venue().received.is_empty(),
+        "the venue was sent nothing"
+    );
+    assert_eq!(
+        engine.strategy().executions,
+        vec![ExecutionEvent::Rejected {
+            client_order_id: ClientOrderId(1),
+            reason: RejectReason::Venue,
+            ts: t1,
+        }],
+        "the strategy hears a venue rejection, and not why"
+    );
+    assert_eq!((stats.refused, stats.submitted), (1, 0));
+}
+
+#[test]
+fn an_order_the_venue_could_not_take_spends_none_of_the_days_count() {
+    // Asked before the risk layer, so an order the venue turned away is not an
+    // order the strategy got out. One a day, and the venue is not ready for
+    // the first: the second is the day's first, and goes. Asked after, the
+    // refused order would have spent the day's one, and the second would trip
+    // the switch -- a venue that was briefly down would stop the strategy.
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00"), trade(2, "100.00")]),
+        Readiness::refusing(Unready::QueueFull, 1),
+        crate::risk::RiskEngine::new(crate::risk::Limits {
+            max_orders_per_day: Some(1),
+            ..crate::risk::Limits::default()
+        }),
+        Greedy,
+        CASH,
+    );
+    engine.run().expect("no source failure");
+
+    assert_eq!(
+        engine.venue().received,
+        vec![ClientOrderId(2)],
+        "the order the venue could take was sent"
+    );
+    assert_eq!(
+        engine.risk().orders_today(),
+        1,
+        "and it was the only one counted"
+    );
+    assert_eq!(engine.risk().tripped(), None, "so nothing tripped");
+}
+
+#[test]
+fn a_malformed_order_is_the_seams_and_the_venue_is_not_asked() {
+    // The seam first: a zero-size order is our bug whatever state the venue is
+    // in, and asking a venue that is down about it would file our bug under the
+    // venue's outage.
+    #[derive(Debug, Default)]
+    struct SendsZero;
+    impl Strategy for SendsZero {
+        fn on_market_event(&mut self, _event: &MarketEvent, ctx: &mut Context<'_>) {
+            ctx.submit(OrderRequest {
+                qty: "0".parse().expect("qty"),
+                ..buy()
+            });
+        }
+    }
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00")]),
+        Readiness::never(Unready::StreamDown),
+        AllowAll,
+        SendsZero,
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    engine.run().expect("no source failure");
+
+    assert_eq!(
+        seen.lock().expect("witness").heard,
+        vec![Heard::Refused(
+            ClientOrderId(1),
+            RejectReason::Malformed,
+            crate::RefusedBy::Seam,
+            meta(1).local_recv_ts
+        )]
+    );
+    assert_eq!(engine.venue().asked.get(), 0, "the venue was not asked");
 }

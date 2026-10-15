@@ -1231,3 +1231,48 @@ fn a_free_run_is_free_whichever_asset_its_fees_would_be_taken_in() {
     }
     .is_free());
 }
+
+#[test]
+fn a_simulated_venue_is_ready_for_any_order_and_judges_its_rules_on_receipt() {
+    // `ready` is for what a live venue can lose: a stream, a check, an order's
+    // fate. A simulator has none of them. Its rules are a venue's to judge on
+    // receipt, with a `Rejected` counted by the rule broken; judged in `ready`,
+    // a breach would turn into our refusal, and every backtest that enforces
+    // filters would move.
+    let filters = quant_core::instrument::Filters {
+        tick_size: "0.01".parse().expect("tick"),
+        lot_size: "0.00001".parse().expect("lot"),
+        min_notional: "5".parse().expect("notional"),
+    };
+    let enforcing = SimulatedVenue::new().enforcing(instrument(), filters);
+    let requests = [
+        // 1.00, against a minimum of 5.
+        order(Side::Buy, "0.01", limit("100.0")),
+        // A tenth of a lot.
+        order(Side::Buy, "0.000001", limit("100.0")),
+        // Off the tick.
+        order(Side::Sell, "1", limit("100.001")),
+        // Not an order at all.
+        order(Side::Buy, "0", OrderKind::Market),
+        order(Side::Buy, "1", OrderKind::Market),
+    ];
+    for request in &requests {
+        assert_eq!(enforcing.ready(request), Ok(()), "{request:?}");
+        assert_eq!(SimulatedVenue::new().ready(request), Ok(()), "{request:?}");
+    }
+
+    // The breach is still found, by the venue, when the order arrives.
+    let mut venue = enforcing;
+    let events = run(&mut venue, requests[0], &tick(), &book());
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ExecutionEvent::Rejected {
+                reason: RejectReason::Malformed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    assert_eq!(venue.stats().filtered_min_notional, 1);
+}

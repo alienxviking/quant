@@ -86,7 +86,7 @@ pub use journal::{InstrumentKey, Journal, JournalEntry};
 pub use portfolio::{Portfolio, Position};
 pub use risk::{AllowAll, Bound, Limits, Refusal, RiskEngine, RiskLayer, TripCause};
 pub use strategy::{Context, Note, Strategy};
-pub use venue::ExecutionVenue;
+pub use venue::{ExecutionVenue, Unready};
 
 /// What a run did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +95,10 @@ pub struct EngineStats {
     pub gaps: u64,
     /// Orders that passed the risk layer and reached the venue.
     pub submitted: u64,
-    /// Orders the risk layer or the seam refused. They never reached a venue.
+    /// Orders refused before they reached a venue: by the seam, by the venue's
+    /// readiness, or by the risk layer. One count, because each is an order
+    /// the strategy asked for and the venue never received; `RefusedBy` on
+    /// each refusal says which.
     pub refused: u64,
     pub cancels: u64,
     pub execution_events: u64,
@@ -218,14 +221,16 @@ pub trait RunObserver {
 
     /// An order was refused before the venue heard about it.
     ///
-    /// `by` separates "we built a malformed order" from "we built a fine order
-    /// the limits declined". Collapsing them would bury a bug of ours in a
+    /// `by` separates "we built a malformed order" from "the venue could not
+    /// take an order now" from "we built a fine order the limits declined".
+    /// Collapsing them would bury a bug of ours, or a venue that is down, in a
     /// counter of events that are working as designed.
     ///
-    /// `bound` names which limit stopped it, and is `None` for a seam refusal —
-    /// the seam is not a limit, and a malformed order breached nothing. It
-    /// deliberately does not reach the strategy: `RejectReason` stays two values
-    /// wide, because a strategy that could tell "too large" from "the daily loss
+    /// `bound` names which limit stopped it, and is `None` for every refusal
+    /// but the risk layer's — the seam and the venue's readiness are not
+    /// limits, and an order they turn away breached nothing. It deliberately
+    /// does not reach the strategy: `RejectReason` stays two values wide,
+    /// because a strategy that could tell "too large" from "the daily loss
     /// budget is spent" could trade around the limits.
     fn on_refused(
         &mut self,
@@ -315,12 +320,22 @@ pub trait RunObserver {
     }
 }
 
-/// Which layer refused an order.
+/// Which layer refused an order, listed in the order `Context::submit` asks
+/// them.
+///
+/// Serialized inside `refused` journal lines, as `"seam"`,
+/// `{"venue":"stream_down"}` and `"risk"`. A variant that carries a value
+/// serializes as an object of one key, so every line written before it existed
+/// still reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusedBy {
     /// The seam: the request was not well-formed enough to send anywhere. Ours.
     Seam,
+    /// The venue said it could not take an order now, and why. Neither our
+    /// mistake nor a limit: a stream that is down, an order in doubt, a check
+    /// not passed. The strategy hears only `RejectReason::Venue`.
+    Venue(Unready),
     /// The risk layer: a fine request the limits declined. Working as designed.
     Risk,
 }

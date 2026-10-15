@@ -14,7 +14,7 @@
 
 use quant_book::Book;
 use quant_core::event::MarketEvent;
-use quant_core::execution::{ClientOrderId, ExecutionEvent, OrderRequest};
+use quant_core::execution::{ClientOrderId, ExecutionEvent, OrderRequest, RejectReason};
 use quant_core::fixed::{Notional, Px};
 use quant_core::instrument::InstrumentId;
 use quant_core::time::Ts;
@@ -158,6 +158,29 @@ impl<'a> Context<'a> {
                 );
             }
             self.ledger.refuse(client_order_id, reason, self.now);
+            return client_order_id;
+        }
+        // Whether the venue can take it now. After the seam, because a
+        // malformed request is ours to refuse whatever state the venue is in;
+        // before the risk layer, so an order the venue could not take spends
+        // none of the day's count and trips nothing; and before anything is
+        // written down as submitted, so the record never says an order went to
+        // a venue that was not there to take it.
+        if let Err(unready) = self.venue.ready(&request) {
+            if let Some(observer) = self.observer.as_mut() {
+                observer.on_refused(
+                    client_order_id,
+                    &request,
+                    RejectReason::Venue,
+                    None,
+                    crate::RefusedBy::Venue(unready),
+                    self.now,
+                );
+            }
+            // `Venue`, and not why: which `Unready` it was is the record's, for
+            // the reason `bound` is.
+            self.ledger
+                .refuse(client_order_id, RejectReason::Venue, self.now);
             return client_order_id;
         }
         // The mark the risk layer prices against: this instrument's mid, or
