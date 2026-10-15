@@ -95,10 +95,10 @@ pub struct EngineStats {
     pub gaps: u64,
     /// Orders that passed the risk layer and reached the venue.
     pub submitted: u64,
-    /// Orders refused before they reached a venue: by the seam, by the venue's
-    /// readiness, or by the risk layer. One count, because each is an order
-    /// the strategy asked for and the venue never received; `RefusedBy` on
-    /// each refusal says which.
+    /// Orders refused before they reached a venue: by the seam, by the record,
+    /// by the venue's readiness, or by the risk layer. One count, because each
+    /// is an order the strategy asked for and the venue never received;
+    /// `RefusedBy` on each refusal says which.
     pub refused: u64,
     pub cancels: u64,
     pub execution_events: u64,
@@ -152,8 +152,9 @@ pub(crate) struct Ledger {
     /// Next client order id. Starts at 1, so a zero id is always a bug rather
     /// than a legitimate first order.
     next_id: u64,
-    /// Execution events raised during a strategy callback — a risk rejection, or
-    /// a seam rejection — waiting to be delivered.
+    /// Execution events raised during a strategy callback — a refusal by the
+    /// seam, the record, the venue's readiness or the risk layer — waiting to be
+    /// delivered.
     ///
     /// Deferred rather than delivered inline because a strategy must not be
     /// re-entered while it is on the stack, and because even a rejection should
@@ -167,6 +168,16 @@ pub(crate) struct Ledger {
     /// simulator. Entries are removed on a terminal event, so this is bounded by
     /// the strategy's working orders rather than by the length of the run.
     orders: HashMap<ClientOrderId, (InstrumentId, Side)>,
+    /// Set the first time the record answers [`WriteAhead::Withhold`], and
+    /// never cleared in-process.
+    ///
+    /// From then on every order is refused as [`RefusedBy::Record`] before the
+    /// venue is even asked. A record that has failed to hold one line cannot be
+    /// trusted to hold the next, and an order sent that the record does not
+    /// hold is an orphan position at a live venue. A latch rather than a retry,
+    /// because what follows a torn line is not a question this process can
+    /// answer by asking again.
+    unrecorded: bool,
     stats: EngineStats,
 }
 
@@ -176,6 +187,7 @@ impl Default for Ledger {
             next_id: 1,
             deferred: Vec::new(),
             orders: HashMap::new(),
+            unrecorded: false,
             stats: EngineStats::default(),
         }
     }
@@ -197,7 +209,8 @@ impl Default for Ledger {
 /// accumulated itself. A third independent tally would not be a check against
 /// the engine — it would be a check against itself.
 pub trait RunObserver {
-    /// An order was minted and is about to reach the venue.
+    /// An order was minted and is about to reach the venue — if the record says
+    /// it may.
     ///
     /// Called **before** `ExecutionVenue::submit`, which is the same rule fills
     /// already follow for the same reason: at M8 an order at a live venue that
@@ -205,6 +218,14 @@ pub trait RunObserver {
     /// afterwards recovers it. The cost is one durable append inside the
     /// strategy's own call stack, which is charged identically in all three
     /// worlds because production charges it anyway.
+    ///
+    /// The answer is what makes the rule enforced rather than hoped for. On
+    /// [`WriteAhead::Withhold`] the engine does not send this order, refuses it
+    /// as [`RefusedBy::Record`], and refuses every later one the same way for
+    /// the rest of the process. This order has already passed the risk layer
+    /// and spent one of the day's count, which can happen once per process.
+    /// Defaulted to `Proceed`, so an observer that writes nothing durable need
+    /// not say so.
     ///
     /// `mark` is the mid the risk layer priced this request against, or `None`
     /// when the book had no prices. The engine computes it and drops it today;
@@ -216,21 +237,23 @@ pub trait RunObserver {
         _request: &OrderRequest,
         _mark: Option<Px>,
         _at: Ts,
-    ) {
+    ) -> WriteAhead {
+        WriteAhead::Proceed
     }
 
     /// An order was refused before the venue heard about it.
     ///
-    /// `by` separates "we built a malformed order" from "the venue could not
-    /// take an order now" from "we built a fine order the limits declined".
-    /// Collapsing them would bury a bug of ours, or a venue that is down, in a
-    /// counter of events that are working as designed.
+    /// `by` separates "we built a malformed order" from "we could not write it
+    /// down" from "the venue could not take an order now" from "we built a fine
+    /// order the limits declined". Collapsing them would bury a bug of ours, a
+    /// failing disk or a venue that is down in a counter of events that are
+    /// working as designed.
     ///
     /// `bound` names which limit stopped it, and is `None` for every refusal
-    /// but the risk layer's — the seam and the venue's readiness are not
-    /// limits, and an order they turn away breached nothing. It deliberately
-    /// does not reach the strategy: `RejectReason` stays two values wide,
-    /// because a strategy that could tell "too large" from "the daily loss
+    /// but the risk layer's — the seam, the record and the venue's readiness
+    /// are not limits, and an order they turn away breached nothing. It
+    /// deliberately does not reach the strategy: `RejectReason` stays two values
+    /// wide, because a strategy that could tell "too large" from "the daily loss
     /// budget is spent" could trade around the limits.
     fn on_refused(
         &mut self,
@@ -323,7 +346,7 @@ pub trait RunObserver {
 /// Which layer refused an order, listed in the order `Context::submit` asks
 /// them.
 ///
-/// Serialized inside `refused` journal lines, as `"seam"`,
+/// Serialized inside `refused` journal lines, as `"seam"`, `"record"`,
 /// `{"venue":"stream_down"}` and `"risk"`. A variant that carries a value
 /// serializes as an object of one key, so every line written before it existed
 /// still reads.
@@ -332,12 +355,33 @@ pub trait RunObserver {
 pub enum RefusedBy {
     /// The seam: the request was not well-formed enough to send anywhere. Ours.
     Seam,
+    /// The record could not hold a submission, this one or an earlier one.
+    /// Once an observer has answered [`WriteAhead::Withhold`], nothing more is
+    /// sent for the rest of the process. Ours: the journal could not be
+    /// written, for whatever reason the observer met.
+    Record,
     /// The venue said it could not take an order now, and why. Neither our
     /// mistake nor a limit: a stream that is down, an order in doubt, a check
     /// not passed. The strategy hears only `RejectReason::Venue`.
     Venue(Unready),
     /// The risk layer: a fine request the limits declined. Working as designed.
     Risk,
+}
+
+/// The record's answer to a submission it has just been told about.
+///
+/// A decision, not a durability claim. `Proceed` says "send it", and a lenient
+/// observer answers it even when its write failed, because it has decided that
+/// a run with a hole in its record beats no run — `quant-backtest`'s
+/// `JournalWriter` does exactly that, for paper. `Withhold` says the order must
+/// not reach the venue, because the record could not hold it.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAhead {
+    /// Send it.
+    Proceed,
+    /// Do not send it, nor anything after it in this process.
+    Withhold,
 }
 
 /// The loop.

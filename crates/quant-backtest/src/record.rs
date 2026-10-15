@@ -20,7 +20,7 @@ use quant_core::instrument::{Exchange, InstrumentId};
 use quant_core::time::Ts;
 use quant_engine::journal::{InstrumentKey, Journal, JournalEntry};
 use quant_engine::risk::Bound;
-use quant_engine::{RefusedBy, RunObserver};
+use quant_engine::{RefusedBy, RunObserver, WriteAhead};
 use tracing::error;
 
 /// How often the engine writes down what it believes.
@@ -180,13 +180,22 @@ impl RunObserver for JournalWriter {
         }
     }
 
+    /// Always [`WriteAhead::Proceed`], even when the line could not be written.
+    ///
+    /// This writer is lenient on purpose, and the policy is `record`'s: a paper
+    /// run that stopped trading because it could not write one line would lose
+    /// the session it exists to conduct, while a run with a hole in its journal
+    /// is recoverable and `reconcile` and `runlog check` say where the hole is.
+    /// Paper and every backtest therefore send exactly what they sent before
+    /// the engine asked. A live run needs the opposite answer, because there an
+    /// order the journal does not hold is a position nobody knows about.
     fn on_submitted(
         &mut self,
         client_order_id: ClientOrderId,
         request: &OrderRequest,
         mark: Option<Px>,
         at: Ts,
-    ) {
+    ) -> WriteAhead {
         self.record(
             &JournalEntry::Submitted {
                 at,
@@ -199,6 +208,7 @@ impl RunObserver for JournalWriter {
             },
             "a submission",
         );
+        WriteAhead::Proceed
     }
 
     fn on_refused(

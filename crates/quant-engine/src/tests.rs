@@ -608,6 +608,10 @@ enum Heard {
 #[derive(Debug, Default)]
 struct Witness {
     heard: Vec<Heard>,
+    /// Answer `Withhold` to this submission, counting from 1, and `Proceed` to
+    /// every other: a record that failed once.
+    withhold_at: Option<usize>,
+    submissions: usize,
 }
 
 impl Witness {
@@ -649,11 +653,15 @@ impl crate::RunObserver for std::sync::Arc<std::sync::Mutex<Witness>> {
         _request: &OrderRequest,
         _mark: Option<quant_core::Px>,
         at: Ts,
-    ) {
-        self.lock()
-            .expect("witness")
-            .heard
-            .push(Heard::Submitted(client_order_id, at));
+    ) -> crate::WriteAhead {
+        let mut witness = self.lock().expect("witness");
+        witness.heard.push(Heard::Submitted(client_order_id, at));
+        witness.submissions += 1;
+        if witness.withhold_at == Some(witness.submissions) {
+            crate::WriteAhead::Withhold
+        } else {
+            crate::WriteAhead::Proceed
+        }
     }
 
     fn on_refused(
@@ -1755,4 +1763,68 @@ fn a_malformed_order_is_the_seams_and_the_venue_is_not_asked() {
         )]
     );
     assert_eq!(engine.venue().asked.get(), 0, "the venue was not asked");
+}
+
+// --- M8.c: a submission the record could not hold is never sent ---
+
+#[test]
+fn a_submission_the_record_could_not_hold_is_never_sent_and_nothing_after_it_is() {
+    // Write-ahead was a call order until now: `on_submitted` ran before the
+    // venue was told, and whether the line reached the disk changed nothing.
+    // The record now answers, and an order it could not hold does not go --
+    // nor does any order after it, because a record that failed once cannot
+    // be trusted with the next line, and an order the record does not hold is
+    // a position nobody knows about.
+    //
+    // A record that fails on the second of four submissions, against a venue
+    // that is always ready.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness {
+        withhold_at: Some(2),
+        ..Witness::default()
+    }));
+    let mut engine = Engine::new(
+        Scripted::new(vec![
+            trade(1, "100.00"),
+            trade(2, "100.00"),
+            trade(3, "100.00"),
+            trade(4, "100.00"),
+        ]),
+        Readiness::refusing(Unready::StreamDown, 0),
+        crate::risk::RiskEngine::new(crate::risk::Limits::default()),
+        Greedy,
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    let stats = engine.run().expect("no source failure");
+
+    let t = |n| meta(n).local_recv_ts;
+    let c = ClientOrderId;
+    let by_record =
+        |id, at| Heard::Refused(c(id), RejectReason::Venue, crate::RefusedBy::Record, at);
+    assert_eq!(
+        seen.lock().expect("witness").heard,
+        vec![
+            Heard::Submitted(c(1), t(1)),
+            Heard::Submitted(c(2), t(2)),
+            by_record(2, t(2)),
+            by_record(3, t(3)),
+            by_record(4, t(4)),
+        ]
+    );
+    assert_eq!(
+        engine.venue().received,
+        vec![c(1)],
+        "only the order the record holds was sent"
+    );
+    assert_eq!(
+        engine.venue().asked.get(),
+        2,
+        "and once the record had failed, the venue was not even asked"
+    );
+    assert_eq!(
+        engine.risk().orders_today(),
+        2,
+        "the withheld order had passed the risk layer; the two after it never reached it"
+    );
+    assert_eq!((stats.submitted, stats.refused), (1, 3));
 }

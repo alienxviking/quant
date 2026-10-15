@@ -22,7 +22,7 @@ use quant_core::time::Ts;
 use crate::portfolio::{Portfolio, Position};
 use crate::risk::RiskLayer;
 use crate::venue::ExecutionVenue;
-use crate::{seam_check, Ledger};
+use crate::{seam_check, Ledger, WriteAhead};
 
 /// Everything a strategy can reach.
 ///
@@ -160,6 +160,13 @@ impl<'a> Context<'a> {
             self.ledger.refuse(client_order_id, reason, self.now);
             return client_order_id;
         }
+        // The record's latch: once it has failed to hold a submission, nothing
+        // more leaves this process (see `Ledger::unrecorded`). Before the venue
+        // is asked, because no answer of the venue's changes what the record
+        // can hold.
+        if self.ledger.unrecorded {
+            return self.refuse_unsent(client_order_id, &request, crate::RefusedBy::Record);
+        }
         // Whether the venue can take it now. After the seam, because a
         // malformed request is ours to refuse whatever state the venue is in;
         // before the risk layer, so an order the venue could not take spends
@@ -167,21 +174,7 @@ impl<'a> Context<'a> {
         // written down as submitted, so the record never says an order went to
         // a venue that was not there to take it.
         if let Err(unready) = self.venue.ready(&request) {
-            if let Some(observer) = self.observer.as_mut() {
-                observer.on_refused(
-                    client_order_id,
-                    &request,
-                    RejectReason::Venue,
-                    None,
-                    crate::RefusedBy::Venue(unready),
-                    self.now,
-                );
-            }
-            // `Venue`, and not why: which `Unready` it was is the record's, for
-            // the reason `bound` is.
-            self.ledger
-                .refuse(client_order_id, RejectReason::Venue, self.now);
-            return client_order_id;
+            return self.refuse_unsent(client_order_id, &request, crate::RefusedBy::Venue(unready));
         }
         // The mark the risk layer prices against: this instrument's mid, or
         // `None` when the book has no prices. A money limit must refuse rather
@@ -225,9 +218,19 @@ impl<'a> Context<'a> {
 
         // Written down *before* the venue is told, which is the fill rule
         // generalised: an order at a venue that we never recorded is an orphan
-        // position, and nothing read afterwards recovers it.
-        if let Some(observer) = self.observer.as_mut() {
-            observer.on_submitted(client_order_id, &request, mark, self.now);
+        // position, and nothing read afterwards recovers it. Enforced rather
+        // than hoped for: a record that could not hold the order says so, and
+        // the order does not go.
+        let now = self.now;
+        let ahead = self
+            .observer
+            .as_mut()
+            .map_or(WriteAhead::Proceed, |observer| {
+                observer.on_submitted(client_order_id, &request, mark, now)
+            });
+        if ahead == WriteAhead::Withhold {
+            self.ledger.unrecorded = true;
+            return self.refuse_unsent(client_order_id, &request, crate::RefusedBy::Record);
         }
         self.ledger.stats.submitted += 1;
         // Remembered so the fill can be booked: a fill names only the order.
@@ -235,6 +238,32 @@ impl<'a> Context<'a> {
             .orders
             .insert(client_order_id, (request.instrument, request.side));
         self.venue.submit(client_order_id, &request, self.now);
+        client_order_id
+    }
+
+    /// Refuse a well-formed order because the record or the venue could not
+    /// take it now, and hand back its id.
+    ///
+    /// The strategy hears `RejectReason::Venue` and not which of the two, or
+    /// why: that is the record's, for the reason a risk refusal's `bound` is.
+    fn refuse_unsent(
+        &mut self,
+        client_order_id: ClientOrderId,
+        request: &OrderRequest,
+        by: crate::RefusedBy,
+    ) -> ClientOrderId {
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_refused(
+                client_order_id,
+                request,
+                RejectReason::Venue,
+                None,
+                by,
+                self.now,
+            );
+        }
+        self.ledger
+            .refuse(client_order_id, RejectReason::Venue, self.now);
         client_order_id
     }
 
