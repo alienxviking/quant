@@ -437,7 +437,20 @@ feature.
    `InstrumentDef`, naming the venue rules our `Filters` do not model
    (`MARKET_LOT_SIZE`, `applyMinToMarket`, `maxNotional`). Accepted when the
    documented response parses exactly and a missing asset is an error naming the
-   field rather than an empty string.
+   field rather than an empty string. *As built (`quant-binance::exchange_info`),
+   three things differ.* That acceptance could not fail on a filter: the
+   documented response's filter list is empty (`rest-api.md` lines 857-860), so
+   a parser that never read one passes it, and the examples that do carry
+   filters give `minPrice` the tick's value, `minQty` the step's, and `LOT_SIZE`
+   and `MARKET_LOT_SIZE` one step between them (`filters.md` lines 54-56,
+   128-130 and 213), so they cannot catch a parser reading the wrong field
+   either. Acceptance therefore also takes every `filters.md` example and
+   fixtures in which those differ. The naming is not limited to three: every
+   field of every filter the definition does not take is reported under the
+   venue's filter name, which is the name a rejection carries, exchange-wide
+   filters included. And nothing is persisted: criterion B's replay must judge
+   the model against the rules the run used, which a fetch at judging time need
+   not return, so how a run writes them down belongs to item 4.
 3. **The engine seam a live venue needs.** A readiness check consulted before an
    order is journalled (§5), venue detail delivered to the observer and never to
    the strategy (§5), and a final drain at shutdown. Accepted when the simulator
