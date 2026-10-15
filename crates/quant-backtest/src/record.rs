@@ -72,10 +72,23 @@ pub struct JournalWriter {
     symbol: String,
     fills: u64,
     failures: u64,
+    /// What a failed append means: see [`Policy`].
+    policy: Policy,
+}
+
+/// What a writer does once an append has failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Policy {
+    /// Count it, log it, carry on writing, and let every order through.
+    Lenient,
+    /// Stop: write nothing more, and withhold every submission. `failed`
+    /// is set by the first failure and never cleared.
+    Strict { failed: bool },
 }
 
 impl JournalWriter {
-    /// A writer for one symbol's journal.
+    /// A lenient writer for one symbol's journal: a line it cannot write is
+    /// counted and logged, and the run goes on. For paper and backtests.
     #[must_use]
     pub fn new(journal: Arc<Mutex<Journal>>, symbol: String, fills: u64) -> Self {
         Self {
@@ -83,6 +96,33 @@ impl JournalWriter {
             symbol,
             fills,
             failures: 0,
+            policy: Policy::Lenient,
+        }
+    }
+
+    /// A strict writer, for a live run: after its first failed append it
+    /// writes nothing more, and answers every submission
+    /// [`WriteAhead::Withhold`].
+    ///
+    /// Withheld, because at a live venue an order the journal does not hold
+    /// is a position nobody knows about, and the engine then refuses it and
+    /// every later one as `RefusedBy::Record`. Nothing more written, because a
+    /// failed append can leave a torn line, and a line appended after one is
+    /// in the middle of the file, where [`quant_engine::journal::read`]
+    /// refuses it as damage: the journal would become unreadable to the
+    /// restart that needs it most. Stopping keeps the torn line at the tail,
+    /// which `read` tolerates. A latch rather than a retry, because what
+    /// follows a torn line is not a question this process can answer by
+    /// asking again.
+    ///
+    /// The shutdown path writes the closing checkpoint and `stopped` through
+    /// the shared journal, outside this writer; a live binary must not write
+    /// them after this writer has failed, for the same reason.
+    #[must_use]
+    pub fn strict(journal: Arc<Mutex<Journal>>, symbol: String, fills: u64) -> Self {
+        Self {
+            policy: Policy::Strict { failed: false },
+            ..Self::new(journal, symbol, fills)
         }
     }
 
@@ -100,18 +140,37 @@ impl JournalWriter {
     /// One place rather than one per call site, so the never-fatal policy
     /// cannot be adopted unevenly as entry types multiply -- which is the shape
     /// of the M4 and M5.c near-misses, where a rule held everywhere it was
-    /// written and not where a later edit forgot it.
-    fn record(&mut self, entry: &JournalEntry, what: &str) {
-        if let Err(e) = write(&self.journal, entry) {
-            // Counted and logged, never fatal. A paper run that died because it
-            // could not write one line would lose the live session it exists to
-            // conduct; a run that carries on with a hole in its journal is
-            // recoverable, and both `reconcile` and `runlog check` will say so
-            // afterwards -- the checkpoint disagrees, or the id sequence has a
-            // hole where the decision should be.
+    /// written and not where a later edit forgot it. The strict policy lives
+    /// here for the same reason.
+    ///
+    /// Returns whether the line is on the disk.
+    fn record(&mut self, entry: &JournalEntry, what: &str) -> bool {
+        if self.policy == (Policy::Strict { failed: true }) {
+            // Not written: after a failed append, a line written now could
+            // land after a torn one. Loud, because the fact is lost.
             self.failures += 1;
-            error!(error = %e, what, "could not journal");
+            error!(
+                what,
+                "not journalled: this journal stopped at its first failure"
+            );
+            return false;
         }
+        let Err(e) = write(&self.journal, entry) else {
+            return true;
+        };
+        // Counted and logged, never fatal. A paper run that died because it
+        // could not write one line would lose the live session it exists to
+        // conduct; a run that carries on with a hole in its journal is
+        // recoverable, and both `reconcile` and `runlog check` will say so
+        // afterwards -- the checkpoint disagrees, or the id sequence has a
+        // hole where the decision should be. A strict writer latches here
+        // too, and writes nothing after this.
+        self.failures += 1;
+        error!(error = %e, what, "could not journal");
+        if let Policy::Strict { failed } = &mut self.policy {
+            *failed = true;
+        }
+        false
     }
 
     fn key(&self) -> InstrumentKey {
@@ -376,15 +435,18 @@ impl RunObserver for JournalWriter {
         }
     }
 
-    /// Always [`WriteAhead::Proceed`], even when the line could not be written.
+    /// A lenient writer answers [`WriteAhead::Proceed`] always, even when the
+    /// line could not be written; a strict one answers
+    /// [`WriteAhead::Withhold`] unless this line is on the disk.
     ///
-    /// This writer is lenient on purpose, and the policy is `record`'s: a paper
-    /// run that stopped trading because it could not write one line would lose
-    /// the session it exists to conduct, while a run with a hole in its journal
-    /// is recoverable and `reconcile` and `runlog check` say where the hole is.
-    /// Paper and every backtest therefore send exactly what they sent before
-    /// the engine asked. A live run needs the opposite answer, because there an
-    /// order the journal does not hold is a position nobody knows about.
+    /// Lenient on purpose for paper and backtests, and the policy is
+    /// `record`'s: a paper run that stopped trading because it could not
+    /// write one line would lose the session it exists to conduct, while a
+    /// run with a hole in its journal is recoverable and `reconcile` and
+    /// `runlog check` say where the hole is. Paper and every backtest
+    /// therefore send exactly what they sent before the engine asked. A live
+    /// run needs the opposite answer, because there an order the journal does
+    /// not hold is a position nobody knows about: [`Self::strict`].
     fn on_submitted(
         &mut self,
         client_order_id: ClientOrderId,
@@ -392,7 +454,7 @@ impl RunObserver for JournalWriter {
         mark: Option<Px>,
         at: Ts,
     ) -> WriteAhead {
-        self.record(
+        let held = self.record(
             &JournalEntry::Submitted {
                 at,
                 client_order_id,
@@ -404,7 +466,11 @@ impl RunObserver for JournalWriter {
             },
             "a submission",
         );
-        WriteAhead::Proceed
+        match self.policy {
+            Policy::Lenient => WriteAhead::Proceed,
+            Policy::Strict { .. } if held => WriteAhead::Proceed,
+            Policy::Strict { .. } => WriteAhead::Withhold,
+        }
     }
 
     fn on_refused(
@@ -1093,6 +1159,94 @@ mod tests {
             vec![JournalEntry::Sighted {
                 at: Ts::from_nanos(71)
             }]
+        );
+    }
+
+    fn order() -> OrderRequest {
+        OrderRequest {
+            instrument: quant_core::instrument::InstrumentId::from_index(0),
+            side: Side::Buy,
+            qty: "0.001".parse().expect("qty"),
+            kind: quant_core::execution::OrderKind::Market,
+            time_in_force: quant_core::execution::TimeInForce::Gtc,
+        }
+    }
+
+    /// Poison the journal's lock, as a thread that panicked holding it does.
+    fn poison(journal: &Arc<Mutex<Journal>>) {
+        let held = Arc::clone(journal);
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().expect("not yet poisoned");
+            panic!("poisoning the journal lock on purpose");
+        })
+        .join();
+        assert!(journal.is_poisoned(), "the fixture must poison the lock");
+    }
+
+    /// One writer driven through a failure and out the other side: a write
+    /// that lands, one that cannot, and two after the lock is usable again.
+    /// The answers to the three submissions, and what the file holds.
+    fn through_a_failure(
+        name: &str,
+        make: fn(Arc<Mutex<Journal>>, String, u64) -> JournalWriter,
+    ) -> (Vec<WriteAhead>, Vec<JournalEntry>) {
+        let (path, journal) = journal(name);
+        let mut writer = make(Arc::clone(&journal), "BTCUSDT".to_owned(), 0);
+        let mut answers =
+            vec![writer.on_submitted(ClientOrderId(1), &order(), None, Ts::from_nanos(1))];
+        poison(&journal);
+        answers.push(writer.on_submitted(ClientOrderId(2), &order(), None, Ts::from_nanos(2)));
+        // The lock works again, so only the writer's own policy can stop a
+        // later line now.
+        journal.clear_poison();
+        answers.push(writer.on_submitted(ClientOrderId(3), &order(), None, Ts::from_nanos(3)));
+        writer.on_blind(
+            quant_core::event::GapCause::Disconnect,
+            Ts::from_nanos(3),
+            Ts::from_nanos(4),
+        );
+        let entries = quant_engine::journal::read(&path).expect("read").entries;
+        (answers, entries)
+    }
+
+    #[test]
+    fn a_strict_writer_withholds_and_stops_at_its_first_failure_and_a_lenient_one_does_not() {
+        // J8. A live run's record must hold every order before it is sent,
+        // and an append after a torn line would leave that line in the middle
+        // of the file, where `read` refuses the whole journal. So the strict
+        // writer answers `Withhold` from its first failure on, and writes
+        // nothing more even when it could.
+        let (answers, entries) = through_a_failure("strict", JournalWriter::strict);
+        assert_eq!(
+            answers,
+            vec![
+                WriteAhead::Proceed,
+                WriteAhead::Withhold,
+                WriteAhead::Withhold
+            ],
+            "withheld at the failure, and still withheld after it"
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the line before the failure: {entries:?}"
+        );
+        assert!(matches!(
+            entries[0],
+            JournalEntry::Submitted {
+                client_order_id: ClientOrderId(1),
+                ..
+            }
+        ));
+
+        // Paper and every backtest: the run is worth more than the line, and
+        // a writer that can write again does.
+        let (answers, entries) = through_a_failure("lenient", JournalWriter::new);
+        assert_eq!(answers, vec![WriteAhead::Proceed; 3]);
+        assert_eq!(
+            entries.len(),
+            3,
+            "everything but the failed line: {entries:?}"
         );
     }
 
