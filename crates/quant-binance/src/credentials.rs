@@ -324,9 +324,13 @@ impl Credentials {
     /// `params` as the value of `signature` (web-socket-api.md:1190-1210).
     /// `session.logon`'s are `apiKey`, `timestamp` and, optionally, `recvWindow`
     /// (web-socket-api.md:3399-3406).
-    #[must_use]
-    pub fn sign_ws_params(&self, params: &[(&str, &str)]) -> String {
-        self.sign(ws_signature_payload(params).as_bytes())
+    ///
+    /// # Errors
+    ///
+    /// [`RepeatedParam`] when `params` names a field more than once, which is
+    /// refused rather than signed: see [`ws_signature_payload`].
+    pub fn sign_ws_params(&self, params: &[(&str, &str)]) -> Result<String, RepeatedParam> {
+        Ok(self.sign(ws_signature_payload(params)?.as_bytes()))
     }
 
     /// The public half of the loaded key, as PEM: what `openssl pkey -in key.pem
@@ -373,19 +377,27 @@ const ED25519_SPKI_PREFIX: [u8; 12] = [
 /// are, not percent-encoded (web-socket-api.md:1276, *"no percent encoding
 /// here!"*).
 ///
-/// A JSON object names each field once, so `params` should too. If it repeats
-/// one, both are signed, in the order given, and the venue — which reads one —
-/// refuses the signature.
-#[must_use]
-pub fn ws_signature_payload(params: &[(&str, &str)]) -> String {
-    let mut signed: Vec<(&str, &str)> = params
-        .iter()
-        .copied()
-        .filter(|&(name, _)| name != "signature")
-        .collect();
-    signed.sort_by(|a, b| a.0.cmp(b.0));
+/// A JSON object names each field once, so `params` must too, `signature`
+/// among them.
+///
+/// # Errors
+///
+/// [`RepeatedParam`] when a name comes twice, whatever the values. Signing
+/// both would be signing a request the venue never reads: it takes one of the
+/// two, checks the signature against that, and refuses with -1022, *"Signature
+/// for this request is not valid"* (errors.md:57-58), which says nothing about
+/// why. That is the refusal this module exists to keep from happening.
+pub fn ws_signature_payload(params: &[(&str, &str)]) -> Result<String, RepeatedParam> {
+    let mut sorted: Vec<(&str, &str)> = params.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    if let Some(pair) = sorted.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(RepeatedParam {
+            name: pair[0].0.to_owned(),
+        });
+    }
     let mut payload = String::new();
-    for (i, (name, value)) in signed.iter().enumerate() {
+    let signed = sorted.iter().filter(|&&(name, _)| name != "signature");
+    for (i, (name, value)) in signed.enumerate() {
         if i > 0 {
             payload.push('&');
         }
@@ -393,8 +405,31 @@ pub fn ws_signature_payload(params: &[(&str, &str)]) -> String {
         payload.push('=');
         payload.push_str(value);
     }
-    payload
+    Ok(payload)
 }
+
+/// A WebSocket API request's `params` named a field more than once.
+///
+/// Carries the name, one of the venue's parameter names, so the error can say
+/// which; never a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepeatedParam {
+    pub name: String,
+}
+
+impl core::fmt::Display for RepeatedParam {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "the WebSocket API params name {} more than once. A JSON object names each field \
+             once, and the venue, reading one of the two, would refuse a signature made over both \
+             with -1022, which says nothing about why",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for RepeatedParam {}
 
 /// Percent-encode everything outside RFC 3986's unreserved characters, in
 /// upper-case hex as the venue's own examples write it (rest-api.md:649).
@@ -596,7 +631,7 @@ mod tests {
     };
     use super::{
         non_empty, private_key_text, ws_signature_payload, CredentialError, Credentials,
-        ED25519_SPKI_PREFIX,
+        RepeatedParam, ED25519_SPKI_PREFIX,
     };
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
@@ -733,7 +768,10 @@ mod tests {
             ("quantity", "0.01000000"),
             ("price", "52000.00"),
         ];
-        assert_eq!(ws_signature_payload(&scrambled), WS_EXAMPLE_PAYLOAD);
+        assert_eq!(
+            ws_signature_payload(&scrambled),
+            Ok(WS_EXAMPLE_PAYLOAD.to_owned())
+        );
 
         // The signature goes into JSON as plain base64, and verifies over that
         // payload under the loaded key's public half. Binance did not publish
@@ -742,13 +780,62 @@ mod tests {
         // round trip rather than a pinned value; the FIX vector pins the
         // arithmetic.
         let creds = example();
-        let signature = creds.sign_ws_params(&scrambled);
+        let signature = creds
+            .sign_ws_params(&scrambled)
+            .expect("no name is repeated");
         let bytes = STANDARD
             .decode(&signature)
             .unwrap_or_else(|e| panic!("plain base64, not percent-encoded: {signature}: {e}"));
         UnparsedPublicKey::new(&ED25519, creds.key_pair.public_key().as_ref())
             .verify(WS_EXAMPLE_PAYLOAD.as_bytes(), &bytes)
             .expect("the signature is over the documented payload");
+    }
+
+    #[test]
+    fn a_repeated_param_name_is_refused_rather_than_signed() {
+        // The venue reads one of the two and checks the signature against
+        // that, so a signature over both comes back as a -1022 that says
+        // nothing about why. The repeats here are not next to each other as
+        // given, so a check of neighbours before sorting would miss them, and
+        // the second has two different values, so a check of whole pairs,
+        // name and value, would miss that one.
+        let repeated = |name: &str| RepeatedParam {
+            name: name.to_owned(),
+        };
+        let same_value = [
+            ("timestamp", "1700000000000"),
+            ("apiKey", "k"),
+            ("timestamp", "1700000000000"),
+        ];
+        assert_eq!(
+            ws_signature_payload(&same_value),
+            Err(repeated("timestamp"))
+        );
+        assert_eq!(
+            example().sign_ws_params(&same_value),
+            Err(repeated("timestamp"))
+        );
+        assert_eq!(
+            ws_signature_payload(&[
+                ("recvWindow", "5000"),
+                ("apiKey", "k"),
+                ("recvWindow", "100")
+            ]),
+            Err(repeated("recvWindow"))
+        );
+        // `signature` is not signed, but it goes into the same JSON object,
+        // and two of them leave the venue to choose which one to check.
+        assert_eq!(
+            ws_signature_payload(&[("signature", "a"), ("apiKey", "k"), ("signature", "b")]),
+            Err(repeated("signature"))
+        );
+        // What is said names the parameter and quotes no value.
+        let said = repeated("timestamp").to_string();
+        assert!(
+            said.contains("params name timestamp more than once"),
+            "{said}"
+        );
+        assert!(!said.contains("1700000000000"), "{said}");
     }
 
     #[test]
