@@ -251,8 +251,8 @@ impl Fill {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeeAsset {
-    /// USDT for BTCUSDT. What every simulated fill charges, and M4's
-    /// simplification.
+    /// USDT for BTCUSDT. What a simulated fill charges unless the simulator is
+    /// told to charge as a spot venue does, and M4's simplification.
     #[default]
     Quote,
     /// BTC for BTCUSDT. What Binance takes on a buy: the position arrives a

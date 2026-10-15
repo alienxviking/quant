@@ -1101,16 +1101,18 @@ use quant_core::event::Side;
 use quant_core::execution::{ClientOrderId, ExecutionEvent, FeeAsset};
 use quant_engine::ExecutionVenue;
 
-/// The real simulator, with each buy's fee taken out of what was bought.
+/// The real simulator, with each buy's fee taken out of what was bought as a
+/// fixed quantity of the base.
 ///
-/// `SimulatedVenue` charges every fee in the quote -- M4's simplification, and
-/// still in its caveats -- so after a buy that fills in full, as every buy
-/// these tests make does against books a whole unit deep, the position is
-/// exactly what was ordered, and an exit that sold `qty` cannot be told from
-/// one that sold what was held. A spot venue takes a buyer's fee in the base
-/// asset. This rewrites each buy's fill that way, a fixed `fee` of the base
-/// per fill, and leaves the matching, the prices and the sells to the
-/// simulator.
+/// Written when `SimulatedVenue` charged every fee in the quote. A buy filling
+/// in full then left exactly what was ordered, so an exit that sold `qty` could
+/// not be told from one that sold what was held, and rewriting the fill was the
+/// only way to take a buy's fee out of what was bought. The simulator can now
+/// do that itself (`FeeIn::Received`), as a rate on what was bought. These
+/// tests keep stating the fee as the quantity of the base they then count in,
+/// which is how they land the holding on the boundaries they are about -- a
+/// whole lot, a lot and change, dust under one. The matching, the prices and
+/// the sells are still the simulator's.
 #[derive(Debug)]
 struct BaseFeeOnBuys {
     inner: SimulatedVenue,

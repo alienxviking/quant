@@ -333,7 +333,7 @@ mod tests {
     fn a_fill_is_journalled_with_the_asset_its_fee_was_taken_in() {
         // The writer used to stamp every fill `FeeAsset::Quote`, whatever the
         // fill said. Harmless while every fill was simulated, because the
-        // simulator only charges in the quote; the first live fill with a base
+        // simulator then charged only in the quote; the first fill with a base
         // fee would have been written down as a quote fee, replayed as one, and
         // `reconcile` would then disagree with the engine's own checkpoint over
         // a value our writer invented.

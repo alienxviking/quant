@@ -45,13 +45,13 @@
 //! well as the exit, or the next up-cross would call that dust "already long"
 //! and never enter again.
 //!
-//! Where fees are charged in the quote asset, as in every backtest and all of
-//! M5, this changes nothing for a run whose entries fill in full and whose
-//! position was built at the same `qty`. The position is then exactly zero or
-//! exactly `qty`, and `qty` is a whole number of lots (a size that is not is
-//! refused at construction), so rounding it down leaves it alone and less
-//! than one lot means zero. That is what lets the fortnight's result still
-//! reproduce to the satoshi.
+//! Where fees are charged in the quote asset, as in every backtest that does
+//! not ask for them in the base and all of M5, this changes nothing for a run
+//! whose entries fill in full and whose position was built at the same `qty`.
+//! The position is then exactly zero or exactly `qty`, and `qty` is a whole
+//! number of lots (a size that is not is refused at construction), so
+//! rounding it down leaves it alone and less than one lot means zero. That is
+//! what lets the fortnight's result still reproduce to the satoshi.
 //!
 //! Two kinds of run differ even with the fee in the quote: one whose entry
 //! the book could fill only in part -- the simulator fills what is there and

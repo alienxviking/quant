@@ -33,6 +33,14 @@
 //! all, and cannot be from recorded data — [`SimStats::caveats`] says so in the
 //! output rather than leaving it in a comment nobody reads.
 //!
+//! **A fee is taken in the quote unless [`Costs`] says otherwise.** A spot venue
+//! takes a buy's fee out of the base it bought, so the position arrives a
+//! fraction smaller and the cash is not touched; [`FeeIn::Received`] charges
+//! that way. [`FeeIn::Quote`], the default, charges every fill in the quote, as
+//! every result before M8 was computed. Whichever it is, the venue's own fee
+//! total is valued in the quote through [`Fill::fee_in_quote`], the conversion
+//! the portfolio uses, so the two totals remain two counts of one quantity.
+//!
 //! **An order is invisible to the market.** Our resting order does not appear in
 //! the reconstructed book and nobody reacts to it. True enough at sizes that are
 //! a rounding error against top-of-book depth, false at any size that matters,
@@ -70,14 +78,14 @@ pub mod costs;
 use quant_book::Book;
 use quant_core::event::{MarketEvent, Side};
 use quant_core::execution::{
-    ClientOrderId, ExecutionEvent, FeeAsset, Fill, OrderRequest, RejectReason, TimeInForce,
+    ClientOrderId, ExecutionEvent, Fill, OrderRequest, RejectReason, TimeInForce,
 };
 use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::{FilterBreach, Filters, InstrumentId};
 use quant_core::time::Ts;
 use quant_engine::ExecutionVenue;
 
-pub use costs::{Costs, FeeSchedule, Latency};
+pub use costs::{Costs, FeeIn, FeeSchedule, Latency};
 
 /// An order the simulator is holding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,11 +187,17 @@ pub struct SimStats {
     /// holding a position it had actually closed, which is exactly the kind of
     /// discrepancy that should be visible.
     pub undelivered: u64,
-    /// Total fees charged, as a positive cost.
+    /// Total fees charged, as a positive cost, valued in the quote.
     ///
     /// Tracked here as well as in the portfolio so the two can be compared: the
     /// venue says what it charged and the portfolio says what it paid, and a
     /// disagreement means one of them is wrong.
+    ///
+    /// A fee taken in the base is a quantity, so it is added in through
+    /// [`Fill::fee_in_quote`] -- the conversion the portfolio and the risk layer
+    /// use -- and never as its raw value, which would understate it by a factor
+    /// of the price. One conversion, so the comparison is of one quantity and a
+    /// disagreement cannot be two ways of valuing the same fee.
     pub fees_charged: Notional,
 }
 
@@ -219,7 +233,9 @@ impl SimStats {
     /// [`Costs`] existed — and a caveat list that errs in that direction is
     /// worse than none, because it invites a reader to discount a cost that was
     /// actually charged. Those two moved to [`Self::switched_off`], which asks
-    /// the configuration instead of assuming.
+    /// the configuration instead of assuming. So, at M8, did "fees are charged
+    /// in the quote currency", once [`FeeIn`] made the asset something a run
+    /// chooses rather than something the simulator could not do.
     #[must_use]
     pub const fn caveats() -> &'static [&'static str] {
         &[
@@ -229,8 +245,6 @@ impl SimStats {
              know what was ahead of us in the queue",
             "no market impact: our orders are invisible to everyone else, which is \
              false at any size that matters and is not recoverable from recorded data",
-            "fees are charged in the quote currency; a spot venue takes them in the \
-             base, leaving the position smaller rather than the cash lower",
         ]
     }
 
@@ -250,6 +264,14 @@ impl SimStats {
             off.push(
                 "no latency: an order is at the venue by the next event, and the book \
                  has not moved since the decision",
+            );
+        }
+        // Only where there are fees to take: with none, "no fees" above is the
+        // whole story, and which asset nothing was taken in is not news.
+        if costs.fee_in == FeeIn::Quote && costs.fees != FeeSchedule::FREE {
+            off.push(
+                "fees in the quote: a spot venue takes a buy's fee in the base, leaving \
+                 the position a fraction smaller rather than the cash a fraction lower",
             );
         }
         off
@@ -353,6 +375,27 @@ impl SimulatedVenue {
         });
     }
 
+    /// A fill of `qty` at `px`, charged as the costs say, and counted.
+    ///
+    /// The one place a fill's fee is decided and added to the venue's total,
+    /// for a taker and a maker alike -- there used to be one in each, and two
+    /// tallies are two places to get a conversion wrong. The total goes
+    /// through [`Fill::fee_in_quote`], as the portfolio's does, so a fee taken
+    /// in the base is counted as money here exactly as it is counted there.
+    fn fill(&mut self, side: Side, px: Px, qty: Qty, is_maker: bool) -> Fill {
+        let (fee, fee_asset) = self.costs.charge(side, px, qty, is_maker);
+        let fill = Fill {
+            px,
+            qty,
+            fee,
+            is_maker,
+            fee_asset,
+        };
+        self.stats.fees_charged =
+            Notional::from_raw(self.stats.fees_charged.raw() + fill.fee_in_quote().raw());
+        fill
+    }
+
     /// Consume levels from the touch outward, producing at most one fill.
     ///
     /// One fill and not one per level: a venue reports an execution, and a
@@ -400,9 +443,7 @@ impl SimulatedVenue {
         // receives less. Zero unless somebody deliberately turned it on.
         let concession = self.costs.adverse_per_fill.raw() * order.request.side.sign();
         let px = Px::from_raw(average_price(cost, taken).raw() + concession);
-        let gross = notional(px, taken);
-        let fee = self.costs.fees.fee(gross, is_maker);
-        self.stats.fees_charged = Notional::from_raw(self.stats.fees_charged.raw() + fee.raw());
+        let fill = self.fill(order.request.side, px, taken, is_maker);
 
         order.remaining = Qty::from_raw(order.remaining.raw() - taken.raw());
         self.stats.fills += 1;
@@ -411,16 +452,7 @@ impl SimulatedVenue {
             now,
             ExecutionEvent::Filled {
                 client_order_id: id,
-                fill: Fill {
-                    px,
-                    qty: taken,
-                    fee,
-                    is_maker,
-                    // The simulator charges in the quote currency, which is M4's
-                    // named simplification and what every result in this
-                    // repository was computed with. Live is where it differs.
-                    fee_asset: FeeAsset::Quote,
-                },
+                fill,
                 remaining,
                 ts: now,
             },
@@ -454,8 +486,7 @@ impl SimulatedVenue {
         // The concession applies as it does to a taker: always against us.
         let concession = self.costs.adverse_per_fill.raw() * order.request.side.sign();
         let px = Px::from_raw(limit.raw() + concession);
-        let fee = self.costs.fees.fee(notional(px, taken), true);
-        self.stats.fees_charged = Notional::from_raw(self.stats.fees_charged.raw() + fee.raw());
+        let fill = self.fill(order.request.side, px, taken, true);
 
         order.remaining = Qty::from_raw(0);
         self.stats.fills += 1;
@@ -464,13 +495,7 @@ impl SimulatedVenue {
             now,
             ExecutionEvent::Filled {
                 client_order_id: id,
-                fill: Fill {
-                    px,
-                    qty: taken,
-                    fee,
-                    is_maker: true,
-                    fee_asset: quant_core::execution::FeeAsset::Quote,
-                },
+                fill,
                 remaining: Qty::from_raw(0),
                 ts: now,
             },
