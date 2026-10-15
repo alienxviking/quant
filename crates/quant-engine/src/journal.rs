@@ -767,9 +767,9 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
         .iter()
         .enumerate()
         .filter(|(_, line)| !line.iter().all(u8::is_ascii_whitespace))
-        .map(|(i, line)| (i + 1, serde_json::from_slice::<JournalEntry>(line)))
+        .map(|(i, line)| (i + 1, line, serde_json::from_slice::<JournalEntry>(line)))
         .peekable();
-    while let Some((number, line)) = parsed.next() {
+    while let Some((number, bytes, line)) = parsed.next() {
         let e = match line {
             // A session a newer build began. Refused at its `started` line,
             // which is the first thing that session wrote, so the error names
@@ -780,10 +780,7 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
             // and a reader that guessed would fold money it does not
             // understand.
             Ok(JournalEntry::Started { schema, .. }) if schema > SCHEMA => {
-                return Err(std::io::Error::other(format!(
-                    "journal line {number} begins a session written in journal schema {schema}, \
-                     and this build reads schema {SCHEMA} and older: read it with a newer build"
-                )))
+                return Err(too_new(number, u64::from(schema)));
             }
             Ok(entry) => {
                 out.entries.push(entry);
@@ -806,18 +803,26 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
             // name. `Io` cannot come out of `from_str`, and is refused with it
             // rather than given a tolerance nothing has argued for.
             Category::Data | Category::Io => {
+                // Still the newer session's line, if it says so. A newer
+                // build may change the shape of a field `started` already
+                // has, and then the line fails here rather than above; read
+                // loosely, it can still name both schemas instead of leaving
+                // "a newer build, or damage" to guess between.
+                if let Some(schema) = claimed_schema(bytes).filter(|&s| s > u64::from(SCHEMA)) {
+                    return Err(too_new(number, schema));
+                }
                 return Err(std::io::Error::other(format!(
                     "journal line {number} is not an entry this build can read, and not the \
                      shape an interrupted write leaves either, so it is not torn -- an entry \
                      from a newer build, or damage: {e}"
-                )))
+                )));
             }
         }
         match parsed.peek() {
             // The write the crash interrupted, not yet written past.
             None => out.torn_tail = true,
             // The same, and the restart that followed it.
-            Some((_, Ok(JournalEntry::Started { .. }))) => out.torn_before_restart.push(number),
+            Some((_, _, Ok(JournalEntry::Started { .. }))) => out.torn_before_restart.push(number),
             Some(_) => {
                 return Err(std::io::Error::other(format!(
                     "journal line {number} is not readable, and only the last line may be torn, \
@@ -827,6 +832,27 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
         }
     }
     Ok(out)
+}
+
+/// The refusal of a session begun in a newer schema, naming both numbers.
+fn too_new(number: usize, schema: u64) -> std::io::Error {
+    std::io::Error::other(format!(
+        "journal line {number} begins a session written in journal schema {schema}, \
+         and this build reads schema {SCHEMA} and older: read it with a newer build"
+    ))
+}
+
+/// The schema a line claims, if it is a `started` line, read as loose JSON.
+///
+/// For a line that would not parse as an entry. Only `type` and `schema` are
+/// looked at, so a newer build's `started` stays recognisable whatever it did
+/// to the fields around them.
+fn claimed_schema(line: &[u8]) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+    if value.get("type")?.as_str()? != "started" {
+        return None;
+    }
+    value.get("schema")?.as_u64()
 }
 
 /// Rebuild a portfolio from a journal alone.
@@ -2310,6 +2336,36 @@ mod m75a_tests {
         let mixed = format!("{}{}", begun_in(SCHEMA), begun_in(SCHEMA + 1));
         let err = read(&temp("schema-mixed", &mixed)).expect_err("still refused");
         assert!(err.to_string().contains("journal line 3 "), "{err}");
+    }
+
+    #[test]
+    fn a_newer_started_line_that_will_not_parse_still_names_its_schema() {
+        // A newer build may change the shape of a field `started` already
+        // has. Then its line fails to parse as an entry, and without a loose
+        // read the refusal falls to "a newer build, or damage", naming
+        // neither schema. Cash as text stands in for that change.
+        let reshaped = |n: u32| {
+            format!(
+                "{{\"type\":\"started\",\"at\":5,\"cash\":\"100\",\"schema\":{n}}}\n\
+                 {{\"type\":\"stopped\",\"at\":6}}\n"
+            )
+        };
+        let err = read(&temp("reshaped-newer", &reshaped(SCHEMA + 1)))
+            .expect_err("a newer schema is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("schema {}", SCHEMA + 1))
+                && message.contains(&format!("schema {SCHEMA} and older")),
+            "names both schemas: {message}"
+        );
+
+        // The same line claiming this build's schema is damage, and says so:
+        // the loose read must not call every malformed `started` too new.
+        let err = read(&temp("reshaped-current", &reshaped(SCHEMA)))
+            .expect_err("damage is still refused");
+        let message = err.to_string();
+        assert!(message.contains("or damage"), "{message}");
+        assert!(!message.contains("read it with a newer build"), "{message}");
     }
 
     #[test]
