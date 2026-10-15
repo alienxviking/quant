@@ -978,9 +978,9 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             // checkpoint nor this fold counts it, and `runlog check` never
             // reads an `Orphaned` line, so an orphan alone never changes its
             // verdict. An orphaned line must be loud in `runlog check`, and
-            // making it so is owed to slice (c)'s pull request for what a live
-            // run writes down (`docs/live-run.md` §4) -- the one that gives an
-            // orphan from another run its entry.
+            // making it so is owed to the readers' pull request,
+            // `m8c-journal-readers` (`docs/live-run.md` §4), with the `stray`
+            // and other-run `foreign` lines that need the same.
             JournalEntry::Orphaned { .. } => {}
         }
     }

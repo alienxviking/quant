@@ -376,7 +376,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65) and the account stream's frame kind (#63); items 4, 6, 7 and 8 below remain |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63) and the journal's entries (item 4, `m8c-journal-live`); item 4's reader debts and items 6, 7 and 8 below remain |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -532,7 +532,9 @@ feature.
    `runlog check`; torn lines shown where an operator looks; the risk tally
    recounted on restart; and `decisions_at` filtering by stamp, because a
    `backtest --journal` file's wall-clock `started` line stops it reading
-   anything at all.
+   anything at all. That filter must still read every `started` line whatever
+   its stamp, because the session's schema is on it: skip the wall-clock one
+   and a schema-3 backtest file is quietly read by the old rule again.
 5. **A frame kind for the account stream.** Container version 3, and the account
    stream under its own data root (§5), where `quant-verify` runs its container
    checks and not the update-id chain. Accepted when a v3 build reads every v1 and

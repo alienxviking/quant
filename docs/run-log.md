@@ -368,6 +368,7 @@ discarded the only evidence.
 
 All six checks ship with the sabotage that reddens them, and each sabotage
 reddens its own tests and nothing else.
+
 ---
 
 ## 8. Schema 3: what a live run writes (M8 slice (c))
@@ -375,8 +376,9 @@ reddens its own tests and nothing else.
 M7.5 widened the journal from money to decisions. A live venue widens it again,
 to what only a real venue knows: its own names for orders and trades, what it
 cited when it declined, and facts that are not events at all. Built in
-`m8c-journal-live`, from the seam `docs/engine-contract.md` §11 describes; the
-reasoning for each decision is in `docs/live-run.md` §5.
+`m8c-journal-live`, from the seam `docs/engine-contract.md` §11 describes. The
+reasoning for each line is in that section and in this one; `docs/live-run.md`
+§5 has the run tag's and the balances'.
 
 **The rule that keeps every old file readable:** every field added to an
 existing line is defaulted on read and written only when it holds something.

@@ -783,6 +783,8 @@ book from not live to live, and the journal writes it as `sighted`: the
 market's return, written down, which `explain` reads in place of inferring it
 from any later line once a session is schema 3. Nothing produces the venue's
 lines until `LiveVenue` exists; `sighted` is in every new backtest and paper
-journal, one per recovery from a gap. Recounting the risk tally after a restart
+journal, one each time a book goes from not live to live: after every gap,
+and also when a book re-anchors after its own update chain broke, which writes
+no `blind` line. Recounting the risk tally after a restart
 is the readers' pull request.
 
