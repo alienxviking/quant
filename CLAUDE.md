@@ -2240,16 +2240,16 @@ hours, and the host still has to stay awake through it.
 
 ### 3. Where M8 is
 
-`docs/live-run.md` is the scoping, written before any of the code. Slice (b) is
-done, (a) is done in the engine and not in the source, and (c) is part done:
+`docs/live-run.md` is the scoping, written before any of the code. Slices (a)
+and (b) are done, (a) only after a miss in the source, and (c) is part done:
 
-- **(a) done in the engine, missed in the source.** The engine can be woken by
-  the venue as well as the market: `EventSource::next_event_timeout` returns a
-  three-way `Wake`, defaulted so a historical replay can never idle and no
-  backtest number moved. But this said "(a) done" while `LiveSource`, the one
-  source the idle wake exists for, never overrode the method, so in production
-  the engine still blocked in `recv()`. And the clock advanced from venue reports
-  on idle wakes only. Both land in `m8a-live-source-idles`.
+- **(a) done, after a miss in the source.** The engine can be woken by the venue
+  as well as the market: `EventSource::next_event_timeout` returns a three-way
+  `Wake`, defaulted so a historical replay can never idle and no backtest number
+  moved. But this said "(a) done" while `LiveSource`, the one source the idle
+  wake exists for, never overrode the method, so in production the engine still
+  blocked in `recv()`. And the clock advanced from venue reports on idle wakes
+  only. Both landed in `m8a-live-source-idles` (#52).
 - **(b) done, and reworked for Ed25519 in slice (c).** `Credentials`
   (redacting `Debug`, environment only), `TradeClient`, and `venue-check`. The
   HMAC version was verified against the real API: a wrong secret came back HTTP
@@ -2311,11 +2311,20 @@ order at our size fills the moment it lands, so a blind resend after a timeout i
 accepted exactly when the first one went through: a doubled position. Criterion
 E recovered through `openOrders`, which cannot see an order that has already
 filled, so it would have recorded a filled order as never having landed. Both
-are corrected: a timed-out submission is never resent, and is resolved by `GET
-/api/v3/order` with `origClientOrderId`, which finds an order whatever its
-status. Found by reading the venue's documentation of the parameter itself
-rather than what everyone remembers about it, which is worth doing for every
-parameter M8 sends.
+are corrected: a timed-out submission is never resent, and is resolved by
+`GET /api/v3/order` with `origClientOrderId`, which finds a filled order as
+readily as an open one. Found by reading the venue's documentation of the
+parameter itself rather than what everyone remembers about it, which is worth
+doing for every parameter M8 sends.
+
+**That lookup does not find every order, and this said it did** ("finds an
+order whatever its status"). A cancel replaces the cancelled order's
+`clientOrderId` with the cancel's own, *"freeing it up for new orders"*
+(web-socket-api.md:4142, :4181, for `order.cancel`; REST's cancel takes the
+same `newClientOrderId`), so after a cancel the original id may find nothing;
+and an order cancelled or expired with nothing filled is archived after 90
+days, answered `-2026` (errors.md:347-348). Slice (d) must design for both
+rather than rely on the unqualified sentence (`docs/live-run.md`, criterion E).
 
 ### 4. Things that are easy to get wrong here specifically
 
