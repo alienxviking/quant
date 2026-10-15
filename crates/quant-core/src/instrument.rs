@@ -195,11 +195,12 @@ pub struct Instrument {
     pub base: String,
     pub quote: String,
     pub kind: InstrumentKind,
-    /// Minimum price increment. Orders must be a multiple of this.
+    /// Minimum price increment. Orders must be a multiple of this. Zero: the
+    /// venue has no tick rule.
     pub tick_size: Px,
-    /// Minimum quantity increment.
+    /// Minimum quantity increment. Zero: the venue has no lot rule.
     pub lot_size: Qty,
-    /// Venue-enforced floor on order value.
+    /// Venue-enforced floor on order value. Zero: the venue has no floor.
     pub min_notional: Notional,
 }
 
@@ -208,6 +209,14 @@ pub struct Instrument {
 /// Split out of [`Instrument`] so something that enforces them need not also
 /// carry an identity — a simulated venue holds these per instrument and has no
 /// business knowing a symbol string.
+///
+/// **Zero in any of the three is no rule**, which is also what `Default` gives:
+/// a zero step skips the multiple-of check, and a zero floor is met by every
+/// order. There is no separate "absent", because zero already means it in every
+/// reader -- [`Self::rejects`], [`Instrument::round_price`] and
+/// [`Qty::round_to_lot`] -- and a definition built from a venue's published
+/// rules relies on that: a rule the venue does not publish arrives as zero,
+/// never as a placeholder value the venue did not state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Filters {
     pub tick_size: Px,
@@ -408,6 +417,8 @@ impl InstrumentRegistry {
 }
 
 /// An instrument definition awaiting registration (i.e. without an id).
+///
+/// The three venue rules follow [`Filters`]: zero in any of them is no rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrumentDef {
     pub exchange: Exchange,
@@ -415,8 +426,11 @@ pub struct InstrumentDef {
     pub base: String,
     pub quote: String,
     pub kind: InstrumentKind,
+    /// Zero: the venue has no tick rule.
     pub tick_size: Px,
+    /// Zero: the venue has no lot rule.
     pub lot_size: Qty,
+    /// Zero: the venue has no floor on order value.
     pub min_notional: Notional,
 }
 
@@ -542,5 +556,72 @@ mod tests {
 
         // Shorts are validated on absolute size.
         assert!(inst.is_valid_order(px, "-0.001".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_zero_in_any_filter_is_no_rule() {
+        // A definition built from a venue's published rules carries a rule the
+        // venue does not publish as zero, so zero must mean "no such rule" in
+        // every reader -- not "a rule nothing can meet", and not "use a
+        // default". Each rule is switched off alone, the other two kept real,
+        // so one zero cannot pass on the strength of another.
+        let real = btcusdt();
+        let off_tick: Px = "68123.456".parse().unwrap();
+        let off_lot: Qty = "0.0012345".parse().unwrap();
+        let px: Px = "68123.45".parse().unwrap();
+        // Worth 68 cents: under the real five-dollar floor.
+        let small: Qty = "0.00001".parse().unwrap();
+        let qty: Qty = "0.001".parse().unwrap();
+
+        let no_tick = Filters {
+            tick_size: Px::ZERO,
+            ..real_filters(&real)
+        };
+        assert_eq!(no_tick.rejects(off_tick, qty), None);
+
+        let no_lot = Filters {
+            lot_size: Qty::ZERO,
+            ..real_filters(&real)
+        };
+        assert_eq!(no_lot.rejects(px, off_lot), None);
+
+        let no_floor = Filters {
+            min_notional: Notional::ZERO,
+            ..real_filters(&real)
+        };
+        assert_eq!(no_floor.rejects(px, small), None);
+
+        // The real rules do refuse all three, so the zeros above are what let
+        // them through.
+        let all = real_filters(&real);
+        assert_eq!(all.rejects(off_tick, qty), Some(FilterBreach::TickSize));
+        assert_eq!(all.rejects(px, off_lot), Some(FilterBreach::LotSize));
+        assert_eq!(all.rejects(px, small), Some(FilterBreach::MinNotional));
+
+        // `Default` is all three off, and still not a licence for a non-order.
+        let none = Filters::default();
+        assert_eq!(none.rejects(off_tick, off_lot), None);
+        assert!(none.accepts(off_tick, off_lot));
+        assert_eq!(none.rejects(px, Qty::ZERO), Some(FilterBreach::NotAnOrder));
+        assert_eq!(none.rejects(Px::ZERO, qty), Some(FilterBreach::NotAnOrder));
+
+        // And the rounding helpers leave a value alone rather than zeroing it.
+        let mut reg = InstrumentRegistry::new();
+        let id = reg.register(InstrumentDef {
+            tick_size: Px::ZERO,
+            lot_size: Qty::ZERO,
+            min_notional: Notional::ZERO,
+            ..real
+        });
+        assert_eq!(reg.expect(id).round_price(off_tick), off_tick);
+        assert_eq!(reg.expect(id).round_qty(off_lot), off_lot);
+    }
+
+    fn real_filters(def: &InstrumentDef) -> Filters {
+        Filters {
+            tick_size: def.tick_size,
+            lot_size: def.lot_size,
+            min_notional: def.min_notional,
+        }
     }
 }
