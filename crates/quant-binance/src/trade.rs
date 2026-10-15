@@ -387,10 +387,11 @@ pub enum NotReady {
     /// object documented for it (rest-api.md:2349-2353).
     UnreadableOrderTest { status: u16 },
     /// The account pays its fees in BNB at a discount: its commission rates
-    /// report `discount.enabledForAccount` true (rest-api.md:4841-4842). A
-    /// fee taken in BNB is in neither asset of the pair, and the user-data
-    /// translator refuses such a fill rather than book it as either
-    /// (`crate::user_data`), so a live run requires the discount off. From
+    /// report `discount.enabledForAccount` true (rest-api.md:4841-4842). The
+    /// user-data translator books a fee only in the pair's base or quote
+    /// asset (`crate::user_data`), so on a pair without BNB it refuses a fill
+    /// whose fee was taken in BNB rather than book it as either, and the run
+    /// procedure turns the discount off. From
     /// [`TradeClient::check_bnb_discount_off`].
     BnbDiscountOn,
     /// The venue answered 200, but not with the commission rates this reads.
@@ -595,6 +596,20 @@ fn fmt_too_few_readings(
     Ok(())
 }
 
+/// [`NotReady::CannotTrade`], said. A constant, as [`BNB_DISCOUNT_ON`] is, to
+/// keep `NotReady`'s `fmt` within clippy's length limit.
+const CANNOT_TRADE: &str = "the venue accepted the key and the signature, and the account \
+     reports canTrade false. The venue does not define the field. If this account's trading \
+     ability is disabled, the venue's remedy is its customer support; this API key's own \
+     permission to trade is a separate setting, in Binance's API Management";
+
+/// [`NotReady::BnbDiscountOn`], said.
+const BNB_DISCOUNT_ON: &str = "the account pays its fees in BNB at a discount \
+     (discount.enabledForAccount is true). The live path's translator of the account stream books \
+     a fee only in the pair's base or quote asset, so on a pair without BNB it refuses every fill \
+     whose fee was taken in BNB, and the run procedure turns the discount off: switch paying fees \
+     in BNB off for this account before trading";
+
 impl core::fmt::Display for NotReady {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -648,12 +663,7 @@ impl core::fmt::Display for NotReady {
                 "the venue refused a signed request (HTTP {status}{})",
                 Said(venue.as_ref()),
             ),
-            Self::CannotTrade => f.write_str(
-                "the venue accepted the key and the signature, and the account reports canTrade \
-                 false. The venue does not define the field. If this account's trading ability is \
-                 disabled, the venue's remedy is its customer support; this API key's own \
-                 permission to trade is a separate setting, in Binance's API Management",
-            ),
+            Self::CannotTrade => f.write_str(CANNOT_TRADE),
             Self::UnreadableAccount(fault) => write!(
                 f,
                 "the venue answered 200, but {fault}. Nothing of the body is printed: it lists \
@@ -684,12 +694,7 @@ impl core::fmt::Display for NotReady {
                 "the venue answered the trade probe with HTTP {status}, but not with the JSON \
                  object documented for it, so whether this key may trade is not shown"
             ),
-            Self::BnbDiscountOn => f.write_str(
-                "the account pays its fees in BNB at a discount (discount.enabledForAccount is \
-                 true). A fee taken in BNB is in neither asset of the pair, and the live path's \
-                 translator of the account stream refuses a fill whose fee it cannot book, so \
-                 switch paying fees in BNB off for this account before trading",
-            ),
+            Self::BnbDiscountOn => f.write_str(BNB_DISCOUNT_ON),
             Self::UnreadableCommission(fault) => write!(
                 f,
                 "the venue answered 200 to the commission rates request, but {fault}. Nothing of \
@@ -1053,12 +1058,12 @@ impl TradeClient {
     /// reading `discount.enabledForAccount` from its commission rates for
     /// `symbol`: `GET /api/v3/account/commission` (rest-api.md:4797-4846).
     ///
-    /// The run requires it off. A spot venue takes a fee in the asset
+    /// The run procedure turns it off. A spot venue takes a fee in the asset
     /// received, which the engine books ([`quant_core::execution::FeeAsset`]);
-    /// with the discount on, it takes BNB instead, which is neither asset of
-    /// the pair, and the user-data translator refuses such a fill loudly
-    /// rather than book it as either. This finds that out before an order
-    /// does.
+    /// with the discount on, it can take BNB instead, and the user-data
+    /// translator books a fee only in the pair's base or quote asset, so on a
+    /// pair without BNB it refuses such a fill loudly rather than book it as
+    /// either. This finds that out before an order does.
     ///
     /// `USER_DATA`, weight 20, and stamped as [`Self::check_ready`] stamps,
     /// the host's clock less `offset_ms`. Its body holds the account's
@@ -3098,11 +3103,17 @@ Content-Length: {}
         for needle in [
             "pays its fees in BNB",
             "discount.enabledForAccount is true",
-            "neither asset of the pair",
+            // What the translator does, and so on which pairs it bites: a fee
+            // in BNB on a BNB pair is in one of the pair's assets.
+            "books a fee only in the pair's base or quote asset",
+            "on a pair without BNB it refuses every fill whose fee was taken in BNB",
+            "the run procedure turns the discount off",
             "switch paying fees in BNB off",
         ] {
             assert!(said.contains(needle), "{needle:?} missing from: {said}");
         }
+        // Not "in neither asset of the pair", which is false on BNBUSDT.
+        assert!(!said.contains("neither asset"), "{said}");
     }
 
     #[tokio::test]

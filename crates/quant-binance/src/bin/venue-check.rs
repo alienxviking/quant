@@ -23,9 +23,10 @@
 //!   are, and must accept it outright: [`probe`] says why any refusal of it, a
 //!   filter failure included, is not ready.
 //! - **`GET /api/v3/account/commission`** checks that the account does not pay
-//!   its fees in BNB (rest-api.md:4797-4846). A fee taken in BNB is in neither
-//!   asset of the pair, and the user-data translator refuses a fill whose fee
-//!   it cannot book, so the run needs the discount off. Its body holds the
+//!   its fees in BNB (rest-api.md:4797-4846). The user-data translator books a
+//!   fee only in the pair's base or quote asset, so on a pair without BNB it
+//!   refuses a fill whose fee was taken in BNB, and the run procedure turns the
+//!   discount off. Its body holds the
 //!   account's commission rates, of which this prints the one flag it reads.
 //!
 //! READY means all of it: the key, the signature and the clock work, the

@@ -443,8 +443,10 @@ feature.
    rest-api.md:2321-2333), which its `USER_DATA` request could not. READY needs
    the venue to accept that probe, the run's own order, outright: any refusal of
    it, a filter failure included, is NOT READY, because the run's orders would
-   meet it. And it refuses READY while the account pays its fees in BNB, which
-   the translator cannot book. What remains of item 1 is the venue: none of it
+   meet it. And it refuses READY while the account pays its fees in BNB: the
+   translator books a fee only in the pair's base or quote asset, so on a pair
+   without BNB it would refuse every fill whose fee was taken in BNB, and the
+   run procedure turns the discount off. What remains of item 1 is the venue: none of it
    has met Binance, and the testnet rehearsal (§5) is its first real test.
 2. **The instrument comes from the venue.** `exchangeInfo` parsed into an
    `InstrumentDef`, naming the venue rules our `Filters` do not model
