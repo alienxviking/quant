@@ -744,10 +744,14 @@ mod tests {
         }
 
         fn named(day_start: i64, header_symbol: &str) -> Self {
+            Self::at_venue(Exchange::Binance, day_start, header_symbol)
+        }
+
+        fn at_venue(exchange: Exchange, day_start: i64, header_symbol: &str) -> Self {
             Self {
                 writer: RawWriter::create(
                     Vec::new(),
-                    FileHeader::new(Exchange::Binance, header_symbol, SESSION),
+                    FileHeader::new(exchange, header_symbol, SESSION),
                     WriterOptions::default(),
                 )
                 .expect("create"),
@@ -1449,6 +1453,69 @@ mod tests {
             0,
             "not read as its own"
         );
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn a_venue_this_build_does_not_read_costs_an_account_session_nothing() {
+        // Only the market's checks need the venue's dialect, so only a market
+        // session can be short of them. The account session gets every check it
+        // was ever going to get, and a warning that it did not would be noise on
+        // every venue added before its market parser is.
+        let (account, _) =
+            Capture::at_venue(Exchange::Coinbase, DAY_29, quant_recorder::ACCOUNT_STREAM)
+                .gap(GapCause::RecorderRestart)
+                .account_event()
+                .seal();
+        let at = CaptureTarget {
+            exchange: Exchange::Coinbase,
+            ..account_target(29)
+        };
+        let report = run("unknown-venue-account", &[(at, account)]);
+        assert_eq!(
+            report.count(code::VENUE_NOT_SUPPORTED),
+            0,
+            "{:#?}",
+            report.findings()
+        );
+        assert!(report.is_clean(), "{:#?}", report.findings());
+
+        // The other side of the line: the same venue's market session is short.
+        let (market, _) = Capture::at_venue(Exchange::Coinbase, DAY_29, "BTCUSDT")
+            .gap(GapCause::RecorderRestart)
+            .trade(7)
+            .seal();
+        let at = CaptureTarget {
+            exchange: Exchange::Coinbase,
+            ..target(29, 0)
+        };
+        let report = run("unknown-venue-market", &[(at, market)]);
+        assert_eq!(
+            report.count(code::VENUE_NOT_SUPPORTED),
+            1,
+            "{:#?}",
+            report.findings()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_in_an_account_capture_is_foreign() {
+        // A book snapshot is market data whichever file it lands in. Read as a
+        // snapshot here it would anchor an episode the account stream does not
+        // have, and count toward the market's totals.
+        let (bytes, _) = Capture::account(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .account_event()
+            .snapshot(100)
+            .seal();
+        let report = run("snapshot-in-account", &[(account_target(29), bytes)]);
+        assert_eq!(
+            report.count(code::FOREIGN_FRAME),
+            1,
+            "{:#?}",
+            report.findings()
+        );
+        assert_eq!(report.totals.snapshots, 0, "not read as a snapshot");
         assert!(!report.is_clean());
     }
 
