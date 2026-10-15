@@ -446,8 +446,11 @@ feature.
    meet it. And it refuses READY while the account pays its fees in BNB: the
    translator books a fee only in the pair's base or quote asset, so on a pair
    without BNB it would refuse every fill whose fee was taken in BNB, and the
-   run procedure turns the discount off. What remains of item 1 is the venue: none of it
-   has met Binance, and the testnet rehearsal (§5) is its first real test.
+   run procedure turns the discount off.
+
+   **The code for item 1 is done.** What remains is meeting the venue, on Spot
+   Testnet first: none of it has met Binance yet, and the testnet rehearsal
+   (§5) is its first real test, before any order on the live venue.
 2. **The instrument comes from the venue.** `exchangeInfo` parsed into an
    `InstrumentDef`, naming the venue rules our `Filters` do not model
    (`MARKET_LOT_SIZE`, `applyMinToMarket`, `maxNotional`). Accepted when the
