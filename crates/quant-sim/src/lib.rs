@@ -654,10 +654,6 @@ impl ExecutionVenue for SimulatedVenue {
                     now,
                     ExecutionEvent::Accepted {
                         client_order_id: id,
-                        // A simulator has no venue-side identity to offer, and
-                        // inventing one would make backtest output look like it
-                        // came from an exchange.
-                        venue_order_id: None,
                         ts: now,
                     },
                 );

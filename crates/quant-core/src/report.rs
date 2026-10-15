@@ -114,21 +114,15 @@ pub enum OrderReport {
 
 impl OrderReport {
     /// The report of `event` with nothing beside it.
-    ///
-    /// `ExecutionEvent::Accepted` still carries a venue order id, the one field
-    /// by which a strategy could tell which venue it was wired to, and on its
-    /// way out. One found there is venue detail, so it is carried across as
-    /// detail, and [`Self::event`] does not hand it back.
     #[must_use]
     pub fn plain(event: ExecutionEvent) -> Self {
         match event {
             ExecutionEvent::Accepted {
                 client_order_id,
-                venue_order_id,
                 ts,
             } => Self::Accepted {
                 client_order_id,
-                venue_order_id,
+                venue_order_id: None,
                 ts,
             },
             ExecutionEvent::Rejected {
@@ -180,9 +174,6 @@ impl OrderReport {
                 ts,
             } => ExecutionEvent::Accepted {
                 client_order_id: *client_order_id,
-                // Detail, which stops here. The event's own field for it is
-                // the leak this projection closes.
-                venue_order_id: None,
                 ts: *ts,
             },
             Self::Rejected {
@@ -648,7 +639,6 @@ mod tests {
         [
             ExecutionEvent::Accepted {
                 client_order_id: ClientOrderId(11),
-                venue_order_id: None,
                 ts: Ts::from_nanos(101),
             },
             ExecutionEvent::Rejected {
@@ -700,28 +690,17 @@ mod tests {
         for event in events() {
             assert!(OrderReport::plain(event).is_plain());
         }
-        // The venue order id an acceptance still carries is detail: kept
-        // beside the event, and not handed back to the strategy.
-        let leaked = OrderReport::plain(ExecutionEvent::Accepted {
-            client_order_id: ClientOrderId(11),
-            venue_order_id: Some(VenueOrderId("4293153".to_owned())),
-            ts: Ts::from_nanos(101),
-        });
-        assert!(!leaked.is_plain());
-        assert_eq!(
-            leaked.event(),
-            ExecutionEvent::Accepted {
-                client_order_id: ClientOrderId(11),
-                venue_order_id: None,
-                ts: Ts::from_nanos(101),
-            }
-        );
 
         let ids = FillIds {
             venue_order_id: VenueOrderId("4293153".to_owned()),
             trade_id: VenueTradeId("12345".to_owned()),
         };
         let detailed = [
+            OrderReport::Accepted {
+                client_order_id: ClientOrderId(11),
+                venue_order_id: Some(VenueOrderId("4293153".to_owned())),
+                ts: Ts::from_nanos(101),
+            },
             OrderReport::Rejected {
                 client_order_id: ClientOrderId(12),
                 reason: RejectReason::Venue,

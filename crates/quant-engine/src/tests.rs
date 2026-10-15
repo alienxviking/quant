@@ -431,7 +431,6 @@ fn the_same_strategy_value_runs_against_two_different_wirings() {
         fn submit(&mut self, client_order_id: ClientOrderId, _r: &OrderRequest, now: Ts) {
             self.out.push(ExecutionEvent::Accepted {
                 client_order_id,
-                venue_order_id: None,
                 ts: now,
             });
         }
@@ -906,7 +905,6 @@ fn every_hook_venue() -> Says {
         vec![
             ExecutionEvent::Accepted {
                 client_order_id: ClientOrderId(1),
-                venue_order_id: None,
                 ts: t2,
             },
             ExecutionEvent::Filled {
@@ -1990,7 +1988,6 @@ fn plain_lifecycle() -> Says {
         vec![
             ExecutionEvent::Accepted {
                 client_order_id: c(1),
-                venue_order_id: None,
                 ts: t(2),
             },
             ExecutionEvent::Filled {
@@ -2016,7 +2013,6 @@ fn plain_lifecycle() -> Says {
         vec![
             ExecutionEvent::Accepted {
                 client_order_id: c(3),
-                venue_order_id: None,
                 ts: t(4),
             },
             ExecutionEvent::Cancelled {
@@ -2453,7 +2449,6 @@ fn the_record_hears_each_report_before_the_strategy_does() {
             Heard::Told(
                 ExecutionEvent::Accepted {
                     client_order_id: c1,
-                    venue_order_id: None,
                     ts: t2,
                 },
                 t2

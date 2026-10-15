@@ -279,18 +279,48 @@ pub enum FeeAsset {
     Base,
 }
 
-/// What happened to an order we sent.
+/// What happened to an order we sent, as a strategy is told it.
 ///
 /// Every variant quotes the [`ClientOrderId`], because that is the only
 /// identifier guaranteed to exist — see the module docs.
+///
+/// **Every field is one a simulator can produce exactly as a live venue does.**
+/// A strategy is told this and nothing else, and a field only a real venue
+/// could fill is a field by which a strategy could tell which venue it is
+/// wired to, which is a bug. What only a real venue knows travels beside the
+/// event, to the record alone, in a [`crate::report::OrderReport`]. The
+/// acceptance carried one such field, the venue's order id, until M8 slice (c)
+/// found it: the live translator filled it and the simulator left it empty.
+/// It is gone, and a compile-time check below keeps anything like it out:
+///
+/// ```compile_fail
+/// use quant_core::execution::{ClientOrderId, ExecutionEvent};
+/// use quant_core::time::Ts;
+/// let _ = ExecutionEvent::Accepted {
+///     client_order_id: ClientOrderId(1),
+///     venue_order_id: None,
+///     ts: Ts::from_nanos(1),
+/// };
+/// ```
+///
+/// while an acceptance a simulator can make is what remains:
+///
+/// ```
+/// use quant_core::execution::{ClientOrderId, ExecutionEvent};
+/// use quant_core::time::Ts;
+/// let _ = ExecutionEvent::Accepted {
+///     client_order_id: ClientOrderId(1),
+///     ts: Ts::from_nanos(1),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecutionEvent {
     /// The venue has the order and it is live.
+    ///
+    /// Not the venue's name for it: that is the record's, beside the event.
     Accepted {
         client_order_id: ClientOrderId,
-        /// Absent when the venue does not supply one, which is legal.
-        venue_order_id: Option<VenueOrderId>,
         ts: Ts,
     },
     /// The order was refused and does not exist.
@@ -363,6 +393,92 @@ impl ExecutionEvent {
             Self::Rejected { .. } | Self::Cancelled { .. } => true,
             Self::Filled { remaining, .. } => remaining.raw() == 0,
             Self::Accepted { .. } => false,
+        }
+    }
+}
+
+/// What a strategy may be told, closed by a compile error rather than a
+/// paragraph.
+///
+/// A type is `Modelled` when a simulator produces its values exactly as a live
+/// venue does, so a strategy reading one learns nothing about its wiring. The
+/// trait is private to this module, so nothing elsewhere can declare a type
+/// modelled; and [`strategy_may_see`] names every field of every
+/// [`ExecutionEvent`] variant, with no `..`, and requires each to be
+/// `Modelled`. A field added to an event therefore fails to compile until its
+/// type is argued into this list, here, where the argument is visible.
+///
+/// There is deliberately no `impl<T: Modelled> Modelled for Option<T>`: an
+/// optional field is how a venue's order id got in, absent in one world and
+/// present in the other.
+mod vocabulary {
+    pub(super) trait Modelled {}
+}
+
+use vocabulary::Modelled;
+
+impl Modelled for ClientOrderId {}
+impl Modelled for Ts {}
+impl Modelled for crate::fixed::Px {}
+impl Modelled for Qty {}
+impl Modelled for crate::fixed::Notional {}
+impl Modelled for RejectReason {}
+impl Modelled for FeeAsset {}
+impl Modelled for bool {}
+
+/// Checked when the crate compiles, never called.
+const _: fn(&ExecutionEvent) = strategy_may_see;
+
+/// Every field of every variant, each required to be [`Modelled`].
+fn strategy_may_see(event: &ExecutionEvent) {
+    const fn modelled<T: Modelled>(_: &T) {}
+    match event {
+        ExecutionEvent::Accepted {
+            client_order_id,
+            ts,
+        } => {
+            modelled(client_order_id);
+            modelled(ts);
+        }
+        ExecutionEvent::Rejected {
+            client_order_id,
+            reason,
+            ts,
+        } => {
+            modelled(client_order_id);
+            modelled(reason);
+            modelled(ts);
+        }
+        ExecutionEvent::Filled {
+            client_order_id,
+            fill:
+                Fill {
+                    px,
+                    qty,
+                    fee,
+                    is_maker,
+                    fee_asset,
+                },
+            remaining,
+            ts,
+        } => {
+            modelled(client_order_id);
+            modelled(px);
+            modelled(qty);
+            modelled(fee);
+            modelled(is_maker);
+            modelled(fee_asset);
+            modelled(remaining);
+            modelled(ts);
+        }
+        ExecutionEvent::Cancelled {
+            client_order_id,
+            remaining,
+            ts,
+        } => {
+            modelled(client_order_id);
+            modelled(remaining);
+            modelled(ts);
         }
     }
 }
@@ -466,8 +582,7 @@ mod tests {
         .is_terminal());
         assert!(!ExecutionEvent::Accepted {
             client_order_id: id,
-            venue_order_id: None,
-            ts,
+            ts
         }
         .is_terminal());
     }
@@ -481,7 +596,6 @@ mod tests {
         let events = [
             ExecutionEvent::Accepted {
                 client_order_id: id,
-                venue_order_id: None,
                 ts,
             },
             ExecutionEvent::Rejected {
