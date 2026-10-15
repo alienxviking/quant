@@ -2558,3 +2558,196 @@ fn a_report_about_an_order_the_engine_is_not_working_is_written_down_and_kept_fr
     );
     assert_eq!(engine.portfolio().fills(), 0, "but nothing was booked");
 }
+
+// --- M8.c: settle, which books what the venue still says and tells nobody ---
+
+/// Fills the first order it is sent, on its `on_poll`th poll, stamped `at`.
+///
+/// A live venue at shutdown: the market source has ended, and a fill for an
+/// order sent before it ended is still on its way.
+#[derive(Debug)]
+struct FillsLate {
+    on_poll: usize,
+    polls: usize,
+    at: Ts,
+    sent: Option<ClientOrderId>,
+}
+
+impl ExecutionVenue for FillsLate {
+    fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+        Ok(())
+    }
+
+    fn submit(&mut self, client_order_id: ClientOrderId, _r: &OrderRequest, _now: Ts) {
+        self.sent.get_or_insert(client_order_id);
+    }
+
+    fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
+
+    fn poll(&mut self, _now: Ts, out: &mut Vec<VenueReport>) {
+        self.polls += 1;
+        if self.polls == self.on_poll {
+            if let Some(client_order_id) = self.sent {
+                out.push(VenueReport::from(ExecutionEvent::Filled {
+                    client_order_id,
+                    fill: fill_of("1"),
+                    remaining: qty("0"),
+                    ts: self.at,
+                }));
+            }
+        }
+    }
+}
+
+#[test]
+fn settle_books_a_late_fill_and_tells_the_strategy_nothing() {
+    // The source has ended with an order still working, and its fill arrives
+    // two polls later. The fill is real money: it must be booked, journalled
+    // and tallied before the closing checkpoint, or the record ends short of
+    // the account. But the market the strategy trades on has ended, so the
+    // strategy is told nothing -- a backtest never delivers a report still in
+    // flight at the end of its data, and a strategy acting during the drain
+    // would leave decisions in the journal that no replay has.
+    let at = Ts::from_nanos(3_000_000_000);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00")]),
+        FillsLate {
+            on_poll: 3,
+            polls: 0,
+            at,
+            sent: None,
+        },
+        AllowAll,
+        Recorder::default(),
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    let stats = engine.run().expect("no source failure");
+    assert_eq!(stats.fills, 0, "nothing had arrived when the source ended");
+    assert_eq!(engine.working(), vec![ClientOrderId(1)]);
+
+    let settled: Vec<crate::Settled> = (0..3).map(|_| engine.settle()).collect();
+    assert_eq!(
+        settled,
+        vec![
+            crate::Settled {
+                delivered: 0,
+                working: vec![ClientOrderId(1)],
+            },
+            crate::Settled {
+                delivered: 1,
+                working: Vec::new(),
+            },
+            crate::Settled {
+                delivered: 0,
+                working: Vec::new(),
+            },
+        ]
+    );
+    let stats = engine.stats();
+    assert_eq!(stats.fills, 1);
+    assert_eq!(engine.portfolio().fills(), 1, "booked");
+    let fills: Vec<Heard> = seen
+        .lock()
+        .expect("witness")
+        .heard
+        .iter()
+        .filter(|h| matches!(h, Heard::Filled(..)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        fills,
+        vec![Heard::Filled(
+            ClientOrderId(1),
+            qty("1"),
+            None,
+            qty("0"),
+            at
+        )],
+        "written down once"
+    );
+    assert_eq!(
+        engine.strategy().executions,
+        Vec::new(),
+        "and the strategy was told nothing"
+    );
+    assert_eq!(
+        stats.last_ts,
+        Some(at),
+        "the period covered runs to the fill, so the closing checkpoint cannot land before it"
+    );
+}
+
+/// Raises doubt about the first order it is sent, on the poll after, and is
+/// not ready for anything while that order's outcome is unknown.
+#[derive(Debug, Default)]
+struct Doubts {
+    sent: Option<ClientOrderId>,
+    raised: bool,
+}
+
+impl ExecutionVenue for Doubts {
+    fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+        if self.raised {
+            Err(Unready::InDoubt)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn submit(&mut self, client_order_id: ClientOrderId, _r: &OrderRequest, _now: Ts) {
+        self.sent.get_or_insert(client_order_id);
+    }
+
+    fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
+
+    fn poll(&mut self, now: Ts, out: &mut Vec<VenueReport>) {
+        if let (Some(client_order_id), false) = (self.sent, self.raised) {
+            self.raised = true;
+            out.push(VenueReport::Notice(Notice::Doubt {
+                client_order_id,
+                change: quant_core::report::DoubtChange::Raised {
+                    cause: quant_core::report::DoubtCause::NoAnswer,
+                    said: None,
+                },
+                ts: now,
+            }));
+        }
+    }
+}
+
+#[test]
+fn an_order_in_doubt_is_still_working_when_the_run_ends() {
+    // An unknown outcome is not an event: the order stays in the ledger, the
+    // venue refuses new orders until it is settled, and at the end the drain
+    // names it as still working rather than pretending it ended. Slice (d)'s
+    // lookup is what will settle it; until then it is loud and stuck.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00"), trade(2, "100.00")]),
+        Doubts::default(),
+        AllowAll,
+        Greedy,
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    engine.run().expect("no source failure");
+
+    let t2 = meta(2).local_recv_ts;
+    let heard = seen.lock().expect("witness").heard.clone();
+    assert!(
+        heard.contains(&Heard::Refused(
+            ClientOrderId(2),
+            RejectReason::Venue,
+            crate::RefusedBy::Venue(Unready::InDoubt),
+            t2
+        )),
+        "the second order was refused while the first was in doubt: {heard:?}"
+    );
+    assert_eq!(
+        engine.settle().working,
+        vec![ClientOrderId(1)],
+        "and the first is still working when the run ends"
+    );
+}

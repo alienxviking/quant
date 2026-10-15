@@ -601,6 +601,46 @@ fn idle_wakes_change_nothing_against_a_simulated_venue() {
     );
 }
 
+#[test]
+fn settling_changes_nothing_against_a_simulated_venue() {
+    // `Engine::settle` exists for a live venue's last fills, and neither
+    // binary that runs the simulator calls it. Were one to, it must change
+    // nothing: it polls at a clock nothing has moved, so a report still in
+    // flight on inbound latency stays undelivered, as M4 decided -- flushing
+    // it would tell the record something the run could not have known.
+    let costs = quant_sim::Costs {
+        latency: quant_sim::Latency {
+            outbound: 0,
+            inbound: 3 * SECOND,
+        },
+        ..quant_sim::Costs::NONE
+    };
+    let mut engine = wire(Script::new(&choppy()), costs);
+    assert!(
+        engine.venue().stats().undelivered > 0,
+        "a report has to be in flight at the end, or settling has nothing to leave alone"
+    );
+    assert!(
+        !engine.working().is_empty(),
+        "and the engine has to still be working the order it is about"
+    );
+
+    let portfolio = engine.portfolio().clone();
+    let venue = engine.venue().stats();
+    let curve = engine.strategy().curve().points.clone();
+    let stats = engine.stats();
+    let working = engine.working();
+    for _ in 0..5 {
+        let settled = engine.settle();
+        assert_eq!(settled.delivered, 0, "nothing is due at this clock");
+        assert_eq!(settled.working, working);
+    }
+    assert_eq!(engine.portfolio(), &portfolio);
+    assert_eq!(engine.venue().stats(), venue);
+    assert_eq!(engine.strategy().curve().points, curve);
+    assert_eq!(engine.stats(), stats);
+}
+
 // --- M6: limits provably veto a misbehaving strategy ---
 //
 // The criterion says "provably, under test", so the misbehaving strategies are

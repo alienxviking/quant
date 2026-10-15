@@ -480,6 +480,42 @@ pub enum WriteAhead {
     Withhold,
 }
 
+/// How long the engine waits on the market before going to look at the venue.
+///
+/// Reached only when a source overrides `next_event_timeout`; a historical
+/// replay never idles, so no backtest number moves. 250 ms is chosen against
+/// what it costs on each side: a fill learned a quarter-second late is nothing
+/// to a strategy sampling on a 60-second grid, and four empty polls a second is
+/// nothing against a market peak of 694 messages a second.
+///
+/// Public because the live binary paces its [`Engine::settle`] loop on it, so
+/// that a drain at shutdown asks the venue no more often than a quiet market
+/// does.
+pub const IDLE_TICK: core::time::Duration = core::time::Duration::from_millis(250);
+
+/// What one [`Engine::settle`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    /// Reports the venue handed over on this call, notices included. Zero
+    /// means it had nothing to say yet, which is the binary's cue to wait.
+    pub delivered: usize,
+    /// Orders the engine is still working after it, lowest id first. Empty
+    /// means there is nothing left to wait for.
+    pub working: Vec<ClientOrderId>,
+}
+
+/// Who hears what a wake brings.
+///
+/// Private: the only wake that is not the strategy's is [`Engine::settle`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Audience {
+    /// The ordinary wake: the record hears everything, and the strategy is
+    /// told what happened to its orders and shown the market.
+    Strategy,
+    /// After the run: the record hears everything, and the strategy nothing.
+    RecordOnly,
+}
+
 /// The loop.
 pub struct Engine<S, V, R, K> {
     source: S,
@@ -594,16 +630,6 @@ where
         self
     }
 
-    /// How long the engine waits on the market before going to look at the
-    /// venue.
-    ///
-    /// Reached only when a source overrides `next_event_timeout`; a historical
-    /// replay never idles, so no backtest number moves. 250 ms is chosen against
-    /// what it costs on each side: a fill learned a quarter-second late is
-    /// nothing to a strategy sampling on a 60-second grid, and four empty polls
-    /// a second is nothing against a market peak of 694 messages a second.
-    const IDLE_TICK: core::time::Duration = core::time::Duration::from_millis(250);
-
     /// Run to the end of the source.
     ///
     /// Wakes on whichever input speaks: a market event, or -- after a quarter
@@ -615,9 +641,9 @@ where
     /// as the end of the stream — see [`EventSource`] for why that distinction
     /// is the difference between a short backtest and a wrong one.
     pub fn run(&mut self) -> Result<EngineStats, SourceError> {
-        while let Some(item) = self.source.next_event_timeout(Self::IDLE_TICK) {
+        while let Some(item) = self.source.next_event_timeout(IDLE_TICK) {
             match item? {
-                Wake::Event(event) => self.dispatch(Some(&event)),
+                Wake::Event(event) => self.dispatch(Some(&event), Audience::Strategy),
                 // Nothing from the market -- but the venue may still have
                 // spoken, and before M8.a nothing could ask it. `poll` was
                 // reachable only from inside a market event's handling, so a
@@ -625,11 +651,47 @@ where
                 // undelivered until data resumed.
                 Wake::Idle => {
                     self.ledger.stats.idle_wakes = self.ledger.stats.idle_wakes.saturating_add(1);
-                    self.dispatch(None);
+                    self.dispatch(None, Audience::Strategy);
                 }
             }
         }
         Ok(self.ledger.stats)
+    }
+
+    /// After [`Self::run`]: one wake on which only the venue speaks. Whatever
+    /// it hands over is booked, written down and tallied by the risk layer,
+    /// exactly as on any wake, and **no strategy method is called**.
+    ///
+    /// A live run's last orders can still be working when the market source
+    /// ends, and their fills are real money that the record must hold before
+    /// the closing checkpoint is written. But the strategy is not told: the
+    /// market it trades on has ended, a backtest never delivers a report still
+    /// in flight at the end of its data, and a strategy that could act during
+    /// the drain would leave decisions in the journal that no replay has.
+    ///
+    /// One wake per call, with no clock read and no waiting, so a test drives
+    /// it deterministically. The live binary loops on it with a deadline of
+    /// its own -- longer than the order client's timeout, which is above the
+    /// venue's ten seconds -- stopping when nothing is working, and pausing
+    /// [`IDLE_TICK`] when a call delivered nothing. Neither backtest nor paper
+    /// calls it; against the simulator it would poll at a clock nothing has
+    /// moved, and a report still in flight would stay undelivered, as M4
+    /// decided it should.
+    pub fn settle(&mut self) -> Settled {
+        self.dispatch(None, Audience::RecordOnly);
+        Settled {
+            delivered: self.reports.len(),
+            working: self.working(),
+        }
+    }
+
+    /// Orders the engine is still working, lowest id first: sent, and not yet
+    /// heard to have ended.
+    #[must_use]
+    pub fn working(&self) -> Vec<ClientOrderId> {
+        let mut working: Vec<ClientOrderId> = self.ledger.orders.keys().copied().collect();
+        working.sort_unstable();
+        working
     }
 
     /// Move the clock forward, never back.
@@ -699,7 +761,11 @@ where
     /// One function rather than two, because the step order is the most
     /// load-bearing thing in this engine and splitting it would put half of it
     /// somewhere a reader has to go and find.
-    fn dispatch(&mut self, event: Option<&MarketEvent>) {
+    ///
+    /// `audience` says whether the strategy is part of this wake. Under
+    /// [`Audience::RecordOnly`] everything is booked and written down exactly
+    /// as it would be otherwise, and no strategy method is called.
+    fn dispatch(&mut self, event: Option<&MarketEvent>, audience: Audience) {
         macro_rules! ctx {
             () => {
                 Context::new(
@@ -818,6 +884,9 @@ where
             let execution = report.event();
             if execution.is_terminal() {
                 self.ledger.orders.remove(&execution.client_order_id());
+            }
+            if audience == Audience::RecordOnly {
+                continue;
             }
             let mut ctx = ctx!();
             self.strategy.on_execution(&execution, &mut ctx);
