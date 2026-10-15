@@ -63,7 +63,9 @@
 use std::time::Duration;
 
 use crate::credentials::Credentials;
-use crate::orders::{Attempt, CancelOrder, CancelReply, NewOrder, Placement, ORDER_PATH};
+use crate::orders::{
+    Attempt, CancelOrder, CancelReply, FilterName, NewOrder, Placement, ORDER_PATH, ORDER_TEST_PATH,
+};
 use crate::rest::SnapshotError;
 
 /// The `recvWindow` sent with every signed request, in milliseconds.
@@ -335,17 +337,65 @@ pub enum NotReady {
     /// an order with *"This account may not place or cancel orders"*, for which
     /// the venue's remedy is its customer support (errors.md:388). A key's own
     /// permission to `TRADE` is a separate setting, in API Management
-    /// (rest-api.md:194-196), and the `USER_DATA` request this check makes
-    /// cannot test it: see [`TradeClient::check_ready`]. Either way this stops
+    /// (rest-api.md:194-196), which the `USER_DATA` request
+    /// [`TradeClient::check_ready`] makes cannot test and
+    /// [`TradeClient::check_trade_permission`] does. Either way this stops
     /// here rather than finding out from an order.
     CannotTrade,
     /// The venue answered 200, but not with the account document this reads.
     /// Which way it was not is said; what it held is not, because it lists the
     /// account's balances.
     UnreadableAccount(AccountFault),
+    /// The venue refused this API key a `TRADE` request: HTTP 401 whatever
+    /// the body says, or `-2015`, *"Invalid API-key, IP, or permissions for
+    /// action"* (errors.md:341-342), under any status but those that decide
+    /// first (see [`Self::BadCredentials`]). The key may not trade: trading is
+    /// not enabled for it in API Management, where a key cannot `TRADE` until
+    /// it is (rest-api.md:194-196), or its IP restriction leaves this address
+    /// out. From [`TradeClient::check_trade_permission`].
+    KeyCannotTrade {
+        status: u16,
+        venue: Option<VenueError>,
+    },
+    /// The venue judged the trade probe and refused it for a reason other
+    /// than one of its numbers: `-1013` or `-2010` with any message but a
+    /// filter failure (errors.md:367-413). The signature and the key's
+    /// permission to trade were accepted, or the order would not have been
+    /// judged, but the venue named a reason it refuses an order, and an
+    /// order of the run's may meet it too. From
+    /// [`TradeClient::check_trade_permission`].
+    ProbeRefused { status: u16, venue: VenueError },
+    /// The venue answered the trade probe with a 2xx, and not with the JSON
+    /// object documented for it (rest-api.md:2349-2353).
+    UnreadableOrderTest { status: u16 },
     /// We could not reach the venue at all.
     Unreachable(String),
 }
+
+/// What `POST /api/v3/order/test` showed about this API key, when it showed
+/// that the key may trade. From [`TradeClient::check_trade_permission`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TradePermission {
+    /// The venue validated the probe order and found nothing to refuse.
+    Granted,
+    /// The venue refused the probe on one of its numbers, *"Filter failure:
+    /// NAME"* (errors.md:425-446). Still proof the key may trade
+    /// ([`WHY_A_VERDICT_PROVES_PERMISSION`]): the numbers are the probe's,
+    /// not the run's.
+    GrantedButFiltered {
+        status: u16,
+        filter: FilterName,
+        venue: VenueError,
+    },
+}
+
+/// Why a verdict on the trade probe's order, a refusal included, proves the
+/// signature and the key's permission to trade, said the same way wherever
+/// one is reported. [`TradeClient::check_trade_permission`] gives the
+/// documentation behind it.
+pub const WHY_A_VERDICT_PROVES_PERMISSION: &str = "the venue judges an order only for a \
+     request whose signature and key it has accepted for trading, and refuses one that fails \
+     either with a code of its own, -1022 or -2015";
 
 /// The venue's own account of a refusal: its error document,
 /// `{"code": -2015, "msg": "..."}` (errors.md:3-10).
@@ -440,6 +490,42 @@ fn fmt_rate_limited(
     }
 }
 
+/// [`NotReady::TooFewClockReadings`], said: how many came back, how many of
+/// those were unusable and why, and why one is not enough when one did come
+/// back.
+fn fmt_too_few_readings(
+    f: &mut core::fmt::Formatter<'_>,
+    attempts: usize,
+    came_back: usize,
+    usable: usize,
+) -> core::fmt::Result {
+    write!(
+        f,
+        "{came_back} of {attempts} readings of the venue's clock came back"
+    )?;
+    if usable < came_back {
+        write!(
+            f,
+            ", {} with a round trip that ran backwards (the host clock stepped while it was being \
+             read)",
+            came_back.saturating_sub(usable)
+        )?;
+    }
+    write!(
+        f,
+        ", and this will not judge the clock on fewer than {MIN_CLOCK_READINGS} usable ones"
+    )?;
+    if usable > 0 {
+        // Why not judge on what there is: the question a reading that did
+        // come back invites.
+        f.write_str(
+            ": a lone reading may be the cold one, its outbound leg carrying the connection's \
+             DNS, TCP and TLS, which no midpoint corrects",
+        )?;
+    }
+    Ok(())
+}
+
 impl core::fmt::Display for NotReady {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -458,34 +544,7 @@ impl core::fmt::Display for NotReady {
                 attempts,
                 came_back,
                 usable,
-            } => {
-                write!(
-                    f,
-                    "{came_back} of {attempts} readings of the venue's clock came back"
-                )?;
-                if usable < came_back {
-                    write!(
-                        f,
-                        ", {} with a round trip that ran backwards (the host clock stepped while \
-                         it was being read)",
-                        came_back.saturating_sub(*usable)
-                    )?;
-                }
-                write!(
-                    f,
-                    ", and this will not judge the clock on fewer than {MIN_CLOCK_READINGS} usable \
-                     ones"
-                )?;
-                if *usable > 0 {
-                    // Why not judge on what there is: the question a reading
-                    // that did come back invites.
-                    f.write_str(
-                        ": a lone reading may be the cold one, its outbound leg carrying the \
-                         connection's DNS, TCP and TLS, which no midpoint corrects",
-                    )?;
-                }
-                Ok(())
-            }
+            } => fmt_too_few_readings(f, *attempts, *came_back, *usable),
             Self::BadCredentials { status, venue } => write!(
                 f,
                 "the venue refused the credentials (HTTP {status}{}). The API key, the signature \
@@ -530,6 +589,27 @@ impl core::fmt::Display for NotReady {
                 f,
                 "the venue answered 200, but {fault}. Nothing of the body is printed: it lists \
                  the account's balances"
+            ),
+            Self::KeyCannotTrade { status, venue } => write!(
+                f,
+                "the venue refused this API key a TRADE request (HTTP {status}{}), so the key \
+                 may not trade. Either trading is not enabled for it in Binance's API \
+                 Management, where a key cannot TRADE until it is, or its IP restriction leaves \
+                 this address out",
+                Said(venue.as_ref()),
+            ),
+            Self::ProbeRefused { status, venue } => write!(
+                f,
+                "the venue refused the trade probe for a reason other than its numbers (HTTP \
+                 {status}{}). That proves the signature and this key's permission to trade, \
+                 because {WHY_A_VERDICT_PROVES_PERMISSION}; but an order of the run's may meet \
+                 the same refusal",
+                Said(Some(venue)),
+            ),
+            Self::UnreadableOrderTest { status } => write!(
+                f,
+                "the venue answered the trade probe with HTTP {status}, but not with the JSON \
+                 object documented for it, so whether this key may trade is not shown"
             ),
             Self::Unreachable(why) => write!(f, "could not reach the venue: {why}"),
         }
@@ -774,9 +854,7 @@ impl TradeClient {
     /// key without that permission passes. Nor does the venue define
     /// `canTrade`: its documentation shows the field and says nothing of it.
     /// Only a request whose security type is `TRADE` tests the key's
-    /// permission, and a later pull request adds one,
-    /// `POST /api/v3/order/test`, which validates an order without sending it
-    /// to the matching engine, at weight 1 (rest-api.md:2321-2333).
+    /// permission, and [`Self::check_trade_permission`] makes one.
     ///
     /// Its body also lists the account's balances (rest-api.md:4215-4226).
     /// They are read for `canTrade` and nothing else, and nothing here ever
@@ -814,6 +892,61 @@ impl TradeClient {
             ));
         }
         account_can_trade(&reply.body)
+    }
+
+    /// Check that this API key may trade, by sending `probe` to
+    /// `POST /api/v3/order/test`, which *"Creates and validates a new order but
+    /// does not send it into the matching engine"* (rest-api.md:2321-2326).
+    ///
+    /// Its security type is `TRADE`, which an API key lacks until trading is
+    /// enabled for it in API Management (rest-api.md:186-196), so it tests
+    /// what [`Self::check_ready`]'s `USER_DATA` request cannot. It weighs 1
+    /// (rest-api.md:2328-2333) and places nothing. It goes to
+    /// [`ORDER_TEST_PATH`] and nowhere else: this takes no path, and the
+    /// probe's parameters are percent-encoded, so nothing in them can move the
+    /// request to `/api/v3/order`. Stamped as `check_ready` stamps, the host's
+    /// clock less `offset_ms`, and sent once.
+    ///
+    /// What the answer says:
+    ///
+    /// - **A 2xx with a JSON object**, `{}` as documented
+    ///   (rest-api.md:2349-2353): the key may trade.
+    /// - **A 401, or `-2015`**: it may not ([`NotReady::KeyCannotTrade`]).
+    /// - **A refusal of the order itself**, under `-1013`, the API refusing a
+    ///   request before the matching engine, or `-2010`, an order refused
+    ///   (errors.md:36-38, 329-330, 367-368): the venue judged the probe,
+    ///   which proves the signature and the key's permission were accepted
+    ///   ([`WHY_A_VERDICT_PROVES_PERMISSION`]). The documentation makes a
+    ///   valid key and signature the condition of a `TRADE` endpoint at all
+    ///   (rest-api.md:186-189, 205-207), names validating the order as this
+    ///   endpoint's work (rest-api.md:2326), and answers a key or signature
+    ///   that fails with its own code, -2015 or -1022 (errors.md:57-58,
+    ///   341-342), not with a verdict on the order. It does not spell out the order of the venue's
+    ///   checks, so that is a reading, and the testnet run is where it is
+    ///   confirmed. A filter failure is [`TradePermission::GrantedButFiltered`]:
+    ///   the probe's numbers are the caller's, not the run's, so a filter
+    ///   refusing them says nothing about the run. Any other reason is
+    ///   [`NotReady::ProbeRefused`], because an order of the run's may meet it.
+    /// - **Anything else** as [`Self::check_ready`] reports a refusal: a
+    ///   firewall, a rate limit or a ban, the venue's own failure, which decide
+    ///   first whatever code comes with them; a bad signature or key format;
+    ///   or a refusal the venue explains for itself.
+    ///
+    /// # Errors
+    ///
+    /// [`NotReady`], as above. None carries the URL or the signature; the
+    /// venue's own code and message are kept.
+    pub async fn check_trade_permission(
+        &self,
+        probe: &NewOrder,
+        offset_ms: i64,
+    ) -> Result<TradePermission, NotReady> {
+        let now = chrono_millis().saturating_sub(offset_ms);
+        let reply = self
+            .send_signed(reqwest::Method::POST, ORDER_TEST_PATH, probe.query(), now)
+            .await
+            .map_err(|e| NotReady::Unreachable(e.to_string()))?;
+        read_order_test(reply.status.as_u16(), reply.retry_after, &reply.body)
     }
 }
 
@@ -908,7 +1041,8 @@ fn classify_refusal(status: u16, retry_after: Option<String>, body: &[u8]) -> No
 ///
 /// What the account reports, which the venue does not define, and not whether
 /// this API key may trade: a `USER_DATA` request cannot test that, as
-/// [`TradeClient::check_ready`] says.
+/// [`TradeClient::check_ready`] says, and [`TradeClient::check_trade_permission`]
+/// does.
 ///
 /// The body is read as JSON for that one field. No error carries any of it: it
 /// lists the account's balances.
@@ -920,6 +1054,42 @@ fn account_can_trade(body: &[u8]) -> Result<(), NotReady> {
         Some(serde_json::Value::Bool(false)) => Err(NotReady::CannotTrade),
         Some(_) => Err(NotReady::UnreadableAccount(AccountFault::CanTradeNotBool)),
         None => Err(NotReady::UnreadableAccount(AccountFault::NoCanTrade)),
+    }
+}
+
+/// What an answer to `POST /api/v3/order/test` says about the key, sorted as
+/// [`TradeClient::check_trade_permission`] describes.
+fn read_order_test(
+    status: u16,
+    retry_after: Option<String>,
+    body: &[u8],
+) -> Result<TradePermission, NotReady> {
+    if (200..=299).contains(&status) {
+        return match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(serde_json::Value::Object(_)) => Ok(TradePermission::Granted),
+            _ => Err(NotReady::UnreadableOrderTest { status }),
+        };
+    }
+    match (status, VenueError::parse(body)) {
+        // As for any signed request: each says the request was never judged,
+        // whatever code comes with it.
+        (403 | 418 | 429 | 500..=599, _) => Err(classify_refusal(status, retry_after, body)),
+        (401, venue) => Err(NotReady::KeyCannotTrade { status, venue }),
+        (_, Some(venue)) if venue.code == -2015 => Err(NotReady::KeyCannotTrade {
+            status,
+            venue: Some(venue),
+        }),
+        (_, Some(venue)) if matches!(venue.code, -1013 | -2010) => {
+            match FilterName::in_message(&venue.msg) {
+                Some(filter) => Ok(TradePermission::GrantedButFiltered {
+                    status,
+                    filter,
+                    venue,
+                }),
+                None => Err(NotReady::ProbeRefused { status, venue }),
+            }
+        }
+        _ => Err(classify_refusal(status, retry_after, body)),
     }
 }
 
@@ -1001,11 +1171,15 @@ fn redact_signature(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        account_can_trade, classify_refusal, midpoint_offset_ms, redact_signature, AccountFault,
-        ClockSample, NotReady, TradeClient, VenueError, MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
+        account_can_trade, classify_refusal, midpoint_offset_ms, read_order_test, redact_signature,
+        AccountFault, ClockSample, NotReady, TradeClient, TradePermission, VenueError,
+        MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS, WHY_A_VERDICT_PROVES_PERMISSION,
     };
     use crate::credentials::fixture;
-    use crate::orders::{CancelOrder, CancelReply, NewOrder, Placement, WhyUnknown};
+    use crate::orders::{
+        CancelOrder, CancelReply, FilterName, NewOrder, Placement, WhyUnknown, ORDER_PATH,
+        ORDER_TEST_PATH,
+    };
     use crate::user_data::RunTag;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
@@ -1759,6 +1933,14 @@ mod tests {
                 status: 400,
                 venue: venue.clone(),
             },
+            NotReady::KeyCannotTrade {
+                status: 401,
+                venue: venue.clone(),
+            },
+            NotReady::ProbeRefused {
+                status: 400,
+                venue: venue.clone().expect("a venue error"),
+            },
         ]
         .iter()
         .map(ToString::to_string)
@@ -2253,5 +2435,269 @@ mod tests {
             ),
             "{placement:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_trade_probe_goes_to_the_test_endpoint_and_nowhere_else() {
+        // It must place nothing. The path is pinned as written out here
+        // (rest-api.md:2323), not read back from the constant, and it is not
+        // the path that places an order.
+        assert_eq!(ORDER_TEST_PATH, "/api/v3/order/test");
+        assert_ne!(ORDER_TEST_PATH, ORDER_PATH);
+        // And on the wire, whatever the base's spelling and whatever the
+        // probe's symbol holds: the method takes no path, and the symbol is
+        // percent-encoded, so neither can move the probe to /api/v3/order.
+        for (suffix, symbol) in [
+            ("", "BTCUSDT"),
+            ("/", "BTCUSDT"),
+            ("//", "BTCUSDT"),
+            ("", "/../../../api/v3/order?symbol=BTCUSDT#"),
+        ] {
+            let probe = order_on(symbol);
+            let venue = TestVenue::start(vec![Reply::Bytes(http("200 OK", "", "{}"))]);
+            let answer = client_at(&format!("{}{suffix}", venue.base))
+                .check_trade_permission(&probe, 0)
+                .await;
+            let requests = venue.stop();
+            assert_eq!(requests.len(), 1, "{requests:#?}");
+            let line = requests[0].lines().next().unwrap_or_default();
+            let path = line
+                .strip_prefix("POST ")
+                .and_then(|rest| rest.split_once('?'))
+                .map(|(path, _)| path);
+            assert_eq!(path, Some("/api/v3/order/test"), "{suffix:?} {symbol:?}");
+            let payload = signed_on_the_wire(&requests[0]);
+            assert!(
+                payload.starts_with(&format!("{}&timestamp=", probe.query())),
+                "{payload}"
+            );
+            assert_eq!(answer, Ok(TradePermission::Granted), "{symbol:?}");
+        }
+    }
+
+    /// The venue's error document, as sent.
+    fn error_doc(code: i64, msg: &str) -> String {
+        format!(r#"{{"code":{code},"msg":"{msg}"}}"#)
+    }
+
+    /// The venue's error document, as read back.
+    fn error_read(code: i64, msg: &str) -> VenueError {
+        VenueError {
+            code,
+            msg: msg.to_owned(),
+        }
+    }
+
+    /// -2015's message (errors.md:342).
+    const KEY_REFUSED: &str = "Invalid API-key, IP, or permissions for action.";
+
+    /// A filter failure's (errors.md:433).
+    const NOTIONAL: &str = "Filter failure: NOTIONAL";
+
+    #[test]
+    fn the_trade_probe_reads_the_keys_permission_off_the_answer() {
+        let (doc, read, key, notional) = (error_doc, error_read, KEY_REFUSED, NOTIONAL);
+        // The venue's own messages for these codes.
+        let lot = "Filter failure: LOT_SIZE"; // errors.md:431
+        let closed = "Market is closed."; // errors.md:376
+        let disabled = "This account may not place or cancel orders."; // errors.md:388
+        let duplicate = "Duplicate order sent."; // errors.md:375
+
+        let cannot = |status, venue| Err(NotReady::KeyCannotTrade { status, venue });
+        let filtered = |filter, code, msg| {
+            Ok(TradePermission::GrantedButFiltered {
+                status: 400,
+                filter,
+                venue: read(code, msg),
+            })
+        };
+        let probe_refused = |code, msg| {
+            Err(NotReady::ProbeRefused {
+                status: 400,
+                venue: read(code, msg),
+            })
+        };
+        let unreadable = Err(NotReady::UnreadableOrderTest { status: 200 });
+        let cases: [(u16, String, Result<TradePermission, NotReady>); 11] = [
+            // Validated, and nothing to refuse (rest-api.md:2349-2353).
+            (200, "{}".to_owned(), Ok(TradePermission::Granted)),
+            // A 2xx that is not the venue's answer shows nothing either way.
+            (200, "<html>Sign in".to_owned(), unreadable.clone()),
+            (200, "[]".to_owned(), unreadable),
+            // The key may not trade: 401 whatever the body says, and -2015
+            // under any status that does not decide first.
+            (401, doc(-2015, key), cannot(401, Some(read(-2015, key)))),
+            (401, String::new(), cannot(401, None)),
+            (400, doc(-2015, key), cannot(400, Some(read(-2015, key)))),
+            // A verdict on the probe's numbers: the key may trade.
+            (
+                400,
+                doc(-1013, notional),
+                filtered(FilterName::Notional, -1013, notional),
+            ),
+            (
+                400,
+                doc(-2010, lot),
+                filtered(FilterName::LotSize, -2010, lot),
+            ),
+            // A verdict for any other reason: the key may trade, and the run
+            // may meet the same refusal.
+            (400, doc(-1013, closed), probe_refused(-1013, closed)),
+            (400, doc(-2010, disabled), probe_refused(-2010, disabled)),
+            (400, doc(-1013, duplicate), probe_refused(-1013, duplicate)),
+        ];
+        for (status, body, expected) in cases {
+            assert_eq!(
+                read_order_test(status, None, body.as_bytes()),
+                expected,
+                "{status} {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trade_probe_answer_that_settles_nothing_is_reported_as_check_ready_reports_it() {
+        let (doc, read, key, notional) = (error_doc, error_read, KEY_REFUSED, NOTIONAL);
+        let signature = "Signature for this request is not valid."; // -1022, errors.md:58
+        let stale = "Timestamp for this request is outside of the recvWindow."; // -1021, errors.md:54
+        let missing = "Mandatory parameter 'quantity' was not sent, was empty/null, or malformed."; // -1102, errors.md:83
+        let cases: [(u16, String, NotReady); 6] = [
+            // Never judged at all, whatever code comes with it: a -2015 or a
+            // filter failure here says nothing about the key.
+            (
+                403,
+                doc(-2015, key),
+                NotReady::Firewall {
+                    venue: Some(read(-2015, key)),
+                },
+            ),
+            (
+                429,
+                doc(-1013, notional),
+                NotReady::RateLimited {
+                    status: 429,
+                    retry_after: None,
+                    venue: Some(read(-1013, notional)),
+                },
+            ),
+            (
+                503,
+                String::new(),
+                NotReady::VenueFailure {
+                    status: 503,
+                    venue: None,
+                },
+            ),
+            // The rest, as check_ready reports a refusal: a bad signature,
+            // a stale stamp, and a request the venue could not read, which
+            // here would mean the encoder's order is not one it takes.
+            (
+                400,
+                doc(-1022, signature),
+                NotReady::BadCredentials {
+                    status: 400,
+                    venue: Some(read(-1022, signature)),
+                },
+            ),
+            (
+                400,
+                doc(-1021, stale),
+                NotReady::Refused {
+                    status: 400,
+                    venue: Some(read(-1021, stale)),
+                },
+            ),
+            (
+                400,
+                doc(-1102, missing),
+                NotReady::Refused {
+                    status: 400,
+                    venue: Some(read(-1102, missing)),
+                },
+            ),
+        ];
+        for (status, body, expected) in cases {
+            assert_eq!(
+                read_order_test(status, None, body.as_bytes()),
+                Err(expected),
+                "{status} {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_trade_probe_is_read_with_its_status_header_and_body() {
+        // Through the client, not only the reader: the 401 with -2015 the venue
+        // pairs (web-socket-api.md:1324-1327), and a rate limit's Retry-After.
+        let key = r#"{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}"#;
+        let venue = TestVenue::start(vec![Reply::Bytes(http("401 Unauthorized", "", key))]);
+        let answer = client_at(&venue.base)
+            .check_trade_permission(&order_on("BTCUSDT"), 0)
+            .await;
+        venue.stop();
+        assert_eq!(
+            answer,
+            Err(NotReady::KeyCannotTrade {
+                status: 401,
+                venue: Some(VenueError {
+                    code: -2015,
+                    msg: "Invalid API-key, IP, or permissions for action.".to_owned(),
+                }),
+            })
+        );
+
+        let venue = TestVenue::start(vec![Reply::Bytes(http(
+            "429 Too Many Requests",
+            "Retry-After: 37\r\n",
+            "",
+        ))]);
+        let answer = client_at(&venue.base)
+            .check_trade_permission(&order_on("BTCUSDT"), 0)
+            .await;
+        venue.stop();
+        assert_eq!(
+            answer,
+            Err(NotReady::RateLimited {
+                status: 429,
+                retry_after: Some("37".to_owned()),
+                venue: None,
+            })
+        );
+    }
+
+    #[test]
+    fn what_the_trade_probe_says_names_the_remedy_and_why_a_refusal_proves_permission() {
+        let said = NotReady::KeyCannotTrade {
+            status: 401,
+            venue: Some(VenueError {
+                code: -2015,
+                msg: "Invalid API-key, IP, or permissions for action.".to_owned(),
+            }),
+        }
+        .to_string();
+        for needle in [
+            "refused this API key a TRADE request",
+            "(HTTP 401, code -2015: Invalid API-key, IP, or permissions for action.)",
+            "API Management",
+            "IP restriction",
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
+        let said = NotReady::ProbeRefused {
+            status: 400,
+            venue: VenueError {
+                code: -1013,
+                msg: "Market is closed.".to_owned(),
+            },
+        }
+        .to_string();
+        for needle in [
+            "(HTTP 400, code -1013: Market is closed.)",
+            "proves the signature and this key's permission to trade",
+            WHY_A_VERDICT_PROVES_PERMISSION,
+            "an order of the run's may meet the same refusal",
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
     }
 }
