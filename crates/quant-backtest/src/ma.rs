@@ -67,9 +67,10 @@
 //! # Why `qty` needs more than the minimum notional
 //!
 //! Whole lots satisfy the lot rule, and a venue has others. Where the fee is
-//! taken in the base, the exit is smaller than the entry by that fee rounded
-//! up to a whole lot -- one lot wherever the fee is no bigger than a lot, as
-//! at 0.001 BTC: 0.00099 out against 0.001 in. And an exit follows a
+//! taken in the base, an exit can be smaller than the entry by that fee
+//! rounded up to a whole lot -- one lot wherever the fee is no bigger than a
+//! lot, as at 0.001 BTC: 0.00099 out against 0.001 in -- whenever no dust
+//! left by an earlier exit makes up the difference. And an exit follows a
 //! down-cross, so it is usually sold lower than the entry was bought. A `qty`
 //! that clears the venue's `min_notional` by less than those two together
 //! leaves an exit under it, which the venue refuses.

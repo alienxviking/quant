@@ -140,10 +140,12 @@ impl Default for FeeSchedule {
 /// USDT pays in BTC and holds a fraction less than it bought, and a seller pays
 /// in USDT. Equity comes out the same either way but for rounding, which is how
 /// the simplification went unnoticed for four milestones. Where the fee lands
-/// does not: `MaCrossover` exits by selling what it holds rounded down to the lot,
-/// so after a fee taken in the base it sells a lot less than after one taken in
-/// the quote. A model charging the quote predicts every such exit a lot bigger
-/// than the one a spot venue is sent.
+/// does not. `MaCrossover` exits by selling what it holds rounded down to the
+/// lot, so with fees taken in the base an exit can be a lot smaller than the
+/// entry, and the dust it leaves decides the size of the next. Replaying M5's
+/// fortnight that way, 42 of its 412 exits sold 0.00099 rather than 0.001. A
+/// model charging the quote sells 0.001 every time, and gets each of those
+/// wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FeeIn {
     /// Every fee in the quote. The default, because every published result in

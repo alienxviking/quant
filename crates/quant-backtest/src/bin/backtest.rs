@@ -21,12 +21,13 @@
 //! as a spot venue does: a buy's in the base, so the position arrives a
 //! fraction smaller and the cash pays the gross alone, and a sell's in the
 //! quote. It is the setting the model replay for M8's criteria B and C runs
-//! with (`docs/live-run.md` §4). Live, the exit after a buy sells what the fee
-//! left, a lot less than `--qty`, and a model charging the quote would predict
-//! every exit a lot bigger than the one sent. Off by default (`--fee-asset
-//! quote`), so every result computed before it, M4's and M5's among them,
-//! still reproduces. `--realistic` says nothing about the asset and leaves
-//! whatever `--fee-asset` set, wherever on the line either of them appears.
+//! with (`docs/live-run.md` §4). Live, an exit sells what the fees and the last
+//! exit's dust left, rounded down to the lot, and a model charging the quote
+//! cannot predict that: replaying M5's fortnight, 42 of its 412 exits come out
+//! a lot smaller than `--qty`. Off by default (`--fee-asset quote`), so every
+//! result computed before it, M4's and M5's among them, still reproduces.
+//! `--realistic` says nothing about the asset and leaves whatever
+//! `--fee-asset` set, wherever on the line either of them appears.
 //!
 //! **Limits are off by default too, for a second reason on top of that one.**
 //! M5's criterion compares a paper session against a backtest over the same
@@ -318,7 +319,7 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
     // produces a confidently wrong number, which is the exact failure this
     // milestone exists to prevent. Asking the thing that did the work makes the
     // two impossible to disagree -- and that includes which asset the fees
-    // were taken in, which decides the size of every exit.
+    // were taken in, which changes the size of the exits.
     let costs = engine.venue().costs();
     println!(
         "costs     fee maker {} taker {} taken {}, latency {}ms out / {}ms in, adverse {}",

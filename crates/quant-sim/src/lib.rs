@@ -35,11 +35,12 @@
 //!
 //! **A fee is taken in the quote unless [`Costs`] says otherwise.** A spot venue
 //! takes a buy's fee out of the base it bought, so the position arrives a
-//! fraction smaller and the cash is not touched; [`FeeIn::Received`] charges
-//! that way. [`FeeIn::Quote`], the default, charges every fill in the quote, as
-//! every result before M8 was computed. Whichever it is, the venue's own fee
-//! total is valued in the quote through [`Fill::fee_in_quote`], the conversion
-//! the portfolio uses, so the two totals remain two counts of one quantity.
+//! fraction smaller and the cash pays the gross alone; [`FeeIn::Received`]
+//! charges that way. [`FeeIn::Quote`], the default, charges every fill in the
+//! quote, as every result before M8 was computed. Whichever it is, the venue's
+//! own fee total is valued in the quote through [`Fill::fee_in_quote`], the
+//! conversion the portfolio uses, so the two totals remain two counts of one
+//! quantity.
 //!
 //! **An order is invisible to the market.** Our resting order does not appear in
 //! the reconstructed book and nobody reacts to it. True enough at sizes that are

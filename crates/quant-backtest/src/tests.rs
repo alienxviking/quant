@@ -1376,19 +1376,9 @@ fn spot_fees() -> quant_sim::Costs {
     }
 }
 
-#[test]
-fn a_crossover_under_fees_in_the_asset_received_exits_the_floored_position() {
-    // What slice (e)'s model replay needs, through the simulator's own option
-    // rather than a wrapper rewriting its fills. Ten basis points of a 0.001
-    // buy is 0.000001 of the base, so 0.000999 arrives. The down-cross sells
-    // the 99 whole lots of it, 0.00099 -- what live sends, where a model
-    // charging the quote would have sold 0.001 -- and leaves 0.000009 of dust,
-    // which the next up-cross treats as flat and enters over.
-    let mut steps = up_then_down();
-    // From the bottom at 85, rise far enough to cross back up.
-    for mid in [88, 95, 104] {
-        steps.push(Step::Book(mid));
-    }
+/// The suite's crossover at 0.001, against the simulator charging
+/// [`spot_fees`] and enforcing the lot, run to the end of `steps`.
+fn run_told(steps: &[Step]) -> Engine<Script, Told, AllowAll, Recorded<MaCrossover>> {
     let instrument = instrument();
     let rules = definition();
     let strategy = Recorded::new(
@@ -1418,8 +1408,26 @@ fn a_crossover_under_fees_in_the_asset_received_exits_the_floored_position() {
         ),
         sent: Vec::new(),
     };
-    let mut engine = Engine::new(Script::new(&steps), venue, AllowAll, strategy, CASH);
+    let mut engine = Engine::new(Script::new(steps), venue, AllowAll, strategy, CASH);
     engine.run().expect("the script cannot fail");
+    engine
+}
+
+#[test]
+fn a_crossover_under_fees_in_the_asset_received_exits_the_floored_position() {
+    // What slice (e)'s model replay needs, through the simulator's own option
+    // rather than a wrapper rewriting its fills. Ten basis points of a 0.001
+    // buy is 0.000001 of the base, so 0.000999 arrives. The down-cross sells
+    // the 99 whole lots of it, 0.00099 -- what live sends, where a model
+    // charging the quote would have sold 0.001 -- and leaves 0.000009 of dust,
+    // which the next up-cross treats as flat and enters over.
+    let mut steps = up_then_down();
+    // From the bottom at 85, rise far enough to cross back up.
+    for mid in [88, 95, 104] {
+        steps.push(Step::Book(mid));
+    }
+    let instrument = instrument();
+    let engine = run_told(&steps);
 
     let ma = engine.strategy().inner().stats();
     assert_eq!(
@@ -1473,6 +1481,37 @@ fn under_fees_in_the_asset_received_the_venue_and_the_portfolio_agree_in_quote_v
         held.is_positive() && held < lot(),
         "the dust of base-asset fees is left: {held}"
     );
+}
+
+#[test]
+fn under_fees_in_the_asset_received_the_dust_an_exit_leaves_tops_up_the_next() {
+    // Why a model charging the quote gets some exits wrong and not all of
+    // them. The first exit sells 0.00099 of the 0.000999 a base fee left and
+    // keeps 0.000009. The next buy delivers 0.000999 on top, 0.001008 in all,
+    // so that exit sells a whole 0.001 and keeps 0.000008 -- and so on, each
+    // trip spending 0.000001 of the dust, until none is left and an exit comes
+    // up a lot short again. At this size and rate that is one exit in ten,
+    // which is what replaying M5's fortnight showed: 42 of its 412.
+    let engine = run_told(&choppy());
+    let exits: Vec<Qty> = engine
+        .venue()
+        .sent
+        .iter()
+        .filter(|r| r.side == Side::Sell)
+        .map(|r| r.qty)
+        .collect();
+    let whole = qty("0.001");
+    assert_eq!(
+        exits,
+        [qty("0.00099"), whole, whole, whole, whole, whole, whole],
+        "short once, then topped up by the dust each time"
+    );
+    assert_eq!(
+        engine.portfolio().position(instrument()).qty,
+        qty("0.000003"),
+        "the 0.000009 the first exit left, less 0.000001 for each of six"
+    );
+    assert_eq!(engine.venue().inner.stats().filtered(), 0);
 }
 
 #[test]
