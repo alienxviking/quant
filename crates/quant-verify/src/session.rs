@@ -51,7 +51,10 @@
 //! market's book and do not apply. They are fed only by depth deltas and
 //! snapshots, and an account session's frames go to neither: they are counted,
 //! not read, because what they say is the translator's business. A frame of the
-//! wrong stream in either kind of session is an error, never read as its own.
+//! wrong stream in either kind of session is an error, never read as its own --
+//! and that includes a `SnapshotFailed` control record in an account session:
+//! gap records are the container's and explain holes in either stream, but a
+//! failed snapshot is the market's, and the account stream has no book.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -424,9 +427,23 @@ fn check_frame(
 
     match (&session.stream, frame.kind) {
         // Gap records are the container's: they explain holes in either stream.
-        (_, FrameKind::Control) => {
+        (CaptureStream::Market { .. }, FrameKind::Control) => {
             check_control(control, frame, session.session_id, &at, state, report);
         }
+        // But a snapshot failure is the market's: the account stream has no book
+        // and fetches no snapshot, so one here was written to the wrong capture,
+        // like a snapshot frame would have been. Exhaustive over the records, so
+        // the next one has to say which stream it belongs to.
+        (CaptureStream::Account, FrameKind::Control) => match control {
+            Some(ControlRecord::Gap { .. }) | None => {
+                check_control(control, frame, session.session_id, &at, state, report);
+            }
+            Some(ControlRecord::SnapshotFailed { .. }) => report.error(
+                code::FOREIGN_FRAME,
+                at(),
+                "a SnapshotFailed record in an account capture: the account stream                  has no book to anchor, so this is the market's, written to the wrong                  capture",
+            ),
+        },
         (CaptureStream::Market { .. }, FrameKind::VenueSnapshot) => {
             check_snapshot(frame, &at, state, report);
         }
@@ -1405,6 +1422,33 @@ mod tests {
         let report = run("market-in-account", &[(account_target(29), bytes)]);
         assert_eq!(report.count(code::FOREIGN_FRAME), 1);
         assert_eq!(report.totals.depth_deltas, 0, "not read as market data");
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn a_snapshot_failure_in_an_account_capture_is_foreign() {
+        // A gap record is the container's and explains a hole in either stream,
+        // but a failed snapshot is the market's: the account stream has no book
+        // and fetches none. Read as its own it would pass as a warning about a
+        // snapshot this stream never wanted.
+        let (bytes, _) = Capture::account(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .account_event()
+            .snapshot_failed(SnapshotPurpose::Resync)
+            .account_event()
+            .seal();
+        let report = run("failure-in-account", &[(account_target(29), bytes)]);
+        assert_eq!(
+            report.count(code::FOREIGN_FRAME),
+            1,
+            "{:#?}",
+            report.findings()
+        );
+        assert_eq!(
+            report.count(code::SNAPSHOT_FAILED),
+            0,
+            "not read as its own"
+        );
         assert!(!report.is_clean());
     }
 
