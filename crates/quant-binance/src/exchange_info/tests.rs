@@ -4,9 +4,10 @@
 //! Citations are to `binance/binance-spot-api-docs` at commit `0556f1a`.
 
 use core::time::Duration;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpListener;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use quant_core::fixed::{Notional, ParseFixedError, Px, Qty};
 use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind};
@@ -952,17 +953,43 @@ fn a_reported_rule_prints_under_the_venues_name() {
     assert_eq!(rule("BARE_RULE", &[]).to_string(), "BARE_RULE");
 }
 
+/// How long the stand-in venue waits for a request before giving up.
+const STAND_IN_PATIENCE: Duration = Duration::from_secs(10);
+
 /// Answer one HTTP request on a loopback port with `status_line` and `body`,
 /// and hand back the request line that arrived.
 ///
 /// No test reaches the real venue, and none should. This stands in for it so
 /// the request the client sends and what [`fetch`] makes of each kind of answer
 /// can both be pinned.
+///
+/// It waits a bounded time, never forever. The client honours proxy settings
+/// from the environment, and on a machine that sends loopback through a proxy
+/// the request never arrives here: that should fail the test, with a request
+/// line saying so, rather than hang it on an `accept` nothing will answer.
 fn serve_once(status_line: &'static str, body: String) -> (String, JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let base = format!("http://{}", listener.local_addr().expect("its address"));
     let served = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("one connection");
+        listener
+            .set_nonblocking(true)
+            .expect("a non-blocking listener");
+        let deadline = Instant::now() + STAND_IN_PATIENCE;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return format!("no request arrived: {e}"),
+            }
+        };
+        // An accepted socket may inherit the listener's mode; this one reads
+        // and writes plainly, and still not forever.
+        stream.set_nonblocking(false).expect("a blocking stream");
+        stream
+            .set_read_timeout(Some(STAND_IN_PATIENCE))
+            .expect("a read timeout");
         let mut head = Vec::new();
         let mut chunk = [0_u8; 1024];
         while !head.windows(4).any(|w| w == b"\r\n\r\n") {
