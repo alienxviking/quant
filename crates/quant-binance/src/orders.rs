@@ -1107,7 +1107,8 @@ mod tests {
     #[test]
     fn a_market_order_never_carries_a_time_in_force() {
         // `MaCrossover`'s order exactly (crates/quant-backtest/src/ma.rs):
-        // market, with `Gtc`, which the venue does not ask a market order for.
+        // market, with `Gtc`, which the venue does not ask a market order for
+        // (rest-api.md:2168-2173).
         let crossover = encode(&market(Side::Buy, "0.001", TimeInForce::Gtc));
         assert_eq!(
             crossover.query(),
@@ -1336,7 +1337,7 @@ mod tests {
     #[test]
     fn an_instrument_this_endpoint_does_not_trade_is_refused() {
         // The same symbol on the futures venue is a different product, and
-        // this endpoint would trade it as spot.
+        // this encoder writes spot orders.
         let mut futures = btcusdt();
         futures.exchange = Exchange::BinanceUsdFutures;
         let mut perpetual = btcusdt();
@@ -1391,7 +1392,7 @@ mod tests {
         json.to_string()
     }
 
-    /// The documented acknowledgement (rest-api.md:2204-2212), its comment
+    /// The documented acknowledgement (rest-api.md:2205-2211), its comment
     /// removed and nothing else changed. It acknowledges somebody else's
     /// order; `with_field` makes it ours.
     const DOCUMENTED_ACK: &str = r#"{
@@ -1402,7 +1403,7 @@ mod tests {
         "transactTime": 1507725176595
     }"#;
 
-    /// The documented `FULL` response (rest-api.md:2237-2292), its comment and
+    /// The documented `FULL` response (rest-api.md:2238-2292), its comment and
     /// all but its first fill removed.
     const DOCUMENTED_FULL: &str = r#"{
         "symbol": "BTCUSDT",
@@ -1464,7 +1465,7 @@ mod tests {
         CancelOrder::encode(ClientOrderId(7), &run(), &btcusdt()).expect("encodes")
     }
 
-    /// The documented answer to a cancel (rest-api.md:2409-2427), its comment
+    /// The documented answer to a cancel (rest-api.md:2410-2427), its comment
     /// removed and nothing else changed. It answers for somebody else's order,
     /// `myOrder1`; `with_field` makes it ours.
     const DOCUMENTED_CANCEL: &str = r#"{
@@ -1541,10 +1542,12 @@ mod tests {
             ("a 500 with no body", answered(500, "")),
             ("a 500 carrying a code", answered(500, &unknown)),
             ("a 502 from something in between", answered(502, "<html>")),
-            // A 5xx whose body reads exactly like a refusal is still a 5xx.
+            // A 5xx whose body reads exactly like a refusal is still a 5xx
+            // (rest-api.md:116-118).
             ("a 503 carrying a refusal", answered(503, &insufficient)),
             ("a 504 carrying -1007", answered(504, &timeout)),
-            // And -1007 and -1006 say unknown under whatever status they come.
+            // And -1007 and -1006 say unknown under whatever status they come
+            // (errors.md:27-31).
             ("a 400 carrying -1007", answered(400, &timeout)),
             ("a 400 carrying -1006", answered(400, &unexpected)),
             // A success the order may stand behind, whatever the body is.
@@ -1570,8 +1573,9 @@ mod tests {
 
     #[test]
     fn a_client_error_that_is_not_a_binance_error_settles_nothing() {
-        // A firewall's page, a bare rate-limit reply, and JSON that is not the
-        // venue's error shape: none of them is the venue's API naming a rule.
+        // A firewall's page (rest-api.md:112), a bare rate-limit reply, and
+        // JSON that is not the venue's error shape (errors.md:3-10): none of
+        // them is the venue's API naming a rule.
         for (status, body) in [
             (400, ""),
             (403, "<html>Request blocked</html>"),
@@ -1596,8 +1600,9 @@ mod tests {
 
     #[test]
     fn a_status_the_endpoint_does_not_answer_with_settles_nothing() {
-        // 409 is how the venue says a request partly succeeded, so a body that
-        // reads like a refusal does not make it one.
+        // 409 is how the venue says a request partly succeeded
+        // (web-socket-api.md:317; rest-api.md:113), so a body that reads like
+        // a refusal does not make it one.
         let refusal = venue_error(
             -2010,
             "Account has insufficient balance for requested action.",
@@ -2524,8 +2529,9 @@ mod tests {
                 }
             }
         );
-        // `clientOrderId` there is the cancel's own id, not the order's, so
-        // finding ours in it says nothing about which order was cancelled.
+        // `clientOrderId` there is the cancel's own id, not the order's
+        // (web-socket-api.md:4200-4203), so finding ours in it says nothing
+        // about which order was cancelled.
         let crossed = with_field(DOCUMENTED_CANCEL, "clientOrderId", "q-r1-7");
         assert!(matches!(
             our_cancel().classify(answered(200, &crossed)),
@@ -2545,7 +2551,8 @@ mod tests {
         );
         let cases = [
             ("a 500 with no body", answered(500, "")),
-            // A 5xx carrying the venue's notice is still a 5xx.
+            // A 5xx carrying the venue's notice is still a 5xx
+            // (rest-api.md:116-118).
             ("a 503 carrying a notice", answered(503, &not_open)),
             ("a 409 carrying a notice", answered(409, &not_open)),
             ("a 400 carrying -1007", answered(400, &timeout)),
