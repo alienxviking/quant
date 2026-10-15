@@ -213,18 +213,22 @@ impl SnapshotClient {
     /// mistake in our understanding of the payload is a normalizer bug we can fix
     /// rather than a capture we have to discard.
     pub async fn depth(&self, symbol: &str) -> Result<Vec<u8>, SnapshotError> {
-        let response = self
-            .http
-            .get(self.depth_url(symbol))
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    SnapshotError::Timeout
-                } else {
-                    SnapshotError::Transport(e.to_string())
-                }
-            })?;
+        self.get_verbatim(self.depth_url(symbol)).await
+    }
+
+    /// One `GET`, returning the body exactly as it arrived.
+    ///
+    /// Shared rather than copied per endpoint: the order below -- status before
+    /// body -- is the part that matters, and a second copy is a second place to
+    /// get it backwards.
+    async fn get_verbatim(&self, url: String) -> Result<Vec<u8>, SnapshotError> {
+        let response = self.http.get(url).send().await.map_err(|e| {
+            if e.is_timeout() {
+                SnapshotError::Timeout
+            } else {
+                SnapshotError::Transport(e.to_string())
+            }
+        })?;
 
         // Status before body: a 429 body is an error document, and writing it into
         // the capture as though it were a book is exactly the sort of silent
