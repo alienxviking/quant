@@ -287,7 +287,42 @@ impl<S: SegmentStore> CaptureSession<S> {
         }
     }
 
+    /// A session recording the account stream, into the account's own tree.
+    ///
+    /// Everything else is the market session's: the same rolling on the
+    /// record's own timestamp, the same sealing of an idle day, the same
+    /// trailers and the same session-scoped `ingest_seq`. That sameness is the
+    /// point of giving the account stream a session rather than a writer of its
+    /// own -- each of those rules was learned the hard way once already.
+    #[must_use]
+    pub fn account(
+        store: S,
+        exchange: Exchange,
+        session_id: [u8; 16],
+        clock: Arc<dyn Clock>,
+        opts: WriterOptions,
+    ) -> Self {
+        Self {
+            store,
+            exchange,
+            stream: CaptureStream::Account,
+            session_id,
+            opts,
+            clock,
+            open: None,
+            reports: Vec::new(),
+            rolls: 0,
+            backdated: 0,
+        }
+    }
+
     /// Write a record, rolling to a new segment first if it belongs to a later day.
+    ///
+    /// Each kind of record is written as its own kind of frame, whichever
+    /// stream the session records: nothing here rewrites what a record is. An
+    /// account record handed to a market session is written as the account
+    /// frame it is, and every reader of the file says so, rather than this
+    /// taking down a capture over a record it could still keep.
     pub fn write(&mut self, record: CaptureRecord) -> StorageResult<()> {
         let ts = record.local_recv_ts();
 
@@ -340,6 +375,13 @@ impl<S: SegmentStore> CaptureSession<S> {
             } => open
                 .writer
                 .write_venue_snapshot(local_recv_ts, ingest_seq, &payload),
+            CaptureRecord::Account {
+                local_recv_ts,
+                ingest_seq,
+                payload,
+            } => open
+                .writer
+                .write_account_payload(local_recv_ts, ingest_seq, &payload),
         }
     }
 
@@ -627,6 +669,50 @@ mod tests {
         assert_eq!(s.rolls(), 1);
         let (reports, _) = s.finish().unwrap();
         assert_eq!(reports[1].stats.frames, 1);
+    }
+
+    #[test]
+    fn an_account_session_rolls_and_seals_like_a_market_one() {
+        // The account stream reuses the session rather than having a writer of
+        // its own, so it inherits rolling on the record's timestamp, trailers and
+        // a session-scoped ingest_seq -- and lands in its own tree, with a header
+        // that names the stream rather than a symbol.
+        let clock = Arc::new(ManualClock::new(Ts::from_secs(BEFORE_MIDNIGHT)));
+        let mut s = CaptureSession::account(
+            MemoryStore::new(),
+            Exchange::Binance,
+            SESSION,
+            clock,
+            WriterOptions::default(),
+        );
+        for (offset, seq) in [(0_i64, 1_u64), (0, 2), (2, 3)] {
+            s.write(CaptureRecord::Account {
+                local_recv_ts: Ts::from_secs(BEFORE_MIDNIGHT + offset),
+                ingest_seq: seq,
+                payload: br#"{"subscriptionId":0,"event":{"e":"executionReport"}}"#.to_vec(),
+            })
+            .unwrap();
+        }
+        assert_eq!(s.rolls(), 1, "the day boundary rolls an account file too");
+
+        let (reports, store) = s.finish().unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(
+            reports[1].first_ingest_seq,
+            Some(3),
+            "seq spans the session"
+        );
+        for (target, bytes) in &store.segments {
+            assert_eq!(target.stream, CaptureStream::Account);
+            let mut reader = RawReader::open(bytes.as_slice()).unwrap();
+            assert_eq!(reader.header().symbol, crate::layout::ACCOUNT_STREAM);
+            let (frames, truncation) = reader.read_all().unwrap();
+            assert_eq!(truncation, None);
+            assert!(reader.is_finalized(), "sealed with a trailer");
+            assert!(frames
+                .iter()
+                .all(|f| f.kind == quant_storage::FrameKind::AccountPayload));
+        }
     }
 
     #[test]

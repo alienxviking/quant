@@ -36,6 +36,19 @@ pub enum CaptureRecord {
         ingest_seq: u64,
         payload: Vec<u8>,
     },
+    /// A frame from the account's own socket, verbatim and uninterpreted.
+    ///
+    /// Its own variant, rather than a `Venue` record that an account session
+    /// writes under another kind, so that what a record is travels with it from
+    /// ingress to disk -- the in-flight half of the discrimination the frame kind
+    /// gives the file. A consumer matching on records has to say what it does
+    /// with one, and the only right answer for a reader of market data is that
+    /// it is not market data.
+    Account {
+        local_recv_ts: Ts,
+        ingest_seq: u64,
+        payload: Vec<u8>,
+    },
 }
 
 impl CaptureRecord {
@@ -44,7 +57,8 @@ impl CaptureRecord {
         match self {
             Self::Venue { ingest_seq, .. }
             | Self::Control { ingest_seq, .. }
-            | Self::Snapshot { ingest_seq, .. } => *ingest_seq,
+            | Self::Snapshot { ingest_seq, .. }
+            | Self::Account { ingest_seq, .. } => *ingest_seq,
         }
     }
 
@@ -53,7 +67,8 @@ impl CaptureRecord {
         match self {
             Self::Venue { local_recv_ts, .. }
             | Self::Control { local_recv_ts, .. }
-            | Self::Snapshot { local_recv_ts, .. } => *local_recv_ts,
+            | Self::Snapshot { local_recv_ts, .. }
+            | Self::Account { local_recv_ts, .. } => *local_recv_ts,
         }
     }
 

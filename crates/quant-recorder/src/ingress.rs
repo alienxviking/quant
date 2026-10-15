@@ -142,10 +142,13 @@ impl PendingControl {
 
 /// Stamps, sequences and enqueues everything the venue sends us.
 ///
-/// One `Ingress` per (recorder process, instrument), matching the definition of
-/// `ingest_seq` in `docs/data-contract.md` §3 and the one-file-per-symbol layout
-/// in §5. Sequence numbers are therefore per instrument and strictly increasing
-/// within a capture file, with no cross-instrument coordination to get wrong.
+/// One `Ingress` per (recorder process, stream) -- one instrument's market data,
+/// or the account stream -- matching the definition of `ingest_seq` in
+/// `docs/data-contract.md` §3 and the layout in §5, where each stream's session
+/// has files of its own. Sequence numbers are therefore per stream and strictly
+/// increasing within a capture file, with no coordination across streams to get
+/// wrong: a frame dropped from one socket leaves its hole in that socket's
+/// capture and nowhere else.
 pub struct Ingress<S> {
     sink: S,
     clock: Arc<dyn Clock>,
@@ -237,6 +240,63 @@ impl<S: RecordSink> Ingress<S> {
         payload: Vec<u8>,
         local_recv_ts: Ts,
     ) -> Result<Accepted, WriterGone> {
+        self.accept_received(
+            payload,
+            local_recv_ts,
+            |local_recv_ts, ingest_seq, payload| CaptureRecord::Venue {
+                local_recv_ts,
+                ingest_seq,
+                payload,
+            },
+        )
+    }
+
+    /// Take a frame from the account's own socket, already stamped.
+    ///
+    /// The account stream gets an `Ingress` of its own, as it gets a session
+    /// and a tree of its own, and this is how its frames enter one. Stamp
+    /// first, here second, parse last -- the order `docs/data-contract.md` §2
+    /// requires, and the reason the stamp comes in rather than being taken
+    /// here: the translator needs the same instant the capture records.
+    ///
+    /// Sequenced by the same code as [`Ingress::accept_at`], not a copy of it.
+    /// The number is consumed whether or not the frame survives, so a frame the
+    /// channel had no room for leaves a hole in the account capture exactly as
+    /// wide as the loss, and a `LocalOverflow` gap record follows it -- the
+    /// evidence the verifier reads, and which a copy would sooner or later stop
+    /// writing the same way.
+    ///
+    /// What may be handed in is [`FrameKind::AccountPayload`]'s rule: frames the
+    /// venue sent, never one that carries key material.
+    ///
+    /// [`FrameKind::AccountPayload`]: quant_storage::FrameKind::AccountPayload
+    pub fn accept_account_at(
+        &mut self,
+        payload: Vec<u8>,
+        local_recv_ts: Ts,
+    ) -> Result<Accepted, WriterGone> {
+        self.accept_received(
+            payload,
+            local_recv_ts,
+            |local_recv_ts, ingest_seq, payload| CaptureRecord::Account {
+                local_recv_ts,
+                ingest_seq,
+                payload,
+            },
+        )
+    }
+
+    /// The one path by which bytes from a venue socket take a sequence number.
+    ///
+    /// `record` builds what travels to the writer; everything that makes a hole
+    /// honest -- the pump ahead of it, the number taken whatever happens, the
+    /// coalesced overflow gap behind a drop -- is here, once.
+    fn accept_received(
+        &mut self,
+        payload: Vec<u8>,
+        local_recv_ts: Ts,
+        record: fn(Ts, u64, Vec<u8>) -> CaptureRecord,
+    ) -> Result<Accepted, WriterGone> {
         let now = local_recv_ts;
         self.metrics.record_message(payload.len() as u64);
 
@@ -250,11 +310,7 @@ impl<S: RecordSink> Ingress<S> {
         let ingest_seq = self.next_seq;
         self.next_seq += 1;
 
-        let record = CaptureRecord::Venue {
-            local_recv_ts: now,
-            ingest_seq,
-            payload,
-        };
+        let record = record(now, ingest_seq, payload);
         match self.sink.try_send(record) {
             Ok(()) => {
                 self.last_good_ts = now;
@@ -500,7 +556,8 @@ mod tests {
                 } => Some(*cause),
                 CaptureRecord::Control { .. }
                 | CaptureRecord::Venue { .. }
-                | CaptureRecord::Snapshot { .. } => None,
+                | CaptureRecord::Snapshot { .. }
+                | CaptureRecord::Account { .. } => None,
             })
             .collect()
     }
@@ -585,6 +642,86 @@ mod tests {
         let hole = seqs[2] - seqs[1] - 1;
         assert_eq!(hole, dropped_on_purpose);
         assert_eq!(hole, ing.stats().dropped);
+    }
+
+    /// An account-stream frame shaped like Binance's user-data events.
+    const ACCOUNT_EVENT: &[u8] =
+        br#"{"subscriptionId":0,"event":{"e":"outboundAccountPosition","E":1700000000000}}"#;
+
+    #[test]
+    fn an_account_frame_is_stamped_by_its_caller_and_kept_verbatim() {
+        // The caller stamps before anything parses the bytes, and the translator
+        // needs that same instant, so the stamp comes in rather than being taken
+        // here; the bytes go out exactly as they came.
+        let (mut ing, _clock) = ingress(8);
+        let stamped = Ts::from_millis(1_699_999_999_999);
+        assert_eq!(
+            ing.accept_account_at(ACCOUNT_EVENT.to_vec(), stamped)
+                .unwrap(),
+            Accepted::Enqueued
+        );
+        assert_eq!(
+            ing.sink().accepted,
+            vec![CaptureRecord::Account {
+                local_recv_ts: stamped,
+                ingest_seq: 1,
+                payload: ACCOUNT_EVENT.to_vec(),
+            }]
+        );
+        assert_eq!(ing.stats().messages, 1);
+    }
+
+    #[test]
+    fn a_dropped_account_frame_leaves_a_hole_as_wide_as_the_loss() {
+        // The market's property, for the account's frames: a hole in an account
+        // capture is the evidence of a dropped frame and its width is the count,
+        // with the overflow gap record right behind it -- what lets the verifier
+        // tell a quiet account from a blind one.
+        let (mut ing, clock) = ingress(2);
+        for _ in 0..2 {
+            assert_eq!(
+                ing.accept_account_at(ACCOUNT_EVENT.to_vec(), clock.now())
+                    .unwrap(),
+                Accepted::Enqueued
+            );
+            tick(&clock);
+        }
+        let dropped_on_purpose = 7;
+        for _ in 0..dropped_on_purpose {
+            assert_eq!(
+                ing.accept_account_at(ACCOUNT_EVENT.to_vec(), clock.now())
+                    .unwrap(),
+                Accepted::Dropped
+            );
+            tick(&clock);
+        }
+        assert_eq!(ing.pending_gaps(), 1, "one coalesced overflow record");
+
+        let before = ing.sink_mut().drain();
+        ing.accept_account_at(b"recovered".to_vec(), clock.now())
+            .unwrap();
+        let after = &ing.sink().accepted;
+        assert!(
+            matches!(
+                after[0],
+                CaptureRecord::Control {
+                    record: ControlRecord::Gap {
+                        cause: GapCause::LocalOverflow,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "the gap lands right after the hole: {after:?}"
+        );
+        let seqs: Vec<u64> = before
+            .iter()
+            .chain(after.iter())
+            .map(CaptureRecord::ingest_seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 10, 11]);
+        assert_eq!(seqs[2] - seqs[1] - 1, dropped_on_purpose);
+        assert_eq!(ing.stats().dropped, dropped_on_purpose);
     }
 
     #[test]
