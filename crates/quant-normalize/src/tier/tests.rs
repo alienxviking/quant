@@ -41,7 +41,8 @@ struct Scratch {
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("quant-tier-{name}.parquet"));
+        let path =
+            std::env::temp_dir().join(format!("quant-tier-{name}-{}.parquet", std::process::id()));
         let _ = std::fs::remove_file(&path);
         Self { path }
     }

@@ -1055,7 +1055,8 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("quant-journal-{name}.jsonl"));
+            let path = std::env::temp_dir()
+                .join(format!("quant-journal-{name}-{}.jsonl", std::process::id()));
             let _ = std::fs::remove_file(&path);
             Self { path }
         }
@@ -1845,7 +1846,10 @@ mod m75a_tests {
     fn temp(name: &str, body: &str) -> std::path::PathBuf {
         let thread = std::thread::current();
         let unique = thread.name().unwrap_or("unnamed").replace("::", "-");
-        let path = std::env::temp_dir().join(format!("quant-m75a-{name}-{unique}.jsonl"));
+        let path = std::env::temp_dir().join(format!(
+            "quant-m75a-{name}-{unique}-{}.jsonl",
+            std::process::id()
+        ));
         let mut f = std::fs::File::create(&path).expect("create");
         f.write_all(body.as_bytes()).expect("write");
         path
