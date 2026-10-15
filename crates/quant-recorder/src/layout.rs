@@ -42,8 +42,9 @@ pub const RAW_DIR: &str = "raw";
 /// That field is where a market capture names its instrument. It is
 /// fixed-width and may not be empty, and the account stream has no instrument,
 /// so its files name the stream there instead -- in lower case, which is not
-/// how Binance writes a symbol, so a reader of the header alone cannot take it
-/// for one.
+/// how Binance writes a symbol, so the name is no Binance instrument's. Which
+/// stream a file holds is still decided by where it sits and what its frames
+/// are, never by this name alone.
 pub const ACCOUNT_STREAM: &str = "account";
 
 /// What a capture file records, which decides the tree it lives in.
