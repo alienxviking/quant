@@ -334,16 +334,28 @@ fi
 # signed round trip, which is `venue-check` -- a separate binary because it talks
 # to the venue, and this script is meant to be runnable with no network on a
 # machine that is about to record.
+#
+# The live path signs with an Ed25519 key, held as the key's text in
+# BINANCE_ED25519_PRIVATE_KEY -- `quant-binance/src/credentials.rs` says why, and
+# how to make one -- and, as there, a value that is only whitespace counts as
+# unset. BINANCE_API_SECRET, the HMAC secret slice (b) signed with, is no longer
+# used. It is looked at only so that someone who still has it set and has no
+# key is told the path moved, rather than handed a variable they have never
+# heard of.
 if [ "${live:-0}" = 1 ]; then
-    for var in BINANCE_API_KEY BINANCE_API_SECRET; do
+    retired_secret="${BINANCE_API_SECRET:-}"
+    for var in BINANCE_API_KEY BINANCE_ED25519_PRIVATE_KEY; do
         value="$(eval "printf '%s' \"\${$var:-}\"")"
-        if [ -z "$value" ]; then
-            report 'credentials' blocker "$var is not set -- live trading cannot start without it"
-        else
+        if [ -n "${value//[[:space:]]/}" ]; then
             # The name, never any part of the value.
             report 'credentials' ok "$var is set"
+        elif [ "$var" = BINANCE_ED25519_PRIVATE_KEY ] && [ -n "${retired_secret//[[:space:]]/}" ]; then
+            report 'credentials' blocker "$var is not set, and BINANCE_API_SECRET is -- the live path no longer signs with an HMAC secret (Binance deprecated HMAC keys; session logon takes Ed25519 only). Make a pair outside the repository with \`openssl genpkey -algorithm ed25519 -out key.pem\`, register the public half from \`openssl pkey -in key.pem -pubout\`, and export $var=\"\$(cat key.pem)\""
+        else
+            report 'credentials' blocker "$var is not set -- live trading cannot start without it"
         fi
     done
+    unset value retired_secret
     report 'credentials' advisory \
         'presence is not proof -- run `cargo run -p quant-binance --bin venue-check` to make one signed request'
 fi
