@@ -1112,7 +1112,9 @@ use quant_engine::ExecutionVenue;
 /// tests keep stating the fee as the quantity of the base they then count in,
 /// which is how they land the holding on the boundaries they are about -- a
 /// whole lot, a lot and change, dust under one. The matching, the prices and
-/// the sells are still the simulator's.
+/// the sells are still the simulator's. The rate itself, through the
+/// simulator's own option, is
+/// `a_crossover_under_fees_in_the_asset_received_exits_the_floored_position`.
 #[derive(Debug)]
 struct BaseFeeOnBuys {
     inner: SimulatedVenue,
@@ -1330,5 +1332,145 @@ fn exactly_one_whole_lot_held_is_a_holding_and_is_sold() {
     assert!(
         engine.portfolio().position(instrument()).qty.is_zero(),
         "and nothing is left: a whole lot is not dust"
+    );
+}
+
+// --- M8.c: the simulator's own fee in the asset received ---
+
+/// The real simulator, remembering every request it was told about and
+/// otherwise left alone.
+#[derive(Debug)]
+struct Told {
+    inner: SimulatedVenue,
+    sent: Vec<OrderRequest>,
+}
+
+impl ExecutionVenue for Told {
+    fn submit(&mut self, client_order_id: ClientOrderId, request: &OrderRequest, now: Ts) {
+        self.sent.push(*request);
+        self.inner.submit(client_order_id, request, now);
+    }
+
+    fn cancel(&mut self, client_order_id: ClientOrderId, now: Ts) {
+        self.inner.cancel(client_order_id, now);
+    }
+
+    // Forwarded explicitly, as `BaseFeeOnBuys` does and for its reason: the
+    // default does nothing, and would hide the market from the simulator.
+    fn observe(&mut self, event: &MarketEvent, book: &quant_book::Book, now: Ts) {
+        self.inner.observe(event, book, now);
+    }
+
+    fn poll(&mut self, now: Ts, out: &mut Vec<ExecutionEvent>) {
+        self.inner.poll(now, out);
+    }
+}
+
+/// Binance spot's ten basis points, taken as Binance takes them: a buy's in
+/// the base, a sell's in the quote.
+fn spot_fees() -> quant_sim::Costs {
+    quant_sim::Costs {
+        fees: quant_sim::FeeSchedule::binance_spot(),
+        fee_in: quant_sim::FeeIn::Received,
+        ..quant_sim::Costs::NONE
+    }
+}
+
+#[test]
+fn a_crossover_under_fees_in_the_asset_received_exits_the_floored_position() {
+    // What slice (e)'s model replay needs, through the simulator's own option
+    // rather than a wrapper rewriting its fills. Ten basis points of a 0.001
+    // buy is 0.000001 of the base, so 0.000999 arrives. The down-cross sells
+    // the 99 whole lots of it, 0.00099 -- what live sends, where a model
+    // charging the quote would have sold 0.001 -- and leaves 0.000009 of dust,
+    // which the next up-cross treats as flat and enters over.
+    let mut steps = up_then_down();
+    // From the bottom at 85, rise far enough to cross back up.
+    for mid in [88, 95, 104] {
+        steps.push(Step::Book(mid));
+    }
+    let instrument = instrument();
+    let rules = definition();
+    let strategy = Recorded::new(
+        MaCrossover::new(MaConfig {
+            instrument,
+            fast: 2,
+            slow: 3,
+            interval: SECOND,
+            qty: qty("0.001"),
+            lot: rules.lot_size,
+        })
+        .expect("a valid configuration"),
+        instrument,
+        SECOND,
+    );
+    let venue = Told {
+        // Enforcing the lot, so an exit the venue would not take is refused
+        // rather than filled. Not the minimum notional, for the reason
+        // `run_base_fee` gives: the script trades near 100.
+        inner: SimulatedVenue::with_costs(spot_fees()).enforcing(
+            instrument,
+            quant_core::instrument::Filters {
+                tick_size: rules.tick_size,
+                lot_size: rules.lot_size,
+                min_notional: Notional::ZERO,
+            },
+        ),
+        sent: Vec::new(),
+    };
+    let mut engine = Engine::new(Script::new(&steps), venue, AllowAll, strategy, CASH);
+    engine.run().expect("the script cannot fail");
+
+    let ma = engine.strategy().inner().stats();
+    assert_eq!(
+        (ma.entries, ma.exits, ma.no_ops),
+        (2, 1, 0),
+        "the second up-cross is an entry, not 'already long': {ma:?}"
+    );
+    let sent = &engine.venue().sent;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!((sent[0].side, sent[0].qty), (Side::Buy, qty("0.001")));
+    assert_eq!(
+        (sent[1].side, sent[1].qty),
+        (Side::Sell, qty("0.00099")),
+        "the 0.000999 the fee left, floored to the lot of 0.00001"
+    );
+    assert_eq!(
+        (sent[2].side, sent[2].qty),
+        (Side::Buy, qty("0.001")),
+        "a full entry over the dust"
+    );
+    assert_eq!(
+        engine.venue().inner.stats().filtered(),
+        0,
+        "and a venue enforcing the lot took every one"
+    );
+    assert_eq!(engine.portfolio().fills(), 3);
+    assert_eq!(
+        engine.portfolio().position(instrument).qty,
+        qty("0.001008"),
+        "the 0.000009 of dust, plus the 0.000999 the second buy delivered"
+    );
+}
+
+#[test]
+fn under_fees_in_the_asset_received_the_venue_and_the_portfolio_agree_in_quote_value() {
+    // M4's two independent tallies, with a fee that is no longer money. A
+    // buy's fee is a quantity of the base now, and the venue and the portfolio
+    // each total it as the money it was worth at its own fill, through the one
+    // conversion both use -- so they still count one quantity, and a total
+    // that added the raw quantity would fall short by a factor of the price.
+    let engine = run_with(&choppy(), spot_fees());
+    let charged = engine.venue().stats().fees_charged;
+    assert!(charged.is_positive(), "fees were charged: {charged}");
+    assert_eq!(charged, engine.portfolio().fees());
+
+    // And not vacuously. Were the buys charged in the quote, this would be
+    // M4's comparison over again. Every exit sells whole lots of a holding a
+    // base fee has shaved, so the run ends holding dust: real, under a lot.
+    let held = engine.portfolio().position(instrument()).qty;
+    assert!(
+        held.is_positive() && held < lot(),
+        "the dust of base-asset fees is left: {held}"
     );
 }
