@@ -185,6 +185,9 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
             at: quant_core::time::Clock::now(&quant_core::time::SystemClock),
             cash: starting,
             schema: quant_engine::journal::SCHEMA,
+            // No run tag: nothing here is sent to a venue, so there are no
+            // client ids at the venue to tell apart.
+            run: None,
         },
     )?;
 
@@ -278,7 +281,15 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Some(cause) = engine.risk().tripped() {
         warn!(%cause, "the kill switch is thrown; the next session will refuse orders");
     }
-    write(&journal, &JournalEntry::Stopped { at: stopped_at })?;
+    // With the orders still working, which against the simulator is any whose
+    // reports were still in flight when the capture ended.
+    write(
+        &journal,
+        &JournalEntry::Stopped {
+            at: stopped_at,
+            working: engine.working(),
+        },
+    )?;
 
     report(&engine, &journal_path, tee_dropped)?;
     capture.map(|()| ExitCode::SUCCESS)

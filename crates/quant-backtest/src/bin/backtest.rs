@@ -53,6 +53,7 @@ use std::sync::{Arc, Mutex};
 
 use quant_backtest::record::{write, JournalWriter};
 use quant_backtest::{EquityCurve, MaConfig, MaConfigError, MaCrossover, Recorded};
+use quant_core::execution::ClientOrderId;
 use quant_core::fixed::{Notional, Qty};
 use quant_core::fixed::{Px, Rate};
 use quant_core::instrument::{
@@ -201,7 +202,8 @@ fn main() -> ExitCode {
     };
 
     if let Some(journal) = journal.as_ref() {
-        if let Err(e) = close_journal(journal, stats.last_ts, engine.portfolio()) {
+        if let Err(e) = close_journal(journal, stats.last_ts, engine.portfolio(), engine.working())
+        {
             eprintln!("could not close the journal: {e}");
             return ExitCode::FAILURE;
         }
@@ -279,6 +281,9 @@ fn start_journal(journal: &Arc<Mutex<Journal>>, args: &Args) -> std::io::Result<
             at: quant_core::time::Clock::now(&quant_core::time::SystemClock),
             cash: args.cash,
             schema: quant_engine::journal::SCHEMA,
+            // No run tag: nothing here is sent to a venue, so there are no
+            // client ids at the venue to tell apart.
+            run: None,
         },
     )
 }
@@ -286,14 +291,19 @@ fn start_journal(journal: &Arc<Mutex<Journal>>, args: &Args) -> std::io::Result<
 /// The two marks the paper binary also ends on, for the same reasons: without a
 /// final checkpoint there is nothing for a recompute to be compared against, and
 /// without `Stopped` a clean end cannot be told from a crash.
+///
+/// `working` is what the engine still held: empty unless inbound latency left
+/// reports in flight when the data ended, which M4 decided are counted rather
+/// than delivered.
 fn close_journal(
     journal: &Arc<Mutex<Journal>>,
     last_ts: Option<Ts>,
     portfolio: &Portfolio,
+    working: Vec<ClientOrderId>,
 ) -> std::io::Result<()> {
     let at = last_ts.unwrap_or(Ts::from_nanos(0));
     write(journal, &JournalEntry::checkpoint(at, portfolio))?;
-    write(journal, &JournalEntry::Stopped { at })
+    write(journal, &JournalEntry::Stopped { at, working })
 }
 
 fn report(

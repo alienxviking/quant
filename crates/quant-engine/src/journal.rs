@@ -78,10 +78,14 @@ use serde_json::error::Category;
 
 use crate::RefusedBy;
 use quant_core::event::Side;
-use quant_core::execution::{ClientOrderId, Fill, RejectReason};
+use quant_core::execution::{ClientOrderId, Fill, RejectReason, VenueOrderId, VenueTradeId};
 use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::{
-    Exchange, Instrument, InstrumentDef, InstrumentId, InstrumentRegistry,
+    Exchange, FilterBreach, Instrument, InstrumentDef, InstrumentId, InstrumentRegistry,
+};
+use quant_core::report::{
+    AccountChange, AnomalyKind, CancelRefusal, Cited, DoubtChange, EndedBy, ForeignOutcome,
+    Holding, Landing, Provenance, VenueText,
 };
 use quant_core::time::Ts;
 
@@ -124,8 +128,27 @@ pub enum JournalEntry {
         ///
         /// Defaulted on read so every journal written before it existed still
         /// parses, and reports as schema 1.
+        ///
+        /// Schema 3 is the first change it was there for, and [`read`] now
+        /// refuses a session begun in a schema newer than [`SCHEMA`], naming
+        /// both numbers.
         #[serde(default = "schema_v1")]
         schema: u32,
+        /// The run tag a live session sends its orders under, as
+        /// `q-<run>-<id>`.
+        ///
+        /// What tells this run's orders from an earlier run's at the venue,
+        /// where the client order ids of every run share one namespace: an
+        /// earlier run's order 5 and this run's order 5 differ only in the
+        /// tag. Like the capital, the **first** `started` line's tag is the
+        /// session's ([`run_tag`]); a restart carries the same one on.
+        ///
+        /// `None` for a backtest and for paper, which send nothing to a venue
+        /// and so have nothing to tell apart. Absent from every journal
+        /// written before schema 3, and written only when present, so a run
+        /// without one writes the line it always wrote.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<String>,
     },
     /// Something traded.
     Filled {
@@ -142,6 +165,23 @@ pub enum JournalEntry {
         /// which is what those runs actually did.
         #[serde(default)]
         fee_asset: quant_core::execution::FeeAsset,
+        /// What of the order was still working after this fill.
+        ///
+        /// Schema 3. A venue reports it on every trade, and a restart that
+        /// finds an order with something left knows the order may still be
+        /// working at the venue, which the fill alone cannot say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remaining: Option<Qty>,
+        /// The venue's id for the order. With `trade_id`, the key one of the
+        /// venue's `myTrades` rows is found by: one line here is one row
+        /// there, which is what criterion A compares. Schema 3, and only ever
+        /// written by a venue that names its orders, which a simulator does
+        /// not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order_id: Option<VenueOrderId>,
+        /// The venue's id for the trade. Schema 3, as `venue_order_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trade_id: Option<VenueTradeId>,
     },
     /// What the *engine* believed at this moment.
     ///
@@ -195,12 +235,28 @@ pub enum JournalEntry {
     Accepted {
         at: Ts,
         client_order_id: ClientOrderId,
+        /// The venue's id for the order, when it named one. Schema 3; a
+        /// simulator names none, and its lines read as they always did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order_id: Option<VenueOrderId>,
     },
     /// The venue declined an order it had been told about.
+    ///
+    /// Keeps that meaning in schema 3: the venue had the request. One that
+    /// never reached it is not a rejection by the venue.
     Rejected {
         at: Ts,
         client_order_id: ClientOrderId,
         reason: RejectReason,
+        /// What the venue said, as it said it: the only durable copy of a
+        /// REST answer, because REST bodies are not in raw. Schema 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cited: Option<Cited>,
+        /// The filter rule the venue named, when it is one we model, for
+        /// criterion B to compare with the rule `Filters::rejects` names.
+        /// Schema 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        breach: Option<FilterBreach>,
     },
     /// A cancel was sent; whether it won the race is a separate entry.
     CancelRequested {
@@ -212,6 +268,14 @@ pub enum JournalEntry {
         at: Ts,
         client_order_id: ClientOrderId,
         remaining: Qty,
+        /// The venue's id for the order, when it named one. Schema 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order_id: Option<VenueOrderId>,
+        /// How the venue says it ended: cancelled, expired, or stopped by
+        /// self-trade prevention. One outcome to the strategy and three to a
+        /// person reconciling against the venue. Schema 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended: Option<EndedBy>,
     },
     /// A fill arrived for an order this engine has no record of.
     ///
@@ -230,6 +294,13 @@ pub enum JournalEntry {
         /// `Quote`, which is what every fill before then was.
         #[serde(default)]
         fee_asset: quant_core::execution::FeeAsset,
+        /// The venue's ids for the order and the trade, when it gave them:
+        /// for a fill nobody can attribute, the only handle a person has on
+        /// the venue's own record of it. Schema 3.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order_id: Option<VenueOrderId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trade_id: Option<VenueTradeId>,
     },
     /// The kill switch was thrown.
     ///
@@ -303,7 +374,163 @@ pub enum JournalEntry {
     ///
     /// Its absence is how a crash is told from a clean stop — the same
     /// two-sided-completeness idea as the raw container's trailer.
-    Stopped { at: Ts },
+    Stopped {
+        at: Ts,
+        /// The orders the engine was still working when it stopped, lowest id
+        /// first: the engine's claim, which a fold of the lifecycle lines can
+        /// be checked against. Stopping is not flattening, and a restart that
+        /// does not know an order may still be live at the venue would trade
+        /// as though it were not.
+        ///
+        /// Schema 3, and written only when not empty. Against the simulator it
+        /// is empty unless reports were still in flight when the data ended,
+        /// which inbound latency makes ordinary: M4 decided those are counted,
+        /// not delivered, so the engine still holds the order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        working: Vec<ClientOrderId>,
+    },
+    /// The venue's REST acknowledgement of an order. Schema 3.
+    ///
+    /// Not an acceptance: the account stream is the one authority for that.
+    /// But the venue's id for the order is what still finds it after a cancel
+    /// has replaced its client id (criterion E), and this may be the only
+    /// line that holds it for an order whose stream report never came.
+    Placed {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        /// The venue's `transactTime`, in milliseconds on the venue's clock.
+        /// For the record only: the engine dispatches on when we heard.
+        transact_ms: i64,
+    },
+    /// A submission that never became an order the venue had. Schema 3.
+    ///
+    /// Not `rejected`, which keeps its meaning: the venue had the request and
+    /// declined it. This one never reached it, or a lookup afterwards found no
+    /// such order. Certain either way, so the order is over.
+    NeverLanded {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        landing: Landing,
+    },
+    /// An order's outcome stopped being known, or became known again.
+    /// Schema 3.
+    ///
+    /// Raised and cleared explicitly, so "left in doubt" is a fold of this
+    /// file rather than an inference from what is missing from it.
+    Doubt {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        change: DoubtChange,
+    },
+    /// A cancel the venue did not carry out, or whose fate is unknown. The
+    /// order, if there is one, is as it was. Schema 3.
+    CancelRefused {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        why: CancelRefusal,
+    },
+    /// A report about an order this run did not send. Schema 3.
+    ///
+    /// The client id is kept as the venue sent it, as text, and never made a
+    /// `ClientOrderId`: an earlier run's order 5 must not be read as this
+    /// run's order 5. A trade is kept whole, commission asset verbatim,
+    /// because it moved the account's balances outside this run's record and
+    /// criterion A has to account for it.
+    Foreign {
+        at: Ts,
+        client_id: VenueText,
+        provenance: Provenance,
+        venue_order_id: VenueOrderId,
+        side: Side,
+        what: ForeignOutcome,
+    },
+    /// The account stream was lost or regained. Schema 3.
+    Account { at: Ts, change: AccountChange },
+    /// A report that could not be read, or contradicts what came before it,
+    /// recorded with its text rather than dropped. Schema 3.
+    Anomaly {
+        at: Ts,
+        /// The order it concerns, when that much could be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_order_id: Option<ClientOrderId>,
+        what: AnomalyKind,
+        detail: VenueText,
+    },
+    /// A report about an order the engine was not working, other than a fill
+    /// (which is `orphaned`): an id it never minted, or an order whose end it
+    /// had already heard. Kept from the strategy and written here. Schema 3.
+    Stray {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        kind: StrayKind,
+        /// The venue's id for the order, when the report named one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order_id: Option<VenueOrderId>,
+    },
+    /// The market came into view: a book went from meaning nothing to
+    /// meaning something, at the first snapshot of a run or the one that
+    /// anchors it again after a gap. Schema 3.
+    ///
+    /// The other half of `blind`, written rather than inferred. Before schema
+    /// 3 a reader took any later line the engine wrote as proof the market was
+    /// back, which holds only while a venue cannot speak without the market:
+    /// a live venue reports on wakes a dark market produces.
+    Sighted { at: Ts },
+    /// What the venue said the account held of the instrument's two assets.
+    /// Schema 3.
+    ///
+    /// Criterion A's baseline: our equity and the venue's two balances,
+    /// marked at one price, must agree, and the balances at the start of a
+    /// run can never be taken after the fact. Written by the live binary at
+    /// start and at stop, through [`JournalEntry::balances`].
+    ///
+    /// The venue's claim, never folded: a recompute that read it would make
+    /// criterion A compare the venue with itself. `at` is the wall clock when
+    /// the venue was asked, as `started` is, because the market has not
+    /// begun, or has ended, when it is taken.
+    Balances {
+        at: Ts,
+        base_asset: String,
+        base_free: Qty,
+        base_locked: Qty,
+        quote_asset: String,
+        quote_free: Notional,
+        quote_locked: Notional,
+    },
+}
+
+/// An instrument whose definition names no assets, so its balances could not
+/// be said to be of anything.
+///
+/// What a placeholder registered by [`replay`] looks like, and what the
+/// user-data translator refuses for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnnamedAssets {
+    pub exchange: Exchange,
+    pub symbol: String,
+}
+
+impl std::fmt::Display for UnnamedAssets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} is registered without its base and quote asset names, so a balance \
+             could not say which asset it is of: register the venue's definition first",
+            self.exchange, self.symbol
+        )
+    }
+}
+
+impl std::error::Error for UnnamedAssets {}
+
+/// What a `stray` line reported: every kind of order report but a fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrayKind {
+    Accepted,
+    Rejected,
+    Cancelled,
 }
 
 impl JournalEntry {
@@ -323,12 +550,66 @@ impl JournalEntry {
             | Self::Orphaned { at, .. }
             | Self::Blind { at, .. }
             | Self::Note { at, .. }
-            | Self::Stopped { at } => *at,
+            | Self::Stopped { at, .. }
+            | Self::Placed { at, .. }
+            | Self::NeverLanded { at, .. }
+            | Self::Doubt { at, .. }
+            | Self::CancelRefused { at, .. }
+            | Self::Foreign { at, .. }
+            | Self::Account { at, .. }
+            | Self::Anomaly { at, .. }
+            | Self::Stray { at, .. }
+            | Self::Sighted { at }
+            | Self::Balances { at, .. } => *at,
         }
     }
 }
 
 impl JournalEntry {
+    /// A `balances` line: what the venue said the account held of
+    /// `instrument`'s two assets, at `at` on the wall clock.
+    ///
+    /// What the live binary calls at start and at stop. The asset names come
+    /// from the instrument's definition rather than from the caller, so the
+    /// line cannot name one asset and hold another's amount, and an amount of
+    /// the base is a quantity while one of the quote is money: two types, so
+    /// the two cannot be passed the wrong way round.
+    ///
+    /// # Errors
+    ///
+    /// [`UnnamedAssets`] when the definition has no asset names, as a
+    /// placeholder registered by [`replay`] has none.
+    pub fn balances(
+        at: Ts,
+        instrument: &Instrument,
+        base: Holding<Qty>,
+        quote: Holding<Notional>,
+    ) -> Result<Self, UnnamedAssets> {
+        if instrument.base.is_empty() || instrument.quote.is_empty() {
+            return Err(UnnamedAssets {
+                exchange: instrument.exchange,
+                symbol: instrument.symbol.clone(),
+            });
+        }
+        let Holding {
+            free: base_free,
+            locked: base_locked,
+        } = base;
+        let Holding {
+            free: quote_free,
+            locked: quote_locked,
+        } = quote;
+        Ok(Self::Balances {
+            at,
+            base_asset: instrument.base.clone(),
+            base_free,
+            base_locked,
+            quote_asset: instrument.quote.clone(),
+            quote_free,
+            quote_locked,
+        })
+    }
+
     /// A checkpoint stating what `portfolio` currently believes.
     ///
     /// Built from the portfolio rather than from fields a caller assembles, so
@@ -486,10 +767,21 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
         .iter()
         .enumerate()
         .filter(|(_, line)| !line.iter().all(u8::is_ascii_whitespace))
-        .map(|(i, line)| (i + 1, serde_json::from_slice::<JournalEntry>(line)))
+        .map(|(i, line)| (i + 1, line, serde_json::from_slice::<JournalEntry>(line)))
         .peekable();
-    while let Some((number, line)) = parsed.next() {
+    while let Some((number, bytes, line)) = parsed.next() {
         let e = match line {
+            // A session a newer build began. Refused at its `started` line,
+            // which is the first thing that session wrote, so the error names
+            // what is actually wrong -- a file this build is too old for --
+            // rather than the first entry type it has never heard of, which
+            // would read as damage. Refused even where every line happens to
+            // parse: a newer schema may have changed what an old field means,
+            // and a reader that guessed would fold money it does not
+            // understand.
+            Ok(JournalEntry::Started { schema, .. }) if schema > SCHEMA => {
+                return Err(too_new(number, u64::from(schema)));
+            }
             Ok(entry) => {
                 out.entries.push(entry);
                 continue;
@@ -511,18 +803,26 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
             // name. `Io` cannot come out of `from_str`, and is refused with it
             // rather than given a tolerance nothing has argued for.
             Category::Data | Category::Io => {
+                // Still the newer session's line, if it says so. A newer
+                // build may change the shape of a field `started` already
+                // has, and then the line fails here rather than above; read
+                // loosely, it can still name both schemas instead of leaving
+                // "a newer build, or damage" to guess between.
+                if let Some(schema) = claimed_schema(bytes).filter(|&s| s > u64::from(SCHEMA)) {
+                    return Err(too_new(number, schema));
+                }
                 return Err(std::io::Error::other(format!(
                     "journal line {number} is not an entry this build can read, and not the \
                      shape an interrupted write leaves either, so it is not torn -- an entry \
                      from a newer build, or damage: {e}"
-                )))
+                )));
             }
         }
         match parsed.peek() {
             // The write the crash interrupted, not yet written past.
             None => out.torn_tail = true,
             // The same, and the restart that followed it.
-            Some((_, Ok(JournalEntry::Started { .. }))) => out.torn_before_restart.push(number),
+            Some((_, _, Ok(JournalEntry::Started { .. }))) => out.torn_before_restart.push(number),
             Some(_) => {
                 return Err(std::io::Error::other(format!(
                     "journal line {number} is not readable, and only the last line may be torn, \
@@ -532,6 +832,27 @@ pub fn read(path: &Path) -> std::io::Result<Recovered> {
         }
     }
     Ok(out)
+}
+
+/// The refusal of a session begun in a newer schema, naming both numbers.
+fn too_new(number: usize, schema: u64) -> std::io::Error {
+    std::io::Error::other(format!(
+        "journal line {number} begins a session written in journal schema {schema}, \
+         and this build reads schema {SCHEMA} and older: read it with a newer build"
+    ))
+}
+
+/// The schema a line claims, if it is a `started` line, read as loose JSON.
+///
+/// For a line that would not parse as an entry. Only `type` and `schema` are
+/// looked at, so a newer build's `started` stays recognisable whatever it did
+/// to the fields around them.
+fn claimed_schema(line: &[u8]) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+    if value.get("type")?.as_str()? != "started" {
+        return None;
+    }
+    value.get("schema")?.as_u64()
 }
 
 /// Rebuild a portfolio from a journal alone.
@@ -598,6 +919,11 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
                 fee,
                 is_maker,
                 fee_asset,
+                // What was left, and the venue's names for the order and the
+                // trade: facts about the order, not money.
+                remaining: _,
+                venue_order_id: _,
+                trade_id: _,
             } => {
                 let id = resolve(registry, instrument);
                 portfolio.apply_fill(
@@ -635,7 +961,35 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             | JournalEntry::Accepted { .. }
             | JournalEntry::Rejected { .. }
             | JournalEntry::CancelRequested { .. }
-            | JournalEntry::Cancelled { .. } => {}
+            | JournalEntry::Cancelled { .. }
+            // What a live venue says on its own, schema 3. Conditions and
+            // acknowledgements, none of them money: an order placed, in doubt,
+            // a cancel refused, the stream lost, a report unreadable, a report
+            // about an order not being worked. Whatever money moved because of
+            // any of them arrives as a `filled` line of its own.
+            | JournalEntry::Placed { .. }
+            | JournalEntry::Doubt { .. }
+            | JournalEntry::CancelRefused { .. }
+            | JournalEntry::Account { .. }
+            | JournalEntry::Anomaly { .. }
+            | JournalEntry::Stray { .. }
+            // Nothing traded: the venue never had the order.
+            | JournalEntry::NeverLanded { .. }
+            // Seeing the market again is the end of an absence of input, as
+            // `blind` is the start of one.
+            | JournalEntry::Sighted { .. } => {}
+            // Money, and not this run's: the `Orphaned` argument below, for an
+            // order that is not even ours to lose track of. Folding a
+            // stranger's trade would make the recompute disagree with a
+            // checkpoint that faithfully reports what this engine holds, and
+            // the disagreement would read as an accounting bug rather than as
+            // what it is. Criterion A accounts for it against the venue's
+            // balances, which is the comparison it belongs in.
+            JournalEntry::Foreign { .. } => {}
+            // The venue's claim about the account, which criterion A compares
+            // with this fold. Folding it in would make that comparison one of
+            // the venue with itself.
+            JournalEntry::Balances { .. } => {}
             // Deliberately *not* folded, and this is the one worth arguing. An
             // orphan is a fill the engine could not attribute, so the live
             // portfolio never saw it either -- folding it here would make the
@@ -650,9 +1004,9 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             // checkpoint nor this fold counts it, and `runlog check` never
             // reads an `Orphaned` line, so an orphan alone never changes its
             // verdict. An orphaned line must be loud in `runlog check`, and
-            // making it so is owed to slice (c)'s pull request for what a live
-            // run writes down (`docs/live-run.md` §4) -- the one that gives an
-            // orphan from another run its entry.
+            // making it so is owed to the readers' pull request,
+            // `m8c-journal-readers` (`docs/live-run.md` §4), with the `stray`
+            // and other-run `foreign` lines that need the same.
             JournalEntry::Orphaned { .. } => {}
         }
     }
@@ -761,7 +1115,34 @@ pub fn agrees(entries: &[JournalEntry]) -> Agreement {
 }
 
 /// The shape this build writes.
-pub const SCHEMA: u32 = 2;
+///
+/// - **1**, everything before M7.5: no `schema` field at all.
+/// - **2**, M7.5: decisions, refusals, the lifecycle, blindness and notes.
+/// - **3**, M8 slice (c): what a live venue says beside an event and on its
+///   own, the run tag, the orders still working at a stop, the market's
+///   return after blindness, and the account's balances.
+///
+/// [`read`] refuses a session begun in a schema above this one, naming both.
+pub const SCHEMA: u32 = 3;
+
+/// The run tag of the session a journal records: the first `started` line's,
+/// or `None` when that line has none, or the journal has no `started` line.
+///
+/// The first and not the latest, as with the capital in [`replay`]: a restart
+/// continues a session rather than beginning one, and a restart that wrote a
+/// different tag would otherwise rename every order the session already sent.
+/// A later line that disagrees is not reconciled here; it is evidence, and the
+/// first line is the authority.
+#[must_use]
+pub fn run_tag(entries: &[JournalEntry]) -> Option<&str> {
+    entries.iter().find_map(|e| {
+        if let JournalEntry::Started { run, .. } = e {
+            Some(run.as_deref())
+        } else {
+            None
+        }
+    })?
+}
 
 /// What a journal with no `schema` field was: everything before M7.5.
 const fn schema_v1() -> u32 {
@@ -770,8 +1151,9 @@ const fn schema_v1() -> u32 {
 
 /// The next client order id a resumed run should mint.
 ///
-/// `max(id) + 1` over every entry that carries one, or 1 for a journal that has
-/// none. Derived from the ids rather than stored beside them, so there is
+/// `max(id) + 1` over the entries that record a mint or the outcome of one
+/// for an order the engine was working, or 1 for a journal that has none.
+/// An id that could have been named without being minted is left out. Derived from the ids rather than stored beside them, so there is
 /// nothing that can disagree with the record.
 ///
 /// Returns 1 for an empty journal, which is what a fresh run uses anyway — so a
@@ -781,10 +1163,10 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
     entries
         .iter()
         .filter_map(|e| match e {
-            // Every entry that carries an id contributes, not only fills: a
-            // refused order consumed an id without ever producing one, and a
-            // resumed run that reused it would make the hole check report holes
-            // where there are none.
+            // Not only fills: a refused order consumed an id without ever
+            // producing one, and a resumed run that reused it would make the
+            // hole check report holes where there are none. Fills count
+            // because before M7.5 they were the only lines with an id.
             JournalEntry::Filled {
                 client_order_id, ..
             }
@@ -800,16 +1182,20 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
             | JournalEntry::Rejected {
                 client_order_id, ..
             }
-            | JournalEntry::CancelRequested {
-                client_order_id, ..
-            }
             | JournalEntry::Cancelled {
                 client_order_id, ..
-            }
-            | JournalEntry::Orphaned {
-                client_order_id, ..
             } => Some(client_order_id.0),
-            JournalEntry::Started { .. }
+            // Before schema 3 these two fed the counter, and neither should
+            // have: each can carry an id no `submitted` or `refused` line
+            // holds, and the next session would then mint past it and leave
+            // the runlog hole check a hole it could not explain.
+            // `Context::cancel` writes whatever id the strategy passes, minted
+            // or not. And an orphan is the fill twin of a `stray`, the engine
+            // withholding a report on an order it is not working, which the
+            // reason below already keeps off the counter.
+            JournalEntry::CancelRequested { .. }
+            | JournalEntry::Orphaned { .. }
+            | JournalEntry::Started { .. }
             | JournalEntry::Checkpoint { .. }
             | JournalEntry::Tripped { .. }
             // Consumes no id: nothing was decided, we simply could not see.
@@ -817,7 +1203,26 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
             // Consumes no id either: a note describes a decision, and the
             // decision that minted an id is recorded by the engine beside it.
             | JournalEntry::Note { .. }
-            | JournalEntry::Stopped { .. } => None,
+            | JournalEntry::Stopped { .. }
+            // What a live venue says, schema 3. Every id this engine minted is
+            // already on a `submitted` or `refused` line, so these add nothing
+            // to the counter -- and an id the venue named must never move it.
+            // `Context::cancel` accepts any id, so a refused cancel can name
+            // one this engine never minted; a stray's id is the venue's word
+            // about an order the engine is not working; and a foreign line's
+            // id is text precisely so it cannot become a `ClientOrderId`.
+            | JournalEntry::Placed { .. }
+            | JournalEntry::NeverLanded { .. }
+            | JournalEntry::Doubt { .. }
+            | JournalEntry::CancelRefused { .. }
+            | JournalEntry::Foreign { .. }
+            | JournalEntry::Account { .. }
+            | JournalEntry::Anomaly { .. }
+            | JournalEntry::Stray { .. }
+            // Consumes no id: the market, not a decision.
+            | JournalEntry::Sighted { .. }
+            // Nor the account, which is the venue's claim.
+            | JournalEntry::Balances { .. } => None,
         })
         .max()
         .map_or(1, |highest| highest + 1)
@@ -1090,6 +1495,9 @@ mod tests {
             fee: fee.parse().expect("fee"),
             is_maker: false,
             fee_asset: quant_core::execution::FeeAsset::Quote,
+            remaining: None,
+            venue_order_id: None,
+            trade_id: None,
         }
     }
 
@@ -1099,11 +1507,13 @@ mod tests {
                 at: Ts::from_nanos(0),
                 cash: amount("100"),
                 schema: SCHEMA,
+                run: None,
             },
             filled(1, Side::Buy, "76650", "0.001", "0.0766"),
             filled(2, Side::Sell, "76700", "0.001", "0.0767"),
             JournalEntry::Stopped {
                 at: Ts::from_nanos(3),
+                working: Vec::new(),
             },
         ]
     }
@@ -1144,6 +1554,7 @@ mod tests {
                 at: Ts::from_nanos(10),
                 cash: amount("64"),
                 schema: SCHEMA,
+                run: None,
             }],
         );
         let recovered = read(&scratch.path).expect("read");
@@ -1160,6 +1571,7 @@ mod tests {
             at: Ts::from_nanos(10),
             cash: amount("64"),
             schema: SCHEMA,
+            run: None,
         });
         let mut registry = InstrumentRegistry::new();
         let portfolio = replay(&restarted, &mut registry);
@@ -1234,6 +1646,7 @@ mod tests {
                 at: Ts::from_nanos(0),
                 cash: amount("100"),
                 schema: SCHEMA,
+                run: None,
             },
             JournalEntry::Filled {
                 at: Ts::from_nanos(1),
@@ -1245,6 +1658,9 @@ mod tests {
                 fee: buy.fee,
                 is_maker: buy.is_maker,
                 fee_asset: buy.fee_asset,
+                remaining: None,
+                venue_order_id: None,
+                trade_id: None,
             },
             // What the engine writes down after booking that fill.
             JournalEntry::checkpoint(Ts::from_nanos(2), &live),
@@ -1313,6 +1729,7 @@ mod tests {
             at: Ts::from_nanos(10),
             cash: amount("100"),
             schema: SCHEMA,
+            run: None,
         };
         let after = filled(11, Side::Buy, "76800", "0.001", "0.0768");
         write_all(&scratch.path, &[restarted.clone(), after.clone()]);
@@ -1376,6 +1793,7 @@ mod tests {
             at: Ts::from_nanos(10),
             cash: amount("100"),
             schema: SCHEMA,
+            run: None,
         };
         write_all(&scratch.path, std::slice::from_ref(&restarted));
         let recovered = read(&scratch.path).expect("a restart after it is not damage");
@@ -1428,6 +1846,7 @@ mod tests {
             at: Ts::from_nanos(10),
             cash: amount("100"),
             schema: SCHEMA,
+            run: None,
         };
         write_all(path, std::slice::from_ref(&started));
         started
@@ -1600,6 +2019,7 @@ mod tests {
             at: Ts::from_nanos(10),
             cash: amount("64"),
             schema: SCHEMA,
+            run: None,
         });
         let mut registry = InstrumentRegistry::new();
         let resumed = resume(&restarted, &mut registry, btcusdt(), amount("50")).expect("resumes");
@@ -1624,6 +2044,7 @@ mod tests {
             at: Ts::from_nanos(5),
             cash: amount("99"),
             schema: SCHEMA,
+            run: None,
         });
         let mut registry = InstrumentRegistry::new();
         let resumed = resume(&entries, &mut registry, btcusdt(), amount("100")).expect("resumes");
@@ -1870,6 +2291,172 @@ mod m75a_tests {
         assert_eq!(cash.to_string(), "100");
     }
 
+    /// The fortnight's shape: schema 1, money and marks only.
+    const M5_SHAPED: &str = concat!(
+        r#"{"type":"started","at":0,"cash":10000000000}"#,
+        "\n",
+        r#"{"type":"filled","at":1789744915849764000,"client_order_id":1,"instrument":{"exchange":"binance","symbol":"BTCUSDT"},"side":"buy","px":8085625000000,"qty":100000,"fee":8085625,"is_maker":false}"#,
+        "\n",
+        r#"{"type":"checkpoint","at":1789744915849764000,"cash":9991906290,"realized":0,"fees":8085625,"fills":1}"#,
+        "\n",
+        r#"{"type":"stopped","at":1789744915849764000}"#,
+        "\n",
+    );
+
+    /// A session of schema `n`, which writes nothing a schema-2 build could
+    /// not read: the refusal must come from the number, not from a line.
+    fn begun_in(n: u32) -> String {
+        format!(
+            "{{\"type\":\"started\",\"at\":5,\"cash\":10000000000,\"schema\":{n}}}\n\
+             {{\"type\":\"stopped\",\"at\":6}}\n"
+        )
+    }
+
+    #[test]
+    fn a_session_begun_in_a_newer_schema_is_refused_naming_both_numbers() {
+        // What the field was added for at M7.5. Without the refusal, a schema-4
+        // file whose lines all happen to parse would be read as though this
+        // build understood them, and one whose lines do not would be reported
+        // as damage at the first unfamiliar entry, which says the wrong thing.
+        let err = read(&temp("schema-4", &begun_in(SCHEMA + 1)))
+            .expect_err("a newer schema is refused, not guessed at");
+        let message = err.to_string();
+        assert!(message.contains("journal line 1 "), "{message}");
+        assert!(
+            message.contains(&format!("schema {}", SCHEMA + 1)),
+            "names the file's schema: {message}"
+        );
+        assert!(
+            message.contains(&format!("schema {SCHEMA} and older")),
+            "and this build's: {message}"
+        );
+
+        // A restart under a newer build, after sessions this build wrote, is
+        // refused at that restart's line.
+        let mixed = format!("{}{}", begun_in(SCHEMA), begun_in(SCHEMA + 1));
+        let err = read(&temp("schema-mixed", &mixed)).expect_err("still refused");
+        assert!(err.to_string().contains("journal line 3 "), "{err}");
+    }
+
+    #[test]
+    fn a_newer_started_line_that_will_not_parse_still_names_its_schema() {
+        // A newer build may change the shape of a field `started` already
+        // has. Then its line fails to parse as an entry, and without a loose
+        // read the refusal falls to "a newer build, or damage", naming
+        // neither schema. Cash as text stands in for that change.
+        let reshaped = |n: u32| {
+            format!(
+                "{{\"type\":\"started\",\"at\":5,\"cash\":\"100\",\"schema\":{n}}}\n\
+                 {{\"type\":\"stopped\",\"at\":6}}\n"
+            )
+        };
+        let err = read(&temp("reshaped-newer", &reshaped(SCHEMA + 1)))
+            .expect_err("a newer schema is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("schema {}", SCHEMA + 1))
+                && message.contains(&format!("schema {SCHEMA} and older")),
+            "names both schemas: {message}"
+        );
+
+        // The same line claiming this build's schema is damage, and says so:
+        // the loose read must not call every malformed `started` too new.
+        let err = read(&temp("reshaped-current", &reshaped(SCHEMA)))
+            .expect_err("damage is still refused");
+        let message = err.to_string();
+        assert!(message.contains("or damage"), "{message}");
+        assert!(!message.contains("read it with a newer build"), "{message}");
+    }
+
+    #[test]
+    fn every_schema_up_to_this_one_still_reads() {
+        // The other side of the boundary. The fortnight's journals are schema
+        // 1, and M7.5's are schema 2, and both are evidence that must stay
+        // readable for as long as the result they support is quoted.
+        let pre = read(&temp("still-pre-m75", PRE_M75)).expect("schema 1, pre-M7.5");
+        assert_eq!(pre.entries.len(), 2);
+        let m5 = read(&temp("still-m5", M5_SHAPED)).expect("schema 1, M5's shape");
+        assert_eq!(m5.entries.len(), 4);
+        for n in 2..=SCHEMA {
+            let file = read(&temp(&format!("still-{n}"), &begun_in(n)))
+                .unwrap_or_else(|e| panic!("schema {n} reads: {e}"));
+            assert!(
+                matches!(file.entries[0], JournalEntry::Started { schema, .. } if schema == n),
+                "{:?}",
+                file.entries
+            );
+        }
+    }
+
+    #[test]
+    fn the_run_tag_is_the_first_session_s_and_an_empty_journal_has_none() {
+        // J9. The tag names this run's orders at the venue, where every run's
+        // client ids share one namespace, so a restart must not rename them:
+        // the first `started` is the authority, as it is for the capital.
+        let started = |at: i64, run: Option<&str>| JournalEntry::Started {
+            at: Ts::from_nanos(at),
+            cash: "100".parse().expect("amount"),
+            schema: SCHEMA,
+            run: run.map(str::to_owned),
+        };
+        let entries = vec![
+            started(1, Some("r7")),
+            filled(1),
+            started(5, Some("r8")),
+            filled(2),
+        ];
+        assert_eq!(
+            super::run_tag(&entries),
+            Some("r7"),
+            "the first, not the last"
+        );
+        assert_eq!(super::run_tag(&[]), None, "an empty journal has no tag");
+        assert_eq!(
+            super::run_tag(&[filled(1)]),
+            None,
+            "nor does one with no `started` line"
+        );
+        // The first line is the authority even when it has no tag: a later
+        // one does not supply what the session never had.
+        assert_eq!(
+            super::run_tag(&[started(1, None), started(5, Some("r8"))]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_run_tag_is_written_only_when_there_is_one() {
+        // Old files read, and a run without a tag writes the line it always
+        // wrote: the tag is an addition, not a change to the line.
+        let untagged = JournalEntry::Started {
+            at: Ts::from_nanos(5),
+            cash: "100".parse().expect("amount"),
+            schema: SCHEMA,
+            run: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&untagged).expect("serialize"),
+            format!(r#"{{"type":"started","at":5,"cash":10000000000,"schema":{SCHEMA}}}"#)
+        );
+        let tagged = JournalEntry::Started {
+            at: Ts::from_nanos(5),
+            cash: "100".parse().expect("amount"),
+            schema: SCHEMA,
+            run: Some("r7".to_owned()),
+        };
+        let line = serde_json::to_string(&tagged).expect("serialize");
+        assert_eq!(
+            line,
+            format!(
+                r#"{{"type":"started","at":5,"cash":10000000000,"schema":{SCHEMA},"run":"r7"}}"#
+            )
+        );
+        assert_eq!(
+            serde_json::from_str::<JournalEntry>(&line).expect("reads back"),
+            tagged
+        );
+    }
+
     #[test]
     fn the_schema_this_build_writes_is_not_the_one_it_defaults_to() {
         // Otherwise the field is decoration: every journal would report the
@@ -1890,6 +2477,7 @@ mod m75a_tests {
                 at: Ts::from_nanos(1),
                 cash: "100".parse().expect("amount"),
                 schema: SCHEMA,
+                run: None,
             },
             filled(7),
             filled(9),
@@ -1930,6 +2518,7 @@ mod m75a_tests {
             },
             JournalEntry::Stopped {
                 at: Ts::from_nanos(6),
+                working: Vec::new(),
             },
         ];
         let a = replay(&fills_only, &mut registry);
@@ -1952,6 +2541,612 @@ mod m75a_tests {
             fee: "0.0001".parse().expect("fee"),
             is_maker: false,
             fee_asset: quant_core::execution::FeeAsset::Quote,
+            remaining: None,
+            venue_order_id: None,
+            trade_id: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod schema3_tests {
+    //! What schema 3 added, pinned as bytes: every new field written with
+    //! distinct, non-zero values (J1), and every line that carries none of
+    //! them written exactly as schema 2 wrote it (J2).
+
+    use super::{InstrumentKey, JournalEntry};
+    use crate::risk::Bound;
+    use crate::RefusedBy;
+    use quant_core::event::Side;
+    use quant_core::execution::{
+        ClientOrderId, FeeAsset, RejectReason, VenueOrderId, VenueTradeId,
+    };
+    use quant_core::instrument::{Exchange, FilterBreach};
+    use quant_core::report::{Cited, EndedBy, VenueText};
+    use quant_core::time::Ts;
+
+    fn key() -> InstrumentKey {
+        InstrumentKey {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+        }
+    }
+
+    const KEY: &str = r#"{"exchange":"binance","symbol":"BTCUSDT"}"#;
+
+    /// `entry` writes exactly `json`, and `json` reads back as `entry`.
+    fn golden(entry: &JournalEntry, json: &str) {
+        assert_eq!(serde_json::to_string(entry).expect("serialize"), json);
+        assert_eq!(
+            &serde_json::from_str::<JournalEntry>(json).expect("deserialize"),
+            entry,
+            "{json}"
+        );
+    }
+
+    fn venue_order(id: &str) -> VenueOrderId {
+        VenueOrderId(id.to_owned())
+    }
+
+    #[test]
+    fn a_line_with_nothing_from_a_live_venue_is_the_line_schema_2_wrote() {
+        // J2. Every backtest and paper session writes these, and `runlog diff`
+        // compares a new replay with an old live journal: a line that changed
+        // shape for a field it does not carry would make the two files differ
+        // for a reason that has nothing to do with either run.
+        golden(
+            &JournalEntry::Accepted {
+                at: Ts::from_nanos(7),
+                client_order_id: ClientOrderId(3),
+                venue_order_id: None,
+            },
+            r#"{"type":"accepted","at":7,"client_order_id":3}"#,
+        );
+        golden(
+            &JournalEntry::Rejected {
+                at: Ts::from_nanos(8),
+                client_order_id: ClientOrderId(3),
+                reason: RejectReason::InsufficientFunds,
+                cited: None,
+                breach: None,
+            },
+            r#"{"type":"rejected","at":8,"client_order_id":3,"reason":"insufficient_funds"}"#,
+        );
+        golden(
+            &JournalEntry::Cancelled {
+                at: Ts::from_nanos(9),
+                client_order_id: ClientOrderId(3),
+                remaining: "0.05".parse().expect("qty"),
+                venue_order_id: None,
+                ended: None,
+            },
+            r#"{"type":"cancelled","at":9,"client_order_id":3,"remaining":5000000}"#,
+        );
+        golden(
+            &JournalEntry::Refused {
+                at: Ts::from_nanos(10),
+                client_order_id: ClientOrderId(4),
+                instrument: key(),
+                side: Side::Buy,
+                qty: "0.002".parse().expect("qty"),
+                reason: RejectReason::Malformed,
+                bound: None,
+                by: RefusedBy::Seam,
+            },
+            &format!(
+                r#"{{"type":"refused","at":10,"client_order_id":4,"instrument":{KEY},"side":"buy","qty":200000,"reason":"malformed","bound":null,"by":"seam"}}"#
+            ),
+        );
+        golden(
+            &JournalEntry::Refused {
+                at: Ts::from_nanos(11),
+                client_order_id: ClientOrderId(5),
+                instrument: key(),
+                side: Side::Sell,
+                qty: "0.001".parse().expect("qty"),
+                reason: RejectReason::RiskLimit,
+                bound: Some(Bound::OrderNotional),
+                by: RefusedBy::Risk,
+            },
+            &format!(
+                r#"{{"type":"refused","at":11,"client_order_id":5,"instrument":{KEY},"side":"sell","qty":100000,"reason":"risk_limit","bound":"order_notional","by":"risk"}}"#
+            ),
+        );
+        golden(
+            &JournalEntry::Stopped {
+                at: Ts::from_nanos(12),
+                working: Vec::new(),
+            },
+            r#"{"type":"stopped","at":12}"#,
+        );
+        // A fill without the venue's names, as every fill a schema-2 build
+        // wrote reads back. (A schema-3 writer always adds `remaining`.)
+        golden(
+            &JournalEntry::Filled {
+                at: Ts::from_nanos(13),
+                client_order_id: ClientOrderId(6),
+                instrument: key(),
+                side: Side::Buy,
+                px: "76650".parse().expect("px"),
+                qty: "0.001".parse().expect("qty"),
+                fee: "0.0766".parse().expect("fee"),
+                is_maker: false,
+                fee_asset: FeeAsset::Quote,
+                remaining: None,
+                venue_order_id: None,
+                trade_id: None,
+            },
+            &format!(
+                r#"{{"type":"filled","at":13,"client_order_id":6,"instrument":{KEY},"side":"buy","px":7665000000000,"qty":100000,"fee":7660000,"is_maker":false,"fee_asset":"quote"}}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn the_fields_schema_3_added_to_existing_lines_have_a_fixed_wire_form() {
+        // J1, for the fields on lines that already existed. Every value is
+        // distinct and none is zero, so a field dropped, swapped or defaulted
+        // on the way through shows here.
+        golden(
+            &JournalEntry::Filled {
+                at: Ts::from_nanos(21),
+                client_order_id: ClientOrderId(7),
+                instrument: key(),
+                side: Side::Sell,
+                px: "76651".parse().expect("px"),
+                qty: "0.0004".parse().expect("qty"),
+                fee: "0.0003".parse().expect("fee"),
+                is_maker: true,
+                fee_asset: FeeAsset::Base,
+                remaining: Some("0.0006".parse().expect("qty")),
+                venue_order_id: Some(venue_order("4293153")),
+                trade_id: Some(VenueTradeId("12345".to_owned())),
+            },
+            &format!(
+                r#"{{"type":"filled","at":21,"client_order_id":7,"instrument":{KEY},"side":"sell","px":7665100000000,"qty":40000,"fee":30000,"is_maker":true,"fee_asset":"base","remaining":60000,"venue_order_id":"4293153","trade_id":"12345"}}"#
+            ),
+        );
+        golden(
+            &JournalEntry::Accepted {
+                at: Ts::from_nanos(22),
+                client_order_id: ClientOrderId(8),
+                venue_order_id: Some(venue_order("4293154")),
+            },
+            r#"{"type":"accepted","at":22,"client_order_id":8,"venue_order_id":"4293154"}"#,
+        );
+        golden(
+            &JournalEntry::Rejected {
+                at: Ts::from_nanos(23),
+                client_order_id: ClientOrderId(9),
+                reason: RejectReason::Venue,
+                cited: Some(Cited {
+                    http_status: Some(400),
+                    code: -1013,
+                    msg: VenueText::new("Filter failure: NOTIONAL"),
+                }),
+                breach: Some(FilterBreach::MinNotional),
+            },
+            r#"{"type":"rejected","at":23,"client_order_id":9,"reason":"venue","cited":{"http_status":400,"code":-1013,"msg":"Filter failure: NOTIONAL"},"breach":"min_notional"}"#,
+        );
+        golden(
+            &JournalEntry::Cancelled {
+                at: Ts::from_nanos(24),
+                client_order_id: ClientOrderId(10),
+                remaining: "0.0007".parse().expect("qty"),
+                venue_order_id: Some(venue_order("4293155")),
+                ended: Some(EndedBy::Expired),
+            },
+            r#"{"type":"cancelled","at":24,"client_order_id":10,"remaining":70000,"venue_order_id":"4293155","ended":"expired"}"#,
+        );
+        golden(
+            &JournalEntry::Orphaned {
+                at: Ts::from_nanos(25),
+                client_order_id: ClientOrderId(11),
+                px: "76652".parse().expect("px"),
+                qty: "0.0002".parse().expect("qty"),
+                fee: "0.0001".parse().expect("fee"),
+                fee_asset: FeeAsset::Base,
+                venue_order_id: Some(venue_order("4293156")),
+                trade_id: Some(VenueTradeId("12346".to_owned())),
+            },
+            r#"{"type":"orphaned","at":25,"client_order_id":11,"px":7665200000000,"qty":20000,"fee":10000,"fee_asset":"base","venue_order_id":"4293156","trade_id":"12346"}"#,
+        );
+        golden(
+            &JournalEntry::Stopped {
+                at: Ts::from_nanos(26),
+                working: vec![ClientOrderId(12), ClientOrderId(14)],
+            },
+            r#"{"type":"stopped","at":26,"working":[12,14]}"#,
+        );
+    }
+}
+
+#[cfg(test)]
+mod venue_entry_tests {
+    //! The entries schema 3 added for what a live venue says on its own, and
+    //! what each site that has no `_` arm decided about them.
+
+    use super::{agrees, next_order_id, replay, Agreement, InstrumentKey, JournalEntry, StrayKind};
+    use quant_core::event::Side;
+    use quant_core::execution::{ClientOrderId, FeeAsset, VenueOrderId, VenueTradeId};
+    use quant_core::instrument::{Exchange, InstrumentRegistry};
+    use quant_core::report::{
+        AccountCause, AccountChange, AnomalyKind, CancelRefusal, Cited, Clearance, DoubtCause,
+        DoubtChange, ForeignOutcome, Holding, Landing, Provenance, VenueText,
+    };
+    use quant_core::time::Ts;
+
+    fn golden(entry: &JournalEntry, json: &str) {
+        assert_eq!(serde_json::to_string(entry).expect("serialize"), json);
+        assert_eq!(
+            &serde_json::from_str::<JournalEntry>(json).expect("deserialize"),
+            entry,
+            "{json}"
+        );
+    }
+
+    fn venue_order(id: &str) -> VenueOrderId {
+        VenueOrderId(id.to_owned())
+    }
+
+    fn cited() -> Cited {
+        Cited {
+            http_status: Some(400),
+            code: -2011,
+            msg: VenueText::new("Unknown order sent."),
+        }
+    }
+
+    const CITED: &str = r#"{"http_status":400,"code":-2011,"msg":"Unknown order sent."}"#;
+
+    /// One line of every entry schema 3 added as a line of its own (the
+    /// venue's, the market's return and the account's balances), every value
+    /// distinct and none zero, with the JSON each must be.
+    // A table, one row per variant: long because the set is.
+    #[allow(clippy::too_many_lines)]
+    fn every_venue_entry() -> Vec<(JournalEntry, String)> {
+        vec![
+            (
+                JournalEntry::Placed {
+                    at: Ts::from_nanos(31),
+                    client_order_id: ClientOrderId(1),
+                    venue_order_id: venue_order("4293153"),
+                    transact_ms: 1_499_405_658_657,
+                },
+                r#"{"type":"placed","at":31,"client_order_id":1,"venue_order_id":"4293153","transact_ms":1499405658657}"#.to_owned(),
+            ),
+            (
+                JournalEntry::NeverLanded {
+                    at: Ts::from_nanos(32),
+                    client_order_id: ClientOrderId(2),
+                    landing: Landing::NotSent {
+                        why: VenueText::new("connection refused"),
+                    },
+                },
+                r#"{"type":"never_landed","at":32,"client_order_id":2,"landing":{"not_sent":{"why":"connection refused"}}}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Doubt {
+                    at: Ts::from_nanos(33),
+                    client_order_id: ClientOrderId(3),
+                    change: DoubtChange::Raised {
+                        cause: DoubtCause::ServerError,
+                        said: Some(cited()),
+                    },
+                },
+                format!(
+                    r#"{{"type":"doubt","at":33,"client_order_id":3,"change":{{"raised":{{"cause":"server_error","said":{CITED}}}}}}}"#
+                ),
+            ),
+            (
+                JournalEntry::Doubt {
+                    at: Ts::from_nanos(34),
+                    client_order_id: ClientOrderId(3),
+                    change: DoubtChange::Cleared {
+                        how: Clearance::Reported,
+                    },
+                },
+                r#"{"type":"doubt","at":34,"client_order_id":3,"change":{"cleared":{"how":"reported"}}}"#.to_owned(),
+            ),
+            (
+                JournalEntry::CancelRefused {
+                    at: Ts::from_nanos(35),
+                    client_order_id: ClientOrderId(42),
+                    why: CancelRefusal::NotOpen(cited()),
+                },
+                format!(
+                    r#"{{"type":"cancel_refused","at":35,"client_order_id":42,"why":{{"not_open":{CITED}}}}}"#
+                ),
+            ),
+            (
+                JournalEntry::Foreign {
+                    at: Ts::from_nanos(36),
+                    client_id: VenueText::new("q-r0-7"),
+                    provenance: Provenance::OtherRun(VenueText::new("r0")),
+                    venue_order_id: venue_order("4293154"),
+                    side: Side::Sell,
+                    what: ForeignOutcome::Traded {
+                        trade_id: VenueTradeId("77".to_owned()),
+                        px: "0.1026".parse().expect("px"),
+                        qty: "0.2".parse().expect("qty"),
+                        commission: "0.0002".parse().expect("commission"),
+                        commission_asset: VenueText::new("BNB"),
+                        remaining: "0.4".parse().expect("qty"),
+                    },
+                },
+                r#"{"type":"foreign","at":36,"client_id":"q-r0-7","provenance":{"other_run":"r0"},"venue_order_id":"4293154","side":"sell","what":{"traded":{"trade_id":"77","px":10260000,"qty":20000000,"commission":20000,"commission_asset":"BNB","remaining":40000000}}}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Account {
+                    at: Ts::from_nanos(37),
+                    change: AccountChange::Lost {
+                        cause: AccountCause::IdleTimeout,
+                    },
+                },
+                r#"{"type":"account","at":37,"change":{"lost":{"cause":"idle_timeout"}}}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Anomaly {
+                    at: Ts::from_nanos(38),
+                    client_order_id: Some(ClientOrderId(5)),
+                    what: AnomalyKind::DuplicateTrade,
+                    detail: VenueText::new("trade 77 again"),
+                },
+                r#"{"type":"anomaly","at":38,"client_order_id":5,"what":"duplicate_trade","detail":"trade 77 again"}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Anomaly {
+                    at: Ts::from_nanos(39),
+                    client_order_id: None,
+                    what: AnomalyKind::Unreadable,
+                    detail: VenueText::new("not json"),
+                },
+                r#"{"type":"anomaly","at":39,"what":"unreadable","detail":"not json"}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Stray {
+                    at: Ts::from_nanos(40),
+                    client_order_id: ClientOrderId(99),
+                    kind: StrayKind::Cancelled,
+                    venue_order_id: Some(venue_order("4293155")),
+                },
+                r#"{"type":"stray","at":40,"client_order_id":99,"kind":"cancelled","venue_order_id":"4293155"}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Stray {
+                    at: Ts::from_nanos(41),
+                    client_order_id: ClientOrderId(98),
+                    kind: StrayKind::Rejected,
+                    venue_order_id: None,
+                },
+                r#"{"type":"stray","at":41,"client_order_id":98,"kind":"rejected"}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Sighted {
+                    at: Ts::from_nanos(43),
+                },
+                r#"{"type":"sighted","at":43}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Balances {
+                    at: Ts::from_nanos(44),
+                    base_asset: "BTC".to_owned(),
+                    base_free: "0.05".parse().expect("qty"),
+                    base_locked: "0.001".parse().expect("qty"),
+                    quote_asset: "USDT".to_owned(),
+                    quote_free: "92.5".parse().expect("notional"),
+                    quote_locked: "7.25".parse().expect("notional"),
+                },
+                r#"{"type":"balances","at":44,"base_asset":"BTC","base_free":5000000,"base_locked":100000,"quote_asset":"USDT","quote_free":9250000000,"quote_locked":725000000}"#.to_owned(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_balances_line_names_its_assets_from_the_instrument() {
+        // The helper the live binary calls at start and at stop. The names
+        // come from the definition, so a line cannot name one asset and hold
+        // another's amount; and every amount distinct, so a free swapped with
+        // a locked shows.
+        let mut registry = InstrumentRegistry::new();
+        let btcusdt = registry.register(quant_core::instrument::InstrumentDef {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+            base: "BTC".to_owned(),
+            quote: "USDT".to_owned(),
+            kind: quant_core::instrument::InstrumentKind::Spot,
+            tick_size: "0.01".parse().expect("tick"),
+            lot_size: "0.00001".parse().expect("lot"),
+            min_notional: "5".parse().expect("notional"),
+        });
+        let line = JournalEntry::balances(
+            Ts::from_nanos(44),
+            registry.expect(btcusdt),
+            Holding {
+                free: "0.05".parse().expect("qty"),
+                locked: "0.001".parse().expect("qty"),
+            },
+            Holding {
+                free: "92.5".parse().expect("notional"),
+                locked: "7.25".parse().expect("notional"),
+            },
+        )
+        .expect("a definition with both names");
+        let (expected, _) = every_venue_entry()
+            .into_iter()
+            .find(|(entry, _)| matches!(entry, JournalEntry::Balances { .. }))
+            .expect("the table holds a balances line");
+        assert_eq!(line, expected);
+
+        // A placeholder, as `replay` registers, names no assets: refused
+        // rather than written as a balance of nothing.
+        let mut placeholders = InstrumentRegistry::new();
+        let placeholder = super::resolve(&mut placeholders, &key());
+        let refused = JournalEntry::balances(
+            Ts::from_nanos(45),
+            placeholders.expect(placeholder),
+            Holding {
+                free: "1".parse().expect("qty"),
+                locked: "2".parse().expect("qty"),
+            },
+            Holding {
+                free: "3".parse().expect("notional"),
+                locked: "4".parse().expect("notional"),
+            },
+        )
+        .expect_err("no asset names, no balances");
+        assert_eq!(refused.symbol, "BTCUSDT");
+        assert!(refused.to_string().contains("without its base and quote"));
+    }
+
+    #[test]
+    fn every_entry_a_live_venue_adds_has_a_fixed_wire_form() {
+        // J1, for the new lines. Pinned before a live venue writes any, so
+        // the first journal a live run produces is in a format that cannot
+        // have drifted by accident.
+        for (entry, json) in every_venue_entry() {
+            golden(&entry, &json);
+            assert_eq!(entry.at(), {
+                let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+                Ts::from_nanos(value["at"].as_i64().expect("at"))
+            });
+        }
+        golden(
+            &JournalEntry::Stray {
+                at: Ts::from_nanos(42),
+                client_order_id: ClientOrderId(97),
+                kind: StrayKind::Accepted,
+                venue_order_id: Some(venue_order("4293157")),
+            },
+            r#"{"type":"stray","at":42,"client_order_id":97,"kind":"accepted","venue_order_id":"4293157"}"#,
+        );
+    }
+
+    fn submitted(id: u64) -> JournalEntry {
+        JournalEntry::Submitted {
+            at: Ts::from_nanos(i64::try_from(id).expect("small")),
+            client_order_id: ClientOrderId(id),
+            instrument: key(),
+            side: Side::Buy,
+            qty: "0.001".parse().expect("qty"),
+            limit: None,
+            mark: None,
+        }
+    }
+
+    fn key() -> InstrumentKey {
+        InstrumentKey {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+        }
+    }
+
+    #[test]
+    fn no_id_a_venue_named_moves_the_counter() {
+        // J4. Every id this engine minted is on a `submitted` or `refused`
+        // line already, so the new lines add nothing; and an id the venue
+        // named must never move it. A stray's id is the venue's word about an
+        // order the engine is not working, `Context::cancel` takes any id so a
+        // refused cancel can name one never minted, and a foreign client id
+        // that happens to look like ours is text on purpose.
+        let mut entries: Vec<JournalEntry> = (1..=5).map(submitted).collect();
+        entries.extend(every_venue_entry().into_iter().map(|(entry, _)| entry));
+        assert_eq!(next_order_id(&entries), 6);
+
+        // And each line on its own, with nothing minted beside it. Behind
+        // five submissions only an id above 5 could show, and most of the
+        // table's ids are 5 or below, so the assertion above sees two of the
+        // eight lines that carry one. Alone, any id a line contributed would
+        // lift the answer off 1.
+        for (entry, json) in every_venue_entry() {
+            assert_eq!(
+                next_order_id(std::slice::from_ref(&entry)),
+                1,
+                "{json} moved the counter"
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_named_but_never_minted_does_not_move_the_counter() {
+        // The two lines from before schema 3 that can carry such an id.
+        // `Context::cancel` journals whatever id the strategy passes, and an
+        // orphan is a fill for an order the engine is not working: the fill
+        // twin of a stray. Either feeding the counter would make the next
+        // session mint 100 here, and runlog's hole check would then report
+        // ids 3 to 99 as decisions nobody wrote down.
+        let mut entries: Vec<JournalEntry> = (1..=2).map(submitted).collect();
+        entries.push(JournalEntry::CancelRequested {
+            at: Ts::from_nanos(3),
+            client_order_id: ClientOrderId(99),
+        });
+        assert_eq!(next_order_id(&entries), 3, "a cancel of an id never minted");
+
+        let mut entries: Vec<JournalEntry> = (1..=2).map(submitted).collect();
+        entries.push(JournalEntry::Orphaned {
+            at: Ts::from_nanos(3),
+            client_order_id: ClientOrderId(99),
+            px: "76652".parse().expect("px"),
+            qty: "0.001".parse().expect("qty"),
+            fee: "0.0766".parse().expect("fee"),
+            fee_asset: FeeAsset::Quote,
+            venue_order_id: None,
+            trade_id: None,
+        });
+        assert_eq!(next_order_id(&entries), 3, "a fill for an order not ours");
+    }
+
+    fn filled(id: u64, side: Side, px: &str) -> JournalEntry {
+        JournalEntry::Filled {
+            at: Ts::from_nanos(i64::try_from(id).expect("small") * 100),
+            client_order_id: ClientOrderId(id),
+            instrument: key(),
+            side,
+            px: px.parse().expect("px"),
+            qty: "0.001".parse().expect("qty"),
+            fee: "0.0766".parse().expect("fee"),
+            is_maker: false,
+            fee_asset: FeeAsset::Quote,
+            remaining: Some("0".parse().expect("qty")),
+            venue_order_id: Some(venue_order(&format!("90{id}"))),
+            trade_id: Some(VenueTradeId(format!("80{id}"))),
+        }
+    }
+
+    #[test]
+    fn what_a_venue_says_on_its_own_moves_no_money() {
+        // J5. A stranger's trade is money that is not this run's, the
+        // `orphaned` argument for an order that is not even ours; the rest
+        // are conditions and acknowledgements. Folding any of them would make
+        // the recompute disagree with a checkpoint that faithfully reports
+        // what this engine holds.
+        let start = JournalEntry::Started {
+            at: Ts::from_nanos(0),
+            cash: "100".parse().expect("cash"),
+            schema: super::SCHEMA,
+            run: Some("r1".to_owned()),
+        };
+        let fills = vec![
+            filled(1, Side::Buy, "76650"),
+            filled(2, Side::Sell, "76700"),
+            filled(3, Side::Buy, "76600"),
+        ];
+        let mut plain = vec![start.clone()];
+        plain.extend(fills.iter().cloned());
+
+        let mut noisy = vec![start];
+        let mut venue = every_venue_entry().into_iter().map(|(entry, _)| entry);
+        for fill in &fills {
+            noisy.extend(venue.by_ref().take(4));
+            noisy.push(fill.clone());
+        }
+        noisy.extend(venue);
+
+        let expected = replay(&plain, &mut InstrumentRegistry::new());
+        let got = replay(&noisy, &mut InstrumentRegistry::new());
+        assert_eq!(got, expected);
+
+        noisy.push(JournalEntry::checkpoint(Ts::from_nanos(1_000), &expected));
+        assert_eq!(agrees(&noisy), Agreement::Agrees);
     }
 }

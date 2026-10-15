@@ -432,6 +432,21 @@ pub trait RunObserver {
     /// `at` is when the notice was heard, which is also where it put the
     /// engine clock if it was the latest thing on its wake.
     fn on_notice(&mut self, notice: &Notice, at: Ts);
+
+    /// A book went from meaning nothing to meaning something: the first
+    /// snapshot of a run, or the one that anchors it again after a gap.
+    ///
+    /// The explicit record of the market's return. `blind` says when the
+    /// market went dark; without this, the only evidence it came back was
+    /// that the engine wrote anything later, which a live venue falsifies by
+    /// reporting on wakes the market did not cause. Called in step 2, from
+    /// the market event that did it, so it is stamped on the event's own
+    /// clock.
+    ///
+    /// **Required**, for [`Self::on_notice`]'s reason: an observer that
+    /// inherited a default here would write a journal in which the market
+    /// never came back, and nothing would say so.
+    fn on_sighted(&mut self, at: Ts);
 }
 
 /// A fill as the engine booked it: the order, what the engine knows about it,
@@ -755,7 +770,18 @@ where
         if self.books.len() <= index {
             self.books.resize_with(index + 1, Book::new);
         }
+        let was_live = self.books[index].is_live();
         self.books[index].apply(event);
+        // The market's return, written down rather than inferred. Before
+        // this, a reader took any line the engine wrote after a `blind` one as
+        // proof the market was back, which holds only while the venue cannot
+        // speak without the market: true of the simulator, false of a live
+        // venue that reports on an idle wake while the feed is dark.
+        if !was_live && self.books[index].is_live() {
+            if let Some(observer) = self.observer.as_deref_mut() {
+                observer.on_sighted(self.now);
+            }
+        }
 
         // 3. The venue matches orders that were already resting.
         self.venue.observe(event, &self.books[index], self.now);

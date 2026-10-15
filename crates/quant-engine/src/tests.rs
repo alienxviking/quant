@@ -594,6 +594,7 @@ enum Heard {
     Filled(ClientOrderId, Qty, Option<FillIds>, Qty, Ts),
     Notice(Notice, Ts),
     Stray(OrderReport, Ts),
+    Sighted(Ts),
     /// Not a hook: a venue that writes to the same log says it was sent this.
     Sent(ClientOrderId),
     /// Not a hook: a strategy that writes to the same log was told this, with
@@ -616,8 +617,9 @@ enum Heard {
 /// most of what there is to check: a fill written down after the strategy
 /// acted on it is the defect the write-ahead rule exists to stop, and three
 /// separate lists could not show it. It heard three hooks of the eleven there
-/// were until the venue seam needed the rest, and the seam added `on_notice`
-/// and `on_stray` to make thirteen.
+/// were until the venue seam needed the rest, the seam added `on_notice` and
+/// `on_stray` to make thirteen, and the live journal added `on_sighted` to make
+/// fourteen.
 #[derive(Debug, Default)]
 struct Witness {
     heard: Vec<Heard>,
@@ -794,6 +796,10 @@ impl crate::RunObserver for std::sync::Arc<std::sync::Mutex<Witness>> {
             .push(Heard::Notice(notice.clone(), at));
     }
 
+    fn on_sighted(&mut self, at: Ts) {
+        self.lock().expect("witness").heard.push(Heard::Sighted(at));
+    }
+
     fn on_stray(&mut self, report: &OrderReport, at: Ts) {
         self.lock()
             .expect("witness")
@@ -962,7 +968,7 @@ fn every_hook_venue() -> Says {
 #[test]
 fn an_observer_hears_every_hook_in_the_order_the_engine_calls_them() {
     // The witness's own proof, and the order every later seam test reads it
-    // in: one run that reaches all thirteen hooks, each once.
+    // in: one run that reaches all fourteen hooks, each once.
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
     let mut engine = Engine::new(
         Scripted::new(vec![snapshot(1), trade(2, "100.75"), gap(3)]),
@@ -987,6 +993,9 @@ fn an_observer_hears_every_hook_in_the_order_the_engine_calls_them() {
     assert_eq!(
         seen.lock().expect("witness").heard,
         vec![
+            // Step 2: the first snapshot gives the book a meaning, before the
+            // venue or the strategy hears of the event.
+            Heard::Sighted(t1),
             Heard::Submitted(c(1), t1),
             Heard::Refused(c(2), RejectReason::Malformed, crate::RefusedBy::Seam, t1),
             Heard::CancelRequested(c(1), t1),
@@ -1028,6 +1037,50 @@ fn witnessed_run(events: Vec<MarketEvent>, limits: crate::risk::Limits) -> Witne
     engine.run().expect("no source failure");
     let out = std::mem::take(&mut *seen.lock().expect("witness"));
     out
+}
+
+#[test]
+fn the_market_s_return_is_reported_once_each_time_a_book_comes_alive() {
+    // J15. A book that goes from meaning nothing to meaning something is the
+    // market coming into view: the first snapshot, and the snapshot that
+    // anchors it again after a gap. Nothing else is: not a trade, not a delta
+    // the book buffers while unanchored, and not a snapshot that arrives while
+    // the book is already live, which is every hourly anchor in a healthy run.
+    let events = vec![
+        snapshot(1),
+        trade(2, "100.50"),
+        gap(3),
+        delta(4, 101, 101, "100.10"),
+        snapshot(5),
+        snapshot(6),
+    ];
+    let seen = witnessed_run(events, crate::risk::Limits::default());
+    let sighted: Vec<Ts> = seen
+        .heard
+        .iter()
+        .filter_map(|h| match h {
+            Heard::Sighted(at) => Some(*at),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sighted,
+        vec![meta(1).local_recv_ts, meta(5).local_recv_ts],
+        "the first snapshot, and the one after the gap, and nothing else"
+    );
+    // And after the gap's own line, which is the order a reader needs: dark,
+    // then seen again.
+    let blind_at = seen
+        .heard
+        .iter()
+        .position(|h| matches!(h, Heard::Blind(..)))
+        .expect("the gap is reported");
+    let second = seen
+        .heard
+        .iter()
+        .rposition(|h| matches!(h, Heard::Sighted(_)))
+        .expect("seen again");
+    assert!(blind_at < second, "{:?}", seen.heard);
 }
 
 #[test]
