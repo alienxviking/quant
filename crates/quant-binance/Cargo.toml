@@ -74,8 +74,13 @@ reqwest = { version = "0.12", default-features = false, features = [
 # payloads for the offline verifier. Nothing on the capture path parses anything:
 # the raw tier's whole value is that our understanding of the dialect can be wrong
 # and fixed later.
+#
+# `raw_value` is for `exchange_info.rs`, which reports every filter field it does
+# not read exactly as the venue wrote it. Reading those through `Value` would put
+# any fractional number through an `f64` on its way to the report. Additive: it
+# adds `RawValue` and changes nothing else serde_json does.
 serde = { workspace = true }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

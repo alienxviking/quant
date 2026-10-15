@@ -59,6 +59,7 @@ pub mod capture;
 pub mod connection;
 pub mod credentials;
 pub mod decode;
+pub mod exchange_info;
 pub mod live;
 pub mod orders;
 pub mod parse;
