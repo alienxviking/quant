@@ -540,32 +540,55 @@ impl TradeClient {
         params: &str,
         now_millis: i64,
     ) -> Result<Vec<u8>, SnapshotError> {
-        let reply = self.send_signed_get(path, params, now_millis).await?;
+        let reply = self
+            .send_signed(reqwest::Method::GET, path, params, now_millis)
+            .await?;
         if !reply.status.is_success() {
             return Err(SnapshotError::Status(reply.status.as_u16()));
         }
         Ok(reply.body)
     }
 
-    /// Send a signed GET and return whatever the venue answered, refusals
-    /// included, so that a refusal can be read for what it says.
-    async fn send_signed_get(
+    /// A signed request to `path`, stamped `stamped_at_ms`: the caller's
+    /// parameters and the signer's, all in the URL's query, and no body.
+    ///
+    /// The one place a signed request is built, so that every one of them is
+    /// built alike. The URL is formatted with the query exactly as it was
+    /// signed. It is not built up with `reqwest`'s `.query()`, which encodes
+    /// what it is given, and given a query already encoded would turn each `%`
+    /// into `%25`. Nothing goes in the body: the venue signs the query string
+    /// and the body concatenated (rest-api.md:555), and with the body empty
+    /// those are one string, the one signed.
+    fn signed_request(
         &self,
+        method: reqwest::Method,
+        path: &str,
+        params: &str,
+        stamped_at_ms: i64,
+    ) -> reqwest::RequestBuilder {
+        let url = format!(
+            "{}{path}?{}",
+            self.base.trim_end_matches('/'),
+            self.signed_query(params, stamped_at_ms)
+        );
+        self.http
+            .request(method, url)
+            // The API key identifies the account and travels in the header;
+            // the private key never leaves `Credentials`.
+            .header("X-MBX-APIKEY", self.credentials.key())
+    }
+
+    /// Send a signed request and return whatever the venue answered, refusals
+    /// included, so that a refusal can be read for what it says.
+    async fn send_signed(
+        &self,
+        method: reqwest::Method,
         path: &str,
         params: &str,
         now_millis: i64,
     ) -> Result<SignedReply, SnapshotError> {
-        let url = format!(
-            "{}{path}?{}",
-            self.base.trim_end_matches('/'),
-            self.signed_query(params, now_millis)
-        );
         let response = self
-            .http
-            .get(url)
-            // The API key identifies the account and travels in the header;
-            // the private key never leaves `Credentials`.
-            .header("X-MBX-APIKEY", self.credentials.key())
+            .signed_request(method, path, params, now_millis)
             .send()
             .await
             .map_err(transport_error)?;
@@ -636,7 +659,7 @@ impl TradeClient {
         // venue's, and the offset above is what reconciles them.
         let now = chrono_millis() - offset_ms;
         let reply = self
-            .send_signed_get("/api/v3/account", "", now)
+            .send_signed(reqwest::Method::GET, "/api/v3/account", "", now)
             .await
             .map_err(|e| NotReady::Unreachable(e.to_string()))?;
         if !reply.status.is_success() {
