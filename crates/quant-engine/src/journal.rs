@@ -998,15 +998,12 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             // read as an accounting bug rather than as what it is: a fill we
             // cannot account for. It is recorded so a human can see it.
             //
-            // Nothing that reads the journal back says so yet. The one thing
-            // that says it out loud is the error `JournalWriter` logs as it
-            // writes the line. `reconcile` agrees, because neither the
-            // checkpoint nor this fold counts it, and `runlog check` never
-            // reads an `Orphaned` line, so an orphan alone never changes its
-            // verdict. An orphaned line must be loud in `runlog check`, and
-            // making it so is owed to the readers' pull request,
-            // `m8c-journal-readers` (`docs/live-run.md` §4), with the `stray`
-            // and other-run `foreign` lines that need the same.
+            // `reconcile` agrees across one, because neither the checkpoint
+            // nor this fold counts it, so agreement is not where it is said.
+            // Two places say it out loud: the error `JournalWriter` logs as
+            // it writes the line, and `runlog check`, where every `orphaned`
+            // line is a finding that fails the check, beside the `stray` and
+            // other-run `foreign` lines that need the same.
             JournalEntry::Orphaned { .. } => {}
         }
     }

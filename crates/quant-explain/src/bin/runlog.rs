@@ -71,6 +71,30 @@ fn check(path: &std::path::Path) -> ExitCode {
         report.entries, report.decisions, report.claims
     );
 
+    if report.not_ours > 0 {
+        // Counted, not flagged: an account shared with a person or another
+        // program is a fact about the account, not a gap in this record.
+        println!(
+            "not ours  {} order(s) on the account this system did not place: counted, \
+             not a finding",
+            report.not_ours
+        );
+    }
+
+    // Findings before the empty case. A file with no decision can still hold
+    // a fill nobody explains, and "nothing to check" would bury it.
+    if !report.is_complete() {
+        println!();
+        for finding in &report.findings {
+            println!("{:<9} {finding}", finding.label());
+        }
+        println!();
+        println!(
+            "verdict   INCOMPLETE: {} thing(s) this file does not account for",
+            report.findings.len()
+        );
+        return ExitCode::FAILURE;
+    }
     if report.decisions == 0 && report.claims == 0 {
         println!();
         println!(
@@ -79,25 +103,13 @@ fn check(path: &std::path::Path) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    if report.is_complete() {
-        println!();
-        println!(
-            "verdict   COMPLETE: every id minted from 1 to {} was written down, and every \
-             claim folds",
-            report.decisions
-        );
-        return ExitCode::SUCCESS;
-    }
-    println!();
-    for finding in &report.findings {
-        println!("missing   {finding}");
-    }
     println!();
     println!(
-        "verdict   INCOMPLETE: {} thing(s) this file implies happened are not in it",
-        report.findings.len()
+        "verdict   COMPLETE: every id minted from 1 to {} was written down, every claim \
+         folds, and nothing the venue said is left unaccounted for",
+        report.decisions
     );
-    ExitCode::FAILURE
+    ExitCode::SUCCESS
 }
 
 fn diff(live: &std::path::Path, replay: &std::path::Path) -> ExitCode {

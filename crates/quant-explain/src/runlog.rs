@@ -28,10 +28,37 @@
 //! Losing one of those leaves no hole. They are covered only by the weaker
 //! lifecycle and strategy claims, and the strategy claim is weaker still
 //! because both sides of its fold are written by the same strategy.
+//!
+//! # What a venue said that the record cannot account for
+//!
+//! From schema 3 a live run writes down what its venue says beside its own
+//! decisions, and four kinds of line are things the run's record does not
+//! account for, each a finding:
+//!
+//! - an `orphaned` fill, which no order of this run explains: money moved,
+//!   and neither the portfolio nor its checkpoints saw it;
+//! - a `stray` report about an order the engine was not working;
+//! - a `foreign` order from another run, or under our prefix and readable as
+//!   nothing we send, one finding per order however many lines it has;
+//! - a `doubt` raised and never cleared, about an order never seen to end.
+//!
+//! A `foreign` order that is not ours at all, a person's or another
+//! program's, is **counted rather than flagged**: sharing an account is a
+//! fact about the account, not a gap in this run's record, and a check that
+//! failed every run on an account somebody else also trades would teach
+//! everyone to ignore it. Criterion A accounts for those trades against the
+//! venue's balances, which is where they belong.
+//!
+//! Every finding fails the check, as every finding before them did. The
+//! question is whether the record is complete, and each of these is a place
+//! where it is not: what was decided, what happened to it, or what it cost.
 
 use std::collections::BTreeMap;
 
-use quant_engine::journal::JournalEntry;
+use quant_core::execution::VenueOrderId;
+use quant_core::report::{DoubtCause, DoubtChange, ForeignOutcome, Provenance, VenueText};
+use quant_core::time::Ts;
+use quant_engine::journal::{JournalEntry, StrayKind};
 
 /// The first journal schema whose sessions write `sighted` lines.
 const SIGHTED_SINCE: u32 = 3;
@@ -57,11 +84,102 @@ pub enum Finding {
     /// it needs saying separately. A checker that assumed its own fix had always
     /// been in place would read such a file as COMPLETE.
     DuplicateDecision { client_order_id: u64, times: usize },
+    /// A fill for an order this engine was not working: an `orphaned` line.
+    UnattributedFill { client_order_id: u64, at: Ts },
+    /// A report other than a fill about an order the engine was not working.
+    Stray {
+        client_order_id: u64,
+        kind: StrayKind,
+        at: Ts,
+    },
+    /// An order another run sent, or one under our prefix that parses as
+    /// nothing we send. One finding per order, however many lines it has.
+    ForeignOrder {
+        client_id: String,
+        venue_order_id: String,
+        /// The other run's tag, or `None` when the id would not parse.
+        run: Option<String>,
+        lines: usize,
+        trades: usize,
+    },
+    /// A doubt raised about an order and never cleared, about an order never
+    /// seen to end.
+    LeftInDoubt {
+        client_order_id: u64,
+        since: Ts,
+        cause: DoubtCause,
+    },
+}
+
+impl Finding {
+    /// The word an operator reads first on the finding's line.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::MissingDecision { .. }
+            | Self::ClaimDoesNotFold { .. }
+            | Self::ClaimWentBackwards { .. }
+            | Self::DuplicateDecision { .. } => "missing",
+            Self::UnattributedFill { .. } => "orphan",
+            Self::Stray { .. } => "stray",
+            Self::ForeignOrder { .. } => "foreign",
+            Self::LeftInDoubt { .. } => "in doubt",
+        }
+    }
 }
 
 impl core::fmt::Display for Finding {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::UnattributedFill {
+                client_order_id,
+                at,
+            } => write!(
+                f,
+                "a fill at {} for order {client_order_id}, which this run was not working, \
+                 so no decision of its explains it and its portfolio never booked it",
+                at.to_rfc3339()
+            ),
+            Self::Stray {
+                client_order_id,
+                kind,
+                at,
+            } => write!(
+                f,
+                "a {kind:?} report at {} about order {client_order_id}, which this run was \
+                 not working",
+                at.to_rfc3339()
+            ),
+            Self::ForeignOrder {
+                client_id,
+                venue_order_id,
+                run,
+                lines,
+                trades,
+            } => {
+                match run {
+                    Some(run) => write!(f, "run {run}'s order")?,
+                    None => write!(
+                        f,
+                        "an order under our prefix that parses as nothing we send,"
+                    )?,
+                }
+                write!(
+                    f,
+                    " {client_id:?} (venue order {venue_order_id}): {lines} line(s), \
+                     {trades} trade(s) on this run's account"
+                )
+            }
+            Self::LeftInDoubt {
+                client_order_id,
+                since,
+                cause,
+            } => write!(
+                f,
+                "order {client_order_id} in doubt since {} ({cause:?}), never cleared and \
+                 never seen to end",
+                since.to_rfc3339()
+            ),
             Self::MissingDecision { client_order_id } => write!(
                 f,
                 "client_order_id {client_order_id} was minted and never written down"
@@ -97,6 +215,9 @@ pub struct Report {
     /// Decisions seen: one per `submitted` or `refused` line.
     pub decisions: usize,
     pub claims: usize,
+    /// Orders on the account that this system did not place at all: counted,
+    /// not flagged. See the module docs.
+    pub not_ours: usize,
     pub findings: Vec<Finding>,
 }
 
@@ -172,6 +293,174 @@ pub fn check(entries: &[JournalEntry]) -> Report {
         .findings
         .extend(fold_claims(entries, &mut report.claims));
     report
+        .findings
+        .extend(venue_findings(entries, &mut report.not_ours));
+    report
+}
+
+/// Orders this run did not send, one entry per order however many lines.
+#[derive(Default)]
+struct Foreigners {
+    /// Another run's, or unparseable: findings, in the order first heard of.
+    orders: Vec<Finding>,
+    /// Not placed by this system at all: counted, by client and venue id.
+    strangers: Vec<(String, String)>,
+}
+
+impl Foreigners {
+    fn hear(
+        &mut self,
+        client_id: &VenueText,
+        provenance: &Provenance,
+        venue_order_id: &VenueOrderId,
+        what: &ForeignOutcome,
+    ) {
+        let traded = usize::from(matches!(what, ForeignOutcome::Traded { .. }));
+        let run = match provenance {
+            Provenance::OtherRun(tag) => Some(tag.as_str().to_owned()),
+            Provenance::Unparseable => None,
+            // A person's order, or another program's: the account is shared,
+            // which is not a gap in this run's record.
+            Provenance::NotOurs => {
+                let key = (client_id.as_str().to_owned(), venue_order_id.0.clone());
+                if !self.strangers.contains(&key) {
+                    self.strangers.push(key);
+                }
+                return;
+            }
+        };
+        let same = self.orders.iter_mut().find(|f| {
+            matches!(f, Finding::ForeignOrder { client_id: c, venue_order_id: v, .. }
+                if c == client_id.as_str() && *v == venue_order_id.0)
+        });
+        if let Some(Finding::ForeignOrder { lines, trades, .. }) = same {
+            *lines += 1;
+            *trades += traded;
+        } else {
+            self.orders.push(Finding::ForeignOrder {
+                client_id: client_id.as_str().to_owned(),
+                venue_order_id: venue_order_id.0.clone(),
+                run,
+                lines: 1,
+                trades: traded,
+            });
+        }
+    }
+}
+
+/// What the venue said that this run's record cannot account for.
+///
+/// Exhaustive over every entry, with no `_` arm, so a line added to the
+/// journal does not build here until somebody has said whether it is one.
+fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut foreign = Foreigners::default();
+    // Orders in doubt now, and since when.
+    let mut doubts: BTreeMap<u64, (Ts, DoubtCause)> = BTreeMap::new();
+
+    // Several arms do the same thing for different reasons, and are kept
+    // apart so each reason stays beside the lines it is about.
+    for entry in entries {
+        #[allow(clippy::match_same_arms)]
+        match entry {
+            JournalEntry::Orphaned {
+                at,
+                client_order_id,
+                ..
+            } => findings.push(Finding::UnattributedFill {
+                client_order_id: client_order_id.0,
+                at: *at,
+            }),
+            JournalEntry::Stray {
+                at,
+                client_order_id,
+                kind,
+                ..
+            } => findings.push(Finding::Stray {
+                client_order_id: client_order_id.0,
+                kind: *kind,
+                at: *at,
+            }),
+            JournalEntry::Foreign {
+                client_id,
+                provenance,
+                venue_order_id,
+                what,
+                ..
+            } => foreign.hear(client_id, provenance, venue_order_id, what),
+            JournalEntry::Doubt {
+                at,
+                client_order_id,
+                change,
+            } => match change {
+                DoubtChange::Raised { cause, .. } => {
+                    // The first raise is when the doubt began; a second
+                    // before any clearing is the same doubt, still open.
+                    doubts.entry(client_order_id.0).or_insert((*at, *cause));
+                }
+                DoubtChange::Cleared { .. } => {
+                    doubts.remove(&client_order_id.0);
+                }
+            },
+            // An order that ended is no longer in doubt: whatever was unknown
+            // about it, its end is known. A fill ends it only when nothing is
+            // left, and a fill that does not say what is left ends nothing.
+            JournalEntry::Filled {
+                client_order_id,
+                remaining,
+                ..
+            } => {
+                if remaining.is_some_and(|r| r.raw() == 0) {
+                    doubts.remove(&client_order_id.0);
+                }
+            }
+            JournalEntry::Rejected {
+                client_order_id, ..
+            }
+            | JournalEntry::Cancelled {
+                client_order_id, ..
+            }
+            | JournalEntry::NeverLanded {
+                client_order_id, ..
+            } => {
+                doubts.remove(&client_order_id.0);
+            }
+            // Not an end: an acceptance, a cancel asked for or refused, a
+            // placement acknowledged, say nothing about how an order ends.
+            JournalEntry::Accepted { .. }
+            | JournalEntry::CancelRequested { .. }
+            | JournalEntry::CancelRefused { .. }
+            | JournalEntry::Placed { .. } => {}
+            // Unreadable or contradictory reports: the venue raises a doubt
+            // beside each, and that doubt is what is checked.
+            JournalEntry::Anomaly { .. } => {}
+            // The account stream lost or regained: the venue raises a doubt
+            // on every working order when it is lost, and those are checked.
+            JournalEntry::Account { .. } => {}
+            // The record's own lines, and the market's: nothing a venue said.
+            // A restart does not settle a doubt, so `started` leaves them.
+            JournalEntry::Started { .. }
+            | JournalEntry::Checkpoint { .. }
+            | JournalEntry::Submitted { .. }
+            | JournalEntry::Refused { .. }
+            | JournalEntry::Tripped { .. }
+            | JournalEntry::Blind { .. }
+            | JournalEntry::Note { .. }
+            | JournalEntry::Stopped { .. }
+            | JournalEntry::Sighted { .. }
+            | JournalEntry::Balances { .. } => {}
+        }
+    }
+    *not_ours = foreign.strangers.len();
+    findings.extend(foreign.orders);
+    findings.extend(doubts.into_iter().map(|(client_order_id, (since, cause))| {
+        Finding::LeftInDoubt {
+            client_order_id,
+            since,
+            cause,
+        }
+    }));
+    findings
 }
 
 /// The strategy's own column, folded against its own claims.
@@ -1056,5 +1345,250 @@ mod tests {
             }]
         );
         assert!(!report.is_complete());
+    }
+
+    fn venue_id(id: &str) -> quant_core::execution::VenueOrderId {
+        quant_core::execution::VenueOrderId(id.to_owned())
+    }
+
+    fn foreign(at: i64, client_id: &str, provenance: Provenance, order: &str) -> JournalEntry {
+        JournalEntry::Foreign {
+            at: Ts::from_nanos(at),
+            client_id: quant_core::report::VenueText::new(client_id),
+            provenance,
+            venue_order_id: venue_id(order),
+            side: Side::Sell,
+            what: ForeignOutcome::Accepted,
+        }
+    }
+
+    fn traded(entry: JournalEntry) -> JournalEntry {
+        let JournalEntry::Foreign {
+            at,
+            client_id,
+            provenance,
+            venue_order_id,
+            side,
+            what: _,
+        } = entry
+        else {
+            unreachable!("only a foreign line trades here")
+        };
+        JournalEntry::Foreign {
+            at,
+            client_id,
+            provenance,
+            venue_order_id,
+            side,
+            what: ForeignOutcome::Traded {
+                trade_id: quant_core::execution::VenueTradeId("77".to_owned()),
+                px: "100".parse().expect("px"),
+                qty: "2".parse().expect("qty"),
+                commission: "0.3".parse().expect("fee"),
+                commission_asset: quant_core::report::VenueText::new("BNB"),
+                remaining: "1".parse().expect("qty"),
+            },
+        }
+    }
+
+    #[test]
+    fn what_the_record_cannot_account_for_is_a_finding_and_a_stranger_is_counted() {
+        // J13. A fill no order of this run explains, a report about an order
+        // it was not working, and another run's order on the same account:
+        // each is something this run's record does not account for. A
+        // stranger's order is a fact about a shared account, and is counted.
+        let other_run = || Provenance::OtherRun(quant_core::report::VenueText::new("r0"));
+        let entries = vec![
+            submitted(1, 10),
+            submitted(2, 20),
+            JournalEntry::Orphaned {
+                at: Ts::from_nanos(30),
+                client_order_id: ClientOrderId(7),
+                px: "100".parse().expect("px"),
+                qty: "1".parse().expect("qty"),
+                fee: "0.1".parse().expect("fee"),
+                fee_asset: quant_core::execution::FeeAsset::Quote,
+                venue_order_id: None,
+                trade_id: None,
+            },
+            JournalEntry::Stray {
+                at: Ts::from_nanos(40),
+                client_order_id: ClientOrderId(9),
+                kind: StrayKind::Accepted,
+                venue_order_id: Some(venue_id("901")),
+            },
+            // Another run's order 5, heard of twice and traded once: one
+            // finding, however many lines.
+            foreign(50, "q-r0-5", other_run(), "500"),
+            traded(foreign(55, "q-r0-5", other_run(), "500")),
+            foreign(60, "q-??", Provenance::Unparseable, "600"),
+            // A person's order on the same account, twice: one order counted.
+            foreign(70, "web_1", Provenance::NotOurs, "700"),
+            traded(foreign(75, "web_1", Provenance::NotOurs, "700")),
+            foreign(80, "web_2", Provenance::NotOurs, "800"),
+        ];
+        let report = check(&entries);
+        assert_eq!(
+            report.findings,
+            vec![
+                Finding::UnattributedFill {
+                    client_order_id: 7,
+                    at: Ts::from_nanos(30),
+                },
+                Finding::Stray {
+                    client_order_id: 9,
+                    kind: StrayKind::Accepted,
+                    at: Ts::from_nanos(40),
+                },
+                Finding::ForeignOrder {
+                    client_id: "q-r0-5".to_owned(),
+                    venue_order_id: "500".to_owned(),
+                    run: Some("r0".to_owned()),
+                    lines: 2,
+                    trades: 1,
+                },
+                Finding::ForeignOrder {
+                    client_id: "q-??".to_owned(),
+                    venue_order_id: "600".to_owned(),
+                    run: None,
+                    lines: 1,
+                    trades: 0,
+                },
+            ]
+        );
+        assert_eq!(report.not_ours, 2, "two orders, three lines");
+        assert!(!report.is_complete());
+        assert_eq!(report.decisions, 2, "none of these is a decision");
+    }
+
+    fn doubt(at: i64, id: u64, change: DoubtChange) -> JournalEntry {
+        JournalEntry::Doubt {
+            at: Ts::from_nanos(at),
+            client_order_id: ClientOrderId(id),
+            change,
+        }
+    }
+
+    fn raised(at: i64, id: u64) -> JournalEntry {
+        doubt(
+            at,
+            id,
+            DoubtChange::Raised {
+                cause: DoubtCause::NoAnswer,
+                said: None,
+            },
+        )
+    }
+
+    fn filled_leaving(at: i64, id: u64, remaining: &str) -> JournalEntry {
+        let JournalEntry::Filled {
+            at: _,
+            client_order_id: _,
+            instrument,
+            side,
+            px,
+            qty,
+            fee,
+            is_maker,
+            fee_asset,
+            remaining: _,
+            venue_order_id,
+            trade_id,
+        } = filled_at(at)
+        else {
+            unreachable!("filled_at builds a fill")
+        };
+        JournalEntry::Filled {
+            at: Ts::from_nanos(at),
+            client_order_id: ClientOrderId(id),
+            instrument,
+            side,
+            px,
+            qty,
+            fee,
+            is_maker,
+            fee_asset,
+            remaining: Some(remaining.parse().expect("qty")),
+            venue_order_id,
+            trade_id,
+        }
+    }
+
+    #[test]
+    fn a_doubt_is_a_finding_until_it_is_cleared_or_the_order_ends() {
+        // J13's other half. Raised and cleared explicitly, so "left in doubt"
+        // is a fold of the file rather than an inference from what is
+        // missing. An acceptance and a partial fill say nothing about how
+        // the order ends, so neither settles it.
+        let mut entries = vec![
+            submitted(1, 10),
+            raised(100, 1),
+            JournalEntry::Accepted {
+                at: Ts::from_nanos(110),
+                client_order_id: ClientOrderId(1),
+                venue_order_id: None,
+            },
+            filled_leaving(120, 1, "0.5"),
+        ];
+        assert_eq!(
+            check(&entries).findings,
+            vec![Finding::LeftInDoubt {
+                client_order_id: 1,
+                since: Ts::from_nanos(100),
+                cause: DoubtCause::NoAnswer,
+            }]
+        );
+        entries.push(filled_leaving(130, 1, "0"));
+        assert!(
+            check(&entries).is_complete(),
+            "filled with nothing left: the order ended, so its outcome is known"
+        );
+
+        // Every other way out: cleared, cancelled, rejected, never landed.
+        let ended = vec![
+            submitted(2, 10),
+            submitted(3, 11),
+            submitted(4, 12),
+            submitted(5, 13),
+            raised(200, 2),
+            doubt(
+                210,
+                2,
+                DoubtChange::Cleared {
+                    how: quant_core::report::Clearance::Reported,
+                },
+            ),
+            raised(300, 3),
+            JournalEntry::Cancelled {
+                at: Ts::from_nanos(310),
+                client_order_id: ClientOrderId(3),
+                remaining: "1".parse().expect("qty"),
+                venue_order_id: None,
+                ended: None,
+            },
+            raised(400, 4),
+            JournalEntry::Rejected {
+                at: Ts::from_nanos(410),
+                client_order_id: ClientOrderId(4),
+                reason: quant_core::execution::RejectReason::Venue,
+                cited: None,
+                breach: None,
+            },
+            raised(500, 5),
+            JournalEntry::NeverLanded {
+                at: Ts::from_nanos(510),
+                client_order_id: ClientOrderId(5),
+                landing: quant_core::report::Landing::NotSent {
+                    why: quant_core::report::VenueText::new("connect refused"),
+                },
+            },
+        ];
+        // Dense from 1 is not this test's question.
+        let left: Vec<_> = check(&ended)
+            .findings
+            .into_iter()
+            .filter(|f| !matches!(f, Finding::MissingDecision { .. }))
+            .collect();
+        assert_eq!(left, Vec::new());
     }
 }
