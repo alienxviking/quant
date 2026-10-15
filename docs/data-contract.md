@@ -328,11 +328,15 @@ striking before some later decision is taken on the strength of capture we do
 not have yet.
 
 There is a narrower rule on top of that while a judged run is in flight: the
-container version is **frozen for its duration** (`docs/paper-run.md`). Bumping
-it would not change the running recorder — that is a binary already loaded — but
-the artifacts have to stay readable by the tools that will judge the run, and two
-weeks of capture that newer tools refuse is the same data loss arriving by a
-different route.
+container version is **frozen for its duration** (`docs/paper-run.md`). Not
+because newer tools would refuse the run's capture — a reader reads every version
+up to its own, so nothing newer refuses anything older. The hazard runs the other
+way, as the rule above says: the run is judged by a build pinned to its start,
+and a recorder rebuilt at a newer version mid-run — a supervisor restart that
+execs a binary rebuilt in the run's checkout — stamps its files with a version
+that pinned build refuses at the header. Part of the run's capture is then
+unreadable by the tools that will judge it, which is the same data loss arriving
+by a different route.
 
 **Container v2 → v3** (M8.c, 2026-10-15). Adds frame kind `3 = AccountPayload`:
 the account stream's frames — what the venue says happened to the account's
@@ -360,8 +364,9 @@ written.
 shut the window: the next container change owes "a migration note here, and a
 successful re-derive of the whole normalized tier before the v2 reader is
 removed". This is the note. No reader was removed — the v3 reader *is* the v2
-reader with one more kind, reading v1 and v2 files by the same code — so the
-re-derive owed before a removal is not yet due. What was owed instead is proof
+reader with one more kind, reading v1 and v2 files by the same code, plus the
+per-version check, which changes nothing already written — so the re-derive owed
+before a removal is not yet due. What was owed instead is proof
 that nothing already written stopped reading, and a v3 build's `verify` gave
 the v2 build's answers on both archives, frame for frame: the M5 fortnight,
 97,937,822 frames, exit 0; the acceptance week, 70,545,346 frames, exit 0 with
