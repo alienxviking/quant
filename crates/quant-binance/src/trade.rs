@@ -651,9 +651,9 @@ impl core::fmt::Display for NotReady {
             ),
             Self::BnbDiscountOn => f.write_str(
                 "the account pays its fees in BNB at a discount (discount.enabledForAccount is \
-                 true). A fee taken in BNB is in neither asset of the pair, and a live run refuses \
-                 a fill whose fee it cannot book, so switch paying fees in BNB off for this \
-                 account before trading",
+                 true). A fee taken in BNB is in neither asset of the pair, and the live path's \
+                 translator of the account stream refuses a fill whose fee it cannot book, so \
+                 switch paying fees in BNB off for this account before trading",
             ),
             Self::UnreadableCommission(fault) => write!(
                 f,
