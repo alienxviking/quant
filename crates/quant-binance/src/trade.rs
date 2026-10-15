@@ -521,8 +521,9 @@ impl TradeClient {
     ///
     /// # Errors
     ///
-    /// [`SnapshotError`] for transport, status and body failures, exactly as the
-    /// public client reports them.
+    /// [`SnapshotError`] for transport, status and body failures, in the public
+    /// client's terms -- except that a failure's text leaves out the URL, which
+    /// here carries the signature, and says what caused the failure instead.
     pub async fn signed_get(
         &self,
         path: &str,

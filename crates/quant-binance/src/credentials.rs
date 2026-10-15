@@ -8,9 +8,9 @@
 //! # Why Ed25519, and not the HMAC secret this began with
 //!
 //! Slice (b) signed with an HMAC secret. Since then the venue has closed every
-//! route the live run needs to that key type but one, and calls that one
-//! deprecated. Three facts from its documentation at commit `0556f1a`, quoted in
-//! `docs/live-run.md` §5:
+//! route the live run needs to that key type but one, and deprecated the key
+//! type itself. Three facts from its documentation at commit `0556f1a`, quoted
+//! in `docs/live-run.md` §5:
 //!
 //! - **Listen keys are gone.** `POST /api/v3/userDataStream` and the WebSocket
 //!   API's `userDataStream.start` stopped answering on 2026-02-20
@@ -35,7 +35,7 @@
 //! none of them fails a test. [`Credentials`] has a hand-written `Debug` that
 //! redacts, no `Display`, and no `Serialize` — so the compiler stops the first
 //! three and the fourth cannot reach it. The private key is held only as
-//! `ring`'s opaque key pair, never as text, so there is no `String` here for
+//! `ring`'s opaque key pair, never as text, so there is no text of it here for
 //! anybody to print.
 //!
 //! The key also never travels with the public-data client.
@@ -230,10 +230,11 @@ impl Credentials {
     /// # Errors
     ///
     /// [`CredentialError`] naming the variable, when one is absent, empty, or
-    /// not text, or when the private key cannot be read as an Ed25519 key.
-    /// Empty counts as absent: `export BINANCE_ED25519_PRIVATE_KEY=` is a
-    /// mistake that should say so, not surface as some other refusal nobody
-    /// could trace back to the shell.
+    /// not text, or when the private key cannot be read as an Ed25519 key; and
+    /// [`CredentialError::HmacSecretInstead`] when the key is missing but the
+    /// retired HMAC secret is set. Empty counts as absent:
+    /// `export BINANCE_ED25519_PRIVATE_KEY=` is a mistake that should say so,
+    /// not surface as some other refusal nobody could trace back to the shell.
     pub fn from_env() -> Result<Self, CredentialError> {
         let key = read(Self::KEY_VAR)?;
         let text = private_key_text(
@@ -473,11 +474,13 @@ fn read(name: &'static str) -> Result<String, CredentialError> {
 /// A set-but-blank variable counts as absent, and whitespace around a value is
 /// not part of it.
 ///
-/// `export BINANCE_ED25519_PRIVATE_KEY=` otherwise reaches the key parser as a
-/// key, and an API key read with PowerShell's `Get-Content -Raw` would carry its
-/// file's CRLF into a request header. Its own function so a test can exercise
-/// **this** path rather than a copy of it — the environment is process-global
-/// and two tests racing on it is a flake this suite does not need.
+/// `export BINANCE_API_KEY=` is a mistake that should be named as one, not sent
+/// as an empty header, and an API key read with PowerShell's `Get-Content -Raw`
+/// would otherwise carry its file's CRLF into a request header. (The key parser
+/// says the same of blank key text on its own, for text that reaches it through
+/// [`Credentials::new`].) Its own function so a test can exercise **this** path
+/// rather than a copy of it — the environment is process-global and two tests
+/// racing on it is a flake this suite does not need.
 fn non_empty(name: &'static str, value: &str) -> Result<String, CredentialError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
