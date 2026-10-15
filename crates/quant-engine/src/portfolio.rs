@@ -485,9 +485,9 @@ mod tests {
         // Equity agrees either way at the fill's own price, which is why
         // criterion A compares equity as its floor. Only there: a base fee is a
         // quantity of the asset, so once the price moves the two part (M5's
-        // fortnight ends at 31.70996473 one way and 31.64743842 the other). Cash and position agree only if the
-        // asset is modelled, which is what lets A compare the venue's two
-        // balances instead.
+        // fortnight ends at 31.70996473 one way and 31.64743842 the other).
+        // Cash and position agree only if the asset is modelled, which is what
+        // lets A compare the venue's two balances instead.
         let instrument = instrument();
         let px: Px = "100".parse().expect("px");
         let qty: Qty = "2".parse().expect("qty");
