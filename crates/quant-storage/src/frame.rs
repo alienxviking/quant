@@ -35,6 +35,9 @@ pub const MAGIC: [u8; 8] = *b"QUANTRAW";
 ///   bumped rather than the kind quietly added -- the alternative is a v1 reader
 ///   getting halfway through a good file and reporting `UnknownFrameKind`, which
 ///   looks like corruption. See `docs/data-contract.md` §6.
+///
+/// A reader reads every version up to this one, and a file admits only the
+/// frame kinds its own version had: see [`FrameKind::since`].
 pub const CONTAINER_VERSION: u16 = 2;
 
 /// Marks the start of a block: ASCII `QRAB`.
@@ -162,14 +165,45 @@ impl FrameKind {
         }
     }
 
+    /// The container version that introduced this kind.
+    ///
+    /// A file admits only the kinds its own header's version had. A kind-2
+    /// frame in a v1 file is not a v1 file using a newer feature: no v1 writer
+    /// could have written that byte, so the file is not what its header says it
+    /// is, and a reader treats it as corruption rather than reading on. Without
+    /// this a newer reader would accept any kind it knows in a file of any age,
+    /// and the version in the header would stop meaning anything.
+    ///
+    /// Exhaustive on purpose, like `Exchange::wire_code`: a new kind is a compile
+    /// error here until someone says which version brought it.
+    #[must_use]
+    pub const fn since(self) -> u16 {
+        match self {
+            Self::VenuePayload | Self::Control => 1,
+            Self::VenueSnapshot => 2,
+        }
+    }
+
+    /// Whether a file whose header says `container_version` may hold this kind.
+    #[must_use]
+    pub const fn admitted_in(self, container_version: u16) -> bool {
+        self.since() <= container_version
+    }
+
     /// Whether the payload is uninterpreted venue bytes.
     ///
     /// The distinction that matters for provenance: everything except
     /// [`Self::Control`] is what the venue said, and nothing in this crate has
     /// looked at it.
+    ///
+    /// Exhaustive rather than a `matches!`, so a new kind has to say which it is
+    /// instead of silently answering "no".
     #[must_use]
     pub const fn is_venue_bytes(self) -> bool {
-        matches!(self, Self::VenuePayload | Self::VenueSnapshot)
+        match self {
+            Self::VenuePayload | Self::VenueSnapshot => true,
+            Self::Control => false,
+        }
     }
 }
 
@@ -747,6 +781,26 @@ mod tests {
         assert!(FrameKind::VenuePayload.is_venue_bytes());
         assert!(FrameKind::VenueSnapshot.is_venue_bytes());
         assert!(!FrameKind::Control.is_venue_bytes());
+    }
+
+    #[test]
+    fn each_kind_is_pinned_to_the_version_that_introduced_it() {
+        // In every recorded file, because the header's version decides which
+        // kinds the file may hold. Moving a kind to a later version would make
+        // good files of the earlier one read as corrupt.
+        for (kind, since) in [
+            (FrameKind::VenuePayload, 1),
+            (FrameKind::Control, 1),
+            (FrameKind::VenueSnapshot, 2),
+        ] {
+            assert_eq!(kind.since(), since, "{kind:?}");
+            assert!(kind.admitted_in(since), "{kind:?} in v{since}");
+            assert!(
+                kind.admitted_in(CONTAINER_VERSION),
+                "{kind:?} in the current version"
+            );
+            assert!(!kind.admitted_in(since - 1), "{kind:?} before v{since}");
+        }
     }
 
     #[test]

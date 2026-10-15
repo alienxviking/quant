@@ -183,6 +183,19 @@ impl<W: Write> RawWriter<W> {
             });
         }
 
+        // A kind the header's version did not have would make a file every reader
+        // refuses as corrupt -- see `FrameKind::since`. Only reachable by stamping
+        // an older version on purpose, since `FileHeader::new` stamps the current
+        // one, and refused here on the argument the sequence check below makes:
+        // persisting a file that cannot be verified is worse than failing a write.
+        let container_version = self.header.container_version;
+        if !kind.admitted_in(container_version) {
+            return Err(StorageError::FrameKindNotInVersion {
+                kind,
+                container_version,
+            });
+        }
+
         // Strictly increasing, not contiguous. A hole means a message was
         // dropped at ingress after its sequence number was already assigned,
         // and that hole -- paired with a LocalOverflow gap record -- is the

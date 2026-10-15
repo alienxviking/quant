@@ -13,6 +13,8 @@
 use core::fmt;
 use std::io;
 
+use crate::frame::FrameKind;
+
 /// Result alias for the raw format.
 pub type StorageResult<T> = Result<T, StorageError>;
 
@@ -100,6 +102,18 @@ pub enum StorageError {
     /// Unknown [`crate::FrameKind`] discriminant.
     UnknownFrameKind(u8),
 
+    /// A frame of a kind the file's own container version did not have.
+    ///
+    /// Not a newer feature: no writer of that version could have produced the
+    /// byte, so the file is not what its header claims -- corrupted, or stamped
+    /// wrong. Kept apart from [`Self::UnknownFrameKind`] because the kind *is*
+    /// known, and the message should say which version it belongs to rather
+    /// than suggest this build is too old. See [`crate::FrameKind::since`].
+    FrameKindNotInVersion {
+        kind: FrameKind,
+        container_version: u16,
+    },
+
     /// A control frame's JSON did not parse.
     Json(serde_json::Error),
 
@@ -166,6 +180,16 @@ impl fmt::Display for StorageError {
             ),
             Self::MalformedFrame(why) => write!(f, "malformed frame: {why}"),
             Self::UnknownFrameKind(code) => write!(f, "unknown frame kind {code}"),
+            Self::FrameKindNotInVersion {
+                kind,
+                container_version,
+            } => write!(
+                f,
+                "frame kind {} ({kind:?}) arrived in container v{}, but this file says it is \
+                 v{container_version}: the file is not what its header claims",
+                kind.code(),
+                kind.since()
+            ),
             Self::Json(e) => write!(f, "control record json error: {e}"),
             Self::Compression(msg) => write!(f, "compression error: {msg}"),
         }
