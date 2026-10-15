@@ -385,6 +385,16 @@ fn check_frame(
         }
         FrameKind::VenueSnapshot => check_snapshot(frame, &at, state, report),
         FrameKind::VenuePayload => check_stream_payload(frame, &at, state, report),
+        // Not read as market data, and not skipped: the account stream is
+        // recorded in files of its own, so one of its frames here means
+        // something wrote to the wrong capture, and the frame's sequence number
+        // was taken from this session's count.
+        FrameKind::AccountPayload => report.error(
+            code::FOREIGN_FRAME,
+            at(),
+            "an account-stream frame in a market capture: the account's own reports \
+             belong in a capture of their own and are never market data",
+        ),
     }
 }
 
@@ -742,6 +752,21 @@ mod tests {
             self
         }
 
+        /// A frame from the account stream's socket. Its bytes are shaped like
+        /// a market trade on purpose: a verifier that read the account kind as
+        /// market data would then find a trade in it, and say nothing.
+        fn account_frame(mut self) -> Self {
+            let (ts, seq) = self.tick();
+            self.writer
+                .write_account_payload(
+                    ts,
+                    seq,
+                    br#"{"stream":"btcusdt@trade","data":{"e":"trade","t":9}}"#,
+                )
+                .unwrap();
+            self
+        }
+
         /// Burn `n` sequence numbers without writing them: exactly what ingress
         /// does when it drops messages.
         fn drop_messages(mut self, n: u64) -> Self {
@@ -1083,6 +1108,24 @@ mod tests {
             .seal();
         let report = run_one("bad-snapshot", bytes);
         assert_eq!(report.count(code::SNAPSHOT_UNREADABLE), 1);
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn an_account_frame_in_a_market_capture_is_an_error() {
+        // The account stream is captured apart from the market, so one of its
+        // frames here was written to the wrong capture. It is neither read as
+        // market data nor passed over in silence.
+        let (bytes, _) = Capture::new(DAY_29)
+            .gap(GapCause::RecorderRestart)
+            .snapshot(100)
+            .account_frame()
+            .delta(101, 102)
+            .seal();
+        let report = run_one("foreign-in-market", bytes);
+        assert_eq!(report.count(code::FOREIGN_FRAME), 1);
+        assert_eq!(report.totals.trades, 0, "never read as market data");
+        assert_eq!(report.totals.stream_messages, 1, "the delta, and only it");
         assert!(!report.is_clean());
     }
 

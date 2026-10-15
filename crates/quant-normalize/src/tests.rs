@@ -100,6 +100,7 @@ impl Tree {
                         last_good_ts: ts,
                     },
                 ),
+                Frame::Account { seq, payload } => writer.write_account_payload(ts, *seq, payload),
             }
             .expect("write frame");
         }
@@ -136,6 +137,11 @@ enum Frame {
     Gap {
         seq: u64,
     },
+    /// A frame of the account stream, which a market capture should never hold.
+    Account {
+        seq: u64,
+        payload: Vec<u8>,
+    },
     /// Seal the pending block. Not a record — it exists so a test can put a
     /// block boundary where it wants one, which is what makes a torn *tail*
     /// distinguishable from a file destroyed entirely. A capture with one small
@@ -147,7 +153,10 @@ enum Frame {
 impl Frame {
     const fn seq(&self) -> u64 {
         match self {
-            Self::Stream { seq, .. } | Self::Snapshot { seq, .. } | Self::Gap { seq } => *seq,
+            Self::Stream { seq, .. }
+            | Self::Snapshot { seq, .. }
+            | Self::Gap { seq }
+            | Self::Account { seq, .. } => *seq,
             Self::Seal => 0,
         }
     }
@@ -362,6 +371,62 @@ fn a_venue_with_no_adapter_is_reported_once_and_not_guessed_at() {
         &items[0],
         ReplayItem::Break(b) if matches!(b.kind, BreakKind::UnsupportedVenue(Exchange::Kraken))
     ));
+}
+
+#[test]
+fn an_account_frame_is_refused_by_name_and_never_becomes_an_event() {
+    // The account stream's bytes are never market data. These are shaped like a
+    // perfectly good trade on purpose: a replay that read the account kind as a
+    // market message would hand out a trade nobody printed, and say nothing.
+    let tree = Tree::new("account-frame");
+    tree.segment(
+        21,
+        &[
+            snapshot(1, 100),
+            Frame::Account {
+                seq: 2,
+                payload: br#"{"stream":"btcusdt@trade","data":{"e":"trade","E":2,"s":"BTCUSDT","t":1,"p":"150.00000000","q":"1.00000000","T":2,"m":true,"M":true}}"#.to_vec(),
+            },
+            delta(3, 101, 101, "101.00000000"),
+        ],
+    );
+
+    let mut events = Vec::new();
+    let mut breaks = Vec::new();
+    for item in SessionReplay::open(&tree.only_session(), instrument()) {
+        match item {
+            ReplayItem::Event(e) => events.push(e),
+            ReplayItem::Break(b) => breaks.push(b),
+        }
+    }
+    assert!(
+        matches!(breaks.as_slice(), [b] if matches!(b.kind, BreakKind::AccountStream)),
+        "{breaks:?}"
+    );
+    assert_eq!(breaks[0].after_seq, Some(2), "it says where");
+    assert!(
+        !events.iter().any(|e| matches!(e, MarketEvent::Trade(_))),
+        "{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e.meta().ingest_seq)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+
+    // And a write across it is abandoned, saying why.
+    let out = tree.root.join("out");
+    let result = crate::normalize_session(&tree.only_session(), instrument(), Some(&out));
+    assert!(
+        result
+            .write_error
+            .as_deref()
+            .is_some_and(|e| e.contains("account-stream")),
+        "{:?}",
+        result.write_error
+    );
 }
 
 #[test]

@@ -532,7 +532,7 @@ mod tests {
     use quant_core::time::Ts;
 
     use super::*;
-    use crate::frame::{ControlRecord, FrameKind};
+    use crate::frame::{ControlRecord, FrameKind, CONTAINER_VERSION};
     use crate::writer::{RawWriter, WriterOptions};
 
     const SESSION: [u8; 16] = [7; 16];
@@ -1101,6 +1101,67 @@ mod tests {
             })) => {}
             other => panic!("expected the snapshot to be refused, got {other:?}"),
         }
+    }
+
+    /// An account-stream frame, shaped like Binance's user-data events.
+    const ACCOUNT_EVENT: &[u8] = br#"{"subscriptionId":0,"event":{"e":"outboundAccountPosition","E":1785326400003,"u":1785326400002,"B":[{"a":"BTC","f":"0.00100000","l":"0.00000000"}]}}"#;
+
+    #[test]
+    fn account_frames_round_trip_in_a_current_file() {
+        let mut writer = RawWriter::create(Vec::new(), header(), WriterOptions::default()).unwrap();
+        let restart = ControlRecord::Gap {
+            cause: GapCause::RecorderRestart,
+            exchange_ts: Ts::from_nanos(T0),
+            last_good_ts: Ts::from_nanos(T0),
+        };
+        writer
+            .write_control(Ts::from_nanos(T0), 1, &restart)
+            .unwrap();
+        writer
+            .write_account_payload(Ts::from_nanos(T0 + 3_000_000), 2, ACCOUNT_EVENT)
+            .unwrap();
+        let bytes = writer.finish().unwrap().0;
+
+        let mut reader = RawReader::open(bytes.as_slice()).unwrap();
+        assert_eq!(reader.header().container_version, CONTAINER_VERSION);
+        let (frames, truncation) = reader.read_all().unwrap();
+        assert_eq!(truncation, None);
+        assert_eq!(
+            frames[1],
+            fixture_frame(FrameKind::AccountPayload, 3, 2, ACCOUNT_EVENT),
+            "the account's bytes, verbatim, under their own kind"
+        );
+        assert!(
+            frames[1].control().unwrap().is_none(),
+            "venue bytes, not ours"
+        );
+    }
+
+    #[test]
+    fn a_v2_file_holding_an_account_frame_is_corruption_not_a_newer_feature() {
+        // The account kind arrived in v3. A file stamped v2 that holds one was
+        // not written by any v2 writer, so it is not the v2 file it claims to be:
+        // refused at that frame, as corruption, not read as a newer feature.
+        let mut writer = RawWriter::create(Vec::new(), header(), WriterOptions::default()).unwrap();
+        writer
+            .write_venue_payload(Ts::from_nanos(T0), 1, DEPTH)
+            .unwrap();
+        writer
+            .write_account_payload(Ts::from_nanos(T0 + 1_000_000), 2, ACCOUNT_EVENT)
+            .unwrap();
+        let mut bytes = writer.finish().unwrap().0;
+        restamp(&mut bytes, 2);
+
+        let mut reader = RawReader::open(bytes.as_slice()).expect("v2 is a version we read");
+        assert!(matches!(reader.next_frame(), Some(Ok(f)) if f.kind == FrameKind::VenuePayload));
+        match reader.next_frame() {
+            Some(Err(StorageError::FrameKindNotInVersion {
+                kind: FrameKind::AccountPayload,
+                container_version: 2,
+            })) => {}
+            other => panic!("expected the account frame to be refused, got {other:?}"),
+        }
+        assert!(reader.next_frame().is_none());
     }
 
     #[test]

@@ -93,6 +93,16 @@ pub enum BreakKind {
     /// A recorded payload did not parse. Loud by invariant 5 — a malformed
     /// price means our model of the venue is wrong.
     ParseFailure(String),
+    /// Bytes from the account stream, which are never market data.
+    ///
+    /// The venue's reports about our own orders, recorded in a capture of their
+    /// own. Reaching one here means account bytes were handed to a market
+    /// replay, and the replay refuses them by name rather than reading them: an
+    /// account frame parsed as a market message would at best fail and at worst
+    /// yield a trade nobody printed. A break, not a skipped frame, because the
+    /// frame took a sequence number from this stream and whatever wrote it to
+    /// the wrong place may have dropped something else.
+    AccountStream,
     /// No adapter in this build knows how to read this venue's bytes.
     UnsupportedVenue(Exchange),
 }
@@ -109,6 +119,9 @@ impl core::fmt::Display for Break {
                 found.saturating_sub(*expected)
             ),
             BreakKind::ParseFailure(e) => write!(f, "parse failure: {e}"),
+            BreakKind::AccountStream => {
+                write!(f, "account-stream bytes in a market replay, refused")
+            }
             BreakKind::UnsupportedVenue(x) => write!(f, "no adapter for venue {x}"),
         }?;
         write!(f, " [{}]", self.segment.display())
@@ -327,7 +340,7 @@ impl SessionReplay {
                 self.pending.push_back(ReplayItem::Event(event));
             }
             Ok(None) => self.stats.ignored += 1,
-            Err(e) => self.brk(BreakKind::ParseFailure(e), path),
+            Err(kind) => self.brk(kind, path),
         }
     }
 }
@@ -366,7 +379,7 @@ const fn supported(exchange: Exchange) -> bool {
     matches!(exchange, Exchange::Binance)
 }
 
-/// Venue dispatch: raw bytes to an event.
+/// Venue dispatch: raw bytes to an event, or the break that refuses them.
 ///
 /// A `match` rather than a trait, deliberately, and for the same reason
 /// `quant-verify` has no venue abstraction: a trait designed from one
@@ -377,17 +390,19 @@ fn decode(
     exchange: Exchange,
     frame: &RawFrame,
     instrument: InstrumentId,
-) -> Result<Option<MarketEvent>, String> {
+) -> Result<Option<MarketEvent>, BreakKind> {
     match exchange {
         Exchange::Binance => decode_binance(frame, instrument),
-        other => Err(format!("no adapter for venue {other}")),
+        other => Err(BreakKind::ParseFailure(format!(
+            "no adapter for venue {other}"
+        ))),
     }
 }
 
 fn decode_binance(
     frame: &RawFrame,
     instrument: InstrumentId,
-) -> Result<Option<MarketEvent>, String> {
+) -> Result<Option<MarketEvent>, BreakKind> {
     // Which parser a frame kind belongs to is `quant-binance::decode`, not a
     // copy here. It is six lines, and M5's live source needs the identical six:
     // a snapshot decoded as a delta corrupts a book *silently*, which is why the
@@ -396,6 +411,11 @@ fn decode_binance(
         FrameKind::VenuePayload => Some(quant_binance::VenueBytes::Stream),
         FrameKind::VenueSnapshot => Some(quant_binance::VenueBytes::Snapshot),
         FrameKind::Control => None,
+        // Decided here, in the exhaustive match, rather than filtered out before
+        // it: the account kind has no parser in this replay, and saying so where
+        // every kind must be answered for is what keeps the next kind from
+        // falling through to one.
+        FrameKind::AccountPayload => return Err(BreakKind::AccountStream),
     };
     match venue {
         Some(what) => quant_binance::decode(
@@ -405,13 +425,18 @@ fn decode_binance(
             frame.local_recv_ts,
             frame.ingest_seq,
         )
-        .map_err(|e| e.to_string()),
+        .map_err(|e| BreakKind::ParseFailure(e.to_string())),
         // Control frames carry the recorder's own account of what happened, and
         // a gap among them is what invalidates a book. A replay that filtered
         // them out would reconstruct straight through a period of blindness.
         // Venue-agnostic, so `quant-storage` owns it and both readers share it.
-        None => frame.control().map_err(|e| e.to_string()).map(|c| {
-            c.and_then(|c| c.into_market_event(instrument, frame.local_recv_ts, frame.ingest_seq))
-        }),
+        None => frame
+            .control()
+            .map_err(|e| BreakKind::ParseFailure(e.to_string()))
+            .map(|c| {
+                c.and_then(|c| {
+                    c.into_market_event(instrument, frame.local_recv_ts, frame.ingest_seq)
+                })
+            }),
     }
 }

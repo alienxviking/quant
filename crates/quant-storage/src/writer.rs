@@ -153,6 +153,26 @@ impl<W: Write> RawWriter<W> {
         self.write_frame(FrameKind::VenueSnapshot, local_recv_ts, ingest_seq, payload)
     }
 
+    /// Append a frame from the account's own socket, verbatim.
+    ///
+    /// Like [`RawWriter::write_venue_snapshot`], different from
+    /// [`RawWriter::write_venue_payload`] only in the kind it stamps; see
+    /// [`FrameKind::AccountPayload`] for why that byte matters, and for which
+    /// frames may be handed here at all.
+    pub fn write_account_payload(
+        &mut self,
+        local_recv_ts: Ts,
+        ingest_seq: u64,
+        payload: &[u8],
+    ) -> StorageResult<()> {
+        self.write_frame(
+            FrameKind::AccountPayload,
+            local_recv_ts,
+            ingest_seq,
+            payload,
+        )
+    }
+
     /// Append a record we authored -- a gap, or a snapshot we failed to get.
     pub fn write_control(
         &mut self,

@@ -67,6 +67,9 @@ pub mod code {
     pub const PAYLOAD_UNREADABLE: &str = "payload-unreadable";
     /// A frame recorded as a snapshot does not contain a book.
     pub const SNAPSHOT_UNREADABLE: &str = "snapshot-unreadable";
+    /// A frame of a kind its stream never carries: the account stream's bytes
+    /// in a market capture, or market data in an account capture.
+    pub const FOREIGN_FRAME: &str = "foreign-frame";
     /// Bytes on disk are not the bytes we wrote.
     pub const CORRUPTION: &str = "corruption";
     /// A file was cut short.

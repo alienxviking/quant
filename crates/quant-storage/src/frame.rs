@@ -35,10 +35,13 @@ pub const MAGIC: [u8; 8] = *b"QUANTRAW";
 ///   bumped rather than the kind quietly added -- the alternative is a v1 reader
 ///   getting halfway through a good file and reporting `UnknownFrameKind`, which
 ///   looks like corruption. See `docs/data-contract.md` §6.
+/// - **v3** -- adds [`FrameKind::AccountPayload`], for M8's account stream.
+///   Bumped for v2's reason: a v2 reader refuses a v3 file at the header rather
+///   than reading most of it and then calling a good file corrupt.
 ///
 /// A reader reads every version up to this one, and a file admits only the
 /// frame kinds its own version had: see [`FrameKind::since`].
-pub const CONTAINER_VERSION: u16 = 2;
+pub const CONTAINER_VERSION: u16 = 3;
 
 /// Marks the start of a block: ASCII `QRAB`.
 ///
@@ -135,6 +138,39 @@ pub enum FrameKind {
     /// the endpoint exactly. A second REST-sourced artifact is when an envelope
     /// earns itself.
     VenueSnapshot,
+    /// Venue bytes from the account's own socket, verbatim: the stream in which
+    /// a venue reports what happened to the account's orders, as opposed to what
+    /// happened in the market. Never parsed by this crate.
+    ///
+    /// # Why this is not just a `VenuePayload`
+    ///
+    /// [`Self::VenueSnapshot`]'s argument, and a stronger case of it. These bytes
+    /// are equally the venue's, but they answer a question about the account,
+    /// not the market, and a reader that took one for a market message would at
+    /// best fail to parse it and at worst find a trade in it. One byte of kind
+    /// says which question a payload answers for as long as the file exists.
+    ///
+    /// # What is recorded, and what never is
+    ///
+    /// Every frame the venue sends on that socket -- the account's events, the
+    /// venue's notice that it is closing the connection, the answers to our
+    /// subscription requests -- byte for byte, so that a disagreement between
+    /// our record of an order and the venue's can be argued from what the venue
+    /// said rather than from our reading of it. Two things are never recorded,
+    /// because the raw tier is kept forever and a credential written into it
+    /// cannot be taken back: anything we sent, which carries the key and its
+    /// signature, and any answer that echoes the key. Binance's answers to
+    /// `session.logon` and `session.status` do (`web-socket-api.md`:3418 and
+    /// :3459). The transport sorts those out before the bytes reach ingress;
+    /// nothing below it parses a payload, so nothing below it could.
+    ///
+    /// # Where these frames live
+    ///
+    /// In files of their own, never beside market data. The account stream gets
+    /// its own capture session and so its own `ingest_seq`, which keeps a gap on
+    /// one socket from reading as blindness on the other; a market file holding
+    /// one of these is misfiled, and its readers say so rather than read it.
+    AccountPayload,
 }
 
 impl FrameKind {
@@ -144,7 +180,12 @@ impl FrameKind {
     /// test holds it to [`FrameKind::from_code`], which is what a reader actually
     /// accepts: a kind missing from here would be a slot that does not exist, and
     /// a panic the first time a file holding that kind is read.
-    pub const ALL: [Self; 3] = [Self::VenuePayload, Self::Control, Self::VenueSnapshot];
+    pub const ALL: [Self; 4] = [
+        Self::VenuePayload,
+        Self::Control,
+        Self::VenueSnapshot,
+        Self::AccountPayload,
+    ];
 
     #[must_use]
     pub const fn code(self) -> u8 {
@@ -152,6 +193,7 @@ impl FrameKind {
             Self::VenuePayload => 0,
             Self::Control => 1,
             Self::VenueSnapshot => 2,
+            Self::AccountPayload => 3,
         }
     }
 
@@ -161,6 +203,7 @@ impl FrameKind {
             0 => Some(Self::VenuePayload),
             1 => Some(Self::Control),
             2 => Some(Self::VenueSnapshot),
+            3 => Some(Self::AccountPayload),
             _ => None,
         }
     }
@@ -181,6 +224,7 @@ impl FrameKind {
         match self {
             Self::VenuePayload | Self::Control => 1,
             Self::VenueSnapshot => 2,
+            Self::AccountPayload => 3,
         }
     }
 
@@ -201,7 +245,7 @@ impl FrameKind {
     #[must_use]
     pub const fn is_venue_bytes(self) -> bool {
         match self {
-            Self::VenuePayload | Self::VenueSnapshot => true,
+            Self::VenuePayload | Self::VenueSnapshot | Self::AccountPayload => true,
             Self::Control => false,
         }
     }
@@ -773,6 +817,7 @@ mod tests {
             (FrameKind::VenuePayload, 0),
             (FrameKind::Control, 1),
             (FrameKind::VenueSnapshot, 2),
+            (FrameKind::AccountPayload, 3),
         ] {
             assert_eq!(kind.code(), code);
             assert_eq!(FrameKind::from_code(code), Some(kind));
@@ -780,6 +825,7 @@ mod tests {
         // A control frame is the only thing in the raw tier we authored.
         assert!(FrameKind::VenuePayload.is_venue_bytes());
         assert!(FrameKind::VenueSnapshot.is_venue_bytes());
+        assert!(FrameKind::AccountPayload.is_venue_bytes());
         assert!(!FrameKind::Control.is_venue_bytes());
     }
 
@@ -792,6 +838,7 @@ mod tests {
             (FrameKind::VenuePayload, 1),
             (FrameKind::Control, 1),
             (FrameKind::VenueSnapshot, 2),
+            (FrameKind::AccountPayload, 3),
         ] {
             assert_eq!(kind.since(), since, "{kind:?}");
             assert!(kind.admitted_in(since), "{kind:?} in v{since}");

@@ -46,6 +46,7 @@
 //!   kind                  u8    0 = venue stream payload
 //!                               1 = control record (ours, JSON)
 //!                               2 = venue snapshot (REST body, verbatim)
+//!                               3 = account stream payload (verbatim; v3)
 //!   local_recv_ts         i64   epoch nanos, stamped at socket read
 //!   ingest_seq            u64   ours, strictly increasing within the file
 //!   payload_len           u32
@@ -96,6 +97,16 @@
 //! different JSON shape answering a different question, and a snapshot misread as
 //! a delta corrupts a book silently instead of failing. One byte of frame kind
 //! replaces a try-parse-both on every frame in the file, forever.
+//!
+//! And again for the account stream, the venue's reports on our own orders,
+//! which M8 records before it parses them: [`FrameKind::AccountPayload`] is
+//! venue bytes too, about the account rather than the market, and no reader of
+//! market data may ever take one for a market message.
+//!
+//! A kind belongs to the container version that introduced it, and a file
+//! admits only the kinds its own version had -- see [`FrameKind::since`]. A v2
+//! file holding an account frame is not using a newer feature; no v2 writer
+//! could have written it, so it is reported as the corruption it is.
 //!
 //! ## 3. Holes in `ingest_seq` are legal, and they are evidence
 //!
