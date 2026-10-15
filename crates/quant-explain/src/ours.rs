@@ -216,7 +216,11 @@ pub fn ours_at(
 /// be *filtered on*.
 const fn entry_ts(entry: &JournalEntry) -> Option<Ts> {
     match entry {
-        JournalEntry::Started { .. } => None,
+        // `Balances` is the wall clock too, when the venue was asked: at the
+        // start of a run, before the market has dated anything. Filtered on,
+        // a start-of-run line could fall after the first fills and vanish
+        // from every prefix that should hold it.
+        JournalEntry::Started { .. } | JournalEntry::Balances { .. } => None,
         JournalEntry::Filled { at, .. }
         | JournalEntry::Checkpoint { at, .. }
         | JournalEntry::Tripped { at, .. }
@@ -271,6 +275,59 @@ mod tests {
             venue_order_id: None,
             trade_id: None,
         }
+    }
+
+    #[test]
+    fn a_balances_line_does_not_date_the_session() {
+        // `balances` is stamped on the wall clock when the venue was asked, as
+        // `started` is, not on the market's clock every other line uses. Read
+        // as the journal's first instant, a start-of-run line stamped a moment
+        // after the replayed market would put every query before the session
+        // began.
+        let path = std::env::temp_dir().join(format!(
+            "quant-explain-ours-balances-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut journal = Journal::open(&path).expect("open");
+        for entry in [
+            JournalEntry::Started {
+                at: Ts::from_nanos(10_000),
+                cash: "100".parse().expect("cash"),
+                schema: SCHEMA,
+                run: Some("r1".to_owned()),
+            },
+            JournalEntry::Balances {
+                at: Ts::from_nanos(10_001),
+                base_asset: "BTC".to_owned(),
+                base_free: "0.05".parse().expect("qty"),
+                base_locked: "0.001".parse().expect("qty"),
+                quote_asset: "USDT".to_owned(),
+                quote_free: "92.5".parse().expect("notional"),
+                quote_locked: "7.25".parse().expect("notional"),
+            },
+            filled(1_000, 1, "0.07665", FeeAsset::Quote),
+        ] {
+            journal.append(&entry).expect("append");
+        }
+        drop(journal);
+
+        let mut registry = InstrumentRegistry::new();
+        let instrument = registry.register(InstrumentDef {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+            base: "BTC".to_owned(),
+            quote: "USDT".to_owned(),
+            kind: InstrumentKind::Spot,
+            tick_size: "0.01".parse().expect("tick"),
+            lot_size: "0.00001".parse().expect("lot"),
+            min_notional: "5".parse().expect("notional"),
+        });
+        let ours = ours_at(&path, instrument, &mut registry, Ts::from_nanos(2_000));
+        let _ = std::fs::remove_file(&path);
+        let ours = ours.expect("readable");
+        assert_eq!(ours.outside_session, None, "the fill dates the session");
+        assert!(ours.last_fill.is_some());
     }
 
     #[test]

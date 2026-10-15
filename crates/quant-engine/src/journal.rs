@@ -85,7 +85,7 @@ use quant_core::instrument::{
 };
 use quant_core::report::{
     AccountChange, AnomalyKind, CancelRefusal, Cited, DoubtChange, EndedBy, ForeignOutcome,
-    Landing, Provenance, VenueText,
+    Holding, Landing, Provenance, VenueText,
 };
 use quant_core::time::Ts;
 
@@ -477,7 +477,52 @@ pub enum JournalEntry {
     /// back, which holds only while a venue cannot speak without the market:
     /// a live venue reports on wakes a dark market produces.
     Sighted { at: Ts },
+    /// What the venue said the account held of the instrument's two assets.
+    /// Schema 3.
+    ///
+    /// Criterion A's baseline: our equity and the venue's two balances,
+    /// marked at one price, must agree, and the balances at the start of a
+    /// run can never be taken after the fact. Written by the live binary at
+    /// start and at stop, through [`JournalEntry::balances`].
+    ///
+    /// The venue's claim, never folded: a recompute that read it would make
+    /// criterion A compare the venue with itself. `at` is the wall clock when
+    /// the venue was asked, as `started` is, because the market has not
+    /// begun, or has ended, when it is taken.
+    Balances {
+        at: Ts,
+        base_asset: String,
+        base_free: Qty,
+        base_locked: Qty,
+        quote_asset: String,
+        quote_free: Notional,
+        quote_locked: Notional,
+    },
 }
+
+/// An instrument whose definition names no assets, so its balances could not
+/// be said to be of anything.
+///
+/// What a placeholder registered by [`replay`] looks like, and what the
+/// user-data translator refuses for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnnamedAssets {
+    pub exchange: Exchange,
+    pub symbol: String,
+}
+
+impl std::fmt::Display for UnnamedAssets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} is registered without its base and quote asset names, so a balance \
+             could not say which asset it is of: register the venue's definition first",
+            self.exchange, self.symbol
+        )
+    }
+}
+
+impl std::error::Error for UnnamedAssets {}
 
 /// What a `stray` line reported: every kind of order report but a fill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -514,12 +559,57 @@ impl JournalEntry {
             | Self::Account { at, .. }
             | Self::Anomaly { at, .. }
             | Self::Stray { at, .. }
-            | Self::Sighted { at } => *at,
+            | Self::Sighted { at }
+            | Self::Balances { at, .. } => *at,
         }
     }
 }
 
 impl JournalEntry {
+    /// A `balances` line: what the venue said the account held of
+    /// `instrument`'s two assets, at `at` on the wall clock.
+    ///
+    /// What the live binary calls at start and at stop. The asset names come
+    /// from the instrument's definition rather than from the caller, so the
+    /// line cannot name one asset and hold another's amount, and an amount of
+    /// the base is a quantity while one of the quote is money: two types, so
+    /// the two cannot be passed the wrong way round.
+    ///
+    /// # Errors
+    ///
+    /// [`UnnamedAssets`] when the definition has no asset names, as a
+    /// placeholder registered by [`replay`] has none.
+    pub fn balances(
+        at: Ts,
+        instrument: &Instrument,
+        base: Holding<Qty>,
+        quote: Holding<Notional>,
+    ) -> Result<Self, UnnamedAssets> {
+        if instrument.base.is_empty() || instrument.quote.is_empty() {
+            return Err(UnnamedAssets {
+                exchange: instrument.exchange,
+                symbol: instrument.symbol.clone(),
+            });
+        }
+        let Holding {
+            free: base_free,
+            locked: base_locked,
+        } = base;
+        let Holding {
+            free: quote_free,
+            locked: quote_locked,
+        } = quote;
+        Ok(Self::Balances {
+            at,
+            base_asset: instrument.base.clone(),
+            base_free,
+            base_locked,
+            quote_asset: instrument.quote.clone(),
+            quote_free,
+            quote_locked,
+        })
+    }
+
     /// A checkpoint stating what `portfolio` currently believes.
     ///
     /// Built from the portfolio rather than from fields a caller assembles, so
@@ -870,6 +960,10 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             // what it is. Criterion A accounts for it against the venue's
             // balances, which is the comparison it belongs in.
             JournalEntry::Foreign { .. } => {}
+            // The venue's claim about the account, which criterion A compares
+            // with this fold. Folding it in would make that comparison one of
+            // the venue with itself.
+            JournalEntry::Balances { .. } => {}
             // Deliberately *not* folded, and this is the one worth arguing. An
             // orphan is a fill the engine could not attribute, so the live
             // portfolio never saw it either -- folding it here would make the
@@ -1095,7 +1189,9 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
             | JournalEntry::Anomaly { .. }
             | JournalEntry::Stray { .. }
             // Consumes no id: the market, not a decision.
-            | JournalEntry::Sighted { .. } => None,
+            | JournalEntry::Sighted { .. }
+            // Nor the account, which is the venue's claim.
+            | JournalEntry::Balances { .. } => None,
         })
         .max()
         .map_or(1, |highest| highest + 1)
@@ -2615,7 +2711,7 @@ mod venue_entry_tests {
     use quant_core::instrument::{Exchange, InstrumentRegistry};
     use quant_core::report::{
         AccountCause, AccountChange, AnomalyKind, CancelRefusal, Cited, Clearance, DoubtCause,
-        DoubtChange, ForeignOutcome, Landing, Provenance, VenueText,
+        DoubtChange, ForeignOutcome, Holding, Landing, Provenance, VenueText,
     };
     use quant_core::time::Ts;
 
@@ -2643,8 +2739,8 @@ mod venue_entry_tests {
     const CITED: &str = r#"{"http_status":400,"code":-2011,"msg":"Unknown order sent."}"#;
 
     /// One line of every entry schema 3 added as a line of its own (the
-    /// venue's, and the market's return), every value distinct and none zero,
-    /// with the JSON each must be.
+    /// venue's, the market's return and the account's balances), every value
+    /// distinct and none zero, with the JSON each must be.
     // A table, one row per variant: long because the set is.
     #[allow(clippy::too_many_lines)]
     fn every_venue_entry() -> Vec<(JournalEntry, String)> {
@@ -2770,7 +2866,76 @@ mod venue_entry_tests {
                 },
                 r#"{"type":"sighted","at":43}"#.to_owned(),
             ),
+            (
+                JournalEntry::Balances {
+                    at: Ts::from_nanos(44),
+                    base_asset: "BTC".to_owned(),
+                    base_free: "0.05".parse().expect("qty"),
+                    base_locked: "0.001".parse().expect("qty"),
+                    quote_asset: "USDT".to_owned(),
+                    quote_free: "92.5".parse().expect("notional"),
+                    quote_locked: "7.25".parse().expect("notional"),
+                },
+                r#"{"type":"balances","at":44,"base_asset":"BTC","base_free":5000000,"base_locked":100000,"quote_asset":"USDT","quote_free":9250000000,"quote_locked":725000000}"#.to_owned(),
+            ),
         ]
+    }
+
+    #[test]
+    fn a_balances_line_names_its_assets_from_the_instrument() {
+        // The helper the live binary calls at start and at stop. The names
+        // come from the definition, so a line cannot name one asset and hold
+        // another's amount; and every amount distinct, so a free swapped with
+        // a locked shows.
+        let mut registry = InstrumentRegistry::new();
+        let btcusdt = registry.register(quant_core::instrument::InstrumentDef {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+            base: "BTC".to_owned(),
+            quote: "USDT".to_owned(),
+            kind: quant_core::instrument::InstrumentKind::Spot,
+            tick_size: "0.01".parse().expect("tick"),
+            lot_size: "0.00001".parse().expect("lot"),
+            min_notional: "5".parse().expect("notional"),
+        });
+        let line = JournalEntry::balances(
+            Ts::from_nanos(44),
+            registry.expect(btcusdt),
+            Holding {
+                free: "0.05".parse().expect("qty"),
+                locked: "0.001".parse().expect("qty"),
+            },
+            Holding {
+                free: "92.5".parse().expect("notional"),
+                locked: "7.25".parse().expect("notional"),
+            },
+        )
+        .expect("a definition with both names");
+        let (expected, _) = every_venue_entry()
+            .into_iter()
+            .find(|(entry, _)| matches!(entry, JournalEntry::Balances { .. }))
+            .expect("the table holds a balances line");
+        assert_eq!(line, expected);
+
+        // A placeholder, as `replay` registers, names no assets: refused
+        // rather than written as a balance of nothing.
+        let mut placeholders = InstrumentRegistry::new();
+        let placeholder = super::resolve(&mut placeholders, &key());
+        let refused = JournalEntry::balances(
+            Ts::from_nanos(45),
+            placeholders.expect(placeholder),
+            Holding {
+                free: "1".parse().expect("qty"),
+                locked: "2".parse().expect("qty"),
+            },
+            Holding {
+                free: "3".parse().expect("notional"),
+                locked: "4".parse().expect("notional"),
+            },
+        )
+        .expect_err("no asset names, no balances");
+        assert_eq!(refused.symbol, "BTCUSDT");
+        assert!(refused.to_string().contains("without its base and quote"));
     }
 
     #[test]

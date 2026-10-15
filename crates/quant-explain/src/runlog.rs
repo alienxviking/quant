@@ -513,7 +513,10 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
             | JournalEntry::Foreign { .. }
             | JournalEntry::Account { .. }
             | JournalEntry::Anomaly { .. }
-            | JournalEntry::Stray { .. } => {}
+            | JournalEntry::Stray { .. }
+            // The account, asked of the venue on the wall clock: not the
+            // market feed.
+            | JournalEntry::Balances { .. } => {}
         }
         if stamp <= from {
             continue;
@@ -547,7 +550,8 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
             | JournalEntry::Account { .. }
             | JournalEntry::Anomaly { .. }
             | JournalEntry::Stray { .. }
-            | JournalEntry::Sighted { .. } => {}
+            | JournalEntry::Sighted { .. }
+            | JournalEntry::Balances { .. } => {}
         }
     }
     out.blind = blind.map(|(stamp, cause)| (stamp, cause, seen_since));
