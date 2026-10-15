@@ -267,7 +267,7 @@ impl NewOrder {
                     let cause = declined_because(&error.msg);
                     Placement::Refused(Refusal::new(http_status, error, cause))
                 }
-                code => match request_refusal(http_status, code) {
+                code => match request_refusal(http_status, code, &NEW_ORDER_ISSUES) {
                     Some(cause) => Placement::Refused(Refusal::new(http_status, error, cause)),
                     None => Placement::Unknown {
                         why: WhyUnknown::unsettled(http_status, error),
@@ -388,7 +388,7 @@ impl CancelOrder {
                 -2011 | -1013 => {
                     CancelReply::Refused(Refusal::new(http_status, error, RefusalCause::Declined))
                 }
-                code => match request_refusal(http_status, code) {
+                code => match request_refusal(http_status, code, &CANCEL_ISSUES) {
                     Some(cause) => CancelReply::Refused(Refusal::new(http_status, error, cause)),
                     None => CancelReply::Unknown {
                         why: WhyUnknown::unsettled(http_status, error),
@@ -677,9 +677,9 @@ pub enum RefusalCause {
     /// `-1022`, `-2014` or `-2015`: the signature, the key's format, or the
     /// key, address or permissions (errors.md:57-58, 338-342).
     Credentials,
-    /// One of the `-11xx` *"Request issues"* (errors.md:71) that a request to
-    /// this endpoint can meet: a parameter missing, empty, malformed or not
-    /// wanted.
+    /// One of the `-11xx` *"Request issues"* (errors.md:71) that the request
+    /// can meet, given the parameters it sends: a parameter missing, empty,
+    /// malformed or not wanted.
     Malformed,
     /// `-1003` or `-1015` with a 429, a request rate limit broken, or a 418,
     /// an address banned for not backing off (rest-api.md:114-115;
@@ -986,9 +986,15 @@ struct CancelAck {
     orig_client_order_id: String,
 }
 
-/// A refusal that a signed request to this endpoint can meet whatever it asks
-/// for, or `None` when the code is not one.
-fn request_refusal(http_status: u16, code: i64) -> Option<RefusalCause> {
+/// A refusal that a signed request to this endpoint can meet, or `None` when
+/// the code is not one.
+///
+/// Every code here but the request issues can meet either request, whatever
+/// it asks for. Of the request issues, `own_issues` are the ones about
+/// parameters only this request sends, [`NEW_ORDER_ISSUES`] or
+/// [`CANCEL_ISSUES`], so that a code about a parameter it never sent is left
+/// unknown.
+fn request_refusal(http_status: u16, code: i64, own_issues: &[i64]) -> Option<RefusalCause> {
     match code {
         -1021 => Some(RefusalCause::Timestamp),
         -1022 | -2014 | -2015 => Some(RefusalCause::Credentials),
@@ -1005,7 +1011,9 @@ fn request_refusal(http_status: u16, code: i64) -> Option<RefusalCause> {
         // (errors.md:22-24) that a 429 reports. Under any other status neither
         // code is the documented failure, so it settles nothing.
         -1003 | -1015 if matches!(http_status, 418 | 429) => Some(RefusalCause::RateLimited),
-        code if REQUEST_ISSUES.contains(&code) => Some(RefusalCause::Malformed),
+        code if REQUEST_ISSUES.contains(&code) || own_issues.contains(&code) => {
+            Some(RefusalCause::Malformed)
+        }
         _ => None,
     }
 }
@@ -1040,15 +1048,19 @@ const DUPLICATE_ORDER: &str = "Duplicate order sent.";
 /// errors.md:374.
 const UNKNOWN_ORDER: &str = "Unknown order sent.";
 
-/// The `-11xx` *"Request issues"* (errors.md:71) whose parameter or condition
-/// can arise on `POST` or `DELETE /api/v3/order`.
+/// The `-11xx` *"Request issues"* (errors.md:71) that either request to
+/// `/api/v3/order` can meet, a new order or a cancel: the ones about any
+/// parameter, or about a parameter both send.
 ///
-/// The rest of the range belongs to other endpoints and protocols (intervals,
-/// listen keys, order lists, SBE, FIX) or to parameters this module never
-/// sends, and one of those here would mean its model of the venue is wrong, so
-/// it is left unknown. So is `-1112`, *"No orders on book for symbol."*
-/// (errors.md:112-113): whether this endpoint sends it is not documented.
-const REQUEST_ISSUES: [i64; 18] = [
+/// A request issue about a parameter only one of them sends is in that one's
+/// own list, [`NEW_ORDER_ISSUES`] or [`CANCEL_ISSUES`], and the other leaves it
+/// unknown. The rest of the range belongs to other endpoints and protocols
+/// (intervals, listen keys, order lists, SBE, FIX) or to parameters this
+/// module never sends, and one of those here would mean its model of the venue
+/// is wrong, so it is left unknown. So is `-1112`, *"No orders on book for
+/// symbol."* (errors.md:112-113): whether this endpoint sends it is not
+/// documented.
+const REQUEST_ISSUES: [i64; 12] = [
     -1100, // ILLEGAL_CHARS, errors.md:72-74
     -1101, // TOO_MANY_PARAMETERS, errors.md:76-79
     -1102, // MANDATORY_PARAM_EMPTY_OR_MALFORMED, errors.md:81-87
@@ -1058,15 +1070,27 @@ const REQUEST_ISSUES: [i64; 18] = [
     -1106, // PARAM_NOT_REQUIRED, errors.md:101-104
     -1108, // PARAM_OVERFLOW, errors.md:106-107
     -1111, // BAD_PRECISION, errors.md:109-110
+    -1121, // BAD_SYMBOL, errors.md:136-137
+    -1128, // OPTIONAL_PARAMS_BAD_COMBO, errors.md:149-154
+    -1130, // INVALID_PARAMETER, errors.md:156-158
+];
+
+/// The request issues about the parameters only a new order sends: its
+/// `timeInForce`, `type`, `side` and `newClientOrderId`. A cancel sends none
+/// of them, so on a cancel these are unknown.
+const NEW_ORDER_ISSUES: [i64; 5] = [
     -1114, // TIF_NOT_REQUIRED, errors.md:115-116
     -1115, // INVALID_TIF, errors.md:118-119
     -1116, // INVALID_ORDER_TYPE, errors.md:121-122
     -1117, // INVALID_SIDE, errors.md:124-125
     -1118, // EMPTY_NEW_CL_ORD_ID, errors.md:127-128
+];
+
+/// The request issue about the parameter only a cancel sends, its
+/// `origClientOrderId`. A new order does not send it, so on a new order this
+/// is unknown.
+const CANCEL_ISSUES: [i64; 1] = [
     -1119, // EMPTY_ORG_CL_ORD_ID, errors.md:130-131
-    -1121, // BAD_SYMBOL, errors.md:136-137
-    -1128, // OPTIONAL_PARAMS_BAD_COMBO, errors.md:149-154
-    -1130, // INVALID_PARAMETER, errors.md:156-158
 ];
 
 #[cfg(test)]
@@ -2072,6 +2096,8 @@ mod tests {
                 -1145,
                 "`cancelRestrictions` has to be either `ONLY_NEW` or `ONLY_PARTIALLY_FILLED`.",
             ),
+            // The parameter only a cancel sends (errors.md:130-131).
+            (-1119, "Original client order ID was empty."),
             // Not documented for this endpoint (errors.md:112-113).
             (-1112, "No orders on book for symbol."),
             // Named only in a heading (errors.md:367): the message is a
@@ -2451,13 +2477,6 @@ mod tests {
             "errors.md:109-110",
         ),
         (
-            -1118,
-            "New client order ID was empty.",
-            400,
-            MALFORMED,
-            "errors.md:127-128; rest-api.md:2396",
-        ),
-        (
             -1119,
             "Original client order ID was empty.",
             400,
@@ -2584,6 +2603,14 @@ mod tests {
                 -1145,
                 "`cancelRestrictions` has to be either `ONLY_NEW` or `ONLY_PARTIALLY_FILLED`.",
             ),
+            // Parameters only a new order sends (errors.md:115-128). A cancel
+            // may send a `newClientOrderId` of its own (rest-api.md:2396), and
+            // this one does not.
+            (-1114, "TimeInForce parameter sent when not required."),
+            (-1115, "Invalid timeInForce."),
+            (-1116, "Invalid orderType."),
+            (-1117, "Invalid side."),
+            (-1118, "New client order ID was empty."),
             (0, ""),
             (-9999, "A code from after this was written."),
         ] {
