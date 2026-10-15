@@ -1,8 +1,9 @@
 //! Where orders go.
 //!
-//! Three implementations eventually: simulated (M3), paper (M5) and live (M8).
-//! The trait is what makes them interchangeable, and its shape is the contract's
-//! central claim — **submission returns nothing**.
+//! Two implementations: simulated (M3), which paper trading uses as well -- M5
+//! found that a paper venue would be the simulator again -- and live (M8, not
+//! built yet). The trait is what makes them interchangeable, and its shape is
+//! the contract's central claim — **submission returns nothing**.
 //!
 //! # Why `submit` has no return value
 //!
@@ -121,9 +122,10 @@ pub trait ExecutionVenue {
 
     /// Show the venue what the market just did.
     ///
-    /// A simulated venue matches resting orders against this. A live or paper
-    /// venue ignores it — the real market already knows — which is why the
-    /// default implementation does nothing and only the simulator overrides it.
+    /// A simulated venue matches resting orders against this, in a backtest and
+    /// in paper alike. A live venue ignores it — the real market already knows
+    /// — which is why the default implementation does nothing and only the
+    /// simulator overrides it.
     ///
     /// Called *before* the strategy sees the event, so an order resting from
     /// earlier can trade against it and an order placed on seeing it cannot.

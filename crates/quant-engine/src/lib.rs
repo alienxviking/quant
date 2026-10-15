@@ -8,8 +8,12 @@
 //! ```text
 //!   EventSource ──► Engine ──► Strategy ──► RiskLayer ──► ExecutionVenue
 //!                      │                                        │
-//!                      └──────── ExecutionEvent ◄───────────────┘
+//!                      └────────── VenueReport ◄────────────────┘
 //! ```
+//!
+//! What comes back is a [`VenueReport`]: an order report, whose event is all the
+//! strategy is told while the record hears the venue's detail beside it, or a
+//! notice, which only the record hears. `docs/engine-contract.md` §11.
 //!
 //! Backtest is `HistoricalSource + SimulatedVenue`. Paper is
 //! `LiveSource + SimulatedVenue` (there is no separate paper venue -- M5 found the
@@ -24,24 +28,32 @@
 //!
 //! 1. **The clock advances to `T`**, or holds if an input has already carried
 //!    it past (counted: [`EngineStats::clock_clamps`]). Only an input moves it
-//!    -- this step, or a venue report in step 4 -- and only forward, so there is
-//!    no time between inputs for a strategy to act in.
+//!    -- this step, or a venue report or notice in step 4 -- and only forward,
+//!    so there is no time between inputs for a strategy to act in.
 //! 2. **The book is updated.** A `Gap` clears it, which is what makes "no prices
 //!    after a disconnect" structural rather than advisory.
 //! 3. **The venue sees the event.** Orders resting from *before* `T` match
 //!    against it. They were placed on earlier information, so trading against
 //!    `T` is exactly what would have happened.
-//! 4. **The strategy is told what happened to its orders**: the reports from
-//!    step 3 and, live, whatever the venue's own stream has delivered since the
-//!    last wake. A report stamped later than the clock moves the clock up to it
-//!    first, so the strategy is never told of something dated after the time it
-//!    reads. In a backtest that never happens: a simulated report is stamped by
-//!    this clock, so it is never later than it.
+//! 4. **The record hears what the venue said, and then the strategy is told
+//!    what happened to its orders**: the reports from step 3 and, live,
+//!    whatever the venue's own stream has delivered since the last wake. Each
+//!    order report is booked and written down, with the venue's detail, before
+//!    the strategy is told its event; a notice is written down and the
+//!    strategy is told nothing; a report about an order the engine is not
+//!    working is written down and withheld. Anything stamped later than the
+//!    clock moves the clock up to it first, so the strategy is never told of
+//!    something dated after the time it reads. In a backtest that never
+//!    happens: a simulated report is stamped by this clock, so it is never later
+//!    than it.
 //! 5. **The strategy sees the market event** and may submit.
+//! 6. **The strategy is asked what it wrote down**, if this wake called it.
 //!
 //! A wake on which the market said nothing -- the source idled -- skips steps 1,
 //! 2, 3 and 5, and ends before calling anything if the venue said nothing
-//! either.
+//! either. If the venue said only notices, the record hears them and no
+//! strategy method is called at all. [`Engine::settle`] is such a wake on
+//! which the strategy is never called, whatever the venue says.
 //!
 //! Step 5 comes after step 3, and that is the whole point. An order submitted on
 //! seeing the trade at `T` is **not** eligible to match against that trade — it
@@ -53,14 +65,14 @@
 //! # The engine clock is the input stream
 //!
 //! `now` is the newest stamp the engine has acted on: the `local_recv_ts` of the
-//! market event in hand, or a venue report's stamp when that is later. It only
-//! moves forward, and there is no system clock anywhere on this path, in any of
-//! the three worlds. A simulated venue stamps its reports with this clock, so in
-//! a backtest and in paper `now` is exactly the market event stream, which makes
-//! a run deterministic and repeatable. Live, a venue report carries the time its
-//! bytes arrived, as a market event does, so `now` is still roughly now, and a
-//! strategy that used a finer notion of time would behave differently in the
-//! three worlds.
+//! market event in hand, or a venue report's or notice's stamp when that is
+//! later. It only moves forward, and there is no system clock anywhere on this
+//! path, in any of the three worlds. A simulated venue stamps its reports with
+//! this clock, so in a backtest and in paper `now` is exactly the market event
+//! stream, which makes a run deterministic and repeatable. Live, a venue report
+//! or notice carries the time its bytes arrived, as a market event does, so
+//! `now` is still roughly now, and a strategy that used a finer notion of time
+//! would behave differently in the three worlds.
 //!
 //! That is invariant 4 arriving at its destination: components take a clock, and
 //! here the clock is the data.
@@ -358,16 +370,17 @@ pub trait RunObserver {
     /// entries, which is invariant 4 holding at one more seam.
     fn on_note(&mut self, _note: &crate::strategy::Note, _at: Ts) {}
 
-    /// A fill arrived for an order this engine has no record of.
+    /// A fill arrived for an order this engine is not working: one it never
+    /// minted, or one whose end it has already heard.
     ///
-    /// The `else` the loop body does not have: `stats.fills` is incremented
-    /// unconditionally and the booking sits inside an `if let` with no
-    /// alternative, so a fill naming an unknown order is counted and then
-    /// silently dropped — not booked into the portfolio, not journalled, and
-    /// invisible in every output. Impossible with `SimulatedVenue`, which only
-    /// fills what it was given; **not** impossible at M8, where a venue can
-    /// report a fill for an order we lost track of across a restart. That is
-    /// exactly the case where silence is most expensive.
+    /// Counted in `stats.fills`, because something did trade, and in
+    /// `stats.withheld`; not booked into the portfolio, because the engine does
+    /// not know whose it was; and not told to the strategy, which would
+    /// otherwise act on a fill its own position does not contain. This hook is
+    /// its only record. Impossible with `SimulatedVenue`, which only fills what
+    /// it was given; **not** impossible at M8, where a venue can report a fill
+    /// for an order we lost track of across a restart. That is exactly the
+    /// case where silence is most expensive.
     ///
     /// `ids` are the venue's names for the order and the trade, when it gave
     /// them: for a fill nobody can attribute, the only handle a person has on

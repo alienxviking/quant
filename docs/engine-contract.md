@@ -72,7 +72,17 @@ resolve. So every request carries an identifier we minted, and every execution
 event quotes it back.
 
 The venue's identifier is recorded when it arrives, because it is what a human
-reconciling against an exchange statement will search for.
+reconciling against an exchange statement will search for. So is the venue's id
+for each **trade** (`VenueTradeId`), because one order can fill in several, and
+`myTrades` names a row by its trade. Its own type rather than a second
+`VenueOrderId`: the order id and the trade id are both integers on one
+`myTrades` row, and a swap must not compile.
+
+**Both reach the record and never the strategy.** Until M8 slice (c) the
+acceptance event carried the venue's order id, which the live translator filled
+and the simulator left empty, so a strategy could tell the two apart by reading
+it. The ids now travel *beside* the event, to the observer alone (§11), and the
+field is gone.
 
 ---
 
@@ -83,14 +93,24 @@ A strategy sees, per event:
 - the [`MarketEvent`](../crates/quant-core/src/event.rs) itself, including `Gap`;
 - a **read-only reconstructed book**, maintained by the engine;
 - the engine clock;
-- its own execution events;
+- its own execution events — the event alone, never what a venue says beside it,
+  and only for orders the engine is working (§11);
 - its **position, cash and equity**, maintained by the engine rather than by the
   strategy — same argument as the book, and it is the accounting a restart has to
   restore (§9), so there is exactly one of it. `equity` is `None` when there is a
   position and no price to mark it at.
 
 It does **not** see the venue, the event source, wall-clock time, or any other
-strategy's orders.
+strategy's orders. Nor anything only a real venue knows: its ids for orders and
+trades, the code it cited when it declined, why it was not ready, a cancel it
+did not carry out, a lost account stream. Those are the record's (§11).
+
+**What a strategy is told is closed by the compiler, not by this paragraph.**
+Every field of every `ExecutionEvent` variant must be of a type a simulator
+produces exactly as a live venue does (`quant-core/src/execution.rs`,
+`Modelled`), with no `Option<T>` let through, because an optional field is how
+the venue's order id got in. A field added to an event does not build until its
+type is argued into that list.
 
 **The engine maintains the book, not the strategy.** Book reconstruction is
 subtle enough to have taken a milestone; every strategy re-deriving it would be
@@ -115,6 +135,16 @@ from a strategy to a venue that does not pass through it.
 Empty until M6 — but *present* from M3, because retrofitting a chokepoint means
 auditing every call site that grew up around its absence.
 
+Since M8 slice (c) the handle asks four things, in this order, and an order any
+of them refuses never reaches the venue: the **seam** (is it well formed?), the
+**record's latch** (has the record already failed to hold a submission?), the
+**venue's readiness** (can it take an order now?), and **risk**. Then the record
+is told, and may still withhold it. The order is argued in §11; the part that
+belongs here is that readiness comes *before* risk, so an order a venue could
+not take spends none of the day's order count and cannot trip the switch, and
+that every one of these refusals reaches the strategy the same way, as a
+`Rejected` after the callback.
+
 ---
 
 ## 6. Ordering and the clock
@@ -127,6 +157,14 @@ the order a live system would have seen them.
 A backtest advances the clock **only** when an event arrives. There is no
 between-events time, which means a strategy cannot act on a schedule the data
 does not justify.
+
+Live there are two inputs, and both move the clock: a market event, and anything
+the venue says — an order report or a notice — stamped when its bytes arrived.
+A venue input stamped later than the clock carries it forward before anything
+else on that wake reads it, so a strategy is never told of something dated after
+the time it reads, and the record stays in time order. Nothing moves it back; a
+market event stamped before the clock is counted as a clamp. A wake on which the
+venue said only notices calls no strategy method at all (§11).
 
 ---
 
@@ -608,4 +646,117 @@ more than one that does not. Running first and adding risk after would want a
 
 Same reasoning that made M1's acceptance run worth more because M1.e's metrics
 existed before it started.
+
+---
+
+## 11. The seam a live venue needs — M8 slice (c)
+
+A live venue is the first that can be unready, the first that knows things the
+strategy must not, and the first whose last fills can arrive after the market
+has ended. Each of those needed the seam to change, and each change had to leave
+the simulator, and so every backtest, exactly where it was. `docs/live-run.md` §5
+records the decisions; this is the shape they produced, in `quant-engine`'s
+`lib.rs`, `strategy.rs` and `venue.rs` and `quant-core`'s `report.rs`.
+
+### Asked before anything is written down
+
+`ExecutionVenue::ready(&self, &OrderRequest) -> Result<(), Unready>` is
+consulted in `Context::submit` after the seam check and the record's latch, and
+before risk. By the time `submit` runs the order is journalled and in the
+engine's ledger, so the only way back would be a `Rejected`, which the journal
+records as the venue declining an order it had been told about — false for one
+that never left. Asked first, the refusal is written as a refusal,
+`RefusedBy::Venue(Unready)`, and the strategy hears `RejectReason::Venue` and
+not why.
+
+**Required, not defaulted.** A defaulted method is what a forwarding wrapper
+inherits without a word (M7.5.e's `take_notes` in `Recorded`), and the
+inherited answer here would be "ready" around a venue that is not. The simulator
+answers always ready; its filters stay judged on receipt, with a `Rejected`, as
+a real venue judges them. `Unready` is closed now because it is serialized
+inside `refused` lines, and includes `Diverged`, which nothing produces yet:
+`LiveVenue` will latch it on an unattributable fill or a stranger's trade on our
+symbol, and only a person clears it.
+
+### A submission the record could not hold is never sent
+
+`RunObserver::on_submitted` answers `WriteAhead::Proceed` or `Withhold`. On
+`Withhold` the order is not sent, is refused as `RefusedBy::Record`, and every
+later submission in the process is refused the same way before the venue is
+asked — a record that failed to hold one line cannot be trusted with the next.
+The withheld order has already passed risk and spent one of the day's count;
+that can happen once per process. `JournalWriter::new` always answers `Proceed`,
+which keeps paper's never-fatal journalling exactly as it was; the strict writer
+a live run needs is the journal pull request's.
+
+### Reports and notices
+
+`poll` hands back `VenueReport`s. An `Order(OrderReport)` is an event with what
+only a real venue knows typed beside it per variant: the venue's order id on an
+acceptance, the order and trade ids on a fill, what the venue cited or why the
+request never landed on a rejection, how an order ended. A `Notice` is a fact
+with no event at all: a REST acknowledgement, an outcome that became unknown or
+known again, a cancel the venue did not carry out, a report about an order this
+run did not send, the account stream lost or regained, a report that could not
+be read.
+
+The record hears the detail (`on_accepted`, `on_rejected`, `on_cancelled`,
+`on_orphaned`, and `on_fill` through one `Booked`) and every notice
+(`on_notice`, required). The strategy is told `OrderReport::event()`, which is
+where venue detail stops, and nothing of a notice. A notice moves the clock like
+any report, so a stream lost during a silent market is dated when it was heard.
+`take_notes` runs only on a wake that called the strategy, so counting its calls
+cannot reveal a talkative venue.
+
+`poll`'s contract, in the trait's docs: append and never block; arrival order,
+stamped by the clock that stamps `local_recv_ts`; at most one terminal report
+per order and none before its last fill; `Order` only for this run's orders;
+never drop a report silently.
+
+### Only an order the engine is working reaches the strategy
+
+A live venue reports on the account, not on the process. A report about an order
+the engine is not working — never minted, or already ended — is withheld: a
+fill goes to `on_orphaned` (counted, not booked), anything else to `on_stray`
+(required), and the strategy is told nothing. `EngineStats::withheld` counts
+them. Against the simulator it is always zero, by construction: an order enters
+the ledger before the simulator is told of it, and the simulator reports only
+on what it was given and nothing after an order's end.
+
+### Settle
+
+`Engine::settle()` is one wake on which only the venue speaks, after `run`.
+Whatever arrives is booked, written down and tallied by risk, and no strategy
+method is called: the market the strategy trades on has ended, a backtest never
+delivers a report still in flight at the end of its data, and a strategy acting
+during the drain would leave decisions no replay has. It returns what it
+delivered and the orders still working (`Engine::working`). The live binary
+loops on it with a deadline of its own, pausing `IDLE_TICK` when nothing came,
+before the closing checkpoint and `Stopped`. Neither `backtest` nor `paper`
+calls it, and against the simulator it changes nothing: it polls at a clock
+nothing has moved, so a report still in flight stays undelivered.
+
+### Acceptance
+
+- [x] The simulator reproduces every existing test, and M5's money check —
+      824 fills, cash 31.64743842 — after every commit that touched the path,
+      with the whole report and a backtest journal byte-identical apart from its
+      wall-clock `started` line.
+- [x] A strategy's view of a lifecycle is identical whichever venue produced it:
+      the same acceptance, fills, declined order, lost cancel and cancellation,
+      through a venue with nothing beside its events and one that says
+      everything a live venue says, give the strategy the same events, clock,
+      position, cash and `take_notes` count, and only the second's record heard
+      the ids and notices.
+- [x] Readiness refuses before anything is written and spends nothing of risk's
+      count; a record that withholds once withholds for good; strays and orphans
+      never reach the strategy; `settle` books a late fill and tells nobody.
+      Every one of those tests was seen red under its break before it was
+      trusted.
+
+What this slice does **not** do is give the new facts lines of their own: the
+journal writer logs each detail and notice it cannot yet write as an error, and
+schema 3's entries are the next pull request's. Nothing produces any of them
+until `LiveVenue` exists. Recounting the risk tally after a restart is the one
+after that.
 

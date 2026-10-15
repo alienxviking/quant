@@ -443,6 +443,19 @@ feature.
    the strategy (§5), and a final drain at shutdown. Accepted when the simulator
    reproduces every existing test and M5's money check, and a strategy's view of
    a lifecycle is identical whichever venue produced it.
+
+   **Built** as `m8c-venue-seam`, the argument in `docs/engine-contract.md` §11.
+   A required `ready`, consulted after the seam and before risk; a
+   `WriteAhead` answer from the record, latched on its first `Withhold`;
+   `poll` handing back order reports with the venue's detail beside each event
+   and notices for facts that are not events, the strategy told only the event;
+   the venue's order id gone from `Accepted`, with a compile-time check keeping
+   anything like it out; reports about orders the engine is not working withheld
+   from the strategy; and `Engine::settle`, a venue-only wake for the binary to
+   loop on at shutdown. Both criteria met: every test and the money check
+   (824 fills, cash 31.64743842) after each commit, and one lifecycle reported
+   by a plain venue and by a talkative one looks identical to the strategy.
+   What the new facts are written down as is item 4.
 4. **What a live run writes down.** The run tag on `Started`; venue order and
    trade ids; entries for an orphan from another run, someone else's trade, losing
    and regaining the account stream, a refused cancel, and a rejection's code;
@@ -693,7 +706,11 @@ the risk layer. It is refused through `RefusedBy` like the other two kinds of
 refusal, journalled as a refusal, and consumes none of the risk layer's daily
 count. The check cannot race: the engine thread is the outbound queue's only
 producer, so room can only grow between the check and the send.
-`SimulatedVenue` takes the default, always ready, and does not change.
+`ready` is a required method rather than a defaulted one, so that a wrapper
+cannot inherit "ready" around a venue that is not; `SimulatedVenue` answers it
+always ready and its behaviour does not change. A failed journal append is the
+engine's refusal rather than the venue's: the record answers `Withhold`, the
+order is refused as `RefusedBy::Record`, and nothing more is sent.
 
 **An unknown outcome is not a rejection.** Until slice (d) exists, a submission
 whose outcome is unknown (a 5xx, `-1007`, `-1006`, a timeout after the request was

@@ -37,8 +37,11 @@ use crate::time::Ts;
 
 /// Our identifier for an order, minted before it is sent.
 ///
-/// Opaque and monotonic within a run. Not persisted across runs, and not the
-/// thing to reconcile an exchange statement against — that is
+/// Dense from 1 and monotonic within a run, and persisted: written on every
+/// journal line about the order, carried across a restart by the engine's
+/// `minting_from`, and sent to a live venue as `q-<run>-<id>`, so that a report
+/// can be told apart from one about an earlier run's order with the same
+/// number. Not the thing to reconcile an exchange statement against — that is
 /// [`VenueOrderId`].
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -179,7 +182,10 @@ pub enum RejectReason {
     InsufficientFunds,
     /// The risk layer refused it. Never reaches a venue at all.
     RiskLimit,
-    /// The venue declined for a reason of its own, or was unreachable.
+    /// The venue declined for a reason of its own, the request never reached
+    /// it, or it was not ready to take an order. Never an order whose outcome
+    /// is unknown: that is no event at all, because a rejection would make the
+    /// engine forget an order that may yet fill.
     Venue,
     /// The book was invalid — a gap, or no prices yet — so there was nothing to
     /// price against. Its own variant because it is the *expected* rejection
@@ -371,7 +377,9 @@ impl ExecutionEvent {
         }
     }
 
-    /// When it happened, on the engine clock.
+    /// When it was heard: from a simulator, the engine clock when the event was
+    /// generated; from a live venue, when its bytes arrived. Never a time the
+    /// venue wrote (invariant 2).
     #[must_use]
     pub const fn ts(&self) -> Ts {
         match self {

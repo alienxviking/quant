@@ -46,9 +46,10 @@ use tracing::error;
 /// strategy that trades less than five times between passes still leaves nothing
 /// new to check, and a hard kill before the fifth fill loses the lot. A
 /// time-based checkpoint would close it and needs a periodic hook the engine
-/// still does not have. `RunObserver` has eleven methods as of M7.5 and fires on
-/// nine things besides fills, but every one of them is driven by an *event* —
-/// there is no tick an observer can see. Since M8 `Engine::run` does wake on a
+/// still does not have. `RunObserver` has thirteen methods since M8 slice (c),
+/// and every one of them is driven by an *input* -- a market event, a venue's
+/// report or notice, a strategy's decision -- so there is no tick an observer
+/// can see. Since M8 `Engine::run` does wake on a
 /// quiet market, but only to ask the venue, and a wake on which the venue has
 /// nothing to say returns before any callback — so a quiet stretch still
 /// produces no callback to checkpoint from. That is a change to the seam, not a

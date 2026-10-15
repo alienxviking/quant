@@ -110,11 +110,14 @@ impl<'a> Context<'a> {
     ///
     /// In a backtest and in paper that is the `local_recv_ts` of the market
     /// event being handled, or of one before it if this one's went backwards
-    /// and the clock held. Live, venue reports move it too: a report received
-    /// after the market event and delivered on the same wake carries the clock
-    /// up to the report's time, and a report can arrive while the market is
-    /// silent, with no market event at all. Either way the clock never reads
-    /// earlier than a report the strategy has been told of.
+    /// and the clock held. Live, what the venue says moves it too, order
+    /// reports and notices alike: one received after the market event and
+    /// delivered on the same wake carries the clock up to its time, and one
+    /// can arrive while the market is silent, with no market event at all.
+    /// Either way the clock never reads earlier than anything the venue said
+    /// on the wakes the strategy has been called on. A wake that brought only
+    /// notices does not call the strategy at all, so a notice can move the
+    /// clock between two readings and say nothing else.
     ///
     /// The only notion of time available. See the engine's module docs for why
     /// there is no other.
