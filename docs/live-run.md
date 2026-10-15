@@ -576,12 +576,15 @@ is accepted, silently, and every later lookup by that name is ambiguous. So the
 run tag must stay the same for the life of a journal, so that a restart still
 recognises its own orders, and must change whenever a journal is lost.
 
-**One authority per fact.** `Accepted` with its venue order id, and every
-`Filled`, come from the **user-data stream**. Rejections come from the REST
+**One authority per fact.** Every acceptance, with the venue's order id, and
+every `Filled` come from the **user-data stream**. Rejections come from the REST
 response, because the stream reports on orders and a rejected request was never
-an order — which is precisely why `VenueOrderId` is optional in the execution
-contract. `newOrderRespType=ACK`, so a fuller response cannot deliver a fill the
-stream will also deliver.
+an order — which is precisely why the venue's order id is optional where it
+travels. That is beside the event rather than in it: `OrderReport::Accepted`
+carries `venue_order_id: Option<VenueOrderId>` to the record, and the
+`ExecutionEvent` the strategy is told carries no venue id at all.
+`newOrderRespType=ACK`, so a fuller response cannot deliver a fill the stream
+will also deliver.
 
 **The user-data socket is recorded into the raw tier before it is parsed.**
 Market data has been immutable-bytes-first since M1 on the argument that our
@@ -700,11 +703,12 @@ engine's ledger holds it, so the only way back would be a `Rejected` through
 `poll`, recorded as *"the venue declined an order it had been told about"*, which
 is false for an order that never left. So every refusal that starts in the
 adapter (no venue filters, a full outbound queue, the account stream down, an
-order in doubt, a failed clock check, a failed journal append) is a readiness
-check the engine consults in `Context::submit`, after the seam check and before
-the risk layer. It is refused through `RefusedBy` like the other two kinds of
-refusal, journalled as a refusal, and consumes none of the risk layer's daily
-count. The check cannot race: the engine thread is the outbound queue's only
+order in doubt, a failed clock check) is a readiness check the engine consults
+in `Context::submit`, after the seam check and before the risk layer. It is
+refused as `RefusedBy::Venue`, one of four kinds of refusal, which
+`Context::submit` asks in this order: the seam's, the record's, the venue's and
+the risk layer's. Like the others it is journalled as a refusal, and it consumes
+none of the risk layer's daily count. The check cannot race: the engine thread is the outbound queue's only
 producer, so room can only grow between the check and the send.
 `ready` is a required method rather than a defaulted one, so that a wrapper
 cannot inherit "ready" around a venue that is not; `SimulatedVenue` answers it
@@ -727,11 +731,17 @@ venue's `-1007` arrives first when it can.
 venue's order and trade ids, orphans from other runs, other people's trades on
 our symbol, a lost stream, a refused cancel and a rejection's code written down.
 None of them may reach a strategy, because a strategy that can tell which venue
-it is wired to is a bug. One already does: `ExecutionEvent::Accepted` carries a
-venue order id that the translator fills and `SimulatedVenue` deliberately leaves
-empty. The seam pull request delivers venue detail beside each event, to the
-observer only, so that a strategy's view of every lifecycle is identical
-whichever venue produced it, which closes that leak too.
+it is wired to is a bug. One did, and the seam pull request closed
+it: `ExecutionEvent::Accepted` used to carry a venue order id that the translator
+filled and `SimulatedVenue` left empty. `poll` now hands back `VenueReport`s, so
+venue detail travels beside each event in an `OrderReport`, to the observer
+only, and the strategy is told `OrderReport::event()`, whose acceptance has no
+venue id to read. The field cannot come back quietly: `quant-core`'s `Modelled`
+guard names every field of every `ExecutionEvent` variant and fails to compile
+one whose type a simulator cannot produce as a live venue does, and a
+`compile_fail` doctest pins that an acceptance with a venue order id does not
+build. A strategy's view of every lifecycle is identical whichever venue
+produced it.
 
 **The account stream is recorded under its own data root.** Interleaved into the
 market capture, an account gap would become a market `Gap` and clear the order
