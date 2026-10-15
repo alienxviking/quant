@@ -1558,3 +1558,79 @@ fn under_fees_in_the_asset_received_a_higher_rate_can_leave_more_held_and_more_e
         "{richer} under a fee in the base, {free} without: the unsold lot rode the jump"
     );
 }
+
+// --- The position the report ends on ---
+
+fn held(qty: &str) -> quant_engine::Position {
+    quant_engine::Position {
+        qty: qty.parse().expect("qty"),
+        avg_px: "100".parse().expect("px"),
+    }
+}
+
+fn sampled_at(mark: Option<&str>) -> EquityPoint {
+    EquityPoint {
+        ts: Ts::from_nanos(0),
+        equity: None,
+        cash: CASH,
+        mark: mark.map(|m| m.parse().expect("mark")),
+    }
+}
+
+#[test]
+fn the_report_says_what_was_held_at_the_end_and_at_what_mark() {
+    // Flat is said, not left to be inferred from a missing line.
+    assert_eq!(
+        crate::position_line(
+            quant_engine::Position::default(),
+            Some(&sampled_at(Some("100")))
+        ),
+        "position  flat at the end"
+    );
+    // Held and priced: the quantity, what it was worth, and the mid it was
+    // worth that at, so cash plus the value is the last equity by hand.
+    assert_eq!(
+        crate::position_line(held("0.000003"), Some(&sampled_at(Some("120000")))),
+        "position  0.000003 held at the end, worth 0.36 at the last sample's mid 120000"
+    );
+    // Held and blind at the end: no value is invented for it.
+    for last in [Some(sampled_at(None)), None] {
+        let line = crate::position_line(held("0.000003"), last.as_ref());
+        assert_eq!(
+            line,
+            "position  0.000003 held at the end, and no mark at the last sample to value it at"
+        );
+    }
+    // A value past what a notional holds is said to be, not wrapped or panicked on.
+    assert!(
+        crate::position_line(held("10000000000"), Some(&sampled_at(Some("10000000000"))))
+            .contains("too large to value")
+    );
+}
+
+#[test]
+fn a_run_with_fees_in_the_base_ends_on_dust_and_the_report_accounts_for_it() {
+    // The case the line exists for. Under fees taken in the asset received an
+    // exit sells what it holds rounded down to the lot, so a run that ends
+    // "flat" in every sense the strategy knows still holds a few satoshi, and
+    // cash alone is not the account.
+    let engine = run_with(&choppy(), spot_fees());
+    let position = engine.portfolio().position(instrument());
+    assert!(!position.is_flat(), "the base fees leave dust behind");
+    let curve = engine.strategy().curve();
+    let last = curve.points.last().expect("a sampled run");
+    let mark = last.mark.expect("the path ends with a live book");
+    let value = mark.notional(position.qty).expect("a small value");
+    assert_eq!(
+        crate::position_line(position, Some(last)),
+        format!(
+            "position  {} held at the end, worth {value} at the last sample's mid {mark}",
+            position.qty
+        )
+    );
+    // And it is the whole of the gap between the cash and the last equity.
+    assert_eq!(
+        Notional::from_raw(engine.portfolio().cash().raw() + value.raw()),
+        curve.last().expect("valued at the end"),
+    );
+}

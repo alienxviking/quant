@@ -207,7 +207,7 @@ fn main() -> ExitCode {
         }
     }
 
-    report(&args, &days, stats, &engine);
+    report(&args, &days, stats, &engine, instrument);
 
     if let Some(path) = &args.journal {
         println!("journal   written to {}", path.display());
@@ -296,7 +296,13 @@ fn close_journal(
     write(journal, &JournalEntry::Stopped { at })
 }
 
-fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, engine: &Wiring) {
+fn report(
+    args: &Args,
+    days: &[quant_core::time::UtcDate],
+    stats: EngineStats,
+    engine: &Wiring,
+    instrument: InstrumentId,
+) {
     let curve = engine.strategy().curve();
     let ma = engine.strategy().inner().stats();
     let portfolio = engine.portfolio();
@@ -371,12 +377,18 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
         "orders    {} submitted, {} refused, {} suppressed while one was working",
         stats.submitted, stats.refused, ma.suppressed
     );
-    print_pnl(portfolio, curve, ma.entries, ma.exits);
+    print_pnl(portfolio, instrument, curve, ma.entries, ma.exits);
     print_sim(engine.venue().stats());
     print_caveats(costs);
 }
 
-fn print_pnl(portfolio: &Portfolio, curve: &EquityCurve, entries: u64, exits: u64) {
+fn print_pnl(
+    portfolio: &Portfolio,
+    instrument: InstrumentId,
+    curve: &EquityCurve,
+    entries: u64,
+    exits: u64,
+) {
     println!(
         "fills     {} ({entries} entries signalled, {exits} exits signalled)",
         portfolio.fills()
@@ -388,6 +400,12 @@ fn print_pnl(portfolio: &Portfolio, curve: &EquityCurve, entries: u64, exits: u6
     );
     println!("realized  {}", portfolio.realized());
     println!("fees      {} (M4 has not happened yet)", portfolio.fees());
+    // What cash does not include, so the gap between it and the last equity
+    // is accounted for on the report rather than left for the reader to infer.
+    println!(
+        "{}",
+        quant_backtest::position_line(portfolio.position(instrument), curve.points.last())
+    );
     match (curve.first(), curve.last()) {
         (Some(first), Some(last)) => {
             let pnl = Notional::from_raw(last.raw() - first.raw());
