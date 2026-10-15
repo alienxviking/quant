@@ -494,7 +494,7 @@ and one older reader had stopped reading backtest journals at all.
 
 ### `runlog check`: what the venue said that the record cannot account for
 
-Four new findings, each failing the check (exit 1) as every finding before them
+Six new findings, each failing the check (exit 1) as every finding before them
 does. The check asks whether the record is complete, and each is a place where
 it is not: what was decided, what happened to it, or what it cost.
 
@@ -504,6 +504,7 @@ it is not: what was decided, what happened to it, or what it cost.
 | `stray` | a report other than a fill about an order the engine was not working | each `stray` line |
 | `foreign` | another run's order, or one under our prefix that parses as nothing we send | one per order, however many `foreign` lines it has, with its line and trade counts |
 | `in doubt` | a doubt raised and never cleared, about an order never seen to end | a fold of `doubt` lines against the order's end |
+| `anomaly` | a report the run could not take at its word: unreadable, a trade id already booked, a report after an order's end, a second end, a contradiction | each `anomaly` line |
 | `torn` | a line an interrupted write tore and a restart wrote past: the entry on it is lost | `read`'s `torn_before_restart` |
 
 **A stranger's order is counted, not flagged.** A `foreign` line whose
@@ -519,8 +520,20 @@ trades against the venue's balances.
 error can arrive after the stream has already reported the fill, and the order
 was still seen to end. An acceptance, a partial fill, a refused cancel and a
 placement say nothing about how the order ends, so none of them settles it,
-before the doubt or after it, and a restart does not either. `anomaly` and `account` lines are not findings themselves: the venue
-raises a doubt beside each, and that doubt is what is checked.
+before the doubt or after it, and a restart does not either.
+
+**An anomaly is a finding in its own right; a lost account stream is not.**
+The first draft let both through on the ground that the venue raises a doubt
+beside each. For an anomaly no venue code has that duty, and most kinds could
+not discharge it: a second end or a contradiction has no doubt cause that fits,
+and an unreadable report may name no order to doubt. So the check flags the
+anomaly itself, which is invariant 5 (a report our model of the venue cannot
+read is loud) applied to the record. If criterion D's recorded reports show a
+kind is routine, it moves to counted with an argument, as a stranger's order
+did. A lost account stream does rest on a doubt, and that duty is written down:
+every order working across the blind stretch is in doubt (`account_blind`;
+`docs/live-run.md` §5 and §4 item 7's acceptance), and with nothing working
+nothing of this run's could have changed.
 
 **Findings come before the empty verdict.** A file with no decision and no claim
 used to read NOTHING TO CHECK, exit 2, before anything else was looked at; a

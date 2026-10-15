@@ -567,7 +567,10 @@ feature.
 7. **`LiveVenue`.** A state machine merging REST outcomes with stream reports: one
    terminal event per order, fills deduplicated by trade id, the in-doubt state
    (§5). Behind it, `impl ExecutionVenue`. Accepted by a permutation test over
-   every interleaving of the REST reply and the stream's reports.
+   every interleaving of the REST reply and the stream's reports, and by a test
+   that losing the account stream puts every working order in doubt
+   (`account_blind`): `runlog check` treats an `account` line as covered by
+   those doubts and does not flag it.
 8. **The `live` binary and a rehearsal.** Paper's session extracted so any venue
    can run it; a startup that records first and trades last; a refusal of any
    size whose floored exit would fall below the minimum notional at the current

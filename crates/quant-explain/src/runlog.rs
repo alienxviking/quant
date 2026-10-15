@@ -32,7 +32,7 @@
 //! # What a venue said that the record cannot account for
 //!
 //! From schema 3 a live run writes down what its venue says beside its own
-//! decisions, and four kinds of line are things the run's record does not
+//! decisions, and five kinds of line are things the run's record does not
 //! account for, each a finding:
 //!
 //! - an `orphaned` fill, which no order of this run explains: money moved,
@@ -41,7 +41,14 @@
 //! - a `foreign` order from another run, or under our prefix and readable as
 //!   nothing we send, one finding per order however many lines it has;
 //! - a `doubt` raised and never cleared, about an order never seen to end,
-//!   before the doubt or after it.
+//!   before the doubt or after it;
+//! - an `anomaly`, a report the run could not take at its word: unreadable,
+//!   a trade id already booked, a report after an order's end, a second end,
+//!   or a contradiction. Each is a place where our model of the venue failed,
+//!   which invariant 5 says is loud, and the record holds the venue's text
+//!   but cannot fold it into its account. No doubt has to stand beside one
+//!   for the check to see it: most kinds have no doubt cause that fits, and
+//!   an unreadable report may name no order to doubt.
 //!
 //! And a line torn by an interrupted write that a restart then wrote past is
 //! a finding, read by [`check_file`]: an entry was being written there and is
@@ -65,7 +72,9 @@
 use std::collections::BTreeMap;
 
 use quant_core::execution::VenueOrderId;
-use quant_core::report::{DoubtCause, DoubtChange, ForeignOutcome, Provenance, VenueText};
+use quant_core::report::{
+    AnomalyKind, DoubtCause, DoubtChange, ForeignOutcome, Provenance, VenueText,
+};
 use quant_core::time::Ts;
 use quant_engine::journal::{JournalEntry, Recovered, StrayKind};
 
@@ -118,6 +127,13 @@ pub enum Finding {
         since: Ts,
         cause: DoubtCause,
     },
+    /// A report the run could not take at its word: an `anomaly` line.
+    Anomaly {
+        what: AnomalyKind,
+        /// The order it concerns, when that much could be read.
+        client_order_id: Option<u64>,
+        at: Ts,
+    },
     /// A line an interrupted write tore and a restart then wrote past, so
     /// the entry on it is lost. Numbered from 1, as an editor numbers them.
     TornBeforeRestart { line: usize },
@@ -136,6 +152,7 @@ impl Finding {
             Self::Stray { .. } => "stray",
             Self::ForeignOrder { .. } => "foreign",
             Self::LeftInDoubt { .. } => "in doubt",
+            Self::Anomaly { .. } => "anomaly",
             Self::TornBeforeRestart { .. } => "torn",
         }
     }
@@ -181,6 +198,22 @@ impl core::fmt::Display for Finding {
                     f,
                     " {client_id:?} (venue order {venue_order_id}): {lines} line(s), \
                      {trades} trade(s) on this run's account"
+                )
+            }
+            Self::Anomaly {
+                what,
+                client_order_id,
+                at,
+            } => {
+                write!(f, "a report at {} ", at.to_rfc3339())?;
+                match client_order_id {
+                    Some(id) => write!(f, "about order {id}")?,
+                    None => write!(f, "naming no order that could be read")?,
+                }
+                write!(
+                    f,
+                    " that the run could not take at its word ({what:?}): its text is on \
+                     file and the record cannot account for it"
                 )
             }
             Self::TornBeforeRestart { line } => write!(
@@ -383,6 +416,51 @@ impl Foreigners {
     }
 }
 
+/// Orders in doubt, folded against how each order ends.
+#[derive(Default)]
+struct Doubts {
+    /// Orders in doubt now, and since when.
+    open: BTreeMap<u64, (Ts, DoubtCause)>,
+    /// Orders already seen to end. A doubt raised about one of these is
+    /// answered before it opens: a REST error can arrive after the stream has
+    /// already reported the fill, and the end is no less known for coming
+    /// first.
+    ended: std::collections::BTreeSet<u64>,
+}
+
+impl Doubts {
+    fn change(&mut self, at: Ts, id: u64, change: &DoubtChange) {
+        match change {
+            DoubtChange::Raised { cause, .. } => {
+                // The first raise is when the doubt began; a second before
+                // any clearing is the same doubt, still open.
+                if !self.ended.contains(&id) {
+                    self.open.entry(id).or_insert((at, *cause));
+                }
+            }
+            DoubtChange::Cleared { .. } => {
+                self.open.remove(&id);
+            }
+        }
+    }
+
+    /// The order ended: whatever was unknown about it, its end is known.
+    fn end(&mut self, id: u64) {
+        self.open.remove(&id);
+        self.ended.insert(id);
+    }
+
+    fn findings(self) -> impl Iterator<Item = Finding> {
+        self.open
+            .into_iter()
+            .map(|(client_order_id, (since, cause))| Finding::LeftInDoubt {
+                client_order_id,
+                since,
+                cause,
+            })
+    }
+}
+
 /// What the venue said that this run's record cannot account for.
 ///
 /// Exhaustive over every entry, with no `_` arm, so a line added to the
@@ -390,13 +468,7 @@ impl Foreigners {
 fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding> {
     let mut findings = Vec::new();
     let mut foreign = Foreigners::default();
-    // Orders in doubt now, and since when.
-    let mut doubts: BTreeMap<u64, (Ts, DoubtCause)> = BTreeMap::new();
-    // Orders already seen to end. A doubt raised about one of these is
-    // answered before it opens: a REST error can arrive after the stream has
-    // already reported the fill, and the end is no less known for coming
-    // first.
-    let mut ended: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut doubts = Doubts::default();
 
     // Several arms do the same thing for different reasons, and are kept
     // apart so each reason stays beside the lines it is about.
@@ -432,18 +504,7 @@ fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding
                 at,
                 client_order_id,
                 change,
-            } => match change {
-                DoubtChange::Raised { cause, .. } => {
-                    // The first raise is when the doubt began; a second
-                    // before any clearing is the same doubt, still open.
-                    if !ended.contains(&client_order_id.0) {
-                        doubts.entry(client_order_id.0).or_insert((*at, *cause));
-                    }
-                }
-                DoubtChange::Cleared { .. } => {
-                    doubts.remove(&client_order_id.0);
-                }
-            },
+            } => doubts.change(*at, client_order_id.0, change),
             // An order that ended is no longer in doubt: whatever was unknown
             // about it, its end is known. A fill ends it only when nothing is
             // left, and a fill that does not say what is left ends nothing.
@@ -453,8 +514,7 @@ fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding
                 ..
             } => {
                 if remaining.is_some_and(|r| r.raw() == 0) {
-                    doubts.remove(&client_order_id.0);
-                    ended.insert(client_order_id.0);
+                    doubts.end(client_order_id.0);
                 }
             }
             JournalEntry::Rejected {
@@ -465,21 +525,32 @@ fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding
             }
             | JournalEntry::NeverLanded {
                 client_order_id, ..
-            } => {
-                doubts.remove(&client_order_id.0);
-                ended.insert(client_order_id.0);
-            }
+            } => doubts.end(client_order_id.0),
             // Not an end: an acceptance, a cancel asked for or refused, a
             // placement acknowledged, say nothing about how an order ends.
             JournalEntry::Accepted { .. }
             | JournalEntry::CancelRequested { .. }
             | JournalEntry::CancelRefused { .. }
             | JournalEntry::Placed { .. } => {}
-            // Unreadable or contradictory reports: the venue raises a doubt
-            // beside each, and that doubt is what is checked.
-            JournalEntry::Anomaly { .. } => {}
-            // The account stream lost or regained: the venue raises a doubt
-            // on every working order when it is lost, and those are checked.
+            // A report the run could not take at its word. A finding in its
+            // own right, not through a doubt: only an unreadable report about
+            // a known order has a doubt cause that fits (`fills_missed`), and
+            // the reader does not rest on a duty no venue code has yet.
+            JournalEntry::Anomaly {
+                at,
+                client_order_id,
+                what,
+                detail: _,
+            } => findings.push(Finding::Anomaly {
+                what: *what,
+                client_order_id: client_order_id.map(|id| id.0),
+                at: *at,
+            }),
+            // The account stream lost or regained. Not a finding itself: an
+            // order working across the blind stretch is put in doubt
+            // (`account_blind`; `docs/live-run.md` §5, and an acceptance
+            // criterion of §4 item 7), and that doubt is what is checked. With
+            // no order working, nothing of this run's could have changed.
             JournalEntry::Account { .. } => {}
             // The record's own lines, and the market's: nothing a venue said.
             // A restart does not settle a doubt, so `started` leaves them.
@@ -497,13 +568,7 @@ fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding
     }
     *not_ours = foreign.strangers.len();
     findings.extend(foreign.orders);
-    findings.extend(doubts.into_iter().map(|(client_order_id, (since, cause))| {
-        Finding::LeftInDoubt {
-            client_order_id,
-            since,
-            cause,
-        }
-    }));
+    findings.extend(doubts.findings());
     findings
 }
 
@@ -1689,6 +1754,53 @@ mod tests {
                 since: Ts::from_nanos(3600),
                 cause: DoubtCause::NoAnswer,
             }]
+        );
+    }
+
+    #[test]
+    fn an_anomaly_is_a_finding_whether_or_not_it_names_an_order() {
+        // An anomaly is a report the run could not take at its word, and the
+        // check does not wait for a doubt beside it: most kinds have no doubt
+        // cause that fits, and an unreadable one may name no order at all.
+        // The boundary's other side: the account stream lost and regained
+        // with nothing working is not a finding, because any order it could
+        // have touched is doubted, and that doubt is checked.
+        let anomaly = |at: i64, id: Option<u64>, what: AnomalyKind| JournalEntry::Anomaly {
+            at: Ts::from_nanos(at),
+            client_order_id: id.map(ClientOrderId),
+            what,
+            detail: VenueText::new("{}"),
+        };
+        let entries = vec![
+            submitted(1, 10),
+            filled_leaving(3000, 1, "0"),
+            JournalEntry::Account {
+                at: Ts::from_nanos(3100),
+                change: quant_core::report::AccountChange::Lost {
+                    cause: quant_core::report::AccountCause::SocketClosed,
+                },
+            },
+            JournalEntry::Account {
+                at: Ts::from_nanos(3200),
+                change: quant_core::report::AccountChange::Regained,
+            },
+            anomaly(3900, Some(1), AnomalyKind::SecondEnd),
+            anomaly(3950, None, AnomalyKind::Unreadable),
+        ];
+        assert_eq!(
+            check(&entries).findings,
+            vec![
+                Finding::Anomaly {
+                    what: AnomalyKind::SecondEnd,
+                    client_order_id: Some(1),
+                    at: Ts::from_nanos(3900),
+                },
+                Finding::Anomaly {
+                    what: AnomalyKind::Unreadable,
+                    client_order_id: None,
+                    at: Ts::from_nanos(3950),
+                },
+            ]
         );
     }
 }
