@@ -296,6 +296,51 @@ impl Credentials {
         let signature = percent_encode(&self.sign(query.as_bytes()));
         format!("{query}&signature={signature}")
     }
+
+    /// The signature for a WebSocket API request with these `params`.
+    ///
+    /// Signs [`ws_signature_payload`]'s string and returns the base64 as it
+    /// stands, **not** percent-encoded: it goes into the request's JSON
+    /// `params` as the value of `signature` (web-socket-api.md:1190-1210).
+    /// `session.logon`'s are `apiKey`, `timestamp` and, optionally, `recvWindow`
+    /// (web-socket-api.md:3399-3406).
+    #[must_use]
+    pub fn sign_ws_params(&self, params: &[(&str, &str)]) -> String {
+        self.sign(ws_signature_payload(params).as_bytes())
+    }
+}
+
+/// The string a WebSocket API request's signature is made over.
+///
+/// Every param except `signature`, sorted by name, each written `name=value`,
+/// joined by `&` (web-socket-api.md:761 and, for Ed25519, :1115-1153). Sorted
+/// by the names' bytes, which is the order Binance's own example sorts in
+/// (Python's `sorted`, web-socket-api.md:1272-1273); for the ASCII names the
+/// venue uses, that is alphabetical with capitals first. Values go in as they
+/// are, not percent-encoded (web-socket-api.md:1276, *"no percent encoding
+/// here!"*).
+///
+/// A JSON object names each field once, so `params` should too. If it repeats
+/// one, both are signed, in the order given, and the venue — which reads one —
+/// refuses the signature.
+#[must_use]
+pub fn ws_signature_payload(params: &[(&str, &str)]) -> String {
+    let mut signed: Vec<(&str, &str)> = params
+        .iter()
+        .copied()
+        .filter(|&(name, _)| name != "signature")
+        .collect();
+    signed.sort_by(|a, b| a.0.cmp(b.0));
+    let mut payload = String::new();
+    for (i, (name, value)) in signed.iter().enumerate() {
+        if i > 0 {
+            payload.push('&');
+        }
+        payload.push_str(name);
+        payload.push('=');
+        payload.push_str(value);
+    }
+    payload
 }
 
 /// Percent-encode everything outside RFC 3986's unreserved characters, in
@@ -491,7 +536,10 @@ mod tests {
     use super::fixture::{
         eight_char_windows, example, percent_decode, EXAMPLE_KEY_BODY, EXAMPLE_KEY_PEM,
     };
-    use super::{non_empty, private_key_text, CredentialError, Credentials};
+    use super::{non_empty, private_key_text, ws_signature_payload, CredentialError, Credentials};
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use ring::signature::{KeyPair as _, UnparsedPublicKey, ED25519};
 
     /// The payload of Binance's own Ed25519 example (fix-api.md:287-312): the
     /// FIX Logon's `MsgType`, `SenderCompID`, `TargetCompID`, `MsgSeqNum` and
@@ -502,6 +550,11 @@ mod tests {
     /// key (fix-api.md:308-311). OpenSSL 3.5.5 reproduces it byte for byte.
     const FIX_SIGNATURE: &str =
         "4MHXelVVcpkdwuLbl6n73HQUXUf1dse2PCgT1DYqW9w8AVZ1RACFGM+5UdlGPrQHrgtS3CvsRURC1oj73j8gCA==";
+
+    /// Binance's Ed25519 WebSocket API example payload (web-socket-api.md:1152).
+    const WS_EXAMPLE_PAYLOAD: &str = "apiKey=4yNzx3yWC5bS6YTwEkSRaC0nRmSQIIStAUOh1b6kqaBrTLIhjC\
+        pI5lJH8q8R8WNO&price=52000.00&quantity=0.01000000&recvWindow=100&side=SELL&symbol=BTC\
+        USDT&timeInForce=GTC&timestamp=1645423376532&type=LIMIT";
 
     /// Pinned against the venue's own published vector rather than against a
     /// value this implementation produced, which would be the test agreeing
@@ -598,6 +651,40 @@ mod tests {
             1,
             "signing twice would send two signatures and the venue checks the first"
         );
+    }
+
+    #[test]
+    fn a_websocket_payload_is_every_param_but_the_signature_sorted_by_name() {
+        // The venue's Ed25519 example (web-socket-api.md:1076-1091), its params
+        // shuffled, with the `signature` placeholder its request carries before
+        // signing.
+        let api_key = "4yNzx3yWC5bS6YTwEkSRaC0nRmSQIIStAUOh1b6kqaBrTLIhjCpI5lJH8q8R8WNO";
+        let scrambled = [
+            ("type", "LIMIT"),
+            ("timestamp", "1645423376532"),
+            ("signature", "------ FILL ME ------"),
+            ("symbol", "BTCUSDT"),
+            ("apiKey", api_key),
+            ("timeInForce", "GTC"),
+            ("side", "SELL"),
+            ("recvWindow", "100"),
+            ("quantity", "0.01000000"),
+            ("price", "52000.00"),
+        ];
+        assert_eq!(ws_signature_payload(&scrambled), WS_EXAMPLE_PAYLOAD);
+
+        // The signature goes into JSON as plain base64, and verifies over that
+        // payload under the loaded key's public half. Binance did not publish
+        // the private key behind its own example signature, so this is a round
+        // trip rather than a pinned value; the FIX vector pins the arithmetic.
+        let creds = example();
+        let signature = creds.sign_ws_params(&scrambled);
+        let bytes = STANDARD
+            .decode(&signature)
+            .unwrap_or_else(|e| panic!("plain base64, not percent-encoded: {signature}: {e}"));
+        UnparsedPublicKey::new(&ED25519, creds.key_pair.public_key().as_ref())
+            .verify(WS_EXAMPLE_PAYLOAD.as_bytes(), &bytes)
+            .expect("the signature is over the documented payload");
     }
 
     #[test]
