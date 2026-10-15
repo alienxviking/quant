@@ -363,7 +363,7 @@ Engine"*.
 | | Slice | Content |
 |---|---|---|
 | a | The engine can receive what a venue says | wake on either input (`next_event_timeout`), forward-only clock. Engine side **done**; `LiveSource`'s half was missed (§1) and lands in `m8a-live-source-idles` |
-| b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c) (§5) |
+| b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
 | c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`); the rest is the pull requests below |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
@@ -399,7 +399,10 @@ feature.
    *placed*, *refused* (with its code and message) or *unknown*. Any 5xx, `-1007`
    and `-1006` are unknown, never refused. Accepted when Binance's documented
    signature examples reproduce and a table test maps every documented code to
-   its class.
+   its class. The credentials half is `m8c-ed25519-credentials`: the Ed25519 key
+   read from the environment, a REST signer that reproduces Binance's published
+   Ed25519 example signature, the WebSocket API signer `session.logon` needs, and
+   `venue-check` on the new key. The requests half follows.
 2. **The instrument comes from the venue.** `exchangeInfo` parsed into an
    `InstrumentDef`, naming the venue rules our `Filters` do not model
    (`MARKET_LOT_SIZE`, `applyMinToMarket`, `maxNotional`). Accepted when the
@@ -480,13 +483,17 @@ thing to find out now than on the afternoon of the run.
 3.2 GB normalized tier is rebuilt rather than copied.
 
 Slice (b) is runnable today with no money at risk: `venue-check` makes one
-signed `GET /api/v3/account`, which exercises the key, the secret, the signature,
-the header and the clock in a single round trip and places nothing. A wrong
-secret comes back HTTP 401, which is the venue's auth layer answering — proof the
-request was well formed enough to be judged on its credentials rather than its
-shape. Two caveats: until `m8b-venue-check-offset` lands its clock reading is off
-by a round trip, and the credentials pull request moves it to the Ed25519 key
-(§5).
+signed `GET /api/v3/account`, which exercises the API key, the Ed25519
+signature, the header and the clock in a single round trip, reads `canTrade`, and
+places nothing. It prints the loaded key's public half to compare with the one
+registered, names why a refusal was refused, and with `--testnet` checks a Spot
+Testnet pair instead (§5). Under slice (b)'s HMAC secret, a wrong secret came
+back HTTP 401, which is the venue's auth layer answering — proof the request was
+well formed enough to be judged on its credentials rather than its shape. The
+Ed25519 key has not met the venue yet: on 2026-10-15 this host's clock, 2.4 s
+ahead of Spot Testnet's, stopped `venue-check` before it signed anything, so its
+first run after the clock is fixed, with a testnet pair, is the signer's first
+real test.
 
 Slice (a) is first and is not negotiable: it is a seam change, every slice after
 it depends on the guarantee, and it is the one thing that can be built and tested
@@ -620,7 +627,10 @@ Ed25519 keys"*. An HMAC key has one route left,
 API Key type"* while the method's own example signature is base64, and Binance's
 key-type page says *"HMAC keys are deprecated."* So the live path signs with Ed25519, which `ring`, already linked
 for TLS, provides. The key pair is generated locally and only its public half is
-registered with Binance. Orders stay on REST, per *one authority per fact*: one
+registered with Binance. The private key reaches the process as its PEM text in
+`BINANCE_ED25519_PRIVATE_KEY` rather than as a path, which keeps slice (b)'s
+rule that key material comes from the environment and not from a file
+(`quant-binance/src/credentials.rs`). Orders stay on REST, per *one authority per fact*: one
 WebSocket carrying both would let a single disconnect blind the stream and leave
 every in-flight order's outcome unknown at the same instant.
 

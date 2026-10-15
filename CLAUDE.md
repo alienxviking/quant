@@ -1846,9 +1846,11 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   planned around it.** M8.b made a host more than 1000 ms from the venue unable
   to trade, where M1 only warned — and M1 declined to start its acceptance run
   on the Windows box partly over a stopped `w32time` and a ~2 s offset. Cheap to
-  find out now, expensive on the afternoon of the run. Until
-  `m8b-venue-check-offset` lands, `venue-check`'s round-trip correction has the
-  wrong sign, so its reading is off by a full round trip.
+  find out now, expensive on the afternoon of the run. Its round-trip
+  correction had the wrong sign until `m8b-venue-check-offset`, and since
+  `m8c-ed25519-credentials` it needs an Ed25519 pair rather than the HMAC
+  secret it was first run with (`venue-check --help` says how to make and load
+  one).
 
 - **The slice (c) mapping found seven defects in shipped code** (2026-10-14/15:
   six independent readers, a seventh cross-checking them, and each consequential
@@ -2184,7 +2186,8 @@ anything around this machine:
 
 ```
 w32tm /query /status ; w32tm /resync
-cargo run --release -p quant-binance --bin venue-check    # needs the API keys
+$env:BINANCE_API_KEY = "..." ; $env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw key.pem
+cargo run --release -p quant-binance --bin venue-check    # -- --testnet for a testnet pair
 ```
 
 **Measured on 2026-10-15: this host is about 2.1 s ahead of Binance**, the
@@ -2199,9 +2202,16 @@ prints the round-trip-corrected offset, which is the quantity that matters —
 measuring `now - serverTime` naively folds one-way latency into the offset and
 would block a run over a clock that is fine. **Its correction had the wrong
 sign**, putting the reading off by a full round trip, until
-`m8b-venue-check-offset`. And it is moving to the Ed25519 key the live run will
-use (`docs/live-run.md` §5), so the keys it needs are a new pair, not the HMAC
-ones it was verified with.
+`m8b-venue-check-offset`. And it now signs with the Ed25519 key the live run will
+use (`m8c-ed25519-credentials`, `docs/live-run.md` §5), so the keys it needs are
+a new pair, not the HMAC ones it was verified with: `openssl genpkey -algorithm
+ed25519 -out key.pem` outside the repository, the public half from `openssl pkey
+-in key.pem -pubout` registered with Binance, and the private key loaded into
+`BINANCE_ED25519_PRIVATE_KEY` as above. It prints the public half of whatever
+key it loaded, to compare with the registered one. Spot Testnet keeps its own
+pairs; `--testnet` checks one there. Its first run here, with Binance's
+published example key against Spot Testnet, read the host **2409 ms ahead** and
+stopped before signing anything, which agrees with the 2.1 s above.
 
 **`ops/*.ps1` is record-only, and there is no live mode in either half.** The
 paper mode exists in the bash half alone, deliberately, and the bash half has
@@ -2223,10 +2233,16 @@ done, (a) is done in the engine and not in the source, and (c) is part done:
   source the idle wake exists for, never overrode the method, so in production
   the engine still blocked in `recv()`. And the clock advanced from venue reports
   on idle wakes only. Both land in `m8a-live-source-idles`.
-- **(b) done.** `Credentials` (redacting `Debug`, environment only, signature
-  pinned against RFC 4231), `TradeClient`, and `venue-check`. Verified against
-  the real API: a wrong secret comes back HTTP 401, which is the venue's auth
-  layer answering and therefore proof the request was well formed.
+- **(b) done, and reworked for Ed25519 in slice (c).** `Credentials`
+  (redacting `Debug`, environment only), `TradeClient`, and `venue-check`. The
+  HMAC version was verified against the real API: a wrong secret came back HTTP
+  401, which is the venue's auth layer answering and therefore proof the request
+  was well formed. `m8c-ed25519-credentials` replaced the HMAC secret with an
+  Ed25519 key in `BINANCE_ED25519_PRIVATE_KEY`, pinned against Binance's own
+  published Ed25519 signature (the FIX API's example) rather than RFC 4231, and
+  added the WebSocket API signer `session.logon` needs. `venue-check` now reads
+  `canTrade` and names why a refusal was refused. The Ed25519 signer has **not
+  met the venue yet**: this host's clock stops `venue-check` before it signs.
 - **(c) part done.** `FeeAsset` shipped: a spot venue takes its fee in the
   asset you received, and modelling it turned out to need one field rather than
   the two balances M4 predicted. PR #50 then fixed what consuming a base-asset

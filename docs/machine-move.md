@@ -223,8 +223,16 @@ outside `recvWindow`, so `TradeClient::check_ready` **refuses to trade** above
 ```powershell
 w32tm /query /status
 w32tm /resync
-cargo run --release -p quant-binance --bin venue-check    # needs the API keys
+$env:BINANCE_API_KEY = "..."
+$env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw key.pem   # an Ed25519 key, kept outside the repo
+cargo run --release -p quant-binance --bin venue-check            # add `-- --testnet` for a testnet pair
 ```
+
+The key is an Ed25519 pair made with `openssl genpkey -algorithm ed25519 -out
+key.pem`, whose public half (`openssl pkey -in key.pem -pubout`) is registered
+with Binance; the HMAC secret slice (b) signed with is no longer used.
+`quant-binance/src/credentials.rs` says why, and `venue-check --help` shows the
+bash form too.
 
 `venue-check` prints the round-trip-corrected offset against the venue's own
 clock, which is the quantity that actually matters — measuring `now - serverTime`
