@@ -517,6 +517,18 @@ impl Query {
     }
 }
 
+/// `name=value`, the value percent-encoded as every parameter here is, for a
+/// signed request that is not an order: the `symbol` that
+/// [`TradeClient::check_bnb_discount_off`] asks about. The same encoder as an
+/// order's, so a symbol goes out spelled the same way in both.
+///
+/// [`TradeClient::check_bnb_discount_off`]: crate::trade::TradeClient::check_bnb_discount_off
+pub(crate) fn param(name: &str, value: &str) -> String {
+    let mut query = Query::default();
+    query.push(name, value);
+    query.0
+}
+
 /// Append `value` to `out`, percent-encoded.
 ///
 /// RFC 3986's unreserved characters pass unchanged, which are exactly the ones

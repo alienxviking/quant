@@ -368,9 +368,47 @@ pub enum NotReady {
     /// The venue answered the trade probe with a 2xx, and not with the JSON
     /// object documented for it (rest-api.md:2349-2353).
     UnreadableOrderTest { status: u16 },
+    /// The account pays its fees in BNB at a discount: its commission rates
+    /// report `discount.enabledForAccount` true (rest-api.md:4841-4842). A
+    /// fee taken in BNB is in neither asset of the pair, and the user-data
+    /// translator refuses such a fill rather than book it as either
+    /// (`crate::user_data`), so a live run requires the discount off. From
+    /// [`TradeClient::check_bnb_discount_off`].
+    BnbDiscountOn,
+    /// The venue answered 200, but not with the commission rates this reads.
+    /// Which way it was not is said; what it held is not, because it holds
+    /// the account's rates.
+    UnreadableCommission(CommissionFault),
     /// We could not reach the venue at all.
     Unreachable(String),
 }
+
+/// How a 200 answer to `GET /api/v3/account/commission` failed to be the
+/// document [`TradeClient::check_bnb_discount_off`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommissionFault {
+    /// The body is not JSON.
+    NotJson,
+    /// There is no `discount.enabledForAccount`.
+    NoDiscountFlag,
+    /// `discount.enabledForAccount` is neither `true` nor `false`.
+    DiscountFlagNotBool,
+}
+
+impl core::fmt::Display for CommissionFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::NotJson => "the body is not JSON",
+            Self::NoDiscountFlag => "the body has no discount.enabledForAccount field",
+            Self::DiscountFlagNotBool => "discount.enabledForAccount is neither true nor false",
+        })
+    }
+}
+
+/// Where an account's commission rates for one symbol are read:
+/// `GET /api/v3/account/commission`, `USER_DATA`, weight 20
+/// (rest-api.md:4797-4813).
+const COMMISSION_PATH: &str = "/api/v3/account/commission";
 
 /// What `POST /api/v3/order/test` showed about this API key, when it showed
 /// that the key may trade. From [`TradeClient::check_trade_permission`].
@@ -610,6 +648,17 @@ impl core::fmt::Display for NotReady {
                 f,
                 "the venue answered the trade probe with HTTP {status}, but not with the JSON \
                  object documented for it, so whether this key may trade is not shown"
+            ),
+            Self::BnbDiscountOn => f.write_str(
+                "the account pays its fees in BNB at a discount (discount.enabledForAccount is \
+                 true). A fee taken in BNB is in neither asset of the pair, and a live run refuses \
+                 a fill whose fee it cannot book, so switch paying fees in BNB off for this \
+                 account before trading",
+            ),
+            Self::UnreadableCommission(fault) => write!(
+                f,
+                "the venue answered 200 to the commission rates request, but {fault}. Nothing of \
+                 the body is printed: it holds the account's commission rates"
             ),
             Self::Unreachable(why) => write!(f, "could not reach the venue: {why}"),
         }
@@ -948,6 +997,52 @@ impl TradeClient {
             .map_err(|e| NotReady::Unreachable(e.to_string()))?;
         read_order_test(reply.status.as_u16(), reply.retry_after, &reply.body)
     }
+
+    /// Check that this account does not pay its fees in BNB at a discount, by
+    /// reading `discount.enabledForAccount` from its commission rates for
+    /// `symbol`: `GET /api/v3/account/commission` (rest-api.md:4797-4846).
+    ///
+    /// The run requires it off. A spot venue takes a fee in the asset
+    /// received, which the engine books ([`quant_core::execution::FeeAsset`]);
+    /// with the discount on, it takes BNB instead, which is neither asset of
+    /// the pair, and the user-data translator refuses such a fill loudly
+    /// rather than book it as either. This finds that out before an order
+    /// does.
+    ///
+    /// `USER_DATA`, weight 20, and stamped as [`Self::check_ready`] stamps,
+    /// the host's clock less `offset_ms`. Its body holds the account's
+    /// commission rates (rest-api.md:4820-4847). It is read for the one field
+    /// and nothing else, and nothing here prints or logs it.
+    ///
+    /// # Errors
+    ///
+    /// [`NotReady::BnbDiscountOn`] when the discount is on, and otherwise
+    /// [`NotReady`] with the reason, a refusal sorted as `check_ready` sorts
+    /// one. None carries any of the body, the URL or the signature.
+    pub async fn check_bnb_discount_off(
+        &self,
+        symbol: &str,
+        offset_ms: i64,
+    ) -> Result<(), NotReady> {
+        let now = chrono_millis().saturating_sub(offset_ms);
+        let reply = self
+            .send_signed(
+                reqwest::Method::GET,
+                COMMISSION_PATH,
+                &crate::orders::param("symbol", symbol),
+                now,
+            )
+            .await
+            .map_err(|e| NotReady::Unreachable(e.to_string()))?;
+        if !reply.status.is_success() {
+            return Err(classify_refusal(
+                reply.status.as_u16(),
+                reply.retry_after,
+                &reply.body,
+            ));
+        }
+        bnb_discount_off(&reply.body)
+    }
 }
 
 /// What the venue answered a signed request with, whatever the status.
@@ -1093,6 +1188,35 @@ fn read_order_test(
     }
 }
 
+/// Whether the commission rates report the BNB discount off for the account:
+/// `discount.enabledForAccount` (rest-api.md:4841-4842).
+///
+/// `enabledForSymbol` beside it is not read. The documentation shows both
+/// without defining either (rest-api.md:4841-4846). Read by their names, the
+/// account's is the setting the run procedure turns off, and it is the
+/// stricter of the two: on for the account and off for this symbol is still
+/// refused.
+///
+/// The body is read as JSON for that one field. No error carries any of it: it
+/// holds the account's commission rates.
+fn bnb_discount_off(body: &[u8]) -> Result<(), NotReady> {
+    let document: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| NotReady::UnreadableCommission(CommissionFault::NotJson))?;
+    match document
+        .get("discount")
+        .and_then(|discount| discount.get("enabledForAccount"))
+    {
+        Some(serde_json::Value::Bool(false)) => Ok(()),
+        Some(serde_json::Value::Bool(true)) => Err(NotReady::BnbDiscountOn),
+        Some(_) => Err(NotReady::UnreadableCommission(
+            CommissionFault::DiscountFlagNotBool,
+        )),
+        None => Err(NotReady::UnreadableCommission(
+            CommissionFault::NoDiscountFlag,
+        )),
+    }
+}
+
 /// A request that got no answer, said without its URL.
 fn transport_error(e: reqwest::Error) -> SnapshotError {
     if e.is_timeout() {
@@ -1171,9 +1295,10 @@ fn redact_signature(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        account_can_trade, classify_refusal, midpoint_offset_ms, read_order_test, redact_signature,
-        AccountFault, ClockSample, NotReady, TradeClient, TradePermission, VenueError,
-        MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS, WHY_A_VERDICT_PROVES_PERMISSION,
+        account_can_trade, bnb_discount_off, classify_refusal, midpoint_offset_ms, read_order_test,
+        redact_signature, AccountFault, ClockSample, CommissionFault, NotReady, TradeClient,
+        TradePermission, VenueError, MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
+        WHY_A_VERDICT_PROVES_PERMISSION,
     };
     use crate::credentials::fixture;
     use crate::orders::{
@@ -2699,5 +2824,110 @@ mod tests {
         ] {
             assert!(said.contains(needle), "{needle:?} missing from: {said}");
         }
+    }
+
+    /// A rate in the commission fixture distinctive enough that a reason which
+    /// quoted the body would show it.
+    const RATE: &str = "0.00071234";
+
+    /// The documented commission rates (rest-api.md:4820-4847), their
+    /// comments removed, one rate made [`RATE`], and the two discount flags as
+    /// given.
+    fn commission(for_account: &str, for_symbol: &str) -> String {
+        format!(
+            r#"{{"symbol":"BTCUSDT","standardCommission":{{"maker":"{RATE}","taker":"0.00000020","buyer":"0.00000030","seller":"0.00000040"}},"specialCommission":{{"maker":"0.01000000","taker":"0.02000000","buyer":"0.03000000","seller":"0.04000000"}},"taxCommission":{{"maker":"0.00000112","taker":"0.00000114","buyer":"0.00000118","seller":"0.00000116"}},"discount":{{"enabledForAccount":{for_account},"enabledForSymbol":{for_symbol},"discountAsset":"BNB","discount":"0.75000000"}}}}"#
+        )
+    }
+
+    #[test]
+    fn the_bnb_discount_is_read_off_the_account_flag_and_nothing_of_the_body_is_said() {
+        // The account's flag decides, and in every case the symbol's says the
+        // opposite, so a reader of the wrong one is caught either way.
+        assert_eq!(
+            bnb_discount_off(commission("false", "true").as_bytes()),
+            Ok(())
+        );
+        let refusals = [
+            (commission("true", "false"), NotReady::BnbDiscountOn),
+            (
+                commission("\"false\"", "false"),
+                NotReady::UnreadableCommission(CommissionFault::DiscountFlagNotBool),
+            ),
+            (
+                format!(r#"{{"symbol":"BTCUSDT","standardCommission":{{"maker":"{RATE}"}}}}"#),
+                NotReady::UnreadableCommission(CommissionFault::NoDiscountFlag),
+            ),
+            (
+                format!(r#"{{"discount":{{"enabledForSymbol":false,"discount":"{RATE}"}}}}"#),
+                NotReady::UnreadableCommission(CommissionFault::NoDiscountFlag),
+            ),
+            (
+                format!("<html>{RATE}</html>"),
+                NotReady::UnreadableCommission(CommissionFault::NotJson),
+            ),
+        ];
+        for (body, expected) in refusals {
+            let why = bnb_discount_off(body.as_bytes()).expect_err("not ready");
+            assert_eq!(why, expected, "{body}");
+            assert!(!why.to_string().contains(RATE), "{why}");
+            assert!(!format!("{why:?}").contains(RATE), "{why:?}");
+        }
+        // The reason names the setting, and why the run needs it off.
+        let said = NotReady::BnbDiscountOn.to_string();
+        for needle in [
+            "pays its fees in BNB",
+            "discount.enabledForAccount is true",
+            "neither asset of the pair",
+            "switch paying fees in BNB off",
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_commission_rates_are_asked_for_the_symbol_checked() {
+        // The symbol goes out encoded as an order's would be, and the
+        // documentation's own non-ASCII symbol is the one that shows a second
+        // encoding, or none: either way the signature stops verifying.
+        let venue = TestVenue::start(vec![Reply::Bytes(http(
+            "200 OK",
+            "",
+            &commission("false", "false"),
+        ))]);
+        let answer = client_at(&venue.base)
+            .check_bnb_discount_off(NON_ASCII, 0)
+            .await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "{requests:#?}");
+        assert!(
+            requests[0].starts_with(
+                "GET /api/v3/account/commission?symbol=%EF%BC%91%EF%BC%92%EF%BC%93%EF%BC%94%EF%BC%95\
+                 %EF%BC%96&timestamp="
+            ),
+            "{}",
+            requests[0]
+        );
+        signed_on_the_wire(&requests[0]);
+        assert_eq!(answer, Ok(()));
+
+        // A refusal is sorted as check_ready sorts one. On a USER_DATA
+        // request -2015 is the key, its address or its permission to read,
+        // which is the credentials, not the key's permission to trade.
+        let key = r#"{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}"#;
+        let venue = TestVenue::start(vec![Reply::Bytes(http("401 Unauthorized", "", key))]);
+        let answer = client_at(&venue.base)
+            .check_bnb_discount_off("BTCUSDT", 0)
+            .await;
+        venue.stop();
+        assert_eq!(
+            answer,
+            Err(NotReady::BadCredentials {
+                status: 401,
+                venue: Some(VenueError {
+                    code: -2015,
+                    msg: "Invalid API-key, IP, or permissions for action.".to_owned(),
+                }),
+            })
+        );
     }
 }
