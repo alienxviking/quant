@@ -95,7 +95,9 @@
 //! - *"Duplicate order sent."*, under `-2010` or `-1013` alike: the request
 //!   was refused because an open order already holds the id this order was
 //!   sent under (errors.md:375; rest-api.md:2153), and that order may be this
-//!   one, sent before;
+//!   one, sent before. Matched on the word rather than the exact text, because
+//!   messages can vary (errors.md:3-4) and a near miss here would fall on the
+//!   unsafe side;
 //! - any other code outside the ones that are, among them a code the endpoint
 //!   is not expected to return, and a 4xx whose body is not a Binance error at
 //!   all;
@@ -249,7 +251,7 @@ impl NewOrder {
             Heard::Error { http_status, error } => match error.code {
                 // An open order holds this order's id, and may be this order:
                 // never a refusal, whichever code it comes under (module docs).
-                -1013 | -2010 if error.msg == DUPLICATE_ORDER => Placement::Unknown {
+                -1013 | -2010 if names_a_duplicate(&error.msg) => Placement::Unknown {
                     why: WhyUnknown::IdInUse {
                         id: self.client_order_id.clone(),
                         http_status,
@@ -1018,9 +1020,22 @@ fn request_refusal(http_status: u16, code: i64, own_issues: &[i64]) -> Option<Re
     }
 }
 
-/// The cause a `-1013` or `-2010` message names, for every message but
-/// [`DUPLICATE_ORDER`], which is not a refusal of the order at all and which
-/// [`NewOrder::classify`] reads before this.
+/// Whether a `-1013` or `-2010` message says an open order already holds the
+/// id: *"Duplicate order sent."* (errors.md:375).
+///
+/// The one message not matched exactly. The documentation warns that messages
+/// can vary (errors.md:3-4), and for every other message a near miss is still a
+/// refusal, which is safe. For this one a near miss would be read as a refusal
+/// of an order the venue holds, taking it out of the engine's books while it
+/// fills. Under these two codes it is the only documented message that says
+/// "duplicate" (errors.md:367-413), so the looser match claims nothing else.
+fn names_a_duplicate(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("duplicate")
+}
+
+/// The cause a `-1013` or `-2010` message names, for every message but a
+/// duplicate ([`names_a_duplicate`]), which is not a refusal of the order at
+/// all and which [`NewOrder::classify`] reads before this.
 ///
 /// Matched exactly as the documentation writes each message. One that differs
 /// by a character is still a refusal, as [`RefusalCause::Declined`], with the
@@ -1041,9 +1056,6 @@ const FILTER_FAILURE: &str = "Filter failure: ";
 /// errors.md:377, and the message of the venue's own example of a failed
 /// order (web-socket-api.md:232-235).
 const INSUFFICIENT_BALANCE: &str = "Account has insufficient balance for requested action.";
-
-/// errors.md:375.
-const DUPLICATE_ORDER: &str = "Duplicate order sent.";
 
 /// errors.md:374.
 const UNKNOWN_ORDER: &str = "Unknown order sent.";
@@ -1671,6 +1683,31 @@ mod tests {
                 "{code}"
             );
             assert_eq!(placement.reject_reason(), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_duplicate_reworded_is_still_a_duplicate() {
+        // Messages can vary (errors.md:3-4). For every other message a near miss
+        // is still a refusal, which is safe; for this one a near miss would take
+        // an order the venue holds out of the engine's books.
+        for msg in [
+            "Duplicate order sent",
+            "duplicate order sent.",
+            "Duplicate order sent. (clOrdId already in use)",
+        ] {
+            for code in [-2010, -1013] {
+                let placement = ours().classify(answered(400, &venue_error(code, msg)));
+                assert!(
+                    matches!(
+                        placement,
+                        Placement::Unknown {
+                            why: WhyUnknown::IdInUse { .. }
+                        }
+                    ),
+                    "{code} {msg:?}: {placement:?}"
+                );
+            }
         }
     }
 
