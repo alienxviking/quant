@@ -18,9 +18,12 @@ use quant_core::execution::{
 };
 use quant_core::fixed::{Px, Qty};
 use quant_core::instrument::Exchange;
-use quant_core::report::{Ended, FillIds, Notice, OrderReport, RejectedWhy};
+use quant_core::report::{
+    AccountChange, DoubtChange, Ended, FillIds, ForeignOutcome, ForeignReport, Notice, OrderReport,
+    RejectedWhy,
+};
 use quant_core::time::Ts;
-use quant_engine::journal::{InstrumentKey, Journal, JournalEntry};
+use quant_engine::journal::{InstrumentKey, Journal, JournalEntry, StrayKind};
 use quant_engine::risk::Bound;
 use quant_engine::{Booked, RefusedBy, RunObserver, WriteAhead};
 use tracing::error;
@@ -117,24 +120,187 @@ impl JournalWriter {
             symbol: self.symbol.clone(),
         }
     }
+}
 
-    /// Say, loudly, that the venue reported something this journal has no line
-    /// for yet.
-    ///
-    /// A bridge, and a deliberately noisy one. The engine now hands the record
-    /// what only a real venue knows (its ids, what it cited, the facts that are
-    /// not events), and the journal entries that hold them are the next pull
-    /// request's, with a schema change of their own. Until then nothing
-    /// produces any of it: the simulator's reports carry none, and no live
-    /// venue exists. Should one arrive first, it is an `error!` rather than a
-    /// silence, so a record that lost it says so where an operator looks.
-    fn unwritten(&self, what: &str, detail: &dyn core::fmt::Debug) {
-        error!(
-            symbol = %self.symbol,
+/// The line a venue's notice is written as, and what to call it if the write
+/// fails.
+///
+/// One exhaustive `match` with no `_` arm, and every notice destructured
+/// without `..`: a fact a venue learns to report later does not build here
+/// until it has a line, and a field added to one does not build until it has
+/// been decided. The alternative is the defect this project keeps meeting, a
+/// fact that reaches the record and is quietly not written down.
+///
+/// Each line is stamped `at`, which the engine passes as the notice's own
+/// stamp, so the notice's `ts` is not read twice.
+fn notice_line(notice: &Notice, at: Ts) -> (JournalEntry, &'static str) {
+    match notice {
+        Notice::Placed {
+            client_order_id,
+            venue_order_id,
+            transact_ms,
+            ts: _,
+        } => (
+            JournalEntry::Placed {
+                at,
+                client_order_id: *client_order_id,
+                venue_order_id: venue_order_id.clone(),
+                transact_ms: *transact_ms,
+            },
+            "a placement",
+        ),
+        Notice::Doubt {
+            client_order_id,
+            change,
+            ts: _,
+        } => (
+            JournalEntry::Doubt {
+                at,
+                client_order_id: *client_order_id,
+                change: change.clone(),
+            },
+            "a doubt",
+        ),
+        Notice::CancelRefused {
+            client_order_id,
+            why,
+            ts: _,
+        } => (
+            JournalEntry::CancelRefused {
+                at,
+                client_order_id: *client_order_id,
+                why: why.clone(),
+            },
+            "a refused cancel",
+        ),
+        Notice::Foreign(ForeignReport {
+            client_id,
+            provenance,
+            venue_order_id,
+            side,
             what,
-            detail = ?detail,
-            "the venue reported something this journal cannot yet write"
-        );
+            ts: _,
+        }) => (
+            JournalEntry::Foreign {
+                at,
+                client_id: client_id.clone(),
+                provenance: provenance.clone(),
+                venue_order_id: venue_order_id.clone(),
+                side: *side,
+                what: what.clone(),
+            },
+            "an order this run did not send",
+        ),
+        Notice::Account { change, ts: _ } => (
+            JournalEntry::Account {
+                at,
+                change: change.clone(),
+            },
+            "the account stream",
+        ),
+        Notice::Anomaly {
+            client_order_id,
+            what,
+            detail,
+            ts: _,
+        } => (
+            JournalEntry::Anomaly {
+                at,
+                client_order_id: *client_order_id,
+                what: *what,
+                detail: detail.clone(),
+            },
+            "an anomaly",
+        ),
+    }
+}
+
+/// Say out loud, as well as write down, the notices a person must look at
+/// while they happen, as an orphan is: a stranger's trade on this account, a
+/// report that could not be taken at its word, an order whose outcome is
+/// unknown, and the account stream lost.
+///
+/// Exhaustive like [`notice_line`], so a new notice is decided here too:
+/// quiet is a choice, not a default.
+fn say_if_loud(symbol: &str, notice: &Notice) {
+    match notice {
+        Notice::Doubt {
+            client_order_id,
+            change: DoubtChange::Raised { cause, said },
+            ts: _,
+        } => error!(
+            symbol,
+            id = client_order_id.0,
+            ?cause,
+            ?said,
+            "an order's outcome is unknown; no order is sent until it is known"
+        ),
+        Notice::Foreign(ForeignReport {
+            client_id,
+            provenance,
+            venue_order_id,
+            side,
+            what:
+                ForeignOutcome::Traded {
+                    trade_id,
+                    px,
+                    qty,
+                    commission,
+                    commission_asset,
+                    remaining: _,
+                },
+            ts: _,
+        }) => error!(
+            symbol,
+            client_id = client_id.as_str(),
+            ?provenance,
+            venue_order_id = venue_order_id.0,
+            ?side,
+            trade_id = trade_id.0,
+            %px,
+            %qty,
+            %commission,
+            commission_asset = commission_asset.as_str(),
+            "an order this run did not send traded on this account"
+        ),
+        Notice::Account {
+            change: AccountChange::Lost { cause },
+            ts: _,
+        } => error!(
+            symbol,
+            ?cause,
+            "the account stream is lost; every working order is in doubt"
+        ),
+        Notice::Anomaly {
+            client_order_id,
+            what,
+            detail,
+            ts: _,
+        } => error!(
+            symbol,
+            id = client_order_id.map(|id| id.0),
+            ?what,
+            detail = detail.as_str(),
+            "a venue report could not be taken at its word"
+        ),
+        // Recorded quietly: an acknowledgement, a doubt resolved, a cancel
+        // that did not take (the order's own report says how it ends), a
+        // stranger's order accepted or ended without trading, and the stream
+        // regained.
+        Notice::Placed { .. }
+        | Notice::Doubt {
+            change: DoubtChange::Cleared { .. },
+            ..
+        }
+        | Notice::CancelRefused { .. }
+        | Notice::Foreign(ForeignReport {
+            what: ForeignOutcome::Accepted | ForeignOutcome::Ended { .. },
+            ..
+        })
+        | Notice::Account {
+            change: AccountChange::Regained,
+            ..
+        } => {}
     }
 }
 
@@ -292,9 +458,26 @@ impl RunObserver for JournalWriter {
             // A simulator's rejection: nothing to cite.
             None => (None, None),
             Some(RejectedWhy::Declined { cited, breach }) => (Some(cited.clone()), *breach),
+            // Not a rejection by the venue, which never had the request, so
+            // not a `rejected` line: that keeps its meaning. Loud, because an
+            // order the strategy decided on did not happen.
             Some(RejectedWhy::NeverLanded(landing)) => {
-                self.unwritten("an order that never reached the venue", landing);
-                (None, None)
+                error!(
+                    symbol = %self.symbol,
+                    id = client_order_id.0,
+                    ?reason,
+                    ?landing,
+                    "an order never reached the venue"
+                );
+                self.record(
+                    &JournalEntry::NeverLanded {
+                        at,
+                        client_order_id,
+                        landing: landing.clone(),
+                    },
+                    "an order that never landed",
+                );
+                return;
             }
         };
         self.record(
@@ -376,12 +559,66 @@ impl RunObserver for JournalWriter {
         );
     }
 
-    fn on_notice(&mut self, notice: &Notice, _at: Ts) {
-        self.unwritten("a venue notice", notice);
+    fn on_notice(&mut self, notice: &Notice, at: Ts) {
+        say_if_loud(&self.symbol, notice);
+        let (entry, what) = notice_line(notice, at);
+        self.record(&entry, what);
     }
 
-    fn on_stray(&mut self, report: &OrderReport, _at: Ts) {
-        self.unwritten("a report about an order the engine is not working", report);
+    fn on_stray(&mut self, report: &OrderReport, at: Ts) {
+        let (client_order_id, kind, venue_order_id) = match report {
+            OrderReport::Accepted {
+                client_order_id,
+                venue_order_id,
+                ts: _,
+            } => (
+                *client_order_id,
+                StrayKind::Accepted,
+                venue_order_id.clone(),
+            ),
+            // What the venue said about an order the engine is not working is
+            // kept to which order and what kind of report: the detail would
+            // describe an order nobody here placed or still holds.
+            OrderReport::Rejected {
+                client_order_id,
+                reason: _,
+                why: _,
+                ts: _,
+            } => (*client_order_id, StrayKind::Rejected, None),
+            OrderReport::Cancelled {
+                client_order_id,
+                remaining: _,
+                ended,
+                ts: _,
+            } => (
+                *client_order_id,
+                StrayKind::Cancelled,
+                ended.as_ref().map(|ended| ended.venue_order_id.clone()),
+            ),
+            // The engine sends a fill it is not working to `on_orphaned`, so
+            // this does not happen. Should it, a fill nobody can attribute is
+            // an orphan whichever hook it came through, and is written as one
+            // rather than dropped.
+            OrderReport::Filled {
+                client_order_id,
+                fill,
+                remaining: _,
+                ids,
+                ts: _,
+            } => {
+                self.on_orphaned(*client_order_id, fill, ids.as_ref(), at);
+                return;
+            }
+        };
+        self.record(
+            &JournalEntry::Stray {
+                at,
+                client_order_id,
+                kind,
+                venue_order_id,
+            },
+            "a report about an order the engine is not working",
+        );
     }
 }
 
@@ -419,7 +656,10 @@ mod tests {
     use quant_core::execution::FeeAsset;
     use quant_core::fixed::Notional;
     use quant_core::instrument::FilterBreach;
-    use quant_core::report::{Cited, EndedBy, VenueText};
+    use quant_core::report::{
+        AccountCause, AnomalyKind, CancelRefusal, Cited, DoubtCause, EndedBy, Landing, Provenance,
+        VenueText,
+    };
     use quant_engine::portfolio::Portfolio;
 
     /// A journal in a fresh temp file, unique to the calling test.
@@ -592,6 +832,250 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// What one hook call wrote, read back from a journal of its own.
+    fn lines_from(name: &str, call: impl FnOnce(&mut JournalWriter)) -> Vec<JournalEntry> {
+        let (path, journal) = journal(name);
+        let mut writer = JournalWriter::new(journal, "BTCUSDT".to_owned(), 0);
+        call(&mut writer);
+        quant_engine::journal::read(&path).expect("read").entries
+    }
+
+    #[test]
+    fn an_order_that_never_landed_is_not_written_as_a_rejection() {
+        // J6. `rejected` means the venue had the request and declined it, and
+        // keeps meaning that: an order that never reached the venue gets a
+        // line of its own, with why, and no `rejected` line beside it.
+        let landing = Landing::NotSent {
+            why: VenueText::new("connection refused"),
+        };
+        let lines = lines_from("never-landed", |writer| {
+            writer.on_rejected(
+                ClientOrderId(4),
+                RejectReason::Venue,
+                Some(&RejectedWhy::NeverLanded(landing.clone())),
+                Ts::from_nanos(9),
+            );
+        });
+        assert_eq!(
+            lines,
+            vec![JournalEntry::NeverLanded {
+                at: Ts::from_nanos(9),
+                client_order_id: ClientOrderId(4),
+                landing,
+            }]
+        );
+
+        // And a rejection the venue cited is a `rejected` line, citation and
+        // all.
+        let cited = Cited {
+            http_status: Some(400),
+            code: -2010,
+            msg: VenueText::new("Account has insufficient balance."),
+        };
+        let lines = lines_from("declined", |writer| {
+            writer.on_rejected(
+                ClientOrderId(5),
+                RejectReason::InsufficientFunds,
+                Some(&RejectedWhy::Declined {
+                    cited: cited.clone(),
+                    breach: None,
+                }),
+                Ts::from_nanos(10),
+            );
+        });
+        assert_eq!(
+            lines,
+            vec![JournalEntry::Rejected {
+                at: Ts::from_nanos(10),
+                client_order_id: ClientOrderId(5),
+                reason: RejectReason::InsufficientFunds,
+                cited: Some(cited),
+                breach: None,
+            }]
+        );
+    }
+
+    /// One notice of every kind, beside the one line each must become.
+    // A table, one row per variant: long because the set is.
+    #[allow(clippy::too_many_lines)]
+    fn every_notice() -> Vec<(Notice, JournalEntry)> {
+        let venue = |id: &str| VenueOrderId(id.to_owned());
+        let cited = Cited {
+            http_status: Some(400),
+            code: -2011,
+            msg: VenueText::new("Unknown order sent."),
+        };
+        let traded = ForeignOutcome::Traded {
+            trade_id: VenueTradeId("77".to_owned()),
+            px: "0.1026".parse().expect("px"),
+            qty: "0.2".parse().expect("qty"),
+            commission: "0.0002".parse().expect("commission"),
+            commission_asset: VenueText::new("BNB"),
+            remaining: "0.4".parse().expect("qty"),
+        };
+        let raised = DoubtChange::Raised {
+            cause: DoubtCause::NoAnswer,
+            said: None,
+        };
+        let lost = AccountChange::Lost {
+            cause: AccountCause::SocketClosed,
+        };
+        vec![
+            (
+                Notice::Placed {
+                    client_order_id: ClientOrderId(1),
+                    venue_order_id: venue("4293153"),
+                    transact_ms: 1_499_405_658_657,
+                    ts: Ts::from_nanos(51),
+                },
+                JournalEntry::Placed {
+                    at: Ts::from_nanos(51),
+                    client_order_id: ClientOrderId(1),
+                    venue_order_id: venue("4293153"),
+                    transact_ms: 1_499_405_658_657,
+                },
+            ),
+            (
+                Notice::Doubt {
+                    client_order_id: ClientOrderId(2),
+                    change: raised.clone(),
+                    ts: Ts::from_nanos(52),
+                },
+                JournalEntry::Doubt {
+                    at: Ts::from_nanos(52),
+                    client_order_id: ClientOrderId(2),
+                    change: raised,
+                },
+            ),
+            (
+                Notice::CancelRefused {
+                    client_order_id: ClientOrderId(3),
+                    why: CancelRefusal::NotOpen(cited.clone()),
+                    ts: Ts::from_nanos(53),
+                },
+                JournalEntry::CancelRefused {
+                    at: Ts::from_nanos(53),
+                    client_order_id: ClientOrderId(3),
+                    why: CancelRefusal::NotOpen(cited),
+                },
+            ),
+            (
+                Notice::Foreign(ForeignReport {
+                    client_id: VenueText::new("q-r0-7"),
+                    provenance: Provenance::OtherRun(VenueText::new("r0")),
+                    venue_order_id: venue("4293154"),
+                    side: Side::Sell,
+                    what: traded.clone(),
+                    ts: Ts::from_nanos(54),
+                }),
+                JournalEntry::Foreign {
+                    at: Ts::from_nanos(54),
+                    client_id: VenueText::new("q-r0-7"),
+                    provenance: Provenance::OtherRun(VenueText::new("r0")),
+                    venue_order_id: venue("4293154"),
+                    side: Side::Sell,
+                    what: traded,
+                },
+            ),
+            (
+                Notice::Account {
+                    change: lost.clone(),
+                    ts: Ts::from_nanos(55),
+                },
+                JournalEntry::Account {
+                    at: Ts::from_nanos(55),
+                    change: lost,
+                },
+            ),
+            (
+                Notice::Anomaly {
+                    client_order_id: Some(ClientOrderId(6)),
+                    what: AnomalyKind::SecondEnd,
+                    detail: VenueText::new("CANCELED after FILLED"),
+                    ts: Ts::from_nanos(56),
+                },
+                JournalEntry::Anomaly {
+                    at: Ts::from_nanos(56),
+                    client_order_id: Some(ClientOrderId(6)),
+                    what: AnomalyKind::SecondEnd,
+                    detail: VenueText::new("CANCELED after FILLED"),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_notice_a_venue_gives_lands_as_one_line_of_its_own_type() {
+        // J7. The only path these facts have to the record is this hook, and
+        // the strategy hears none of them, so a notice the writer dropped
+        // would be lost with no error anywhere and a journal that merely
+        // looked like a quiet venue. Table-driven over every variant, each in
+        // a journal of its own, so one that writes nothing, or writes two
+        // lines, or the wrong one, shows by name.
+        for (i, (notice, line)) in every_notice().into_iter().enumerate() {
+            let at = notice.ts();
+            let lines = lines_from(&format!("notice-{i}"), |writer| {
+                writer.on_notice(&notice, at);
+            });
+            assert_eq!(lines, vec![line], "{notice:?}");
+        }
+    }
+
+    #[test]
+    fn a_report_about_an_order_the_engine_is_not_working_is_a_stray_line() {
+        let venue = |id: &str| VenueOrderId(id.to_owned());
+        let reports = [
+            (
+                OrderReport::Accepted {
+                    client_order_id: ClientOrderId(97),
+                    venue_order_id: Some(venue("4293157")),
+                    ts: Ts::from_nanos(61),
+                },
+                StrayKind::Accepted,
+                Some(venue("4293157")),
+            ),
+            (
+                OrderReport::Rejected {
+                    client_order_id: ClientOrderId(98),
+                    reason: RejectReason::Venue,
+                    why: None,
+                    ts: Ts::from_nanos(62),
+                },
+                StrayKind::Rejected,
+                None,
+            ),
+            (
+                OrderReport::Cancelled {
+                    client_order_id: ClientOrderId(99),
+                    remaining: "0.3".parse().expect("qty"),
+                    ended: Some(Ended {
+                        venue_order_id: venue("4293158"),
+                        how: EndedBy::Cancelled,
+                    }),
+                    ts: Ts::from_nanos(63),
+                },
+                StrayKind::Cancelled,
+                Some(venue("4293158")),
+            ),
+        ];
+        for (i, (report, kind, venue_order_id)) in reports.into_iter().enumerate() {
+            let at = report.ts();
+            let lines = lines_from(&format!("stray-{i}"), |writer| {
+                writer.on_stray(&report, at);
+            });
+            assert_eq!(
+                lines,
+                vec![JournalEntry::Stray {
+                    at,
+                    client_order_id: report.client_order_id(),
+                    kind,
+                    venue_order_id,
+                }],
+                "{report:?}"
+            );
+        }
     }
 
     #[test]

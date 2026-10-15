@@ -229,7 +229,17 @@ const fn entry_ts(entry: &JournalEntry) -> Option<Ts> {
         | JournalEntry::Orphaned { at, .. }
         | JournalEntry::Blind { at, .. }
         | JournalEntry::Note { at, .. }
-        | JournalEntry::Stopped { at, .. } => Some(*at),
+        | JournalEntry::Stopped { at, .. }
+        // What a live venue says, schema 3: each stamped when we heard it, on
+        // the clock every other entry here is stamped on.
+        | JournalEntry::Placed { at, .. }
+        | JournalEntry::NeverLanded { at, .. }
+        | JournalEntry::Doubt { at, .. }
+        | JournalEntry::CancelRefused { at, .. }
+        | JournalEntry::Foreign { at, .. }
+        | JournalEntry::Account { at, .. }
+        | JournalEntry::Anomaly { at, .. }
+        | JournalEntry::Stray { at, .. } => Some(*at),
     }
 }
 

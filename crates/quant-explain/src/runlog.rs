@@ -427,6 +427,11 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
         if stamp > at {
             break;
         }
+        // `Stopped` and the venue's own lines do the same thing, nothing, for
+        // different reasons, and the arms are kept apart so each reason stays
+        // written down beside the entries it is about: `replay`'s argument
+        // for keeping `Orphaned` separate.
+        #[allow(clippy::match_same_arms)]
         match entry {
             JournalEntry::Blind { cause, .. } => {
                 blind = Some((stamp, format!("{cause:?}")));
@@ -445,24 +450,49 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
             // would make every run that died in an outage report the stream as
             // seen again, which is the one case where saying so is most wrong.
             JournalEntry::Stopped { .. } => {}
-            // Any *other* entry the engine wrote is taken as proof the stream
-            // came back. Against a simulated venue the engine's clock only
-            // advances on a market event, so a line stamped after the gap was
-            // written while handling a later one. That rests on venue reports
-            // never arriving without a market event, which a live venue breaks
-            // -- see the doc comment above for what slice (c) owes.
+            // Every *other* entry the engine wrote before schema 3 is taken as
+            // proof the stream came back. Against a simulated venue the
+            // engine's clock only advances on a market event, so a line
+            // stamped after the gap was written while handling a later one.
+            // That rests on venue reports never arriving without a market
+            // event, which a live venue breaks -- see the doc comment above.
             //
-            // This listed `Submitted | Filled` until the post-milestone audit,
-            // which is narrower than the sentence above it in a way that
-            // mattered: a run that recovers and then simply does not trade for
-            // an hour kept reporting "with nothing seen since", turning a quiet
-            // hour back into the dark hour this block exists to tell it apart
-            // from. The comment stated the right rule and the match arm
-            // implemented a different one.
-            _ if blind.is_some() => {
-                seen_since = true;
+            // Every one of them, not only trades. This listed `Submitted |
+            // Filled` until the post-milestone audit, which is narrower than
+            // the sentence above it in a way that mattered: a run that
+            // recovers and then simply does not trade for an hour kept
+            // reporting "with nothing seen since", turning a quiet hour back
+            // into the dark hour this block exists to tell it apart from.
+            //
+            // Listed by name rather than caught by `_`, so an entry added
+            // later is a compile error here until somebody has decided
+            // whether it is evidence about the market.
+            JournalEntry::Filled { .. }
+            | JournalEntry::Checkpoint { .. }
+            | JournalEntry::Tripped { .. }
+            | JournalEntry::Submitted { .. }
+            | JournalEntry::Refused { .. }
+            | JournalEntry::Accepted { .. }
+            | JournalEntry::Rejected { .. }
+            | JournalEntry::CancelRequested { .. }
+            | JournalEntry::Cancelled { .. }
+            | JournalEntry::Orphaned { .. }
+            | JournalEntry::Note { .. } => {
+                if blind.is_some() {
+                    seen_since = true;
+                }
             }
-            _ => {}
+            // What a live venue says on its own, schema 3. No evidence about
+            // the market at all: a venue speaks on a wake the market did not
+            // cause, which is exactly the wake a dark market produces.
+            JournalEntry::Placed { .. }
+            | JournalEntry::NeverLanded { .. }
+            | JournalEntry::Doubt { .. }
+            | JournalEntry::CancelRefused { .. }
+            | JournalEntry::Foreign { .. }
+            | JournalEntry::Account { .. }
+            | JournalEntry::Anomaly { .. }
+            | JournalEntry::Stray { .. } => {}
         }
         if stamp <= from {
             continue;
@@ -474,7 +504,28 @@ pub fn decisions_at(entries: &[JournalEntry], at: i64, span: i64) -> Decisions {
             JournalEntry::Note { kind, .. } => {
                 *out.notes.entry(kind.clone()).or_insert(0) += 1;
             }
-            _ => {}
+            // Not decisions, and not the strategy's own account of one: money,
+            // claims, controls, the lifecycle after a decision, and what a
+            // venue said. Named, so a new entry has to be placed here.
+            JournalEntry::Started { .. }
+            | JournalEntry::Filled { .. }
+            | JournalEntry::Checkpoint { .. }
+            | JournalEntry::Tripped { .. }
+            | JournalEntry::Accepted { .. }
+            | JournalEntry::Rejected { .. }
+            | JournalEntry::CancelRequested { .. }
+            | JournalEntry::Cancelled { .. }
+            | JournalEntry::Orphaned { .. }
+            | JournalEntry::Blind { .. }
+            | JournalEntry::Stopped { .. }
+            | JournalEntry::Placed { .. }
+            | JournalEntry::NeverLanded { .. }
+            | JournalEntry::Doubt { .. }
+            | JournalEntry::CancelRefused { .. }
+            | JournalEntry::Foreign { .. }
+            | JournalEntry::Account { .. }
+            | JournalEntry::Anomaly { .. }
+            | JournalEntry::Stray { .. } => {}
         }
     }
     out.blind = blind.map(|(stamp, cause)| (stamp, cause, seen_since));
@@ -771,6 +822,44 @@ mod tests {
         let d = decisions_at(&entries, 10_000, 1_000);
         let (_, _, recovered) = d.blind.expect("the outage is still the answer");
         assert!(!recovered, "shutting down is not seeing the market again");
+    }
+
+    #[test]
+    fn what_a_venue_says_on_its_own_is_no_evidence_the_market_came_back() {
+        // A live venue speaks on wakes the market did not cause, which is
+        // exactly what a dark market produces: the account stream coming
+        // back, a placement acknowledged, an order in doubt. None of it says
+        // anything about the market feed, so none of it ends a blindness.
+        use quant_core::report::{AccountChange, Clearance, DoubtChange};
+        let blind = JournalEntry::Blind {
+            at: Ts::from_nanos(200),
+            cause: quant_core::event::GapCause::Disconnect,
+            last_good_ts: Ts::from_nanos(190),
+        };
+        let said = [
+            JournalEntry::Account {
+                at: Ts::from_nanos(300),
+                change: AccountChange::Regained,
+            },
+            JournalEntry::Placed {
+                at: Ts::from_nanos(310),
+                client_order_id: ClientOrderId(1),
+                venue_order_id: quant_core::execution::VenueOrderId("4293153".to_owned()),
+                transact_ms: 1_499_405_658_657,
+            },
+            JournalEntry::Doubt {
+                at: Ts::from_nanos(320),
+                client_order_id: ClientOrderId(1),
+                change: DoubtChange::Cleared {
+                    how: Clearance::Reported,
+                },
+            },
+        ];
+        for line in said {
+            let d = decisions_at(&[blind.clone(), line.clone()], 10_000, 1_000);
+            let (_, _, recovered) = d.blind.expect("the outage is still the answer");
+            assert!(!recovered, "{line:?} is not the market");
+        }
     }
 
     #[test]

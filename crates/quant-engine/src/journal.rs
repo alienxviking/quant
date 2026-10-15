@@ -83,7 +83,10 @@ use quant_core::fixed::{Notional, Px, Qty};
 use quant_core::instrument::{
     Exchange, FilterBreach, Instrument, InstrumentDef, InstrumentId, InstrumentRegistry,
 };
-use quant_core::report::{Cited, EndedBy};
+use quant_core::report::{
+    AccountChange, AnomalyKind, CancelRefusal, Cited, DoubtChange, EndedBy, ForeignOutcome,
+    Landing, Provenance, VenueText,
+};
 use quant_core::time::Ts;
 
 use crate::portfolio::Portfolio;
@@ -386,6 +389,94 @@ pub enum JournalEntry {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         working: Vec<ClientOrderId>,
     },
+    /// The venue's REST acknowledgement of an order. Schema 3.
+    ///
+    /// Not an acceptance: the account stream is the one authority for that.
+    /// But the venue's id for the order is what still finds it after a cancel
+    /// has replaced its client id (criterion E), and this may be the only
+    /// line that holds it for an order whose stream report never came.
+    Placed {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        venue_order_id: VenueOrderId,
+        /// The venue's `transactTime`, in milliseconds on the venue's clock.
+        /// For the record only: the engine dispatches on when we heard.
+        transact_ms: i64,
+    },
+    /// A submission that never became an order the venue had. Schema 3.
+    ///
+    /// Not `rejected`, which keeps its meaning: the venue had the request and
+    /// declined it. This one never reached it, or a lookup afterwards found no
+    /// such order. Certain either way, so the order is over.
+    NeverLanded {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        landing: Landing,
+    },
+    /// An order's outcome stopped being known, or became known again.
+    /// Schema 3.
+    ///
+    /// Raised and cleared explicitly, so "left in doubt" is a fold of this
+    /// file rather than an inference from what is missing from it.
+    Doubt {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        change: DoubtChange,
+    },
+    /// A cancel the venue did not carry out, or whose fate is unknown. The
+    /// order, if there is one, is as it was. Schema 3.
+    CancelRefused {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        why: CancelRefusal,
+    },
+    /// A report about an order this run did not send. Schema 3.
+    ///
+    /// The client id is kept as the venue sent it, as text, and never made a
+    /// `ClientOrderId`: an earlier run's order 5 must not be read as this
+    /// run's order 5. A trade is kept whole, commission asset verbatim,
+    /// because it moved the account's balances outside this run's record and
+    /// criterion A has to account for it.
+    Foreign {
+        at: Ts,
+        client_id: VenueText,
+        provenance: Provenance,
+        venue_order_id: VenueOrderId,
+        side: Side,
+        what: ForeignOutcome,
+    },
+    /// The account stream was lost or regained. Schema 3.
+    Account { at: Ts, change: AccountChange },
+    /// A report that could not be read, or contradicts what came before it,
+    /// recorded with its text rather than dropped. Schema 3.
+    Anomaly {
+        at: Ts,
+        /// The order it concerns, when that much could be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_order_id: Option<ClientOrderId>,
+        what: AnomalyKind,
+        detail: VenueText,
+    },
+    /// A report about an order the engine was not working, other than a fill
+    /// (which is `orphaned`): an id it never minted, or an order whose end it
+    /// had already heard. Kept from the strategy and written here. Schema 3.
+    Stray {
+        at: Ts,
+        client_order_id: ClientOrderId,
+        kind: StrayKind,
+        /// The venue's id for the order, when the report named one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        venue_order_id: Option<VenueOrderId>,
+    },
+}
+
+/// What a `stray` line reported: every kind of order report but a fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrayKind {
+    Accepted,
+    Rejected,
+    Cancelled,
 }
 
 impl JournalEntry {
@@ -405,7 +496,15 @@ impl JournalEntry {
             | Self::Orphaned { at, .. }
             | Self::Blind { at, .. }
             | Self::Note { at, .. }
-            | Self::Stopped { at, .. } => *at,
+            | Self::Stopped { at, .. }
+            | Self::Placed { at, .. }
+            | Self::NeverLanded { at, .. }
+            | Self::Doubt { at, .. }
+            | Self::CancelRefused { at, .. }
+            | Self::Foreign { at, .. }
+            | Self::Account { at, .. }
+            | Self::Anomaly { at, .. }
+            | Self::Stray { at, .. } => *at,
         }
     }
 }
@@ -736,7 +835,28 @@ pub fn replay(entries: &[JournalEntry], registry: &mut InstrumentRegistry) -> Po
             | JournalEntry::Accepted { .. }
             | JournalEntry::Rejected { .. }
             | JournalEntry::CancelRequested { .. }
-            | JournalEntry::Cancelled { .. } => {}
+            | JournalEntry::Cancelled { .. }
+            // What a live venue says on its own, schema 3. Conditions and
+            // acknowledgements, none of them money: an order placed, in doubt,
+            // a cancel refused, the stream lost, a report unreadable, a report
+            // about an order not being worked. Whatever money moved because of
+            // any of them arrives as a `filled` line of its own.
+            | JournalEntry::Placed { .. }
+            | JournalEntry::Doubt { .. }
+            | JournalEntry::CancelRefused { .. }
+            | JournalEntry::Account { .. }
+            | JournalEntry::Anomaly { .. }
+            | JournalEntry::Stray { .. }
+            // Nothing traded: the venue never had the order.
+            | JournalEntry::NeverLanded { .. } => {}
+            // Money, and not this run's: the `Orphaned` argument below, for an
+            // order that is not even ours to lose track of. Folding a
+            // stranger's trade would make the recompute disagree with a
+            // checkpoint that faithfully reports what this engine holds, and
+            // the disagreement would read as an accounting bug rather than as
+            // what it is. Criterion A accounts for it against the venue's
+            // balances, which is the comparison it belongs in.
+            JournalEntry::Foreign { .. } => {}
             // Deliberately *not* folded, and this is the one worth arguing. An
             // orphan is a fill the engine could not attribute, so the live
             // portfolio never saw it either -- folding it here would make the
@@ -945,7 +1065,22 @@ pub fn next_order_id(entries: &[JournalEntry]) -> u64 {
             // Consumes no id either: a note describes a decision, and the
             // decision that minted an id is recorded by the engine beside it.
             | JournalEntry::Note { .. }
-            | JournalEntry::Stopped { .. } => None,
+            | JournalEntry::Stopped { .. }
+            // What a live venue says, schema 3. Every id this engine minted is
+            // already on a `submitted` or `refused` line, so these add nothing
+            // to the counter -- and an id the venue named must never move it.
+            // `Context::cancel` accepts any id, so a refused cancel can name
+            // one this engine never minted; a stray's id is the venue's word
+            // about an order the engine is not working; and a foreign line's
+            // id is text precisely so it cannot become a `ClientOrderId`.
+            | JournalEntry::Placed { .. }
+            | JournalEntry::NeverLanded { .. }
+            | JournalEntry::Doubt { .. }
+            | JournalEntry::CancelRefused { .. }
+            | JournalEntry::Foreign { .. }
+            | JournalEntry::Account { .. }
+            | JournalEntry::Anomaly { .. }
+            | JournalEntry::Stray { .. } => None,
         })
         .max()
         .map_or(1, |highest| highest + 1)
@@ -2451,5 +2586,277 @@ mod schema3_tests {
             },
             r#"{"type":"stopped","at":26,"working":[12,14]}"#,
         );
+    }
+}
+
+#[cfg(test)]
+mod venue_entry_tests {
+    //! The entries schema 3 added for what a live venue says on its own, and
+    //! what each site that has no `_` arm decided about them.
+
+    use super::{agrees, next_order_id, replay, Agreement, InstrumentKey, JournalEntry, StrayKind};
+    use quant_core::event::Side;
+    use quant_core::execution::{ClientOrderId, FeeAsset, VenueOrderId, VenueTradeId};
+    use quant_core::instrument::{Exchange, InstrumentRegistry};
+    use quant_core::report::{
+        AccountCause, AccountChange, AnomalyKind, CancelRefusal, Cited, Clearance, DoubtCause,
+        DoubtChange, ForeignOutcome, Landing, Provenance, VenueText,
+    };
+    use quant_core::time::Ts;
+
+    fn golden(entry: &JournalEntry, json: &str) {
+        assert_eq!(serde_json::to_string(entry).expect("serialize"), json);
+        assert_eq!(
+            &serde_json::from_str::<JournalEntry>(json).expect("deserialize"),
+            entry,
+            "{json}"
+        );
+    }
+
+    fn venue_order(id: &str) -> VenueOrderId {
+        VenueOrderId(id.to_owned())
+    }
+
+    fn cited() -> Cited {
+        Cited {
+            http_status: Some(400),
+            code: -2011,
+            msg: VenueText::new("Unknown order sent."),
+        }
+    }
+
+    const CITED: &str = r#"{"http_status":400,"code":-2011,"msg":"Unknown order sent."}"#;
+
+    /// One line of every entry schema 3 added for a venue, every value
+    /// distinct and none zero, with the JSON each must be.
+    // A table, one row per variant: long because the set is.
+    #[allow(clippy::too_many_lines)]
+    fn every_venue_entry() -> Vec<(JournalEntry, String)> {
+        vec![
+            (
+                JournalEntry::Placed {
+                    at: Ts::from_nanos(31),
+                    client_order_id: ClientOrderId(1),
+                    venue_order_id: venue_order("4293153"),
+                    transact_ms: 1_499_405_658_657,
+                },
+                r#"{"type":"placed","at":31,"client_order_id":1,"venue_order_id":"4293153","transact_ms":1499405658657}"#.to_owned(),
+            ),
+            (
+                JournalEntry::NeverLanded {
+                    at: Ts::from_nanos(32),
+                    client_order_id: ClientOrderId(2),
+                    landing: Landing::NotSent {
+                        why: VenueText::new("connection refused"),
+                    },
+                },
+                r#"{"type":"never_landed","at":32,"client_order_id":2,"landing":{"not_sent":{"why":"connection refused"}}}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Doubt {
+                    at: Ts::from_nanos(33),
+                    client_order_id: ClientOrderId(3),
+                    change: DoubtChange::Raised {
+                        cause: DoubtCause::ServerError,
+                        said: Some(cited()),
+                    },
+                },
+                format!(
+                    r#"{{"type":"doubt","at":33,"client_order_id":3,"change":{{"raised":{{"cause":"server_error","said":{CITED}}}}}}}"#
+                ),
+            ),
+            (
+                JournalEntry::Doubt {
+                    at: Ts::from_nanos(34),
+                    client_order_id: ClientOrderId(3),
+                    change: DoubtChange::Cleared {
+                        how: Clearance::Reported,
+                    },
+                },
+                r#"{"type":"doubt","at":34,"client_order_id":3,"change":{"cleared":{"how":"reported"}}}"#.to_owned(),
+            ),
+            (
+                JournalEntry::CancelRefused {
+                    at: Ts::from_nanos(35),
+                    client_order_id: ClientOrderId(42),
+                    why: CancelRefusal::NotOpen(cited()),
+                },
+                format!(
+                    r#"{{"type":"cancel_refused","at":35,"client_order_id":42,"why":{{"not_open":{CITED}}}}}"#
+                ),
+            ),
+            (
+                JournalEntry::Foreign {
+                    at: Ts::from_nanos(36),
+                    client_id: VenueText::new("q-r0-7"),
+                    provenance: Provenance::OtherRun(VenueText::new("r0")),
+                    venue_order_id: venue_order("4293154"),
+                    side: Side::Sell,
+                    what: ForeignOutcome::Traded {
+                        trade_id: VenueTradeId("77".to_owned()),
+                        px: "0.1026".parse().expect("px"),
+                        qty: "0.2".parse().expect("qty"),
+                        commission: "0.0002".parse().expect("commission"),
+                        commission_asset: VenueText::new("BNB"),
+                        remaining: "0.4".parse().expect("qty"),
+                    },
+                },
+                r#"{"type":"foreign","at":36,"client_id":"q-r0-7","provenance":{"other_run":"r0"},"venue_order_id":"4293154","side":"sell","what":{"traded":{"trade_id":"77","px":10260000,"qty":20000000,"commission":20000,"commission_asset":"BNB","remaining":40000000}}}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Account {
+                    at: Ts::from_nanos(37),
+                    change: AccountChange::Lost {
+                        cause: AccountCause::IdleTimeout,
+                    },
+                },
+                r#"{"type":"account","at":37,"change":{"lost":{"cause":"idle_timeout"}}}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Anomaly {
+                    at: Ts::from_nanos(38),
+                    client_order_id: Some(ClientOrderId(5)),
+                    what: AnomalyKind::DuplicateTrade,
+                    detail: VenueText::new("trade 77 again"),
+                },
+                r#"{"type":"anomaly","at":38,"client_order_id":5,"what":"duplicate_trade","detail":"trade 77 again"}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Anomaly {
+                    at: Ts::from_nanos(39),
+                    client_order_id: None,
+                    what: AnomalyKind::Unreadable,
+                    detail: VenueText::new("not json"),
+                },
+                r#"{"type":"anomaly","at":39,"what":"unreadable","detail":"not json"}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Stray {
+                    at: Ts::from_nanos(40),
+                    client_order_id: ClientOrderId(99),
+                    kind: StrayKind::Cancelled,
+                    venue_order_id: Some(venue_order("4293155")),
+                },
+                r#"{"type":"stray","at":40,"client_order_id":99,"kind":"cancelled","venue_order_id":"4293155"}"#.to_owned(),
+            ),
+            (
+                JournalEntry::Stray {
+                    at: Ts::from_nanos(41),
+                    client_order_id: ClientOrderId(98),
+                    kind: StrayKind::Rejected,
+                    venue_order_id: None,
+                },
+                r#"{"type":"stray","at":41,"client_order_id":98,"kind":"rejected"}"#.to_owned(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_entry_a_live_venue_adds_has_a_fixed_wire_form() {
+        // J1, for the new lines. Pinned before a live venue writes any, so
+        // the first journal a live run produces is in a format that cannot
+        // have drifted by accident.
+        for (entry, json) in every_venue_entry() {
+            golden(&entry, &json);
+            assert_eq!(entry.at(), {
+                let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+                Ts::from_nanos(value["at"].as_i64().expect("at"))
+            });
+        }
+        golden(
+            &JournalEntry::Stray {
+                at: Ts::from_nanos(42),
+                client_order_id: ClientOrderId(97),
+                kind: StrayKind::Accepted,
+                venue_order_id: Some(venue_order("4293157")),
+            },
+            r#"{"type":"stray","at":42,"client_order_id":97,"kind":"accepted","venue_order_id":"4293157"}"#,
+        );
+    }
+
+    fn submitted(id: u64) -> JournalEntry {
+        JournalEntry::Submitted {
+            at: Ts::from_nanos(i64::try_from(id).expect("small")),
+            client_order_id: ClientOrderId(id),
+            instrument: key(),
+            side: Side::Buy,
+            qty: "0.001".parse().expect("qty"),
+            limit: None,
+            mark: None,
+        }
+    }
+
+    fn key() -> InstrumentKey {
+        InstrumentKey {
+            exchange: Exchange::Binance,
+            symbol: "BTCUSDT".to_owned(),
+        }
+    }
+
+    #[test]
+    fn no_id_a_venue_named_moves_the_counter() {
+        // J4. Every id this engine minted is on a `submitted` or `refused`
+        // line already, so the new lines add nothing; and an id the venue
+        // named must never move it. A stray's id is the venue's word about an
+        // order the engine is not working, `Context::cancel` takes any id so a
+        // refused cancel can name one never minted, and a foreign client id
+        // that happens to look like ours is text on purpose.
+        let mut entries: Vec<JournalEntry> = (1..=5).map(submitted).collect();
+        entries.extend(every_venue_entry().into_iter().map(|(entry, _)| entry));
+        assert_eq!(next_order_id(&entries), 6);
+    }
+
+    fn filled(id: u64, side: Side, px: &str) -> JournalEntry {
+        JournalEntry::Filled {
+            at: Ts::from_nanos(i64::try_from(id).expect("small") * 100),
+            client_order_id: ClientOrderId(id),
+            instrument: key(),
+            side,
+            px: px.parse().expect("px"),
+            qty: "0.001".parse().expect("qty"),
+            fee: "0.0766".parse().expect("fee"),
+            is_maker: false,
+            fee_asset: FeeAsset::Quote,
+            remaining: Some("0".parse().expect("qty")),
+            venue_order_id: Some(venue_order(&format!("90{id}"))),
+            trade_id: Some(VenueTradeId(format!("80{id}"))),
+        }
+    }
+
+    #[test]
+    fn what_a_venue_says_on_its_own_moves_no_money() {
+        // J5. A stranger's trade is money that is not this run's, the
+        // `orphaned` argument for an order that is not even ours; the rest
+        // are conditions and acknowledgements. Folding any of them would make
+        // the recompute disagree with a checkpoint that faithfully reports
+        // what this engine holds.
+        let start = JournalEntry::Started {
+            at: Ts::from_nanos(0),
+            cash: "100".parse().expect("cash"),
+            schema: super::SCHEMA,
+            run: Some("r1".to_owned()),
+        };
+        let fills = vec![
+            filled(1, Side::Buy, "76650"),
+            filled(2, Side::Sell, "76700"),
+            filled(3, Side::Buy, "76600"),
+        ];
+        let mut plain = vec![start.clone()];
+        plain.extend(fills.iter().cloned());
+
+        let mut noisy = vec![start];
+        let mut venue = every_venue_entry().into_iter().map(|(entry, _)| entry);
+        for fill in &fills {
+            noisy.extend(venue.by_ref().take(4));
+            noisy.push(fill.clone());
+        }
+        noisy.extend(venue);
+
+        let expected = replay(&plain, &mut InstrumentRegistry::new());
+        let got = replay(&noisy, &mut InstrumentRegistry::new());
+        assert_eq!(got, expected);
+
+        noisy.push(JournalEntry::checkpoint(Ts::from_nanos(1_000), &expected));
+        assert_eq!(agrees(&noisy), Agreement::Agrees);
     }
 }
