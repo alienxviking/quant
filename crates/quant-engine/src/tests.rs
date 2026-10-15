@@ -2777,3 +2777,52 @@ fn an_order_in_doubt_is_still_working_when_the_run_ends() {
         "and the first is still working when the run ends"
     );
 }
+
+#[test]
+fn a_refusal_is_written_as_the_journal_reads_it_for_every_layer_and_every_unready() {
+    // `refused` lines hold a `RefusedBy`, and `Unready` is closed now because
+    // of it: a renamed variant, or a dropped `rename_all`, would leave every
+    // line already written unreadable by the next build. So the wire form is
+    // pinned, exactly, both ways. The match has no `_` arm, so a variant
+    // added to `Unready` does not compile here until its line is written down.
+    let wire = |unready: Unready| -> &'static str {
+        match unready {
+            Unready::Unchecked => r#"{"venue":"unchecked"}"#,
+            Unready::NoFilters => r#"{"venue":"no_filters"}"#,
+            Unready::Untagged => r#"{"venue":"untagged"}"#,
+            Unready::NoBaseline => r#"{"venue":"no_baseline"}"#,
+            Unready::StreamDown => r#"{"venue":"stream_down"}"#,
+            Unready::InDoubt => r#"{"venue":"in_doubt"}"#,
+            Unready::QueueFull => r#"{"venue":"queue_full"}"#,
+            Unready::Diverged => r#"{"venue":"diverged"}"#,
+        }
+    };
+    let every_unready = [
+        Unready::Unchecked,
+        Unready::NoFilters,
+        Unready::Untagged,
+        Unready::NoBaseline,
+        Unready::StreamDown,
+        Unready::InDoubt,
+        Unready::QueueFull,
+        Unready::Diverged,
+    ];
+    let mut cases = vec![
+        (crate::RefusedBy::Seam, r#""seam""#),
+        (crate::RefusedBy::Record, r#""record""#),
+        (crate::RefusedBy::Risk, r#""risk""#),
+    ];
+    cases.extend(
+        every_unready
+            .iter()
+            .map(|&unready| (crate::RefusedBy::Venue(unready), wire(unready))),
+    );
+    for (by, json) in cases {
+        assert_eq!(serde_json::to_string(&by).expect("serialize"), json);
+        assert_eq!(
+            serde_json::from_str::<crate::RefusedBy>(json).expect("deserialize"),
+            by,
+            "{json}"
+        );
+    }
+}
