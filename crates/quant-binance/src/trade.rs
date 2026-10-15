@@ -1470,6 +1470,10 @@ mod tests {
         /// Write nothing, and hold the connection open until the venue is
         /// stopped: a venue that took the request and never answered it.
         Silence,
+        /// Write these bytes, and then hold the connection open until the
+        /// venue is stopped: a venue that began an answer and never finished
+        /// it.
+        Stall(String),
     }
 
     /// A test venue on this machine that, unlike [`serve_once`], can be sent
@@ -1519,6 +1523,10 @@ mod tests {
                                     stream.write_all(bytes.as_bytes()).expect("write");
                                 }
                                 Some(Reply::Silence) => held.push(stream),
+                                Some(Reply::Stall(bytes)) => {
+                                    stream.write_all(bytes.as_bytes()).expect("write");
+                                    held.push(stream);
+                                }
                                 // No replies at all: hang up without a word.
                                 None => {}
                             }
@@ -2579,6 +2587,84 @@ mod tests {
         // It broke off in the body, after the status had arrived.
         assert!(why.contains("body"), "{why}");
         says_nothing_secret(why, &requests[0]);
+    }
+
+    #[tokio::test]
+    async fn an_order_or_a_cancel_the_venue_read_and_hung_up_on_is_unknown_never_not_sent() {
+        // The venue read the whole request and closed the connection without
+        // a word. The request had left this machine, so the order may exist
+        // and the cancel may have taken effect: the outcome is unknown, and
+        // the one thing it must never be is "not sent", which the engine
+        // would hear as a rejection. Nor is it sent again.
+        let venue = TestVenue::start(Vec::new());
+        let placement = client_at(&venue.base)
+            .place_order(&order_on("BTCUSDT"), STAMP)
+            .await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "the venue had the order: {requests:#?}");
+        let Placement::Unknown {
+            why: WhyUnknown::Interrupted(why),
+        } = &placement
+        else {
+            panic!("expected an interrupted answer, got {placement:?}")
+        };
+        says_nothing_secret(why, &requests[0]);
+        assert_eq!(placement.reject_reason(), None);
+
+        let venue = TestVenue::start(Vec::new());
+        let reply = client_at(&venue.base)
+            .cancel_order(&cancel_on("BTCUSDT"), STAMP)
+            .await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "the venue had the cancel: {requests:#?}");
+        let CancelReply::Unknown {
+            why: WhyUnknown::Interrupted(why),
+        } = &reply
+        else {
+            panic!("expected an interrupted answer, got {reply:?}")
+        };
+        says_nothing_secret(why, &requests[0]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_whose_body_never_finishes_arriving_is_a_timeout_never_not_sent() {
+        // The venue sent its status line and headers, promising a body, and
+        // then held the connection open without sending it. The status says
+        // the request reached the venue; the wait ends on the client's own
+        // timeout, shortened here, and the outcome is unknown, never "not
+        // sent".
+        let head = format!(
+            "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+
+",
+            OUR_ACK.len()
+        );
+        let venue = TestVenue::start(vec![Reply::Stall(head.clone())]);
+        let client = client_at(&venue.base).with_order_timeout(Duration::from_millis(300));
+        let placement = client.place_order(&order_on("BTCUSDT"), STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "the venue had the order: {requests:#?}");
+        assert_eq!(
+            placement,
+            Placement::Unknown {
+                why: WhyUnknown::TimedOut
+            }
+        );
+        assert_eq!(placement.reject_reason(), None);
+
+        let venue = TestVenue::start(vec![Reply::Stall(head)]);
+        let client = client_at(&venue.base).with_order_timeout(Duration::from_millis(300));
+        let reply = client.cancel_order(&cancel_on("BTCUSDT"), STAMP).await;
+        let requests = venue.stop();
+        assert_eq!(requests.len(), 1, "the venue had the cancel: {requests:#?}");
+        assert_eq!(
+            reply,
+            CancelReply::Unknown {
+                why: WhyUnknown::TimedOut
+            }
+        );
     }
 
     #[tokio::test]
