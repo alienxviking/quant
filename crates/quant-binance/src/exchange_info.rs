@@ -48,9 +48,19 @@
 //!
 //! # An absent or disabled rule is zero
 //!
-//! `InstrumentDef` has no "absent", and needs none: zero in any of its three
-//! rules already means no rule to every reader of it (see [`Filters`]). The
-//! venue's own cases land on that without translation:
+//! `InstrumentDef` has no "absent", and the readers that apply its rules need
+//! none: zero in any of the three already means no rule to
+//! [`Filters::accepts`] and [`Filters::rejects`], [`Instrument::round_price`]
+//! and [`Qty::round_to_lot`] (see [`Filters`]).
+//!
+//! Not to every reader. `MaCrossover` refuses a zero lot, because it sizes an
+//! exit in whole lots and a zero lot makes every size whole
+//! (`quant_backtest::MaConfigError::Lot`). So a symbol the venue lists without
+//! `LOT_SIZE` cannot be traded by it. The definition here is still exact; the
+//! strategy refuses it when it is built, at startup, loudly and before any
+//! order is sent.
+//!
+//! The venue's own cases land on zero without translation:
 //!
 //! - **An absent filter.** *"All filters are optional"* (`rest-api.md` lines
 //!   858-859), so a symbol without `PRICE_FILTER` has no tick rule, and the
@@ -73,8 +83,9 @@
 //! lines 194-205); `LOT_SIZE` is the symbol's (lines 111-122), and the only one a
 //! limit order meets. The model has one lot for every kind of order, so it takes
 //! `LOT_SIZE`'s, always, and reports `MARKET_LOT_SIZE` whole -- even when
-//! `LOT_SIZE` is absent, which leaves the lot at zero rather than borrowing the
-//! market order's step.
+//! `LOT_SIZE` is absent, which leaves the lot at zero, and the symbol one
+//! `MaCrossover` refuses to trade (above), rather than borrowing the market
+//! order's step.
 //!
 //! That matters more than the symmetry suggests. `MaCrossover` sends market
 //! orders only, so `MARKET_LOT_SIZE` is the quantity rule every one of its orders
@@ -131,6 +142,9 @@
 //! (`docs/live-run.md` §4).
 //!
 //! [`Filters`]: quant_core::instrument::Filters
+//! [`Filters::accepts`]: quant_core::instrument::Filters::accepts
+//! [`Filters::rejects`]: quant_core::instrument::Filters::rejects
+//! [`Instrument::round_price`]: quant_core::instrument::Instrument::round_price
 
 use core::fmt;
 use std::collections::BTreeMap;

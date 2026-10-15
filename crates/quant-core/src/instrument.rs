@@ -198,7 +198,8 @@ pub struct Instrument {
     /// Minimum price increment. Orders must be a multiple of this. Zero: the
     /// venue has no tick rule.
     pub tick_size: Px,
-    /// Minimum quantity increment. Zero: the venue has no lot rule.
+    /// Minimum quantity increment. Zero: the venue has no lot rule, which
+    /// `MaCrossover` refuses to trade under (see [`Filters`]).
     pub lot_size: Qty,
     /// Venue-enforced floor on order value. Zero: the venue has no floor.
     pub min_notional: Notional,
@@ -210,13 +211,19 @@ pub struct Instrument {
 /// carry an identity — a simulated venue holds these per instrument and has no
 /// business knowing a symbol string.
 ///
-/// **Zero in any of the three is no rule**, which is also what `Default` gives:
-/// a zero step skips the multiple-of check, and a zero floor is met by every
-/// order. There is no separate "absent", because zero already means it in every
-/// reader -- [`Self::rejects`], [`Instrument::round_price`] and
-/// [`Qty::round_to_lot`] -- and a definition built from a venue's published
-/// rules relies on that: a rule the venue does not publish arrives as zero,
-/// never as a placeholder value the venue did not state.
+/// **Zero in any of the three is no rule** to the readers that apply them --
+/// [`Self::accepts`], [`Self::rejects`], [`Instrument::round_price`] and
+/// [`Qty::round_to_lot`] -- which is also what `Default` gives: a zero step
+/// skips the multiple-of check, and a zero floor is met by every order. Those
+/// readers need no separate "absent", and a definition built from a venue's
+/// published rules relies on that: a rule the venue does not publish arrives as
+/// zero, never as a placeholder value the venue did not state.
+///
+/// Not every reader takes zero that way. `quant_backtest::MaCrossover` refuses
+/// a zero lot, because it sizes an exit in whole lots and a zero lot makes
+/// every size whole. So a symbol the venue lists without a lot rule cannot be
+/// traded by it: it refuses when it is built, at startup, loudly and before any
+/// order is sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Filters {
     pub tick_size: Px,
@@ -418,7 +425,8 @@ impl InstrumentRegistry {
 
 /// An instrument definition awaiting registration (i.e. without an id).
 ///
-/// The three venue rules follow [`Filters`]: zero in any of them is no rule.
+/// The three venue rules follow [`Filters`]: zero in any of them is no rule to
+/// the readers that apply them, and a zero lot is refused by `MaCrossover`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrumentDef {
     pub exchange: Exchange,
@@ -428,7 +436,8 @@ pub struct InstrumentDef {
     pub kind: InstrumentKind,
     /// Zero: the venue has no tick rule.
     pub tick_size: Px,
-    /// Zero: the venue has no lot rule.
+    /// Zero: the venue has no lot rule, which `MaCrossover` refuses to trade
+    /// under.
     pub lot_size: Qty,
     /// Zero: the venue has no floor on order value.
     pub min_notional: Notional,
@@ -562,9 +571,10 @@ mod tests {
     fn a_zero_in_any_filter_is_no_rule() {
         // A definition built from a venue's published rules carries a rule the
         // venue does not publish as zero, so zero must mean "no such rule" in
-        // every reader -- not "a rule nothing can meet", and not "use a
-        // default". Each rule is switched off alone, the other two kept real,
-        // so one zero cannot pass on the strength of another.
+        // every reader that applies one -- not "a rule nothing can meet", and
+        // not "use a default". (`MaCrossover` refuses a zero lot instead; its
+        // own tests pin that.) Each rule is switched off alone, the other two
+        // kept real, so one zero cannot pass on the strength of another.
         let real = btcusdt();
         let off_tick: Px = "68123.456".parse().unwrap();
         let off_lot: Qty = "0.0012345".parse().unwrap();
