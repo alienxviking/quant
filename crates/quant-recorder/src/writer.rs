@@ -397,7 +397,6 @@ mod tests {
         let mut session = CaptureSession::account(
             FileStore::new(&root),
             Exchange::Binance,
-            [0xac; 16],
             Arc::clone(&clock),
             WriterOptions::default(),
         );

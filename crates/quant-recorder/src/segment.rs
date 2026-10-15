@@ -290,11 +290,23 @@ impl<S: SegmentStore> CaptureSession<S> {
     /// trailers and the same session-scoped `ingest_seq`. That sameness is the
     /// point of giving the account stream a session rather than a writer of its
     /// own -- each of those rules was learned the hard way once already.
+    ///
+    /// # Its id is minted here, not passed in
+    ///
+    /// The one thing it must not share with a market session is its id.
+    /// `(session_id, capture_date, part)` is a file's whole identity in
+    /// `quant-meta`'s `capture_segments` and in `verify --reconcile`, and neither
+    /// has the stream in it: an account session holding the market capture's id
+    /// would make each of its files the same row as a market file of that day --
+    /// an upsert that overwrites the market's row rather than a duplicate anyone
+    /// would see. The natural way to get there is to mint one id for "the run"
+    /// and hand it to both sessions, so this constructor takes no id at all and
+    /// mints a fresh v4 UUID; [`Self::session_id`] reads it back for whoever
+    /// registers the session.
     #[must_use]
     pub fn account(
         store: S,
         exchange: Exchange,
-        session_id: [u8; 16],
         clock: Arc<dyn Clock>,
         opts: WriterOptions,
     ) -> Self {
@@ -302,10 +314,16 @@ impl<S: SegmentStore> CaptureSession<S> {
             store,
             exchange,
             CaptureStream::Account,
-            session_id,
+            *uuid::Uuid::new_v4().as_bytes(),
             clock,
             opts,
         )
+    }
+
+    /// The id every file of this session is stamped with.
+    #[must_use]
+    pub const fn session_id(&self) -> [u8; 16] {
+        self.session_id
     }
 
     /// Both constructors, once: the stream is the only thing a market session
@@ -698,7 +716,6 @@ mod tests {
         let mut s = CaptureSession::account(
             MemoryStore::new(),
             Exchange::Binance,
-            SESSION,
             clock,
             WriterOptions::default(),
         );
@@ -730,6 +747,49 @@ mod tests {
                 .iter()
                 .all(|f| f.kind == quant_storage::FrameKind::AccountPayload));
         }
+    }
+
+    #[test]
+    fn every_account_session_gets_an_id_of_its_own() {
+        // The constructor mints the id so that no caller can hand the account
+        // session the market capture's: the two would then share every
+        // (session_id, capture_date, part) the metadata tier keys a file by.
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Ts::from_secs(BEFORE_MIDNIGHT)));
+        let mint = || {
+            CaptureSession::account(
+                MemoryStore::new(),
+                Exchange::Binance,
+                Arc::clone(&clock),
+                WriterOptions::default(),
+            )
+            .session_id()
+        };
+        let (a, b) = (mint(), mint());
+        assert_ne!(a, b, "two account sessions, two ids");
+        assert_eq!(a[6] >> 4, 4, "a v4 UUID, the market capture's kind of id");
+        assert_ne!(
+            a,
+            session(Arc::new(ManualClock::new(Ts::EPOCH))).session_id()
+        );
+
+        // And the files carry the id the accessor reports.
+        let mut s = CaptureSession::account(
+            MemoryStore::new(),
+            Exchange::Binance,
+            Arc::clone(&clock),
+            WriterOptions::default(),
+        );
+        let id = s.session_id();
+        s.write(CaptureRecord::Account {
+            local_recv_ts: Ts::from_secs(BEFORE_MIDNIGHT),
+            ingest_seq: 1,
+            payload: b"{}".to_vec(),
+        })
+        .unwrap();
+        let (_, store) = s.finish().unwrap();
+        let reader = RawReader::open(store.segments[0].1.as_slice()).unwrap();
+        assert_eq!(reader.header().session_id, id);
+        assert_eq!(store.segments[0].0.session_id, id);
     }
 
     #[test]
