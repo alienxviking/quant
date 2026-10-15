@@ -54,14 +54,21 @@
 //!
 //! So [`Credentials::PRIVATE_KEY_VAR`] holds the key's *text*, not a path to it.
 //! A path would have this read a file after all, with the rule moved one
-//! indirection away. The PEM file stays wherever the operator keeps it, outside
-//! the repository, and the shell that starts the run reads it into the
-//! variable:
+//! indirection away. The PEM file stays outside the repository, at an absolute
+//! path -- `$HOME/.binance/ed25519.pem` in bash,
+//! `$env:USERPROFILE\.binance\ed25519.pem` in PowerShell -- and the shell that
+//! starts the run reads it into the variable:
 //!
 //! ```text
-//! export BINANCE_ED25519_PRIVATE_KEY="$(cat key.pem)"            # bash
-//! $env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw key.pem    # PowerShell
+//! export BINANCE_ED25519_PRIVATE_KEY="$(cat "$HOME/.binance/ed25519.pem")"
+//! $env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw "$env:USERPROFILE\.binance\ed25519.pem"
 //! ```
+//!
+//! Absolute, because these lines are run beside `cargo run`, which works only
+//! inside the workspace: a relative path would make and read the key in the
+//! repository. **Never create the key inside this repository.** It is public,
+//! and the `*.pem` line in `.gitignore` is a second line of defence, not the
+//! first.
 //!
 //! Two forms are read. One is the PEM text, `-----BEGIN PRIVATE KEY-----` to
 //! `-----END PRIVATE KEY-----`, with LF or CRLF line ends (PowerShell's
@@ -74,9 +81,20 @@
 //!
 //! # Making a key pair
 //!
+//! Outside the repository, at the absolute path above. In bash:
+//!
 //! ```text
-//! openssl genpkey -algorithm ed25519 -out key.pem    # the private key: outside the repository
-//! openssl pkey -in key.pem -pubout                   # the public key: register this with Binance
+//! mkdir -p "$HOME/.binance"
+//! openssl genpkey -algorithm ed25519 -out "$HOME/.binance/ed25519.pem"   # the private key
+//! openssl pkey -in "$HOME/.binance/ed25519.pem" -pubout                  # the public key, to register
+//! ```
+//!
+//! In PowerShell:
+//!
+//! ```text
+//! New-Item -ItemType Directory -Force "$env:USERPROFILE\.binance"
+//! openssl genpkey -algorithm ed25519 -out "$env:USERPROFILE\.binance\ed25519.pem"
+//! openssl pkey -in "$env:USERPROFILE\.binance\ed25519.pem" -pubout
 //! ```
 //!
 //! Binance also documents its own way to make one: the FIX API's pages link a
@@ -165,10 +183,13 @@ impl core::fmt::Display for CredentialError {
                 "{var} is not set, and {} is. The live path no longer signs with an HMAC \
                  secret: Binance has deprecated HMAC keys, and the session logon the account \
                  stream needs takes an Ed25519 key only. Make a key pair outside this \
-                 repository -- `openssl genpkey -algorithm ed25519 -out key.pem`, then `openssl \
-                 pkey -in key.pem -pubout` for the public key -- register the public key with \
-                 Binance, set {} to the API key it issues for that key, and load the private key \
-                 with `export {var}=\"$(cat key.pem)\"`. {} is not used, and can be unset.",
+                 repository, never inside it -- `mkdir -p \"$HOME/.binance\"`, `openssl genpkey \
+                 -algorithm ed25519 -out \"$HOME/.binance/ed25519.pem\"`, then `openssl pkey -in \
+                 \"$HOME/.binance/ed25519.pem\" -pubout` for the public key -- register the public \
+                 key with Binance, set {} to the API key it issues for that key, and load the \
+                 private key with `export {var}=\"$(cat \"$HOME/.binance/ed25519.pem\")\"` \
+                 (`venue-check --help` gives the PowerShell form). {} is not used, and can be \
+                 unset.",
                 Credentials::RETIRED_SECRET_VAR,
                 Credentials::KEY_VAR,
                 Credentials::RETIRED_SECRET_VAR,
@@ -176,8 +197,8 @@ impl core::fmt::Display for CredentialError {
             Self::Encrypted => write!(
                 f,
                 "{var} holds an encrypted private key. Decrypt it first -- `openssl pkey -in \
-                 encrypted.pem -out key.pem` asks for its passphrase -- and load the decrypted \
-                 text, keeping both files outside this repository."
+                 <the encrypted key> -out \"$HOME/.binance/ed25519.pem\"` asks for its passphrase \
+                 -- and load the decrypted text, keeping both files outside this repository."
             ),
             Self::NotPrivateKeyPem => write!(
                 f,
@@ -333,9 +354,9 @@ impl Credentials {
         Ok(self.sign(ws_signature_payload(params)?.as_bytes()))
     }
 
-    /// The public half of the loaded key, as PEM: what `openssl pkey -in key.pem
-    /// -pubout` prints, so it can be compared with the key registered with the
-    /// venue.
+    /// The public half of the loaded key, as PEM: what `openssl pkey -pubout`
+    /// prints for the private key's file, so it can be compared with the key
+    /// registered with the venue.
     ///
     /// Not secret: it is the half the venue is given.
     #[must_use]
@@ -856,7 +877,7 @@ mod tests {
             .verify(FIX_PAYLOAD, &signature)
             .expect("the published signature verifies under the derived public key");
 
-        // What `openssl pkey -in key.pem -pubout` prints for the example key
+        // What `openssl pkey -pubout` prints for the example key
         // (OpenSSL 3.5.5), which is what an operator registers and compares.
         assert_eq!(
             creds.public_key_pem(),
@@ -994,9 +1015,17 @@ mod tests {
 
     #[test]
     fn an_encrypted_key_says_how_to_decrypt_it() {
+        // To an absolute path outside the repository: a relative one, run
+        // where `cargo run` runs, writes the decrypted key into the repository.
         let said = CredentialError::Encrypted.to_string();
-        assert!(said.contains("openssl pkey"), "{said}");
-        assert!(said.contains("BINANCE_ED25519_PRIVATE_KEY"), "{said}");
+        for needle in [
+            "openssl pkey -in <the encrypted key> -out \"$HOME/.binance/ed25519.pem\"",
+            "BINANCE_ED25519_PRIVATE_KEY",
+            "outside this repository",
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
+        assert!(!said.contains("key.pem"), "{said}");
     }
 
     #[test]
@@ -1026,12 +1055,18 @@ mod tests {
             "deprecated",
             "session logon",
             "Ed25519",
-            "openssl genpkey -algorithm ed25519 -out key.pem",
-            "openssl pkey -in key.pem -pubout",
+            // Every path absolute and outside the repository, which a
+            // relative one, run where `cargo run` runs, would not be.
+            "outside this repository, never inside it",
+            "mkdir -p \"$HOME/.binance\"",
+            "openssl genpkey -algorithm ed25519 -out \"$HOME/.binance/ed25519.pem\"",
+            "openssl pkey -in \"$HOME/.binance/ed25519.pem\" -pubout",
+            "export BINANCE_ED25519_PRIVATE_KEY=\"$(cat \"$HOME/.binance/ed25519.pem\")\"",
             "BINANCE_API_KEY",
         ] {
             assert!(said.contains(needle), "{needle:?} missing from: {said}");
         }
+        assert!(!said.contains("key.pem"), "{said}");
 
         // Without the old secret it is the ordinary missing variable.
         assert_eq!(

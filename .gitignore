@@ -13,10 +13,11 @@
 .env.*
 !.env.example
 
-# Key files. The live path's Ed25519 private key is made with
-# `openssl genpkey ... -out key.pem` and belongs outside this repository (see
-# quant-binance/src/credentials.rs); this catches one made here by mistake
-# before `git add .` publishes it, because this repository is public.
+# Key files. The live path's Ed25519 private key belongs outside this
+# repository, at an absolute path -- $HOME/.binance/ed25519.pem -- and is never
+# made inside it (see quant-binance/src/credentials.rs). This is the second line
+# of defence, not the first: it catches one made here by mistake before
+# `git add .` publishes it, because this repository is public.
 *.pem
 
 # Python research environment

@@ -2186,7 +2186,8 @@ anything around this machine:
 
 ```
 w32tm /query /status ; w32tm /resync
-$env:BINANCE_API_KEY = "..." ; $env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw key.pem
+$env:BINANCE_API_KEY = "..."
+$env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw "$env:USERPROFILE\.binance\ed25519.pem"
 cargo run --release -p quant-binance --bin venue-check    # -- --testnet for a testnet pair
 ```
 
@@ -2204,12 +2205,22 @@ would block a run over a clock that is fine. **Its correction had the wrong
 sign**, putting the reading off by a full round trip, until
 `m8b-venue-check-offset`. And it now signs with the Ed25519 key the live run will
 use (`m8c-ed25519-credentials`, `docs/live-run.md` §5), so the keys it needs are
-a new pair, not the HMAC ones it was verified with: `openssl genpkey -algorithm
-ed25519 -out key.pem` outside the repository, the public half from `openssl pkey
--in key.pem -pubout` registered with Binance, and the private key loaded into
-`BINANCE_ED25519_PRIVATE_KEY` as above. It prints the public half of whatever
-key it loaded, to compare with the registered one. Spot Testnet keeps its own
-pairs; `--testnet` checks one there. **READY is not permission to trade**: it
+a new pair, not the HMAC ones it was verified with, made once at an absolute
+path outside the repository and **never inside it**:
+
+```
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.binance"
+openssl genpkey -algorithm ed25519 -out "$env:USERPROFILE\.binance\ed25519.pem"
+openssl pkey -in "$env:USERPROFILE\.binance\ed25519.pem" -pubout    # the public half, to register
+```
+
+Absolute, because these commands run beside `cargo run` in the workspace, where
+a relative path would put the key in a public repository and leave `*.pem` in
+`.gitignore` as the only defence. The public half is registered with Binance,
+and the private key is loaded into `BINANCE_ED25519_PRIVATE_KEY` as above.
+`venue-check` prints the public half of whatever key it loaded, to compare with
+the registered one. Spot Testnet keeps its own pairs; `--testnet` checks one
+there. **READY is not permission to trade**: it
 says the key, the signature and the clock work and the account reports
 `canTrade`, a field the venue never defines. The probe is a `USER_DATA`
 request, and a key cannot `TRADE` until trading is enabled for it in API

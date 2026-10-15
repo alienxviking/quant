@@ -23,14 +23,18 @@
 //! ```text
 //! # bash
 //! export BINANCE_API_KEY=...
-//! export BINANCE_ED25519_PRIVATE_KEY="$(cat key.pem)"
+//! export BINANCE_ED25519_PRIVATE_KEY="$(cat "$HOME/.binance/ed25519.pem")"
 //! # PowerShell
 //! $env:BINANCE_API_KEY = "..."
-//! $env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw key.pem
+//! $env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw "$env:USERPROFILE\.binance\ed25519.pem"
 //!
 //! cargo run -p quant-binance --bin venue-check               # the live venue
 //! cargo run -p quant-binance --bin venue-check -- --testnet  # Spot Testnet
 //! ```
+//!
+//! The key's path is absolute and outside the repository, because `cargo run`
+//! works only inside the workspace and a relative path beside it would put the
+//! private key in the repository. Never create it there.
 //!
 //! `--testnet` checks against Spot Testnet instead ([`SPOT_TESTNET_REST`]),
 //! where `docs/live-run.md` §5 rehearses, with a key pair separate from the
@@ -72,28 +76,36 @@ const CLOCK_READINGS: usize = 5;
 // would say so only at run time, every time.
 const _: () = assert!(MIN_CLOCK_READINGS <= CLOCK_READINGS);
 
-const USAGE: &str = "\
-usage: venue-check [--testnet]
+/// The help text. A raw string, so the commands in it read exactly as they are
+/// to be typed, quotes and backslashes included.
+const USAGE: &str = r#"usage: venue-check [--testnet]
 
 Makes one signed request, GET /api/v3/account, and places nothing. It reads two
 variables, which the shell that runs it must export:
 
   bash:        export BINANCE_API_KEY=...
-               export BINANCE_ED25519_PRIVATE_KEY=\"$(cat key.pem)\"
-  PowerShell:  $env:BINANCE_API_KEY = \"...\"
-               $env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw key.pem
+               export BINANCE_ED25519_PRIVATE_KEY="$(cat "$HOME/.binance/ed25519.pem")"
+  PowerShell:  $env:BINANCE_API_KEY = "..."
+               $env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw "$env:USERPROFILE\.binance\ed25519.pem"
 
-key.pem is an Ed25519 private key, kept outside this repository:
+The private key is an Ed25519 key in a file at that absolute path, outside this
+repository. Never create it inside the repository, which is public. To make one:
 
-  openssl genpkey -algorithm ed25519 -out key.pem
-  openssl pkey -in key.pem -pubout     # the public key, to register with Binance
+  bash:        mkdir -p "$HOME/.binance"
+               openssl genpkey -algorithm ed25519 -out "$HOME/.binance/ed25519.pem"
+               openssl pkey -in "$HOME/.binance/ed25519.pem" -pubout
+  PowerShell:  New-Item -ItemType Directory -Force "$env:USERPROFILE\.binance"
+               openssl genpkey -algorithm ed25519 -out "$env:USERPROFILE\.binance\ed25519.pem"
+               openssl pkey -in "$env:USERPROFILE\.binance\ed25519.pem" -pubout
+
+The last command prints the public key, which is what to register with Binance.
 
   --testnet   check Spot Testnet, https://testnet.binance.vision, instead of the
               live venue. A testnet key pair is separate from the live one:
               register one with the testnet and load that instead.
 
 Exit 0 ready, 1 not ready, 2 for an argument it does not take.
-";
+"#;
 
 /// What a pass prints.
 ///
@@ -397,18 +409,27 @@ mod tests {
 
     #[test]
     fn the_usage_shows_both_shells_how_to_make_a_key_and_the_testnet() {
+        // Every path to the key absolute and outside the repository, in both
+        // shells: these lines are run where `cargo run` runs, inside the
+        // workspace, so a relative path would put the private key in it.
         for needle in [
             "export BINANCE_API_KEY=",
-            "export BINANCE_ED25519_PRIVATE_KEY=\"$(cat key.pem)\"",
+            r#"export BINANCE_ED25519_PRIVATE_KEY="$(cat "$HOME/.binance/ed25519.pem")""#,
+            r#"mkdir -p "$HOME/.binance""#,
+            r#"openssl genpkey -algorithm ed25519 -out "$HOME/.binance/ed25519.pem""#,
+            r#"openssl pkey -in "$HOME/.binance/ed25519.pem" -pubout"#,
             "$env:BINANCE_API_KEY = ",
-            "$env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw key.pem",
-            "openssl genpkey -algorithm ed25519 -out key.pem",
-            "openssl pkey -in key.pem -pubout",
+            r#"$env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw "$env:USERPROFILE\.binance\ed25519.pem""#,
+            r#"New-Item -ItemType Directory -Force "$env:USERPROFILE\.binance""#,
+            r#"openssl genpkey -algorithm ed25519 -out "$env:USERPROFILE\.binance\ed25519.pem""#,
+            r#"openssl pkey -in "$env:USERPROFILE\.binance\ed25519.pem" -pubout"#,
+            "Never create it inside the repository",
             "--testnet",
             "https://testnet.binance.vision",
             "A testnet key pair is separate from the live one",
         ] {
             assert!(USAGE.contains(needle), "{needle:?} missing from the usage");
         }
+        assert!(!USAGE.contains("key.pem"), "a relative key path: {USAGE}");
     }
 }

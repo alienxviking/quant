@@ -224,13 +224,24 @@ outside `recvWindow`, so `TradeClient::check_ready` **refuses to trade** above
 w32tm /query /status
 w32tm /resync
 $env:BINANCE_API_KEY = "..."
-$env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw key.pem   # an Ed25519 key, kept outside the repo
-cargo run --release -p quant-binance --bin venue-check            # add `-- --testnet` for a testnet pair
+$env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw "$env:USERPROFILE\.binance\ed25519.pem"
+cargo run --release -p quant-binance --bin venue-check    # add `-- --testnet` for a testnet pair
 ```
 
-The key is an Ed25519 pair made with `openssl genpkey -algorithm ed25519 -out
-key.pem`, whose public half (`openssl pkey -in key.pem -pubout`) is registered
-with Binance; the HMAC secret slice (b) signed with is no longer used.
+The key is an Ed25519 pair whose private half lives at that absolute path,
+outside the repository, made once with:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.binance"
+openssl genpkey -algorithm ed25519 -out "$env:USERPROFILE\.binance\ed25519.pem"
+openssl pkey -in "$env:USERPROFILE\.binance\ed25519.pem" -pubout    # the public half, to register
+```
+
+**Never create the key inside the repository.** These commands run beside
+`cargo run`, which works only inside the workspace, so a relative path would
+put the private key in a public repository; the `*.pem` line in `.gitignore`
+is the second line of defence, not the first. The public half is registered
+with Binance, and the HMAC secret slice (b) signed with is no longer used.
 `quant-binance/src/credentials.rs` says why, and `venue-check --help` shows the
 bash form too.
 

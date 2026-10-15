@@ -350,7 +350,7 @@ if [ "${live:-0}" = 1 ]; then
             # The name, never any part of the value.
             report 'credentials' ok "$var is set"
         elif [ "$var" = BINANCE_ED25519_PRIVATE_KEY ] && [ -n "${retired_secret//[[:space:]]/}" ]; then
-            report 'credentials' blocker "$var is not set, and BINANCE_API_SECRET is -- the live path no longer signs with an HMAC secret (Binance deprecated HMAC keys; session logon takes Ed25519 only). Make a pair outside the repository with \`openssl genpkey -algorithm ed25519 -out key.pem\`, register the public half from \`openssl pkey -in key.pem -pubout\`, and export $var=\"\$(cat key.pem)\""
+            report 'credentials' blocker "$var is not set, and BINANCE_API_SECRET is -- the live path no longer signs with an HMAC secret (Binance deprecated HMAC keys; session logon takes Ed25519 only). Make a pair outside the repository, never inside it: \`mkdir -p \"\$HOME/.binance\"\`, \`openssl genpkey -algorithm ed25519 -out \"\$HOME/.binance/ed25519.pem\"\`, register the public half from \`openssl pkey -in \"\$HOME/.binance/ed25519.pem\" -pubout\`, and export $var=\"\$(cat \"\$HOME/.binance/ed25519.pem\")\""
         else
             report 'credentials' blocker "$var is not set -- live trading cannot start without it"
         fi
