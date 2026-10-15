@@ -60,6 +60,7 @@ pub mod connection;
 pub mod credentials;
 pub mod decode;
 pub mod live;
+pub mod orders;
 pub mod parse;
 pub mod rest;
 pub mod sequence;
