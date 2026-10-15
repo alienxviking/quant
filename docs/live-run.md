@@ -402,7 +402,10 @@ feature.
    its class. The credentials half is `m8c-ed25519-credentials`: the Ed25519 key
    read from the environment, a REST signer that reproduces Binance's published
    Ed25519 example signature, the WebSocket API signer `session.logon` needs, and
-   `venue-check` on the new key. The requests half follows.
+   `venue-check` on the new key. The requests half follows, and with it
+   `POST /api/v3/order/test` (`TRADE`, weight 1, rest-api.md:2321-2333), the
+   probe that tests the key's permission to trade, which `venue-check`'s
+   `USER_DATA` request cannot.
 2. **The instrument comes from the venue.** `exchangeInfo` parsed into an
    `InstrumentDef`, naming the venue rules our `Filters` do not model
    (`MARKET_LOT_SIZE`, `applyMinToMarket`, `maxNotional`). Accepted when the
@@ -487,13 +490,19 @@ signed `GET /api/v3/account`, which exercises the API key, the Ed25519
 signature, the header and the clock in a single round trip, reads `canTrade`, and
 places nothing. It prints the loaded key's public half to compare with the one
 registered, names why a refusal was refused, and with `--testnet` checks a Spot
-Testnet pair instead (§5). Under slice (b)'s HMAC secret, a wrong secret came
-back HTTP 401, which is the venue's auth layer answering — proof the request was
-well formed enough to be judged on its credentials rather than its shape. The
-Ed25519 key has not met the venue yet: on 2026-10-15 this host's clock, 2.4 s
-ahead of Spot Testnet's, stopped `venue-check` before it signed anything, so its
-first run after the clock is fixed, with a testnet pair, is the signer's first
-real test.
+Testnet pair instead (§5). What it does not exercise is the key's permission to
+trade. The account endpoint is `USER_DATA`, and *"by default, an API key cannot
+`TRADE`"* until trading is enabled for it in API Management, so a key without
+that permission comes back READY; and the venue never defines `canTrade`, so
+reading it settles nothing about the key. A `TRADE` request is what tests the
+permission: `POST /api/v3/order/test`, which validates an order without sending
+it to the matching engine at weight 1, comes with the requests half of slice
+(c) (§4). Under slice (b)'s HMAC secret, a wrong secret came back HTTP 401,
+which is the venue's auth layer answering — proof the request was well formed
+enough to be judged on its credentials rather than its shape. The Ed25519 key
+has not met the venue yet: on 2026-10-15 this host's clock, 2.4 s ahead of Spot
+Testnet's, stopped `venue-check` before it signed anything, so its first run
+after the clock is fixed, with a testnet pair, is the signer's first real test.
 
 Slice (a) is first and is not negotiable: it is a seam change, every slice after
 it depends on the guarantee, and it is the one thing that can be built and tested

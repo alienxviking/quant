@@ -255,13 +255,18 @@ pub enum NotReady {
         status: u16,
         venue: Option<VenueError>,
     },
-    /// The venue accepted the key and the signature, and says this account
-    /// cannot trade: `canTrade` is false (rest-api.md:4207).
+    /// The venue accepted the key and the signature, and the account document
+    /// reports `canTrade` false (rest-api.md:4207).
     ///
-    /// The venue's documentation shows the field without defining it. What it
-    /// does say is that an API key cannot trade until trading is enabled for it
-    /// (rest-api.md:194-196). Whichever of the key or the account the `false`
-    /// is about, an order would be refused, and this refuses first.
+    /// The venue's documentation shows the field without defining it, so this
+    /// does not claim to know whose the `false` is. Taken at its word it is the
+    /// account's, and an account whose trading ability is disabled is refused
+    /// an order with *"This account may not place or cancel orders"*, for which
+    /// the venue's remedy is its customer support (errors.md:388). A key's own
+    /// permission to `TRADE` is a separate setting, in API Management
+    /// (rest-api.md:194-196), and the `USER_DATA` request this check makes
+    /// cannot test it: see [`TradeClient::check_ready`]. Either way this stops
+    /// here rather than finding out from an order.
     CannotTrade,
     /// The venue answered 200, but not with the account document this reads.
     /// Which way it was not is said; what it held is not, because it lists the
@@ -445,9 +450,10 @@ impl core::fmt::Display for NotReady {
                 Said(venue.as_ref()),
             ),
             Self::CannotTrade => f.write_str(
-                "the venue accepted the key and the signature, and says this account cannot \
-                 trade (canTrade is false). An API key cannot trade until trading is enabled for \
-                 it in Binance's API Management",
+                "the venue accepted the key and the signature, and the account reports canTrade \
+                 false. The venue does not define the field. If this account's trading ability is \
+                 disabled, the venue's remedy is its customer support; this API key's own \
+                 permission to trade is a separate setting, in Binance's API Management",
             ),
             Self::UnreadableAccount(fault) => write!(
                 f,
@@ -581,15 +587,25 @@ impl TradeClient {
         })
     }
 
-    /// Ask the venue whether this account can trade, and whether our clock
-    /// agrees with its own.
+    /// Check that the venue accepts this API key and its signature, that our
+    /// clock agrees with the venue's, and that the account reports `canTrade`.
     ///
     /// `GET /api/v3/account` is not the cheapest signed call: its weight is 20
     /// (rest-api.md:4180-4181), where `GET /api/v3/openOrders` for one symbol
-    /// is 6 (rest-api.md:4293-4294). It is the probe because its answer says
-    /// whether this key may trade at all — `canTrade` (rest-api.md:4207) — as
-    /// well as proving the API key, the private key, the signature
-    /// construction and the clock in one round trip. It places no order.
+    /// is 6 (rest-api.md:4293-4294). It is the probe because, as well as
+    /// proving the API key, the private key, the signature construction and
+    /// the clock in one round trip, its answer carries the account's
+    /// `canTrade` (rest-api.md:4207). It places no order.
+    ///
+    /// It does **not** prove this key may trade. Its security type is
+    /// `USER_DATA` (rest-api.md:4174), and an API key cannot `TRADE` until
+    /// trading is enabled for it in API Management (rest-api.md:194-196), so a
+    /// key without that permission passes. Nor does the venue define
+    /// `canTrade`: its documentation shows the field and says nothing of it.
+    /// Only a request whose security type is `TRADE` tests the key's
+    /// permission, and a later pull request adds one,
+    /// `POST /api/v3/order/test`, which validates an order without sending it
+    /// to the matching engine, at weight 1 (rest-api.md:2321-2333).
     ///
     /// Its body also lists the account's balances (rest-api.md:4215-4226).
     /// They are read for `canTrade` and nothing else, and nothing here ever
@@ -664,8 +680,11 @@ fn classify_refusal(status: u16, retry_after: Option<String>, body: &[u8]) -> No
     }
 }
 
-/// Whether the account document says this key may trade (`canTrade`,
-/// rest-api.md:4207).
+/// Whether the account document reports `canTrade` true (rest-api.md:4207).
+///
+/// What the account reports, which the venue does not define, and not whether
+/// this API key may trade: a `USER_DATA` request cannot test that, as
+/// [`TradeClient::check_ready`] says.
 ///
 /// The body is read as JSON for that one field. No error carries any of it: it
 /// lists the account's balances.
@@ -1445,11 +1464,20 @@ mod tests {
             assert!(!said.contains(BALANCE), "{said}");
             assert!(!format!("{why:?}").contains(BALANCE), "{why:?}");
         }
-        // A key without trading permission has its own reason, which says
-        // what to do about it.
+        // An account that reports it cannot trade has its own reason. The
+        // venue does not define the field, so the reason claims nothing about
+        // whose the `false` is, and names both remedies: the venue's support,
+        // for an account whose trading is disabled, and API Management, for a
+        // key's permission to trade.
         let said = NotReady::CannotTrade.to_string();
-        assert!(said.contains("canTrade is false"), "{said}");
-        assert!(said.contains("API Management"), "{said}");
+        for needle in [
+            "the account reports canTrade false",
+            "The venue does not define the field",
+            "customer support",
+            "API Management",
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
     }
 
     #[tokio::test]

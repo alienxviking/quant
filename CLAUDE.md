@@ -2209,9 +2209,15 @@ ed25519 -out key.pem` outside the repository, the public half from `openssl pkey
 -in key.pem -pubout` registered with Binance, and the private key loaded into
 `BINANCE_ED25519_PRIVATE_KEY` as above. It prints the public half of whatever
 key it loaded, to compare with the registered one. Spot Testnet keeps its own
-pairs; `--testnet` checks one there. Its first run here, with Binance's
-published example key against Spot Testnet, read the host **2409 ms ahead** and
-stopped before signing anything, which agrees with the 2.1 s above.
+pairs; `--testnet` checks one there. **READY is not permission to trade**: it
+says the key, the signature and the clock work and the account reports
+`canTrade`, a field the venue never defines. The probe is a `USER_DATA`
+request, and a key cannot `TRADE` until trading is enabled for it in API
+Management, so a key without that permission passes. `POST /api/v3/order/test`,
+a `TRADE` request at weight 1, tests it, and comes with the requests half of
+slice (c). Its first run here, with Binance's published example key against
+Spot Testnet, read the host **2409 ms ahead** and stopped before signing
+anything, which agrees with the 2.1 s above.
 
 **`ops/*.ps1` is record-only, and there is no live mode in either half.** The
 paper mode exists in the bash half alone, deliberately, and the bash half has
@@ -2241,8 +2247,10 @@ done, (a) is done in the engine and not in the source, and (c) is part done:
   Ed25519 key in `BINANCE_ED25519_PRIVATE_KEY`, pinned against Binance's own
   published Ed25519 signature (the FIX API's example) rather than RFC 4231, and
   added the WebSocket API signer `session.logon` needs. `venue-check` now reads
-  `canTrade` and names why a refusal was refused. The Ed25519 signer has **not
-  met the venue yet**: this host's clock stops `venue-check` before it signs.
+  `canTrade` and names why a refusal was refused; its READY does not cover the
+  key's permission to trade, which its `USER_DATA` probe cannot test. The
+  Ed25519 signer has **not met the venue yet**: this host's clock stops
+  `venue-check` before it signs.
 - **(c) part done.** `FeeAsset` shipped: a spot venue takes its fee in the
   asset you received, and modelling it turned out to need one field rather than
   the two balances M4 predicted. PR #50 then fixed what consuming a base-asset

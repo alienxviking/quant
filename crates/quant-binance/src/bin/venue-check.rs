@@ -2,13 +2,23 @@
 //!
 //! The preflight `docs/live-run.md` slice (b) names, and the only part of M8
 //! that can be run end to end before any money is at risk. It makes exactly one
-//! signed request, `GET /api/v3/account`. That is not the cheapest signed call
-//! -- its weight is 20 (rest-api.md:4180-4181), where `GET /api/v3/openOrders`
-//! for one symbol is 6 (rest-api.md:4293-4294) -- but it is the one whose answer
-//! says whether this key may trade at all (`canTrade`, rest-api.md:4207), and it
-//! exercises the API key, the Ed25519 signature, the header and the clock in
-//! one round trip and places nothing. Its body also lists the account's
+//! signed request, `GET /api/v3/account`, which exercises the API key, the
+//! Ed25519 signature, the header and the clock in one round trip and places
+//! nothing. That is not the cheapest signed call -- its weight is 20
+//! (rest-api.md:4180-4181), where `GET /api/v3/openOrders` for one symbol is 6
+//! (rest-api.md:4293-4294) -- but its answer carries the account's `canTrade`
+//! (rest-api.md:4207), which this reads. Its body also lists the account's
 //! balances, which this never prints.
+//!
+//! READY is not permission to trade, and says so. The account endpoint is
+//! `USER_DATA` (rest-api.md:4174), and an API key cannot `TRADE` until trading
+//! is enabled for it in API Management (rest-api.md:194-196), so a key without
+//! that permission passes this check all the same. Nor does `canTrade` settle
+//! it: the venue's documentation shows the field and never defines it. Only a
+//! request whose security type is `TRADE` tests the key's permission, and a
+//! later pull request adds one, `POST /api/v3/order/test`, which validates an
+//! order without sending it to the matching engine, at weight 1
+//! (rest-api.md:2321-2333).
 //!
 //! ```text
 //! # bash
@@ -83,6 +93,22 @@ key.pem is an Ed25519 private key, kept outside this repository:
               register one with the testnet and load that instead.
 
 Exit 0 ready, 1 not ready, 2 for an argument it does not take.
+";
+
+/// What a pass prints.
+///
+/// It names what was proved and, as plainly, what was not: the request is
+/// `USER_DATA`, which a key with no permission to trade passes all the same,
+/// so READY must not read as that permission. See the module docs.
+const READY: &str = "\
+venue        a signed request was accepted, and the account reports canTrade true
+
+verdict      READY: the API key, the Ed25519 key, the signature and the clock work,
+             and the account reports canTrade. NOT checked: whether this API key
+             may trade. GET /api/v3/account needs only USER_DATA permission, and
+             a key cannot TRADE until trading is enabled for it in Binance's API
+             Management. Nothing was ordered, and nothing is said of balances,
+             which are not printed.
 ";
 
 /// Which venue to check.
@@ -267,13 +293,7 @@ async fn check(venue: Venue, credentials: Credentials, offset: i64) -> ExitCode 
     };
     match client.check_ready(offset).await {
         Ok(()) => {
-            println!("venue        a signed request was accepted, and the account can trade");
-            println!();
-            println!("verdict      READY: the API key, the Ed25519 key and the clock all work.");
-            println!(
-                "             Nothing was ordered, and this proves nothing about balances, \
-                 which are not printed."
-            );
+            print!("{READY}");
             ExitCode::SUCCESS
         }
         Err(why) => {
@@ -299,7 +319,7 @@ fn millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, Command, UnknownArgument, Venue, USAGE};
+    use super::{parse_args, Command, UnknownArgument, Venue, READY, USAGE};
     use std::ffi::OsString;
 
     fn args(list: &[&str]) -> Vec<OsString> {
@@ -354,6 +374,25 @@ mod tests {
             OsString::from_vec(vec![0xff])
         };
         assert_eq!(parse_args([odd]), Err(UnknownArgument));
+    }
+
+    #[test]
+    fn ready_says_what_it_proved_and_that_permission_to_trade_is_not_part_of_it() {
+        // `GET /api/v3/account` is USER_DATA, which a key that cannot TRADE
+        // passes all the same. A pass that read as "this key may trade" would
+        // be the check vouching for the one thing it never tested.
+        let said = READY.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "READY: the API key, the Ed25519 key, the signature and the clock work",
+            "the account reports canTrade",
+            "NOT checked: whether this API key may trade",
+            "GET /api/v3/account needs only USER_DATA permission",
+            "cannot TRADE until trading is enabled for it in Binance's API Management",
+            "Nothing was ordered",
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
+        assert!(!said.contains("the account can trade"), "{said}");
     }
 
     #[test]
