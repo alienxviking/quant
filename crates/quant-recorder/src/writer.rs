@@ -363,7 +363,13 @@ mod tests {
             .name()
             .unwrap_or("unnamed")
             .replace("::", "-");
-        let root = std::env::temp_dir().join(format!("quant-recorder-account-{unique}"));
+        // The process id too: the thread name is unique within one run, and two
+        // `cargo test` runs at once -- two worktrees, say -- would otherwise
+        // write to one directory and delete it out from under each other.
+        let root = std::env::temp_dir().join(format!(
+            "quant-recorder-account-{}-{unique}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
 
         // Mid-day, so nothing here rolls.
@@ -399,14 +405,13 @@ mod tests {
             let outcome = run_writer(&rx, &mut session, Duration::from_millis(20));
             (outcome, session)
         });
-        while ing.pending_gaps() > 0 {
+        within_ten_seconds("make room for the gap record", || {
             ing.pump().unwrap();
-        }
+            ing.pending_gaps() == 0
+        });
         // Until the writer has emptied the channel, so the last frame has room:
         // one that found none would be dropped, and a drop is not this test's.
-        while ing.metrics().queue_depth() > 0 {
-            thread::yield_now();
-        }
+        within_ten_seconds("empty the channel", || ing.metrics().queue_depth() == 0);
         assert_eq!(
             ing.accept_account_at(
                 b"{\"event\":{\"e\":\"serverShutdown\"}}".to_vec(),
@@ -466,6 +471,19 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Spin until `done`, waiting on the writer thread -- bounded, so a writer
+    /// that died or wedged fails the test instead of hanging the suite.
+    fn within_ten_seconds(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "gave up waiting for the writer to {what}"
+            );
+            thread::yield_now();
+        }
     }
 
     /// The other half of the roll story: an instrument that goes quiet across
