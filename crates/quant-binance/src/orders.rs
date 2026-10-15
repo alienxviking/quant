@@ -1,16 +1,21 @@
-//! Orders as Binance's REST API spells them.
+//! Orders as Binance's REST API spells them, and what its answers mean.
 //!
 //! Pure logic, like [`crate::user_data`]: no network, no credentials, no clock.
 //! [`NewOrder::encode`] turns the engine's [`OrderRequest`] into the parameters
 //! of `POST /api/v3/order`, and [`CancelOrder::encode`] names an order for
 //! `DELETE /api/v3/order`. Both stop short of `timestamp`, `recvWindow` and
 //! `signature`, which the signer appends, and neither sends anything: that is
-//! the transport's job, wired in a later pull request.
+//! the transport's job, wired in a later pull request. What the transport saw
+//! comes back here as an [`Attempt`], and [`NewOrder::classify`] says what it
+//! means for the order.
 //!
 //! Citations are `file:line` in `binance/binance-spot-api-docs` at commit
-//! `0556f1a`. Nothing here has met the real venue yet. Every request below is
-//! checked against the documentation's own examples, and the requests criterion
-//! D sends on purpose are the first real test of them.
+//! `0556f1a`. Nothing here has met the real venue yet. The requests are checked
+//! against the documentation's own examples, and the answers are the
+//! documentation's examples or are built from its error catalogue, so the
+//! orders criterion D sends on purpose, and the answers they get, are the
+//! first real test of both. Those answers belong beside these fixtures once
+//! they are recorded.
 //!
 //! # Every order asks for an acknowledgement and nothing more
 //!
@@ -18,7 +23,7 @@
 //! every fill come from the user-data stream. `MARKET` and `LIMIT` orders
 //! default to a `FULL` response (rest-api.md:2159), which carries the fills
 //! (rest-api.md:2236-2292), so every order sends `newOrderRespType=ACK`, whose
-//! response carries only the order's identity (faqs/spot_glossary.md:7-8). A
+//! response carries only the order's identity (`faqs/spot_glossary.md:7-8`). A
 //! response that delivered fills would give each fill two authorities.
 //!
 //! Every order also sends `newClientOrderId`, from [`RunTag::client_order_id`],
@@ -67,11 +72,52 @@
 //! every order's venue verdict with the model's; an encoder that refused
 //! locally would make the first impossible, and leave the second comparing the
 //! model with itself.
+//!
+//! # An unknown outcome is never a refusal
+//!
+//! The classification is lopsided on purpose. An order classified
+//! [`Placement::Refused`] leaves the engine's ledger as one that never existed.
+//! If the venue in fact placed it, its fill arrives as an orphan and never
+//! reaches the portfolio, and an order sent in its place doubles the position.
+//! An order classified [`Placement::Unknown`] stays working, and readiness
+//! refuses every new order until the stream mentions it or a lookup settles it
+//! (`docs/live-run.md` §5): loud and stuck, which is the safe failure. So a
+//! refusal needs a code the documentation ties to a request that was not
+//! carried out, and every ambiguity is unknown:
+//!
+//! - any 5xx, whatever code it carries: *"It is important to **NOT** treat
+//!   this as a failure operation; the execution status is **UNKNOWN** and could
+//!   have been a success"* (rest-api.md:116-118);
+//! - `-1007` and `-1006`, which say the execution status is unknown
+//!   (errors.md:27-31), and `-1000`, `-1001` and `-1008`, which say nothing
+//!   about it (errors.md:13-17, 33-34);
+//! - a code the endpoint is not expected to return, and a 4xx whose body is
+//!   not a Binance error at all;
+//! - a 2xx whose body is not the acknowledgement asked for, or that
+//!   acknowledges an order sent under another id: the venue may still have
+//!   placed ours;
+//! - a timeout, or a failure after the request may have left.
+//!
+//! **The code decides, not the status.** The documentation gives a status for
+//! almost none of its codes (`429` with `-1015` is the exception,
+//! `faqs/order_count_decrement.md:57`), and none at all for `-1007`, so "a 4xx
+//! was not placed" is not a rule it supports. A 4xx is a refusal only when its
+//! code says so, and a 5xx never is.
+//!
+//! Only a request that never left is certainly not placed, and only the
+//! transport can know that it never left: [`Attempt::NotConnected`].
+//!
+//! A refusal keeps the venue's code and message verbatim, for the journal:
+//! criterion B compares the rule the venue cited with the rule the model would
+//! cite, and the message is where the venue cites it. The engine hears a
+//! coarser [`RejectReason`], through [`RefusalCause::reject_reason`].
 
 use core::fmt;
 
 use quant_core::event::Side;
-use quant_core::execution::{ClientOrderId, OrderKind, OrderRequest, TimeInForce};
+use quant_core::execution::{
+    ClientOrderId, OrderKind, OrderRequest, RejectReason, TimeInForce, VenueOrderId,
+};
 use quant_core::fixed::{Px, Qty};
 use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind};
 
@@ -157,6 +203,47 @@ impl NewOrder {
     #[must_use]
     pub fn client_order_id(&self) -> &str {
         &self.client_order_id
+    }
+
+    /// What `attempt`, the transport's account of sending this order, means
+    /// for the order. The module docs give the rule, and why it leans the way
+    /// it does.
+    #[must_use]
+    pub fn classify(&self, attempt: Attempt<'_>) -> Placement {
+        match heard(attempt) {
+            Heard::Success { http_status, body } => self.acknowledged(http_status, body),
+            Heard::Error { http_status, error } => match placement_refusal(http_status, &error) {
+                Some(cause) => Placement::Refused(Refusal::new(http_status, error, cause)),
+                None => Placement::Unknown {
+                    why: WhyUnknown::unsettled(http_status, error),
+                },
+            },
+            Heard::Unknown(why) => Placement::Unknown { why },
+            Heard::NotSent(why) => Placement::NotSent { why },
+        }
+    }
+
+    /// A 2xx: placed, if the body is the acknowledgement of this order.
+    fn acknowledged(&self, http_status: u16, body: &[u8]) -> Placement {
+        match serde_json::from_slice::<Ack>(body) {
+            Err(e) => Placement::Unknown {
+                why: WhyUnknown::UnreadableBody {
+                    http_status,
+                    detail: e.to_string(),
+                },
+            },
+            Ok(ack) if ack.client_order_id != self.client_order_id => Placement::Unknown {
+                why: WhyUnknown::OtherOrder {
+                    sent: self.client_order_id.clone(),
+                    echoed: ack.client_order_id,
+                },
+            },
+            Ok(ack) => Placement::Placed {
+                order_id: VenueOrderId(ack.order_id.to_string()),
+                client_order_id: ack.client_order_id,
+                transact_time_ms: ack.transact_time,
+            },
+        }
     }
 }
 
@@ -322,6 +409,497 @@ fn percent_encode(value: &str, out: &mut String) {
         }
     }
 }
+
+/// What the transport saw when it sent a request.
+///
+/// Filled in by the caller, the only one that can know it, so that everything
+/// from here on is pure. The text in [`Attempt::NotConnected`] and
+/// [`Attempt::Failed`] is a description for the log, which the caller has
+/// stripped of anything that must not be logged: an HTTP client's error can
+/// quote the URL, and the URL carries the signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt<'a> {
+    /// The venue answered: its HTTP status, and the whole body.
+    Answered { status: u16, body: &'a [u8] },
+    /// No connection was made, so nothing of the request left this machine: a
+    /// name that would not resolve, a connection refused, a TLS handshake that
+    /// failed.
+    ///
+    /// The one outcome that proves an order was not placed, and so the one the
+    /// caller must be sure of. A request that may have been written to a
+    /// connection, even one that then broke, is [`Attempt::Failed`], and a
+    /// timeout once connected is [`Attempt::TimedOut`]. When unsure, not this.
+    NotConnected(&'a str),
+    /// No answer within the client's own timeout, after the request may have
+    /// left. `docs/live-run.md` §5 puts that timeout above the venue's ten
+    /// seconds (rest-api.md:102), so that the venue's `-1007` arrives first
+    /// when it can.
+    TimedOut,
+    /// Any other failure after the request may have left: a connection reset,
+    /// a body that stopped arriving.
+    Failed(&'a str),
+}
+
+/// What the venue's answer to a new order means for the order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// The venue has the order: its acknowledgement (rest-api.md:2203-2212),
+    /// naming the id the order was sent under.
+    ///
+    /// Not an `Accepted`. Acceptance comes from the stream, the one authority
+    /// for it (module docs). What this settles is that the order is not in
+    /// doubt, and it carries the venue's id for it.
+    Placed {
+        /// The venue's `orderId`, written as [`crate::user_data`] writes the
+        /// stream's, so that both name one order identically.
+        order_id: VenueOrderId,
+        /// The `clientOrderId` acknowledged, which is the one the order was
+        /// sent under: an acknowledgement naming another is
+        /// [`Placement::Unknown`].
+        client_order_id: String,
+        /// The venue's `transactTime`, in milliseconds since the epoch on the
+        /// venue's clock (rest-api.md:97; `faqs/spot_glossary.md:420-421`). For
+        /// the record only: the engine dispatches on when we heard a thing,
+        /// never on when the venue says it happened (invariant 2).
+        transact_time_ms: i64,
+    },
+    /// The venue refused it, with a code the documentation ties to a request
+    /// that was not carried out.
+    Refused(Refusal),
+    /// Whether the order exists cannot be told from this. Never a rejection:
+    /// see the module docs.
+    Unknown { why: WhyUnknown },
+    /// The request never left. Certainly not placed.
+    NotSent { why: String },
+}
+
+impl Placement {
+    /// The reason to give the engine, when this outcome is one it may hear as
+    /// a rejection: a refusal, or a request that never left, which is the
+    /// venue being *"unreachable"* in [`RejectReason::Venue`]'s own words.
+    ///
+    /// `None` for an order the venue placed, and above all for one whose fate
+    /// is unknown, which must stay working. A rejection removes an order from
+    /// the engine's ledger, and the order's fill would then arrive as an
+    /// orphan.
+    #[must_use]
+    pub fn reject_reason(&self) -> Option<RejectReason> {
+        match self {
+            Self::Refused(refusal) => Some(refusal.cause.reject_reason()),
+            Self::NotSent { .. } => Some(RejectReason::Venue),
+            Self::Placed { .. } | Self::Unknown { .. } => None,
+        }
+    }
+}
+
+/// A request the venue refused, as it said so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub http_status: u16,
+    /// The venue's error code, verbatim.
+    pub code: i64,
+    /// The venue's message, verbatim. Kept for the journal: criterion B
+    /// compares the rule the venue cited with the one the model would cite,
+    /// and the message is where the venue cites it.
+    pub msg: String,
+    pub cause: RefusalCause,
+}
+
+impl Refusal {
+    fn new(http_status: u16, error: VenueError, cause: RefusalCause) -> Self {
+        Self {
+            http_status,
+            code: error.code,
+            msg: error.msg,
+            cause,
+        }
+    }
+}
+
+/// Why the venue refused a request, as a closed set. The code and message
+/// beside it in [`Refusal`] keep the detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalCause {
+    /// *"Filter failure: NAME"* (errors.md:425-446), sent under `-1013`, a
+    /// request that *"didn't reach the Matching Engine"* (errors.md:36-38).
+    Filter(FilterName),
+    /// *"Account has insufficient balance for requested action."*
+    /// (errors.md:377): criterion D7's refusal, and one the simulator never
+    /// makes.
+    InsufficientBalance,
+    /// *"Duplicate order sent."*: the id is already in use (errors.md:375),
+    /// meaning an open order already has this `newClientOrderId`
+    /// (rest-api.md:2153). Its own cause because it is news about our ids
+    /// rather than about the order: some order is open under a name
+    /// [`RunTag`] exists to keep unique, and that needs a person.
+    DuplicateClientOrderId,
+    /// Any other refusal, named only in its message: the matching engine's
+    /// (`-2010`, *"This code is sent when an error has been returned by the
+    /// matching engine"*, errors.md:367-368), or the API's before it
+    /// (`-1013`).
+    Declined,
+    /// `-1021`, a timestamp outside `recvWindow` (errors.md:53-55), which the
+    /// venue checks before it forwards a request to the matching engine
+    /// (rest-api.md:225-241).
+    Timestamp,
+    /// `-1022`, `-2014` or `-2015`: the signature, the key's format, or the
+    /// key, address or permissions (errors.md:57-58, 338-342).
+    Credentials,
+    /// One of the `-11xx` *"Request issues"* (errors.md:71) that a request to
+    /// this endpoint can meet: a parameter missing, empty, malformed or not
+    /// wanted.
+    Malformed,
+    /// `-1003` or `-1015` with a 429, a request rate limit broken, or a 418,
+    /// an address banned for not backing off (rest-api.md:114-115;
+    /// `faqs/order_count_decrement.md:57`).
+    RateLimited,
+}
+
+impl RefusalCause {
+    /// The reason the engine hears, coarser on purpose: [`RejectReason`] is a
+    /// closed set of categories, and the detail stays in the [`Refusal`].
+    ///
+    /// A filter breach is [`RejectReason::Malformed`], whose own docs include
+    /// *"a venue filter — tick size, lot size, minimum notional"*.
+    #[must_use]
+    pub const fn reject_reason(self) -> RejectReason {
+        match self {
+            Self::Filter(_) | Self::Malformed => RejectReason::Malformed,
+            Self::InsufficientBalance => RejectReason::InsufficientFunds,
+            Self::DuplicateClientOrderId
+            | Self::Declined
+            | Self::Timestamp
+            | Self::Credentials
+            | Self::RateLimited => RejectReason::Venue,
+        }
+    }
+}
+
+/// The filter a *"Filter failure: NAME"* names.
+///
+/// Every filter the venue documents (filters.md:5-28; errors.md:428-446 lists
+/// the same names, all but `MAX_ASSET`), and [`FilterName::Unrecognised`] for
+/// any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterName {
+    PriceFilter,
+    PercentPrice,
+    PercentPriceBySide,
+    LotSize,
+    MinNotional,
+    Notional,
+    IcebergParts,
+    MarketLotSize,
+    MaxNumOrders,
+    MaxNumAlgoOrders,
+    MaxNumIcebergOrders,
+    MaxPosition,
+    TrailingDelta,
+    MaxNumOrderAmends,
+    MaxNumOrderLists,
+    ExchangeMaxNumOrders,
+    ExchangeMaxNumAlgoOrders,
+    ExchangeMaxNumIcebergOrders,
+    ExchangeMaxNumOrderLists,
+    MaxAsset,
+    /// A name the documentation did not have at the commit this was written
+    /// against. Not guessed at: the message beside it in [`Refusal`] carries
+    /// the name, and a filter nobody here has heard of is a reason to read it.
+    Unrecognised,
+}
+
+/// Each filter as the venue spells it, in the order filters.md lists them.
+/// One table for both directions, so parsing and spelling cannot disagree.
+const FILTER_NAMES: [(&str, FilterName); 20] = [
+    ("PRICE_FILTER", FilterName::PriceFilter),
+    ("PERCENT_PRICE", FilterName::PercentPrice),
+    ("PERCENT_PRICE_BY_SIDE", FilterName::PercentPriceBySide),
+    ("LOT_SIZE", FilterName::LotSize),
+    ("MIN_NOTIONAL", FilterName::MinNotional),
+    ("NOTIONAL", FilterName::Notional),
+    ("ICEBERG_PARTS", FilterName::IcebergParts),
+    ("MARKET_LOT_SIZE", FilterName::MarketLotSize),
+    ("MAX_NUM_ORDERS", FilterName::MaxNumOrders),
+    ("MAX_NUM_ALGO_ORDERS", FilterName::MaxNumAlgoOrders),
+    ("MAX_NUM_ICEBERG_ORDERS", FilterName::MaxNumIcebergOrders),
+    ("MAX_POSITION", FilterName::MaxPosition),
+    ("TRAILING_DELTA", FilterName::TrailingDelta),
+    ("MAX_NUM_ORDER_AMENDS", FilterName::MaxNumOrderAmends),
+    ("MAX_NUM_ORDER_LISTS", FilterName::MaxNumOrderLists),
+    ("EXCHANGE_MAX_NUM_ORDERS", FilterName::ExchangeMaxNumOrders),
+    (
+        "EXCHANGE_MAX_NUM_ALGO_ORDERS",
+        FilterName::ExchangeMaxNumAlgoOrders,
+    ),
+    (
+        "EXCHANGE_MAX_NUM_ICEBERG_ORDERS",
+        FilterName::ExchangeMaxNumIcebergOrders,
+    ),
+    (
+        "EXCHANGE_MAX_NUM_ORDER_LISTS",
+        FilterName::ExchangeMaxNumOrderLists,
+    ),
+    ("MAX_ASSET", FilterName::MaxAsset),
+];
+
+impl FilterName {
+    /// The filter `name` spells, exactly as the venue spells it.
+    #[must_use]
+    pub fn parse(name: &str) -> Self {
+        FILTER_NAMES
+            .iter()
+            .find(|(spelling, _)| *spelling == name)
+            .map_or(Self::Unrecognised, |&(_, filter)| filter)
+    }
+
+    /// The venue's spelling, or `None` for [`FilterName::Unrecognised`].
+    #[must_use]
+    pub fn as_str(self) -> Option<&'static str> {
+        FILTER_NAMES
+            .iter()
+            .find(|(_, filter)| *filter == self)
+            .map(|&(spelling, _)| spelling)
+    }
+}
+
+/// Why an answer settles nothing about a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhyUnknown {
+    /// A 5xx: *"the issue is on Binance's side"*, and *"the execution status
+    /// is UNKNOWN and could have been a success"* (rest-api.md:116-118). The
+    /// body's code and message, when it carried a Binance error, are kept, and
+    /// decide nothing.
+    ServerError {
+        http_status: u16,
+        said: Option<VenueError>,
+    },
+    /// A Binance error whose code does not say the request was refused: one
+    /// that says the outcome is unknown, one that says nothing about it, or one
+    /// this endpoint is not expected to send.
+    Unsettled {
+        http_status: u16,
+        code: i64,
+        msg: String,
+    },
+    /// A body that is not the answer expected: a 2xx that is not the
+    /// acknowledgement, or a 4xx that is not a Binance error.
+    UnreadableBody { http_status: u16, detail: String },
+    /// An acknowledgement naming the order sent as `echoed`, when this request
+    /// was sent as `sent`. Ours may or may not have been placed.
+    OtherOrder { sent: String, echoed: String },
+    /// A status outside 2xx, 4xx and 5xx, or a 409. The venue sends 409 when a
+    /// request *"partially failed but also partially succeeded"*
+    /// (web-socket-api.md:317), for a cancel-replace (rest-api.md:113), which
+    /// this system never sends; what succeeded may have been the order.
+    UnexpectedStatus { http_status: u16 },
+    /// [`Attempt::TimedOut`].
+    TimedOut,
+    /// [`Attempt::Failed`], with the caller's description.
+    Interrupted(String),
+}
+
+impl WhyUnknown {
+    fn unsettled(http_status: u16, error: VenueError) -> Self {
+        Self::Unsettled {
+            http_status,
+            code: error.code,
+            msg: error.msg,
+        }
+    }
+}
+
+impl fmt::Display for WhyUnknown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ServerError { http_status, said } => {
+                write!(
+                    f,
+                    "HTTP {http_status}, an error on the venue's side, after which whether the \
+                     request was carried out is unknown"
+                )?;
+                match said {
+                    Some(said) => write!(f, " (code {}: {})", said.code, said.msg),
+                    None => Ok(()),
+                }
+            }
+            Self::Unsettled {
+                http_status,
+                code,
+                msg,
+            } => write!(
+                f,
+                "HTTP {http_status} with code {code} ({msg}), which does not say the request \
+                 was refused"
+            ),
+            Self::UnreadableBody {
+                http_status,
+                detail,
+            } => write!(
+                f,
+                "HTTP {http_status} with a body that is not the answer expected: {detail}"
+            ),
+            Self::OtherOrder { sent, echoed } => write!(
+                f,
+                "the venue's answer names {echoed}, and this request was sent as {sent}"
+            ),
+            Self::UnexpectedStatus { http_status } => write!(
+                f,
+                "HTTP {http_status}, which this endpoint is not expected to answer with"
+            ),
+            Self::TimedOut => f.write_str("no answer before the client stopped waiting"),
+            Self::Interrupted(why) => {
+                write!(f, "the request failed after it may have left: {why}")
+            }
+        }
+    }
+}
+
+/// A Binance error body, `{"code": -1121, "msg": "Invalid symbol."}`
+/// (errors.md:3-10). Both fields are required; anything else in the body is
+/// ignored.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct VenueError {
+    pub code: i64,
+    pub msg: String,
+}
+
+/// An [`Attempt`], read as far as every endpoint reads it alike.
+enum Heard<'a> {
+    /// A 2xx, whose body is the endpoint's to read.
+    Success {
+        http_status: u16,
+        body: &'a [u8],
+    },
+    /// A 4xx carrying a Binance error, for the endpoint to read by its code.
+    Error {
+        http_status: u16,
+        error: VenueError,
+    },
+    Unknown(WhyUnknown),
+    NotSent(String),
+}
+
+fn heard(attempt: Attempt<'_>) -> Heard<'_> {
+    let (http_status, body) = match attempt {
+        Attempt::Answered { status, body } => (status, body),
+        Attempt::NotConnected(why) => return Heard::NotSent(why.to_owned()),
+        Attempt::TimedOut => return Heard::Unknown(WhyUnknown::TimedOut),
+        Attempt::Failed(why) => return Heard::Unknown(WhyUnknown::Interrupted(why.to_owned())),
+    };
+    match http_status {
+        200..=299 => Heard::Success { http_status, body },
+        409 => Heard::Unknown(WhyUnknown::UnexpectedStatus { http_status }),
+        400..=499 => match serde_json::from_slice::<VenueError>(body) {
+            Ok(error) => Heard::Error { http_status, error },
+            Err(e) => Heard::Unknown(WhyUnknown::UnreadableBody {
+                http_status,
+                detail: e.to_string(),
+            }),
+        },
+        500..=599 => Heard::Unknown(WhyUnknown::ServerError {
+            http_status,
+            said: serde_json::from_slice(body).ok(),
+        }),
+        _ => Heard::Unknown(WhyUnknown::UnexpectedStatus { http_status }),
+    }
+}
+
+/// The fields of an acknowledgement this module reads
+/// (rest-api.md:2203-2212). The fuller responses begin with the same fields
+/// (rest-api.md:2214-2292), so a venue that ignored `ACK` would still be read
+/// correctly, and the fills such a response carries would still be left to the
+/// stream.
+#[derive(serde::Deserialize)]
+struct Ack {
+    #[serde(rename = "orderId")]
+    order_id: u64,
+    #[serde(rename = "clientOrderId")]
+    client_order_id: String,
+    #[serde(rename = "transactTime")]
+    transact_time: i64,
+}
+
+/// Why a new order was refused, when its code says it was.
+fn placement_refusal(http_status: u16, error: &VenueError) -> Option<RefusalCause> {
+    match error.code {
+        // The two codes whose message names the reason: the API refusing the
+        // request before the matching engine (errors.md:36-38), and the
+        // matching engine refusing it (errors.md:367-368). The message, not
+        // the code, says which reason, because -1013's messages are drawn from
+        // both of the documentation's tables (errors.md:38).
+        -1013 | -2010 => Some(declined_because(&error.msg)),
+        code => request_refusal(http_status, code),
+    }
+}
+
+/// A refusal that a signed request to this endpoint can meet whatever it asks
+/// for, or `None` when the code is not one.
+fn request_refusal(http_status: u16, code: i64) -> Option<RefusalCause> {
+    match code {
+        -1021 => Some(RefusalCause::Timestamp),
+        -1022 | -2014 | -2015 => Some(RefusalCause::Credentials),
+        // Documented with these two statuses and no others. Any other pairing
+        // is not one the documentation describes, so it settles nothing.
+        -1003 | -1015 if matches!(http_status, 418 | 429) => Some(RefusalCause::RateLimited),
+        code if REQUEST_ISSUES.contains(&code) => Some(RefusalCause::Malformed),
+        _ => None,
+    }
+}
+
+/// The cause a `-1013` or `-2010` message names.
+///
+/// Matched exactly as the documentation writes each message. One that differs
+/// by a character is still a refusal, as [`RefusalCause::Declined`], with the
+/// message kept; it just names no cause this module knows.
+fn declined_because(msg: &str) -> RefusalCause {
+    if let Some(name) = msg.strip_prefix(FILTER_FAILURE) {
+        return RefusalCause::Filter(FilterName::parse(name));
+    }
+    match msg {
+        INSUFFICIENT_BALANCE => RefusalCause::InsufficientBalance,
+        DUPLICATE_ORDER => RefusalCause::DuplicateClientOrderId,
+        _ => RefusalCause::Declined,
+    }
+}
+
+/// How every filter failure's message begins (errors.md:428-446).
+const FILTER_FAILURE: &str = "Filter failure: ";
+
+/// errors.md:377, and the message of the venue's own example of a failed
+/// order (web-socket-api.md:232-235).
+const INSUFFICIENT_BALANCE: &str = "Account has insufficient balance for requested action.";
+
+/// errors.md:375.
+const DUPLICATE_ORDER: &str = "Duplicate order sent.";
+
+/// The `-11xx` *"Request issues"* (errors.md:71) whose parameter or condition
+/// can arise on `POST` or `DELETE /api/v3/order`.
+///
+/// The rest of the range belongs to other endpoints and protocols (intervals,
+/// listen keys, order lists, SBE, FIX) or to parameters this module never
+/// sends, and one of those here would mean its model of the venue is wrong, so
+/// it is left unknown. So is `-1112`, *"No orders on book for symbol."*
+/// (errors.md:112-113): whether this endpoint sends it is not documented.
+const REQUEST_ISSUES: [i64; 18] = [
+    -1100, // ILLEGAL_CHARS, errors.md:72-74
+    -1101, // TOO_MANY_PARAMETERS, errors.md:76-79
+    -1102, // MANDATORY_PARAM_EMPTY_OR_MALFORMED, errors.md:81-87
+    -1103, // UNKNOWN_PARAM, errors.md:89-91
+    -1104, // UNREAD_PARAMETERS, errors.md:93-95
+    -1105, // PARAM_EMPTY, errors.md:97-99
+    -1106, // PARAM_NOT_REQUIRED, errors.md:101-104
+    -1108, // PARAM_OVERFLOW, errors.md:106-107
+    -1111, // BAD_PRECISION, errors.md:109-110
+    -1114, // TIF_NOT_REQUIRED, errors.md:115-116
+    -1115, // INVALID_TIF, errors.md:118-119
+    -1116, // INVALID_ORDER_TYPE, errors.md:121-122
+    -1117, // INVALID_SIDE, errors.md:124-125
+    -1118, // EMPTY_NEW_CL_ORD_ID, errors.md:127-128
+    -1119, // EMPTY_ORG_CL_ORD_ID, errors.md:130-131
+    -1121, // BAD_SYMBOL, errors.md:136-137
+    -1128, // OPTIONAL_PARAMS_BAD_COMBO, errors.md:149-154
+    -1130, // INVALID_PARAMETER, errors.md:156-158
+];
 
 #[cfg(test)]
 mod tests {
@@ -672,5 +1250,802 @@ mod tests {
         assert_eq!(cancel.query(), "symbol=BTCUSDT&origClientOrderId=q-r1-7");
         assert_eq!(value(cancel.query(), "newClientOrderId"), None);
         assert_eq!(cancel.client_order_id(), "q-r1-7");
+    }
+
+    /// Our order 7: a market buy, the shape `MaCrossover` sends.
+    fn ours() -> NewOrder {
+        encode(&market(Side::Buy, "0.001", TimeInForce::Gtc))
+    }
+
+    fn answered(status: u16, body: &str) -> Attempt<'_> {
+        Attempt::Answered {
+            status,
+            body: body.as_bytes(),
+        }
+    }
+
+    /// A Binance error body (errors.md:3-10).
+    fn venue_error(code: i64, msg: &str) -> String {
+        serde_json::json!({ "code": code, "msg": msg }).to_string()
+    }
+
+    /// `document` with `field` replaced by `value`.
+    fn with_field(document: &str, field: &str, value: &str) -> String {
+        let mut json: serde_json::Value =
+            serde_json::from_str(document).expect("the example is JSON");
+        json[field] = serde_json::Value::from(value);
+        json.to_string()
+    }
+
+    /// The documented acknowledgement (rest-api.md:2204-2212), its comment
+    /// removed and nothing else changed. It acknowledges somebody else's
+    /// order; `with_field` makes it ours.
+    const DOCUMENTED_ACK: &str = r#"{
+        "symbol": "BTCUSDT",
+        "orderId": 28,
+        "orderListId": -1,
+        "clientOrderId": "6gCrw2kRUAF9CvJDGP16IP",
+        "transactTime": 1507725176595
+    }"#;
+
+    /// The documented `FULL` response (rest-api.md:2237-2292), its comment and
+    /// all but its first fill removed.
+    const DOCUMENTED_FULL: &str = r#"{
+        "symbol": "BTCUSDT",
+        "orderId": 28,
+        "orderListId": -1,
+        "clientOrderId": "6gCrw2kRUAF9CvJDGP16IP",
+        "transactTime": 1507725176595,
+        "price": "0.00000000",
+        "origQty": "10.00000000",
+        "executedQty": "10.00000000",
+        "origQuoteOrderQty": "0.000000",
+        "cummulativeQuoteQty": "10.00000000",
+        "status": "FILLED",
+        "timeInForce": "GTC",
+        "type": "MARKET",
+        "side": "SELL",
+        "workingTime": 1507725176595,
+        "selfTradePreventionMode": "NONE",
+        "fills": [
+            {
+                "price": "4000.00000000",
+                "qty": "1.00000000",
+                "commission": "4.00000000",
+                "commissionAsset": "USDT",
+                "tradeId": 56
+            }
+        ]
+    }"#;
+
+    /// Which way an answer to a venue error went: what the documentation
+    /// decides, without the detail around it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Class {
+        Refused(RefusalCause),
+        Unknown,
+    }
+
+    fn placement_class(placement: &Placement) -> Class {
+        match placement {
+            Placement::Refused(refusal) => Class::Refused(refusal.cause),
+            Placement::Unknown { .. } => Class::Unknown,
+            other => panic!("a venue error cannot be {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_documented_acknowledgement_of_our_order_is_placed() {
+        let placed = Placement::Placed {
+            order_id: VenueOrderId("28".to_owned()),
+            client_order_id: "q-r1-7".to_owned(),
+            transact_time_ms: 1_507_725_176_595,
+        };
+        let ack = with_field(DOCUMENTED_ACK, "clientOrderId", "q-r1-7");
+        assert_eq!(ours().classify(answered(200, &ack)), placed);
+        assert_eq!(placed.reject_reason(), None);
+        // What a venue that ignored `ACK` would send: still placed, and its
+        // fill still left to the stream.
+        let full = with_field(DOCUMENTED_FULL, "clientOrderId", "q-r1-7");
+        assert_eq!(ours().classify(answered(200, &full)), placed);
+    }
+
+    #[test]
+    fn an_acknowledgement_of_another_order_settles_nothing() {
+        // The documented example as it stands, naming an id the venue made up.
+        assert_eq!(
+            ours().classify(answered(200, DOCUMENTED_ACK)),
+            Placement::Unknown {
+                why: WhyUnknown::OtherOrder {
+                    sent: "q-r1-7".to_owned(),
+                    echoed: "6gCrw2kRUAF9CvJDGP16IP".to_owned(),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn the_venue_may_have_placed_it_so_these_are_never_refused() {
+        let insufficient = venue_error(
+            -2010,
+            "Account has insufficient balance for requested action.",
+        );
+        let timeout = venue_error(
+            -1007,
+            "Timeout waiting for response from backend server. Send status unknown; execution \
+             status unknown.",
+        );
+        let unexpected = venue_error(
+            -1006,
+            "An unexpected response was received from the message bus. Execution status unknown.",
+        );
+        let unknown = venue_error(
+            -1000,
+            "An unknown error occurred while processing the request.",
+        );
+        let no_order_id =
+            r#"{"symbol":"BTCUSDT","clientOrderId":"q-r1-7","transactTime":1507725176595}"#;
+        let cases = [
+            ("a 500 with no body", answered(500, "")),
+            ("a 500 carrying a code", answered(500, &unknown)),
+            ("a 502 from something in between", answered(502, "<html>")),
+            // A 5xx whose body reads exactly like a refusal is still a 5xx.
+            ("a 503 carrying a refusal", answered(503, &insufficient)),
+            ("a 504 carrying -1007", answered(504, &timeout)),
+            // And -1007 and -1006 say unknown under whatever status they come.
+            ("a 400 carrying -1007", answered(400, &timeout)),
+            ("a 400 carrying -1006", answered(400, &unexpected)),
+            // A success the order may stand behind, whatever the body is.
+            ("a 200 with no body", answered(200, "")),
+            (
+                "a 200 from a captive portal",
+                answered(200, "<html>Sign in"),
+            ),
+            ("a 200 without an order id", answered(200, no_order_id)),
+            ("a 200 carrying a refusal", answered(200, &insufficient)),
+            ("a timeout", Attempt::TimedOut),
+            ("a reset after sending", Attempt::Failed("connection reset")),
+        ];
+        for (what, attempt) in cases {
+            let placement = ours().classify(attempt);
+            assert!(
+                matches!(placement, Placement::Unknown { .. }),
+                "{what}: {placement:?}"
+            );
+            assert_eq!(placement.reject_reason(), None, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_client_error_that_is_not_a_binance_error_settles_nothing() {
+        // A firewall's page, a bare rate-limit reply, and JSON that is not the
+        // venue's error shape: none of them is the venue's API naming a rule.
+        for (status, body) in [
+            (400, ""),
+            (403, "<html>Request blocked</html>"),
+            (429, ""),
+            (418, "banned"),
+            (400, r#"{"msg":"a message and no code"}"#),
+            (400, r#"{"code":"-2010","msg":"a code that is text"}"#),
+            (400, r#"{"code":-2010}"#),
+        ] {
+            let placement = ours().classify(answered(status, body));
+            assert!(
+                matches!(
+                    &placement,
+                    Placement::Unknown {
+                        why: WhyUnknown::UnreadableBody { http_status, .. }
+                    } if *http_status == status
+                ),
+                "{status} {body}: {placement:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_status_the_endpoint_does_not_answer_with_settles_nothing() {
+        // 409 is how the venue says a request partly succeeded, so a body that
+        // reads like a refusal does not make it one.
+        let refusal = venue_error(
+            -2010,
+            "Account has insufficient balance for requested action.",
+        );
+        for status in [409, 100, 302, 600] {
+            assert_eq!(
+                ours().classify(answered(status, &refusal)),
+                Placement::Unknown {
+                    why: WhyUnknown::UnexpectedStatus {
+                        http_status: status
+                    }
+                },
+                "{status}"
+            );
+        }
+    }
+
+    /// A request issue, which every `-11xx` row of the code tables expects.
+    const MALFORMED: Class = Class::Refused(RefusalCause::Malformed);
+
+    /// A row of a code table: the code and message as the catalogue writes
+    /// them, the status they come under, the class the documentation puts them
+    /// in, and the lines that say so.
+    type Row = (i64, &'static str, u16, Class, &'static str);
+
+    /// Every code `POST /api/v3/order` can meet.
+    ///
+    /// The documentation does not say which codes each endpoint returns, so
+    /// this table is the reading of its catalogue that the module rests on.
+    /// Codes for other endpoints and protocols, and for parameters never sent,
+    /// are left out of it, and are in
+    /// `a_code_a_new_order_is_not_expected_to_meet_settles_nothing`.
+    const PLACING: &[Row] = &[
+        (
+            -1000,
+            "An unknown error occurred while processing the request.",
+            400,
+            Class::Unknown,
+            "errors.md:13-14",
+        ),
+        (
+            -1001,
+            "Internal error; unable to process your request. Please try again.",
+            400,
+            Class::Unknown,
+            "errors.md:16-17",
+        ),
+        (
+            -1002,
+            "You are not authorized to execute this request.",
+            401,
+            Class::Unknown,
+            "errors.md:19-20, which says nothing of the outcome",
+        ),
+        (
+            -1003,
+            "Too many requests queued.",
+            429,
+            Class::Refused(RefusalCause::RateLimited),
+            "errors.md:22-23; rest-api.md:114, 153",
+        ),
+        (
+            -1003,
+            "Way too much request weight used; IP banned until %s. Please use WebSocket \
+                 Streams for live updates to avoid bans.",
+            418,
+            Class::Refused(RefusalCause::RateLimited),
+            "errors.md:25; rest-api.md:115, 159",
+        ),
+        (
+            -1003,
+            "Too much request weight used; current limit is %s request weight per %s. \
+                 Please use WebSocket Streams for live updates to avoid polling the API.",
+            400,
+            Class::Unknown,
+            "errors.md:24, under a status rest-api.md:114-115 does not give it",
+        ),
+        (
+            -1006,
+            "An unexpected response was received from the message bus. Execution status \
+                 unknown.",
+            400,
+            Class::Unknown,
+            "errors.md:27-28",
+        ),
+        (
+            -1007,
+            "Timeout waiting for response from backend server. Send status unknown; \
+                 execution status unknown.",
+            400,
+            Class::Unknown,
+            "errors.md:30-31; rest-api.md:102-104",
+        ),
+        (
+            -1008,
+            "Server is currently overloaded with other requests. Please try again in a few \
+                 minutes.",
+            400,
+            Class::Unknown,
+            "errors.md:33-34",
+        ),
+        (
+            -1013,
+            "Filter failure: NOTIONAL",
+            400,
+            Class::Refused(RefusalCause::Filter(FilterName::Notional)),
+            "errors.md:36-38, 433",
+        ),
+        (
+            -1013,
+            "Filter failure: MIN_NOTIONAL",
+            400,
+            Class::Refused(RefusalCause::Filter(FilterName::MinNotional)),
+            "errors.md:36-38, 432",
+        ),
+        (
+            -1013,
+            "Filter failure: LOT_SIZE",
+            400,
+            Class::Refused(RefusalCause::Filter(FilterName::LotSize)),
+            "errors.md:36-38, 431",
+        ),
+        (
+            -1013,
+            "Market is closed.",
+            400,
+            Class::Refused(RefusalCause::Declined),
+            "errors.md:36-38, 376",
+        ),
+        (
+            -1013,
+            "Account has insufficient balance for requested action.",
+            400,
+            Class::Refused(RefusalCause::InsufficientBalance),
+            "errors.md:36-38, 377",
+        ),
+        (
+            -1014,
+            "Unsupported order combination.",
+            400,
+            Class::Unknown,
+            "errors.md:40-41, which says nothing of the outcome",
+        ),
+        (
+            -1015,
+            "Too many new orders; current limit is %s orders per %s.",
+            429,
+            Class::Refused(RefusalCause::RateLimited),
+            "errors.md:43-45; faqs/order_count_decrement.md:57",
+        ),
+        (
+            -1016,
+            "This service is no longer available.",
+            400,
+            Class::Unknown,
+            "errors.md:47-48",
+        ),
+        (
+            -1020,
+            "This operation is not supported.",
+            400,
+            Class::Unknown,
+            "errors.md:50-51",
+        ),
+        (
+            -1021,
+            "Timestamp for this request is outside of the recvWindow.",
+            400,
+            Class::Refused(RefusalCause::Timestamp),
+            "errors.md:53-54; rest-api.md:225-241",
+        ),
+        (
+            -1021,
+            "Timestamp for this request was 1000ms ahead of the server's time.",
+            400,
+            Class::Refused(RefusalCause::Timestamp),
+            "errors.md:55; rest-api.md:225-241",
+        ),
+        (
+            -1022,
+            "Signature for this request is not valid.",
+            400,
+            Class::Refused(RefusalCause::Credentials),
+            "errors.md:57-58",
+        ),
+        (
+            -1100,
+            "Illegal characters found in parameter '%s'; legal range is '%s'.",
+            400,
+            MALFORMED,
+            "errors.md:72-74",
+        ),
+        (
+            -1101,
+            "Duplicate values for a parameter detected.",
+            400,
+            MALFORMED,
+            "errors.md:76-79",
+        ),
+        (
+            -1102,
+            "Mandatory parameter '%s' was not sent, was empty/null, or malformed.",
+            400,
+            MALFORMED,
+            "errors.md:81-87",
+        ),
+        (
+            -1103,
+            "An unknown parameter was sent.",
+            400,
+            MALFORMED,
+            "errors.md:89-91",
+        ),
+        (
+            -1104,
+            "Not all sent parameters were read; read '%s' parameter(s) but was sent '%s'.",
+            400,
+            MALFORMED,
+            "errors.md:93-95",
+        ),
+        (
+            -1105,
+            "Parameter '%s' was empty.",
+            400,
+            MALFORMED,
+            "errors.md:97-99",
+        ),
+        (
+            -1106,
+            "Parameter '%s' sent when not required.",
+            400,
+            MALFORMED,
+            "errors.md:101-104",
+        ),
+        (
+            -1108,
+            "Parameter '%s' overflowed.",
+            400,
+            MALFORMED,
+            "errors.md:106-107",
+        ),
+        (
+            -1111,
+            "Parameter '%s' has too much precision.",
+            400,
+            MALFORMED,
+            "errors.md:109-110",
+        ),
+        (
+            -1114,
+            "TimeInForce parameter sent when not required.",
+            400,
+            MALFORMED,
+            "errors.md:115-116",
+        ),
+        (
+            -1115,
+            "Invalid timeInForce.",
+            400,
+            MALFORMED,
+            "errors.md:118-119",
+        ),
+        (
+            -1116,
+            "Invalid orderType.",
+            400,
+            MALFORMED,
+            "errors.md:121-122",
+        ),
+        (-1117, "Invalid side.", 400, MALFORMED, "errors.md:124-125"),
+        (
+            -1118,
+            "New client order ID was empty.",
+            400,
+            MALFORMED,
+            "errors.md:127-128",
+        ),
+        (
+            -1121,
+            "Invalid symbol.",
+            400,
+            MALFORMED,
+            "errors.md:136-137",
+        ),
+        (
+            -1128,
+            "Combination of optional parameters invalid.",
+            400,
+            MALFORMED,
+            "errors.md:149-154",
+        ),
+        (
+            -1130,
+            "Data sent for parameter '%s' is not valid.",
+            400,
+            MALFORMED,
+            "errors.md:156-158",
+        ),
+        (
+            -2010,
+            "Account has insufficient balance for requested action.",
+            400,
+            Class::Refused(RefusalCause::InsufficientBalance),
+            "errors.md:329-330, 367-368, 377; web-socket-api.md:232-235",
+        ),
+        (
+            -2010,
+            "Duplicate order sent.",
+            400,
+            Class::Refused(RefusalCause::DuplicateClientOrderId),
+            "errors.md:375; rest-api.md:2153",
+        ),
+        (
+            -2010,
+            "Market orders are not supported for this symbol.",
+            400,
+            Class::Refused(RefusalCause::Declined),
+            "errors.md:367-368, 378",
+        ),
+        (
+            -2010,
+            "Price * QTY is zero or less.",
+            400,
+            Class::Refused(RefusalCause::Declined),
+            "errors.md:367-368, 385",
+        ),
+        (
+            -2010,
+            "This account may not place or cancel orders.",
+            400,
+            Class::Refused(RefusalCause::Declined),
+            "errors.md:367-368, 388",
+        ),
+        (
+            -2014,
+            "API-key format invalid.",
+            401,
+            Class::Refused(RefusalCause::Credentials),
+            "errors.md:338-339",
+        ),
+        (
+            -2015,
+            "Invalid API-key, IP, or permissions for action.",
+            401,
+            Class::Refused(RefusalCause::Credentials),
+            "errors.md:341-342",
+        ),
+    ];
+
+    #[test]
+    fn every_code_a_new_order_can_meet_is_classified_as_documented() {
+        for &(code, msg, status, class, documented) in PLACING {
+            let placement = ours().classify(answered(status, &venue_error(code, msg)));
+            assert_eq!(
+                placement_class(&placement),
+                class,
+                "{code} {msg:?} under {status}: {documented}"
+            );
+            if let Placement::Refused(refusal) = placement {
+                // Kept verbatim, for the journal and for criterion B.
+                assert_eq!(
+                    (refusal.http_status, refusal.code, refusal.msg.as_str()),
+                    (status, code, msg)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_code_a_new_order_is_not_expected_to_meet_settles_nothing() {
+        // Each of these means the venue did something this module's model of
+        // it does not cover, so none of them may take an order off the books.
+        for (code, msg) in [
+            // A cancel's code (errors.md:332-333), and a query's (335-336).
+            (-2011, "Unknown order sent."),
+            (-2013, "Order does not exist."),
+            // A listen key's (errors.md:142-143), and a parameter's this
+            // module never sends (errors.md:171-172).
+            (-1125, "This listenKey does not exist."),
+            (
+                -1145,
+                "`cancelRestrictions` has to be either `ONLY_NEW` or `ONLY_PARTIALLY_FILLED`.",
+            ),
+            // Not documented for this endpoint (errors.md:112-113).
+            (-1112, "No orders on book for symbol."),
+            // Named only in a heading (errors.md:367): the message is a
+            // refusal's, and the code, which decides, is not one.
+            (
+                -1010,
+                "Account has insufficient balance for requested action.",
+            ),
+            (0, ""),
+            (-9999, "A code from after this was written."),
+        ] {
+            assert_eq!(
+                ours().classify(answered(400, &venue_error(code, msg))),
+                Placement::Unknown {
+                    why: WhyUnknown::Unsettled {
+                        http_status: 400,
+                        code,
+                        msg: msg.to_owned(),
+                    }
+                },
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_failures_name_the_filter_and_an_unknown_one_says_so() {
+        // Every filter filters.md documents, spelled as it spells them, with
+        // the line each is defined at. Written out here, not read from the
+        // module's table, which would only be checking the table against
+        // itself.
+        let documented = [
+            ("PRICE_FILTER", FilterName::PriceFilter, 37),
+            ("PERCENT_PRICE", FilterName::PercentPrice, 60),
+            ("PERCENT_PRICE_BY_SIDE", FilterName::PercentPriceBySide, 81),
+            ("LOT_SIZE", FilterName::LotSize, 111),
+            ("MIN_NOTIONAL", FilterName::MinNotional, 134),
+            ("NOTIONAL", FilterName::Notional, 157),
+            ("ICEBERG_PARTS", FilterName::IcebergParts, 183),
+            ("MARKET_LOT_SIZE", FilterName::MarketLotSize, 194),
+            ("MAX_NUM_ORDERS", FilterName::MaxNumOrders, 217),
+            ("MAX_NUM_ALGO_ORDERS", FilterName::MaxNumAlgoOrders, 229),
+            (
+                "MAX_NUM_ICEBERG_ORDERS",
+                FilterName::MaxNumIcebergOrders,
+                241,
+            ),
+            ("MAX_POSITION", FilterName::MaxPosition, 253),
+            ("TRAILING_DELTA", FilterName::TrailingDelta, 272),
+            ("MAX_NUM_ORDER_AMENDS", FilterName::MaxNumOrderAmends, 301),
+            ("MAX_NUM_ORDER_LISTS", FilterName::MaxNumOrderLists, 316),
+            (
+                "EXCHANGE_MAX_NUM_ORDERS",
+                FilterName::ExchangeMaxNumOrders,
+                331,
+            ),
+            (
+                "EXCHANGE_MAX_NUM_ALGO_ORDERS",
+                FilterName::ExchangeMaxNumAlgoOrders,
+                343,
+            ),
+            (
+                "EXCHANGE_MAX_NUM_ICEBERG_ORDERS",
+                FilterName::ExchangeMaxNumIcebergOrders,
+                355,
+            ),
+            (
+                "EXCHANGE_MAX_NUM_ORDER_LISTS",
+                FilterName::ExchangeMaxNumOrderLists,
+                366,
+            ),
+            ("MAX_ASSET", FilterName::MaxAsset, 381),
+        ];
+        for (name, filter, line) in documented {
+            assert_eq!(FilterName::parse(name), filter, "filters.md:{line}");
+            assert_eq!(filter.as_str(), Some(name), "filters.md:{line}");
+            let message = format!("Filter failure: {name}");
+            let refused = ours().classify(answered(400, &venue_error(-1013, &message)));
+            assert_eq!(
+                placement_class(&refused),
+                Class::Refused(RefusalCause::Filter(filter)),
+                "filters.md:{line}"
+            );
+            assert_eq!(refused.reject_reason(), Some(RejectReason::Malformed));
+        }
+        // Twenty names for twenty filters: no two share one.
+        for (i, (_, a, _)) in documented.iter().enumerate() {
+            for (_, b, _) in &documented[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+
+        // A name the documentation does not have, and near misses of one it
+        // does, are none of them.
+        for name in [
+            "SOMETHING_NEW",
+            "notional",
+            "NOTIONAL ",
+            " NOTIONAL",
+            "MIN-NOTIONAL",
+            "",
+            "Filter failure: NOTIONAL",
+        ] {
+            assert_eq!(
+                FilterName::parse(name),
+                FilterName::Unrecognised,
+                "{name:?}"
+            );
+        }
+        assert_eq!(FilterName::Unrecognised.as_str(), None);
+        // Still a refusal, because the code says so; only the filter is
+        // unknown, and the message names it.
+        let unheard_of = venue_error(-1013, "Filter failure: SOMETHING_NEW");
+        assert_eq!(
+            placement_class(&ours().classify(answered(400, &unheard_of))),
+            Class::Refused(RefusalCause::Filter(FilterName::Unrecognised))
+        );
+    }
+
+    #[test]
+    fn each_refusal_gives_the_engine_a_reason_and_an_unknown_outcome_gives_it_none() {
+        for (cause, reason) in [
+            (
+                RefusalCause::Filter(FilterName::Notional),
+                RejectReason::Malformed,
+            ),
+            (
+                RefusalCause::Filter(FilterName::Unrecognised),
+                RejectReason::Malformed,
+            ),
+            (
+                RefusalCause::InsufficientBalance,
+                RejectReason::InsufficientFunds,
+            ),
+            (RefusalCause::DuplicateClientOrderId, RejectReason::Venue),
+            (RefusalCause::Declined, RejectReason::Venue),
+            (RefusalCause::Timestamp, RejectReason::Venue),
+            (RefusalCause::Credentials, RejectReason::Venue),
+            (RefusalCause::Malformed, RejectReason::Malformed),
+            (RefusalCause::RateLimited, RejectReason::Venue),
+        ] {
+            assert_eq!(cause.reject_reason(), reason, "{cause:?}");
+            let refused = Placement::Refused(Refusal {
+                http_status: 400,
+                code: -2010,
+                msg: String::new(),
+                cause,
+            });
+            assert_eq!(refused.reject_reason(), Some(reason), "{cause:?}");
+        }
+        // A request that never left is the venue unreachable. An unknown
+        // outcome, and a placed order, are not rejections at all.
+        let not_sent = Placement::NotSent {
+            why: "dns error".to_owned(),
+        };
+        assert_eq!(not_sent.reject_reason(), Some(RejectReason::Venue));
+        for why in [
+            WhyUnknown::TimedOut,
+            WhyUnknown::ServerError {
+                http_status: 503,
+                said: None,
+            },
+        ] {
+            assert_eq!(Placement::Unknown { why }.reject_reason(), None);
+        }
+    }
+
+    #[test]
+    fn only_a_request_that_never_left_is_certainly_not_sent() {
+        let order = ours();
+        assert_eq!(
+            order.classify(Attempt::NotConnected("dns error: no such host")),
+            Placement::NotSent {
+                why: "dns error: no such host".to_owned()
+            }
+        );
+        assert_eq!(
+            order.classify(Attempt::TimedOut),
+            Placement::Unknown {
+                why: WhyUnknown::TimedOut
+            }
+        );
+        assert_eq!(
+            order.classify(Attempt::Failed("connection reset")),
+            Placement::Unknown {
+                why: WhyUnknown::Interrupted("connection reset".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn a_reason_for_doubt_says_what_was_seen() {
+        let said = WhyUnknown::ServerError {
+            http_status: 503,
+            said: Some(VenueError {
+                code: -1008,
+                msg: "Server is currently overloaded".to_owned(),
+            }),
+        }
+        .to_string();
+        assert!(said.starts_with("HTTP 503, "), "{said}");
+        assert!(
+            said.ends_with("(code -1008: Server is currently overloaded)"),
+            "{said}"
+        );
+        let said = WhyUnknown::ServerError {
+            http_status: 500,
+            said: None,
+        }
+        .to_string();
+        assert!(!said.contains("code"), "{said}");
+        let said = WhyUnknown::Unsettled {
+            http_status: 400,
+            code: -1007,
+            msg: "Timeout".to_owned(),
+        }
+        .to_string();
+        assert!(said.contains("400 with code -1007 (Timeout)"), "{said}");
     }
 }
