@@ -354,9 +354,20 @@ pub enum Landing {
 /// Remote text bound for a file kept for good: a garbled body must not be able
 /// to bloat the journal, and a cut through a character would leave a line that
 /// is not valid UTF-8.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// Reading one back goes through the same cut. A derived `Deserialize` would
+/// build one of any length from whatever a file held, so the bound would hold
+/// only for text this process made.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(transparent)]
 pub struct VenueText(String);
+
+impl<'de> serde::Deserialize<'de> for VenueText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Ok(Self::new(&text))
+    }
+}
 
 impl VenueText {
     /// The most bytes kept.
@@ -808,6 +819,25 @@ mod tests {
         // One that ends exactly on it is kept.
         let fitting = format!("{}é", "x".repeat(VenueText::MAX - 2));
         assert_eq!(VenueText::new(&fitting).as_str(), fitting);
+    }
+
+    #[test]
+    fn venue_text_read_back_is_bounded_as_when_it_was_made() {
+        // The bound is a property of the type, not of one constructor: a
+        // journal line edited by hand, or written by a build without the cut,
+        // must not read back as a `VenueText` no constructor could make.
+        let read = |text: &str| -> VenueText {
+            serde_json::from_value(serde_json::Value::String(text.to_owned()))
+                .expect("any string reads")
+        };
+        let long = "x".repeat(VenueText::MAX + 44);
+        assert_eq!(read(&long), VenueText::new(&long));
+        assert_eq!(read(&long).as_str().len(), VenueText::MAX);
+        // Cut on a character boundary, as `new` cuts.
+        let straddling = format!("{}é", "x".repeat(VenueText::MAX - 1));
+        assert_eq!(read(&straddling).as_str(), "x".repeat(VenueText::MAX - 1));
+        // And text within the bound reads back as it was.
+        assert_eq!(read("Unknown order sent.").as_str(), "Unknown order sent.");
     }
 
     /// `value` writes exactly `json`, and `json` reads back as `value`.
