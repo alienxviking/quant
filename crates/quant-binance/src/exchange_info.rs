@@ -88,10 +88,15 @@
 //! order's step.
 //!
 //! That matters more than the symmetry suggests. `MaCrossover` sends market
-//! orders only, so `MARKET_LOT_SIZE` is the quantity rule every one of its orders
-//! meets, and the model checks a different one. Whether a market order must also
-//! pass `LOT_SIZE` the documentation does not say. Criterion B is where that gets
-//! learned, and this report is what lets it name the rule.
+//! orders only, and a market order meets both rules. `LOT_SIZE`'s are the
+//! symbol's, with no exception by order type (`filters.md` lines 112 and
+//! 118-122); a quote-quantity `MARKET` order *"will not break `LOT_SIZE` filter
+//! rules"* (`CHANGELOG.md` line 2513); and one is refused when the book holds
+//! less than `LOT_SIZE`'s minimum (`errors.md` line 403). So where a symbol
+//! lists both, every order `MaCrossover` sends meets two quantity rules; the
+//! model checks one of them, and only its step. A refusal under the other reads
+//! `Filter failure: MARKET_LOT_SIZE` (`errors.md` line 435), and this report is
+//! what lets criterion B name it.
 //!
 //! # Two notional filters
 //!
