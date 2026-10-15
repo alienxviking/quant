@@ -120,6 +120,10 @@ pub enum CredentialError {
     Missing(&'static str),
     /// The variable is set but is not usable text.
     NotText(&'static str),
+    /// [`Credentials::PRIVATE_KEY_VAR`] is missing, and the variable the HMAC
+    /// path read, [`Credentials::RETIRED_SECRET_VAR`], is set: a setup from
+    /// before the live path moved to Ed25519.
+    HmacSecretInstead,
     /// The private key is encrypted. It has to be decrypted before it can be
     /// read, and decrypting is the operator's step, not this program's.
     Encrypted,
@@ -151,6 +155,19 @@ impl core::fmt::Display for CredentialError {
                 Credentials::KEY_VAR,
             ),
             Self::NotText(name) => write!(f, "{name} is set but is not valid text"),
+            Self::HmacSecretInstead => write!(
+                f,
+                "{var} is not set, and {} is. The live path no longer signs with an HMAC \
+                 secret: Binance has deprecated HMAC keys, and the session logon the account \
+                 stream needs takes an Ed25519 key only. Make a key pair outside this \
+                 repository -- `openssl genpkey -algorithm ed25519 -out key.pem`, then `openssl \
+                 pkey -in key.pem -pubout` for the public key -- register the public key with \
+                 Binance, set {} to the API key it issues for that key, and load the private key \
+                 with `export {var}=\"$(cat key.pem)\"`. {} is not used, and can be unset.",
+                Credentials::RETIRED_SECRET_VAR,
+                Credentials::KEY_VAR,
+                Credentials::RETIRED_SECRET_VAR,
+            ),
             Self::Encrypted => write!(
                 f,
                 "{var} holds an encrypted private key. Decrypt it first -- `openssl pkey -in \
@@ -198,6 +215,12 @@ impl Credentials {
     pub const KEY_VAR: &'static str = "BINANCE_API_KEY";
     /// The Ed25519 private key's text: PEM, or the bare base64 body.
     pub const PRIVATE_KEY_VAR: &'static str = "BINANCE_ED25519_PRIVATE_KEY";
+    /// The HMAC secret slice (b) signed with.
+    ///
+    /// Never used to sign. Read only to tell someone who set it, and not
+    /// [`Self::PRIVATE_KEY_VAR`], that the live path has moved, rather than
+    /// that a variable they have never heard of is missing.
+    pub const RETIRED_SECRET_VAR: &'static str = "BINANCE_API_SECRET";
 
     /// Read both from the environment.
     ///
@@ -210,7 +233,10 @@ impl Credentials {
     /// could trace back to the shell.
     pub fn from_env() -> Result<Self, CredentialError> {
         let key = read(Self::KEY_VAR)?;
-        let text = read(Self::PRIVATE_KEY_VAR)?;
+        let text = private_key_text(
+            read(Self::PRIVATE_KEY_VAR),
+            read(Self::RETIRED_SECRET_VAR).is_ok(),
+        )?;
         Self::new(key, &text)
     }
 
@@ -379,6 +405,26 @@ fn non_empty(name: &'static str, value: &str) -> Result<String, CredentialError>
     Ok(trimmed.to_owned())
 }
 
+/// The private key's text, or why there is none: `read` is what reading
+/// [`Credentials::PRIVATE_KEY_VAR`] gave, and `retired_secret_set` whether
+/// [`Credentials::RETIRED_SECRET_VAR`] is set.
+///
+/// A missing key beside a set HMAC secret is someone on the old path, and
+/// "this variable is missing" would send them looking for a value they do not
+/// have. Its own function, like [`non_empty`], so a test can drive it without
+/// touching the process environment.
+fn private_key_text(
+    read: Result<String, CredentialError>,
+    retired_secret_set: bool,
+) -> Result<String, CredentialError> {
+    match read {
+        Err(CredentialError::Missing(_)) if retired_secret_set => {
+            Err(CredentialError::HmacSecretInstead)
+        }
+        other => other,
+    }
+}
+
 /// Keys and helpers for tests, in this crate and only there.
 #[cfg(test)]
 pub(crate) mod fixture {
@@ -445,7 +491,7 @@ mod tests {
     use super::fixture::{
         eight_char_windows, example, percent_decode, EXAMPLE_KEY_BODY, EXAMPLE_KEY_PEM,
     };
-    use super::{non_empty, CredentialError, Credentials};
+    use super::{non_empty, private_key_text, CredentialError, Credentials};
 
     /// The payload of Binance's own Ed25519 example (fix-api.md:287-312): the
     /// FIX Logon's `MsgType`, `SenderCompID`, `TargetCompID`, `MsgSeqNum` and
@@ -687,6 +733,44 @@ mod tests {
         assert!(text.contains("BINANCE_ED25519_PRIVATE_KEY"), "{text}");
         assert!(text.contains("BINANCE_API_KEY"), "{text}");
         assert!(text.contains("never in a file"), "{text}");
+    }
+
+    #[test]
+    fn a_retired_hmac_secret_without_a_key_says_what_changed_and_how_to_make_a_pair() {
+        // Someone with slice (b)'s setup has an HMAC secret and no Ed25519 key.
+        // "BINANCE_ED25519_PRIVATE_KEY is not set" would send them looking for a
+        // value they do not have; this says why it is needed and how to make it.
+        let missing = || Err(CredentialError::Missing(Credentials::PRIVATE_KEY_VAR));
+        let why = private_key_text(missing(), true).expect_err("refused");
+        assert_eq!(why, CredentialError::HmacSecretInstead);
+        let said = why.to_string();
+        for needle in [
+            "BINANCE_ED25519_PRIVATE_KEY is not set",
+            "BINANCE_API_SECRET",
+            "no longer signs with an HMAC secret",
+            "deprecated",
+            "session logon",
+            "Ed25519",
+            "openssl genpkey -algorithm ed25519 -out key.pem",
+            "openssl pkey -in key.pem -pubout",
+            "BINANCE_API_KEY",
+        ] {
+            assert!(said.contains(needle), "{needle:?} missing from: {said}");
+        }
+
+        // Without the old secret it is the ordinary missing variable.
+        assert_eq!(
+            private_key_text(missing(), false),
+            Err(CredentialError::Missing(Credentials::PRIVATE_KEY_VAR))
+        );
+        // A key that is there is used, whatever else is set, and any other
+        // failure to read it is reported as itself.
+        assert_eq!(
+            private_key_text(Ok("text".to_owned()), true),
+            Ok("text".to_owned())
+        );
+        let not_text = CredentialError::NotText(Credentials::PRIVATE_KEY_VAR);
+        assert_eq!(private_key_text(Err(not_text.clone()), true), Err(not_text));
     }
 
     #[test]
