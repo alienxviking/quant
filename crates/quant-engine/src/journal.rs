@@ -733,6 +733,39 @@ pub struct Recovered {
     pub torn_before_restart: Vec<usize>,
 }
 
+impl Recovered {
+    /// The lines torn before a restart, said in one phrase, or `None` when
+    /// there are none.
+    ///
+    /// One phrase so that every reader says the same thing, and short enough
+    /// to ride on a verdict line: a verdict is the line an operator reads,
+    /// the one `ops/verify-loop.sh` copies into its log and `ops/status.sh`
+    /// shows, and a lost entry said only in a full report is said where
+    /// nobody looks. The torn *tail* is left out on purpose: it is the
+    /// ordinary state of a journal still being written, and only a restart
+    /// writing past a torn line makes the loss permanent.
+    #[must_use]
+    pub fn torn_note(&self) -> Option<String> {
+        let lines: Vec<String> = self
+            .torn_before_restart
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        match lines.as_slice() {
+            [] => None,
+            [line] => Some(format!(
+                "line {line} was torn by an interrupted write and a restart wrote past it, \
+                 so the entry on it is lost"
+            )),
+            _ => Some(format!(
+                "lines {} were torn by interrupted writes and restarts wrote past them, \
+                 so the entries on them are lost",
+                lines.join(", ")
+            )),
+        }
+    }
+}
+
 /// Read a journal back.
 ///
 /// A missing file is an empty journal, not an error: the first run of a session
@@ -1750,6 +1783,33 @@ mod tests {
         // overwritten or removed.
         let text = std::fs::read_to_string(&scratch.path).expect("read");
         assert!(text.contains("{\"type\":\"fil\n"), "{text}");
+    }
+
+    #[test]
+    fn a_line_torn_before_a_restart_is_said_in_one_phrase_and_a_torn_tail_is_not() {
+        // J14's half in the journal: the phrase a verdict line carries, so
+        // that `reconcile`, `runlog check` and `explain` say the same thing
+        // where an operator reads first. A torn tail is the ordinary state of
+        // a journal still being written, and is not in it.
+        let tail_only = Recovered {
+            torn_tail: true,
+            ..Recovered::default()
+        };
+        assert_eq!(tail_only.torn_note(), None);
+
+        let one = Recovered {
+            torn_before_restart: vec![5],
+            ..Recovered::default()
+        };
+        let said = one.torn_note().expect("a lost entry is said");
+        assert!(said.starts_with("line 5 was torn"), "{said}");
+
+        let two = Recovered {
+            torn_before_restart: vec![3, 9],
+            ..Recovered::default()
+        };
+        let said = two.torn_note().expect("two lost entries are said");
+        assert!(said.starts_with("lines 3, 9 were torn"), "{said}");
     }
 
     #[test]

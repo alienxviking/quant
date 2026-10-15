@@ -44,7 +44,7 @@ fn main() -> ExitCode {
 
     describe_journal(&path, &recovered);
     describe_portfolio(&portfolio, &registry, &recovered);
-    verdict(&recovered.entries)
+    verdict(&recovered)
 }
 
 /// `None` when the arguments were wrong or help was printed.
@@ -174,44 +174,55 @@ fn describe_portfolio(portfolio: &Portfolio, registry: &InstrumentRegistry, reco
 /// The engine accumulated its numbers in memory as fills arrived; this replayed
 /// them from the file afterwards. Their agreement is evidence. The identity
 /// printed above is not.
-fn verdict(entries: &[JournalEntry]) -> ExitCode {
+///
+/// A line torn before a restart rides on the verdict line, whatever the
+/// verdict, and changes no exit code. Agreement cannot see the entry it lost:
+/// the restarted engine resumed from the same short file, so its checkpoints
+/// and this fold are short by the same entry. The verdict line is what
+/// `ops/verify-loop.sh` copies into its log and `ops/status.sh` shows, so
+/// that is where the loss has to be said; the `torn` line above it is in a
+/// report nobody opens at 3am.
+fn verdict(recovered: &Recovered) -> ExitCode {
     println!();
-    match journal::agrees(entries) {
-        Agreement::Agrees => {
-            println!("verdict   AGREES: the engine's checkpoint matches this recompute");
-            ExitCode::SUCCESS
-        }
-        Agreement::NothingToCheck => {
-            // Deliberately not success, and its own exit code, distinct from
-            // both. "Nobody disagreed" and "two independent answers matched" are
-            // different statements and only one of them is evidence.
-            println!(
-                "verdict   NOTHING TO CHECK: no checkpoint in this journal, so the \
-                 recompute has nothing to be compared against"
-            );
-            ExitCode::from(2)
-        }
+    let (said, code) = match journal::agrees(&recovered.entries) {
+        Agreement::Agrees => (
+            "AGREES: the engine's checkpoint matches this recompute".to_owned(),
+            ExitCode::SUCCESS,
+        ),
+        // Deliberately not success, and its own exit code, distinct from
+        // both. "Nobody disagreed" and "two independent answers matched" are
+        // different statements and only one of them is evidence.
+        Agreement::NothingToCheck => (
+            "NOTHING TO CHECK: no checkpoint in this journal, so the recompute has \
+             nothing to be compared against"
+                .to_owned(),
+            ExitCode::from(2),
+        ),
         Agreement::Differs {
             field,
             claimed,
             recomputed,
-        } => {
-            println!(
-                "verdict   DISAGREES on {field}: the engine claimed {claimed}, \
-                 the journal replays to {recomputed}"
-            );
-            ExitCode::FAILURE
-        }
+        } => (
+            format!(
+                "DISAGREES on {field}: the engine claimed {claimed}, the journal replays \
+                 to {recomputed}"
+            ),
+            ExitCode::FAILURE,
+        ),
         Agreement::FillCountDiffers {
             claimed,
             recomputed,
-        } => {
-            println!(
-                "verdict   DISAGREES on fills: the engine counted {claimed}, the \
-                 journal holds {recomputed}. A fill was acted on and not written \
-                 down, or written twice."
-            );
-            ExitCode::FAILURE
-        }
+        } => (
+            format!(
+                "DISAGREES on fills: the engine counted {claimed}, the journal holds \
+                 {recomputed}. A fill was acted on and not written down, or written twice."
+            ),
+            ExitCode::FAILURE,
+        ),
+    };
+    match recovered.torn_note() {
+        Some(torn) => println!("verdict   {}. But {torn}", said.trim_end_matches('.')),
+        None => println!("verdict   {said}"),
     }
+    code
 }

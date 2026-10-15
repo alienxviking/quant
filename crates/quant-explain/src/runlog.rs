@@ -42,6 +42,14 @@
 //!   nothing we send, one finding per order however many lines it has;
 //! - a `doubt` raised and never cleared, about an order never seen to end.
 //!
+//! And a line torn by an interrupted write that a restart then wrote past is
+//! a finding, read by [`check_file`]: an entry was being written there and is
+//! lost, and nothing else in the file can say what it was. `reconcile`
+//! agrees across one, because the restarted engine resumed from the same
+//! short file, and the hole check need not see it either: a lost submission
+//! with the highest id leaves no hole, because the restart mints that id
+//! again.
+//!
 //! A `foreign` order that is not ours at all, a person's or another
 //! program's, is **counted rather than flagged**: sharing an account is a
 //! fact about the account, not a gap in this run's record, and a check that
@@ -58,7 +66,7 @@ use std::collections::BTreeMap;
 use quant_core::execution::VenueOrderId;
 use quant_core::report::{DoubtCause, DoubtChange, ForeignOutcome, Provenance, VenueText};
 use quant_core::time::Ts;
-use quant_engine::journal::{JournalEntry, StrayKind};
+use quant_engine::journal::{JournalEntry, Recovered, StrayKind};
 
 /// The first journal schema whose sessions write `sighted` lines.
 const SIGHTED_SINCE: u32 = 3;
@@ -109,6 +117,9 @@ pub enum Finding {
         since: Ts,
         cause: DoubtCause,
     },
+    /// A line an interrupted write tore and a restart then wrote past, so
+    /// the entry on it is lost. Numbered from 1, as an editor numbers them.
+    TornBeforeRestart { line: usize },
 }
 
 impl Finding {
@@ -124,6 +135,7 @@ impl Finding {
             Self::Stray { .. } => "stray",
             Self::ForeignOrder { .. } => "foreign",
             Self::LeftInDoubt { .. } => "in doubt",
+            Self::TornBeforeRestart { .. } => "torn",
         }
     }
 }
@@ -170,6 +182,11 @@ impl core::fmt::Display for Finding {
                      {trades} trade(s) on this run's account"
                 )
             }
+            Self::TornBeforeRestart { line } => write!(
+                f,
+                "line {line} was torn by an interrupted write and a restart wrote past \
+                 it, so the entry on it is lost and nothing here can say what it was"
+            ),
             Self::LeftInDoubt {
                 client_order_id,
                 since,
@@ -226,6 +243,23 @@ impl Report {
     pub fn is_complete(&self) -> bool {
         self.findings.is_empty()
     }
+}
+
+/// [`check`], and the lines `read` found torn before a restart.
+///
+/// What a caller holding the file rather than its entries runs, which is
+/// every caller but a test: a torn line is a fact about the file, and the
+/// entries alone cannot say where one was.
+#[must_use]
+pub fn check_file(recovered: &Recovered) -> Report {
+    let mut report = check(&recovered.entries);
+    report.findings.extend(
+        recovered
+            .torn_before_restart
+            .iter()
+            .map(|&line| Finding::TornBeforeRestart { line }),
+    );
+    report
 }
 
 /// Does this file account for every decision it implies?
@@ -1345,6 +1379,36 @@ mod tests {
             }]
         );
         assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn a_line_torn_before_a_restart_fails_the_check_where_nothing_else_can_see_it() {
+        // J14. The restarted engine resumed from the same short file, so
+        // nothing downstream disagrees: here the lost line is the highest
+        // submission, and the restart minted its id again, so the ids are
+        // dense and the decisions alone read COMPLETE.
+        let recovered = Recovered {
+            entries: vec![submitted(1, 10), submitted(2, 20)],
+            torn_tail: false,
+            torn_before_restart: vec![3],
+        };
+        assert!(
+            check(&recovered.entries).is_complete(),
+            "the entries see nothing"
+        );
+        let report = check_file(&recovered);
+        assert_eq!(
+            report.findings,
+            vec![Finding::TornBeforeRestart { line: 3 }]
+        );
+
+        // A torn tail is a journal still being written, not a lost entry.
+        let still_writing = Recovered {
+            torn_tail: true,
+            torn_before_restart: Vec::new(),
+            ..recovered
+        };
+        assert!(check_file(&still_writing).is_complete());
     }
 
     fn venue_id(id: &str) -> quant_core::execution::VenueOrderId {

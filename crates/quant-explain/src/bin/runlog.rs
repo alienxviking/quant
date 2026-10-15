@@ -64,7 +64,7 @@ fn check(path: &std::path::Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let report = runlog::check(&recovered.entries);
+    let report = runlog::check_file(&recovered);
     println!("runlog    {}", path.display());
     println!(
         "entries   {} lines, {} decisions, {} strategy claims",

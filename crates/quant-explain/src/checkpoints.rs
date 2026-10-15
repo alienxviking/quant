@@ -32,6 +32,12 @@ pub struct Agreement {
     /// The first disagreement, with both values. Only the first: a divergence
     /// propagates, so the hundredth is a consequence rather than a finding.
     pub divergence: Option<String>,
+    /// The lines torn before a restart, as [`Recovered::torn_note`] says
+    /// them. Not a disagreement, and never one: the restarted engine resumed
+    /// from the same short file, so its checkpoints agree with it.
+    ///
+    /// [`Recovered::torn_note`]: quant_engine::journal::Recovered::torn_note
+    pub torn: Option<String>,
 }
 
 impl Agreement {
@@ -49,7 +55,10 @@ impl Agreement {
 /// Propagates an unreadable journal.
 pub fn check_all(journal_path: &Path) -> std::io::Result<Agreement> {
     let recovered = journal::read(journal_path)?;
-    let mut out = Agreement::default();
+    let mut out = Agreement {
+        torn: recovered.torn_note(),
+        ..Agreement::default()
+    };
 
     for (i, entry) in recovered.entries.iter().enumerate() {
         let JournalEntry::Checkpoint {
@@ -145,6 +154,30 @@ mod tests {
         let agreement = check("sound", &lines);
         assert!(agreement.agrees(), "{:?}", agreement.divergence);
         assert_eq!(agreement.matched, 1, "the checkpoint was actually compared");
+    }
+
+    #[test]
+    fn a_line_torn_before_a_restart_is_said_beside_an_agreement() {
+        // J14 in `explain --check-journal`. The checkpoints agree, because the
+        // restarted engine resumed from the same short file, which is exactly
+        // why the loss has to be said beside the verdict rather than by it.
+        let lines = format!(
+            "{}\n{}\n{}\n{}",
+            sound_journal(),
+            r#"{"type":"fil"#,
+            r#"{"type":"started","at":2500,"cash":10000000000}"#,
+            honest_checkpoint()
+        );
+        let agreement = check("torn", &lines);
+        assert!(agreement.agrees(), "{:?}", agreement.divergence);
+        let torn = agreement.torn.expect("the lost entry is said");
+        assert!(torn.starts_with("line 4 was torn"), "{torn}");
+
+        let whole = check(
+            "whole",
+            &format!("{}\n{}", sound_journal(), honest_checkpoint()),
+        );
+        assert_eq!(whole.torn, None);
     }
 
     #[test]
