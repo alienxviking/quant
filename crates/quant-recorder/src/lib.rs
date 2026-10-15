@@ -120,7 +120,7 @@ pub mod tee;
 pub mod writer;
 
 pub use backoff::{Backoff, BackoffPolicy};
-pub use catalog::{catalog, Catalog, CatalogEntry, SessionFiles};
+pub use catalog::{account_catalog, catalog, AccountFiles, Catalog, CatalogEntry, SessionFiles};
 pub use ingress::{Accepted, GapOutcome, Ingress, IngressStats, WriterGone, MAX_PENDING_GAPS};
 pub use layout::{
     format_session_id, parse_session_id, parse_utc_date, CaptureStream, CaptureTarget,

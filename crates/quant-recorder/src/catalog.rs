@@ -6,6 +6,12 @@
 //! through [`CaptureTarget::parse`], and group the results into the sessions that
 //! produced them, with each session's segments in the order they were written.
 //!
+//! The account stream's tree, `root/account`, is walked the same way by
+//! [`account_catalog`], and only by it. Two functions over one walk, rather than
+//! one that returns both, because nearly every caller reads market data and
+//! must never be handed the account's files: [`catalog`] cannot return them,
+//! so no reader of market data can forget to leave them out.
+//!
 //! # Why this lives here and not in the tool that wants it
 //!
 //! The verifier needed it first, and for a while it was the verifier's own code.
@@ -45,7 +51,7 @@ use std::path::{Path, PathBuf};
 
 use quant_core::instrument::Exchange;
 
-use crate::layout::{CaptureTarget, RAW_DIR};
+use crate::layout::{CaptureStream, CaptureTarget, ACCOUNT_STREAM, RAW_DIR};
 
 /// One capture file, and where it sits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,14 +78,30 @@ pub struct SessionFiles {
     pub segments: Vec<CatalogEntry>,
 }
 
-/// Everything under a data root, sorted into what fits the layout and what does
-/// not.
-#[derive(Debug, Default)]
-pub struct Catalog {
+/// One account-stream capture session's files, in the order they were written.
+///
+/// Identity is `(exchange, session_id)`: the stream has no symbol, and the
+/// session is what tells two runs apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountFiles {
+    pub exchange: Exchange,
+    pub session_id: [u8; 16],
+    /// At least one, in write order.
+    pub segments: Vec<CatalogEntry>,
+}
+
+/// Everything in one capture tree under a data root, sorted into what fits the
+/// layout and what does not.
+///
+/// `S` is what one session's files are: [`SessionFiles`] for market data, from
+/// [`catalog`], or [`AccountFiles`] for the account stream, from
+/// [`account_catalog`].
+#[derive(Debug)]
+pub struct Catalog<S = SessionFiles> {
     /// Sessions, in the order their first segment was encountered.
-    pub sessions: Vec<SessionFiles>,
-    /// Files under `raw/` that are not market capture files at the expected
-    /// depth -- including another stream's, should one ever be moved there.
+    pub sessions: Vec<S>,
+    /// Files in the tree that are not its captures at the expected depth --
+    /// including the other stream's, should one ever be moved there.
     ///
     /// Not filtered out silently: something unexpected in the immutable tier is
     /// worth a line of output whatever it turns out to be. The macOS
@@ -94,6 +116,18 @@ pub struct Catalog {
     pub unreadable: Vec<(PathBuf, io::Error)>,
 }
 
+// By hand, because the derive would demand `S: Default`, which a session of
+// files has no business being.
+impl<S> Default for Catalog<S> {
+    fn default() -> Self {
+        Self {
+            sessions: Vec::new(),
+            strays: Vec::new(),
+            unreadable: Vec::new(),
+        }
+    }
+}
+
 /// Walk `root/raw` and group every market capture file into its session.
 ///
 /// Market data only, and that is the guarantee every reader of market data
@@ -106,7 +140,7 @@ pub struct Catalog {
 /// (the verifier's "NOTHING VERIFIED" verdict, for one).
 #[must_use]
 pub fn catalog(root: &Path) -> Catalog {
-    let mut out = Catalog::default();
+    let mut out: Catalog = Catalog::default();
     for path in walk(&root.join(RAW_DIR), &mut out.unreadable) {
         let parsed = CaptureTarget::parse(&path)
             .and_then(|target| Some((target.stream.symbol()?.to_owned(), target)));
@@ -124,6 +158,38 @@ pub fn catalog(root: &Path) -> Catalog {
             None => out.sessions.push(SessionFiles {
                 exchange: entry.target.exchange,
                 symbol,
+                session_id: entry.target.session_id,
+                segments: vec![entry],
+            }),
+        }
+    }
+    out
+}
+
+/// Walk `root/account` and group every account-stream capture file into its
+/// session, by the walk and the ordering [`catalog`] uses for market data.
+///
+/// The account stream only: a market capture found in this tree is a stray
+/// here, as an account file is one in `raw/`. A missing `account/` directory is
+/// not an error -- no run before M8 has one, and a root without one simply has
+/// no account stream to report.
+#[must_use]
+pub fn account_catalog(root: &Path) -> Catalog<AccountFiles> {
+    let mut out: Catalog<AccountFiles> = Catalog::default();
+    for path in walk(&root.join(ACCOUNT_STREAM), &mut out.unreadable) {
+        let Some(target) =
+            CaptureTarget::parse(&path).filter(|t| t.stream == CaptureStream::Account)
+        else {
+            out.strays.push(path);
+            continue;
+        };
+        let entry = CatalogEntry { path, target };
+        match out.sessions.iter_mut().find(|s| {
+            s.session_id == entry.target.session_id && s.exchange == entry.target.exchange
+        }) {
+            Some(existing) => existing.segments.push(entry),
+            None => out.sessions.push(AccountFiles {
+                exchange: entry.target.exchange,
                 session_id: entry.target.session_id,
                 segments: vec![entry],
             }),
@@ -174,7 +240,6 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, unreadable: &mut Vec<(PathBuf, io
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{CaptureStream, CaptureTarget};
     use quant_core::time::UtcDate;
 
     /// A tree of empty files at real capture paths. Contents are irrelevant here
@@ -344,6 +409,68 @@ mod tests {
             "only the account file moved into raw/, which is reported: {:?}",
             catalog.strays
         );
+    }
+
+    #[test]
+    fn the_account_catalog_finds_the_account_stream_in_write_order() {
+        // The same walk and the same ordering as market data, over the other
+        // tree: written out of order to prove the sort does the work.
+        let tree = Tree::new("account-order");
+        tree.account_segment(2, 23);
+        tree.account_segment(2, 21);
+        tree.account_segment(2, 22);
+        tree.account_segment(3, 22);
+        tree.segment("BTCUSDT", 1, 21, 0);
+
+        let catalog = account_catalog(&tree.root);
+        assert_eq!(catalog.sessions.len(), 2, "two runs, two sessions");
+        let first = catalog
+            .sessions
+            .iter()
+            .find(|s| s.session_id == [2; 16])
+            .expect("the session written on three days");
+        let days: Vec<u8> = first.segments.iter().map(|s| s.target.date.day).collect();
+        assert_eq!(days, vec![21, 22, 23]);
+        assert!(catalog
+            .sessions
+            .iter()
+            .flat_map(|s| &s.segments)
+            .all(|e| e.target.stream == CaptureStream::Account));
+        assert!(catalog.strays.is_empty(), "{:?}", catalog.strays);
+    }
+
+    #[test]
+    fn a_market_file_in_the_account_tree_is_a_stray_there() {
+        // The mirror of the market catalog's rule: each walks its own tree and
+        // reports the other stream's files as strays rather than taking them in.
+        let tree = Tree::new("account-strays");
+        tree.account_segment(2, 21);
+        Tree::touch(
+            &tree
+                .root
+                .join(ACCOUNT_STREAM)
+                .join("exchange=binance")
+                .join("symbol=BTCUSDT")
+                .join("date=2026-08-21")
+                .join("session=01010101-0101-0101-0101-010101010101")
+                .join("part-00000.bin.zst"),
+        );
+
+        let catalog = account_catalog(&tree.root);
+        assert_eq!(catalog.sessions.len(), 1, "{:?}", catalog.sessions);
+        assert_eq!(catalog.sessions[0].session_id, [2; 16]);
+        assert_eq!(catalog.strays.len(), 1, "{:?}", catalog.strays);
+    }
+
+    #[test]
+    fn a_root_with_no_account_tree_has_no_account_sessions() {
+        // Every root written before M8. Not an error: nothing was recorded.
+        let tree = Tree::new("no-account");
+        tree.segment("BTCUSDT", 1, 21, 0);
+        let catalog = account_catalog(&tree.root);
+        assert!(catalog.sessions.is_empty(), "{:?}", catalog.sessions);
+        assert!(catalog.strays.is_empty(), "{:?}", catalog.strays);
+        assert!(catalog.unreadable.is_empty());
     }
 
     #[test]
