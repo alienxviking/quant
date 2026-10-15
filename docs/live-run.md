@@ -440,10 +440,12 @@ feature.
    `ORDER_TIMEOUT`, 20 s, above the venue's ten plus `recvWindow`, so that the
    venue's `-1007` arrives first. With it `venue-check` proves the key's
    permission to trade with `POST /api/v3/order/test` (`TRADE`, weight 1,
-   rest-api.md:2321-2333), which its `USER_DATA` request could not, and refuses
-   READY while the account pays its fees in BNB, which the translator cannot
-   book. What remains of item 1 is the venue: none of it has met Binance, and
-   the testnet rehearsal (§5) is its first real test.
+   rest-api.md:2321-2333), which its `USER_DATA` request could not. READY needs
+   the venue to accept that probe, the run's own order, outright: any refusal of
+   it, a filter failure included, is NOT READY, because the run's orders would
+   meet it. And it refuses READY while the account pays its fees in BNB, which
+   the translator cannot book. What remains of item 1 is the venue: none of it
+   has met Binance, and the testnet rehearsal (§5) is its first real test.
 2. **The instrument comes from the venue.** `exchangeInfo` parsed into an
    `InstrumentDef`, naming the venue rules our `Filters` do not model
    (`MARKET_LOT_SIZE`, `applyMinToMarket`, `maxNotional`). Accepted when the
@@ -530,9 +532,16 @@ Ed25519 signature, the header and the clock in a single round trip and reads
 `TRADE`"* until trading is enabled for it in API Management, so a key without
 that permission passes it, and the venue never defines `canTrade`. So
 `POST /api/v3/order/test`, a `TRADE` request at weight 1 that validates a market
-buy without sending it to the matching engine, is what proves the permission. A
-refusal of the probe's numbers proves it too, on a reading of the documentation
-the rehearsal has to confirm (`TradeClient::check_trade_permission`).
+buy without sending it to the matching engine, is what proves the permission,
+and READY needs it to accept the probe outright. The probe is the run's own
+order, a market buy of the run's symbol at the run's size, and nothing else of
+`venue-check`'s reaches the request, so any refusal of it is one the run's orders
+would meet. A filter failure is NOT READY and names the filter, whether that
+filter judges the order's numbers or the account's open orders and position
+(filters.md:217-219, :253-260, :331-333). Such a refusal also suggests the key
+may trade, since the venue judged the order, but only on a reading of the
+documentation that the Spot Testnet rehearsal has to confirm
+(`TradeClient::check_trade_permission`), and READY never rests on it.
 `GET /api/v3/account/commission` then checks that the account does not pay its
 fees in BNB. READY means all three passed. It prints the loaded key's public
 half to compare with the one registered, names why a refusal was refused, and

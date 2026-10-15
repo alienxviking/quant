@@ -2225,9 +2225,12 @@ there. **READY now covers permission to trade** (`m8c-order-transport`). The
 account request is `USER_DATA`, which a key that cannot `TRADE` passes, and its
 `canTrade` is a field the venue never defines; so READY also needs
 `POST /api/v3/order/test`, a `TRADE` request at weight 1 that validates a
-market buy and sends nothing to the matching engine, to show the key may
-trade, and the account not to pay its fees in BNB, which the translator
-refuses.
+market buy and sends nothing to the matching engine, to accept the run's own
+order outright, which shows the key may trade, and the account not to pay its
+fees in BNB, which the translator refuses. Any refusal of the probe is NOT
+READY, a filter failure included: the probe is the run's size on the run's
+symbol, and filters such as `MAX_NUM_ORDERS` and `MAX_POSITION` judge the
+account, so the run's orders would meet them too.
 `--symbol` sets the symbol both are asked about, `BTCUSDT` by default. Its
 first run here, with Binance's published example key against Spot Testnet,
 read the host **2409 ms ahead** and stopped before signing anything, which

@@ -18,9 +18,10 @@
 //!   `canTrade` does not settle it either: the venue's documentation shows the
 //!   field and never defines it. This endpoint is `TRADE`, weight 1, and
 //!   *"Creates and validates a new order but does not send it into the matching
-//!   engine"* (rest-api.md:2321-2333). It is sent a market buy of the checked
-//!   symbol, encoded as the run's orders are; [`probe`] says what it holds, and
-//!   why a refusal of its numbers still proves the permission.
+//!   engine"* (rest-api.md:2321-2333). It is sent the run's own order, a market
+//!   buy of the checked symbol at the run's size, encoded as the run's orders
+//!   are, and must accept it outright: [`probe`] says why any refusal of it, a
+//!   filter failure included, is not ready.
 //! - **`GET /api/v3/account/commission`** checks that the account does not pay
 //!   its fees in BNB (rest-api.md:4797-4846). A fee taken in BNB is in neither
 //!   asset of the pair, and the user-data translator refuses a fill whose fee
@@ -28,7 +29,8 @@
 //!   account's commission rates, of which this prints the one flag it reads.
 //!
 //! READY means all of it: the key, the signature and the clock work, the
-//! account reports `canTrade`, the key may trade, and fees are not paid in BNB.
+//! account reports `canTrade`, the venue accepts the run's own order outright,
+//! which shows the key may trade, and fees are not paid in BNB.
 //!
 //! ```text
 //! # bash
@@ -68,8 +70,7 @@ use quant_binance::credentials::Credentials;
 use quant_binance::orders::{EncodeError, NewOrder};
 use quant_binance::rest::{SnapshotClient, SPOT_REST, SPOT_TESTNET_REST};
 use quant_binance::trade::{
-    ClockSample, NotReady, TradeClient, TradePermission, MAX_CLOCK_SKEW_MS, MIN_CLOCK_READINGS,
-    WHY_A_VERDICT_PROVES_PERMISSION,
+    ClockSample, NotReady, TradeClient, MAX_CLOCK_SKEW_MS, MIN_CLOCK_READINGS,
 };
 use quant_binance::user_data::RunTag;
 use quant_core::event::Side;
@@ -155,7 +156,8 @@ Exit 0 ready, 1 not ready, 2 for an argument it does not take.
 /// commission rates were read and are not printed.
 const READY: &str = "\
 verdict      READY: the API key, the Ed25519 key, the signature and the clock work,
-             the account reports canTrade, this API key may trade, and the account
+             the account reports canTrade, this API key may trade, the venue found
+             nothing to refuse in a market buy at the run's size, and the account
              does not pay its fees in BNB. Nothing was ordered: the trade probe went
              to /api/v3/order/test, which validates an order without sending it to
              the matching engine. Balances and commission rates are not printed.
@@ -375,12 +377,16 @@ async fn clock_offset(venue: Venue) -> Result<i64, ExitCode> {
 /// register them, there because an instrument must have some, and the asset
 /// names stay empty because nothing reads them.
 ///
-/// The venue does check the probe's quantity, against its current rules, and
-/// may refuse it on a filter: rules that changed, or another symbol's. That
-/// answer still proves what the probe is for, because
-/// [`WHY_A_VERDICT_PROVES_PERMISSION`]: the venue judges the order only once
-/// the request has passed the checks a key without permission to trade fails.
-/// `TradeClient::check_trade_permission` gives the documentation behind it.
+/// So nothing of those literals reaches the request, and what does is the run's
+/// own order: its symbol, side, type and size. The venue checks it against its
+/// rules and the account as they stand, as it will check the run's, and some of
+/// its filters judge the account rather than the order: the orders open on the
+/// symbol or on the exchange, and the position in the base asset
+/// (filters.md:217-219, :253-260, :331-333). Any refusal of the probe, a filter
+/// failure included, is one the run's orders would meet, so READY needs the
+/// venue to accept it outright. `TradeClient::check_trade_permission` sorts the
+/// answers, and says what a refusal suggests about the key, and on what
+/// footing.
 fn probe(symbol: &str) -> Result<NewOrder, EncodeError> {
     let instrument = InstrumentDef {
         exchange: Exchange::Binance,
@@ -424,29 +430,15 @@ async fn check(venue: Venue, symbol: &str, credentials: Credentials, offset: i64
             return ExitCode::FAILURE;
         }
     };
-    match client.check_trade_permission(&probe, offset).await {
-        Ok(TradePermission::Granted) => println!(
-            "permission   POST /api/v3/order/test accepted a market buy of {PROBE_QTY} {symbol}: \
-             this API key may trade"
-        ),
-        Ok(TradePermission::GrantedButFiltered {
-            status,
-            venue: said,
-            ..
-        }) => {
-            println!(
-                "permission   POST /api/v3/order/test refused the probe on its numbers (HTTP \
-                 {status}, code {}: {}), and this API key may trade all the same, because \
-                 {WHY_A_VERDICT_PROVES_PERMISSION}",
-                said.code, said.msg
-            );
-            println!(
-                "             the probe's numbers are literals, not the venue's current rules, \
-                 so the filter says nothing about the run"
-            );
-        }
-        Err(why) => return not_ready(venue, &why),
+    // Ready only on the venue's acceptance outright: a refusal of the probe,
+    // a filter failure included, is one the run's own orders would meet.
+    if let Err(why) = client.check_trade_permission(&probe, offset).await {
+        return not_ready(venue, &why);
     }
+    println!(
+        "permission   POST /api/v3/order/test accepted a market buy of {PROBE_QTY} {symbol}, the \
+         run's own order, and refused nothing: this API key may trade"
+    );
 
     if let Err(why) = client.check_bnb_discount_off(symbol, offset).await {
         return not_ready(venue, &why);
@@ -593,12 +585,15 @@ mod tests {
     fn ready_says_what_it_proved_and_that_nothing_was_ordered() {
         // Each of the three requests has its clause, the permission to trade
         // among them now that a TRADE request proves it, and the pass says
-        // where the probe went: an order that was only validated.
+        // where the probe went: an order that was only validated. READY
+        // follows only the venue's acceptance of the probe outright, so it
+        // says that too: a pass is a pass for the run's own order.
         let said = READY.split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
             "READY: the API key, the Ed25519 key, the signature and the clock work",
             "the account reports canTrade",
             "this API key may trade",
+            "the venue found nothing to refuse in a market buy at the run's size",
             "the account does not pay its fees in BNB",
             "Nothing was ordered",
             "/api/v3/order/test, which validates an order without sending it to the matching \

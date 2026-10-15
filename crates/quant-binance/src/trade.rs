@@ -358,13 +358,31 @@ pub enum NotReady {
         venue: Option<VenueError>,
     },
     /// The venue judged the trade probe and refused it for a reason other
-    /// than one of its numbers: `-1013` or `-2010` with any message but a
-    /// filter failure (errors.md:367-413). The signature and the key's
-    /// permission to trade were accepted, or the order would not have been
-    /// judged, but the venue named a reason it refuses an order, and an
-    /// order of the run's may meet it too. From
+    /// than a filter: `-1013` or `-2010` with any message but a filter
+    /// failure (errors.md:367-413). The venue named a reason it refuses an
+    /// order, and an order of the run's may meet it too. From
     /// [`TradeClient::check_trade_permission`].
+    ///
+    /// That the venue judged the order at all suggests it accepted the
+    /// signature and the key's permission to trade, and the reason says so,
+    /// as a reading the Spot Testnet rehearsal must confirm.
     ProbeRefused { status: u16, venue: VenueError },
+    /// The venue refused the trade probe on a filter: `-1013` or `-2010`
+    /// with *"Filter failure: NAME"* (errors.md:425-446). The probe is the
+    /// run's own order ([`TradeClient::check_trade_permission`]), so the
+    /// run's orders would meet the same filter, and that holds for both
+    /// kinds there are: the filters that judge an order's numbers, and those
+    /// that judge the account, its open orders on the symbol or on the
+    /// exchange and its position in the base asset (filters.md:217-219,
+    /// :253-260, :331-333; errors.md:436-446). `filter` is the one the venue
+    /// cited.
+    ///
+    /// Read for the key's permission as [`Self::ProbeRefused`] is.
+    ProbeFiltered {
+        status: u16,
+        filter: FilterName,
+        venue: VenueError,
+    },
     /// The venue answered the trade probe with a 2xx, and not with the JSON
     /// object documented for it (rest-api.md:2349-2353).
     UnreadableOrderTest { status: u16 },
@@ -410,30 +428,19 @@ impl core::fmt::Display for CommissionFault {
 /// (rest-api.md:4797-4813).
 const COMMISSION_PATH: &str = "/api/v3/account/commission";
 
-/// What `POST /api/v3/order/test` showed about this API key, when it showed
-/// that the key may trade. From [`TradeClient::check_trade_permission`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TradePermission {
-    /// The venue validated the probe order and found nothing to refuse.
-    Granted,
-    /// The venue refused the probe on one of its numbers, *"Filter failure:
-    /// NAME"* (errors.md:425-446). Still proof the key may trade
-    /// ([`WHY_A_VERDICT_PROVES_PERMISSION`]): the numbers are the probe's,
-    /// not the run's.
-    GrantedButFiltered {
-        status: u16,
-        filter: FilterName,
-        venue: VenueError,
-    },
-}
-
-/// Why a verdict on the trade probe's order, a refusal included, proves the
-/// signature and the key's permission to trade, said the same way wherever
-/// one is reported. [`TradeClient::check_trade_permission`] gives the
+/// What a refusal of the trade probe's order suggests about the signature and
+/// the key's permission to trade, and on what footing, said the same way
+/// wherever one is reported. [`TradeClient::check_trade_permission`] gives the
 /// documentation behind it.
-pub const WHY_A_VERDICT_PROVES_PERMISSION: &str = "the venue judges an order only for a \
-     request whose signature and key it has accepted for trading, and refuses one that fails \
-     either with a code of its own, -1022 or -2015";
+///
+/// A reading, and never a reason to be ready: only a probe the venue accepts
+/// outright is.
+const A_VERDICT_SUGGESTS_PERMISSION: &str = "That the venue judged the order at all suggests \
+     it accepted the signature and this key's permission to trade, because it judges an order \
+     only for a request whose signature and key it has accepted for trading, and refuses one \
+     that fails either with a code of its own, -1022 or -2015. That is a reading of its \
+     documentation, which does not state the order of its checks, and the Spot Testnet \
+     rehearsal must confirm it";
 
 /// The venue's own account of a refusal: its error document,
 /// `{"code": -2015, "msg": "..."}` (errors.md:3-10).
@@ -526,6 +533,30 @@ fn fmt_rate_limited(
         Some(wait) => write!(f, "; its Retry-After says {wait} (seconds)"),
         None => Ok(()),
     }
+}
+
+/// [`NotReady::ProbeFiltered`], said: the filter the venue cited, by its name
+/// when this knows it, and why it stops the run as well as the probe.
+fn fmt_probe_filtered(
+    f: &mut core::fmt::Formatter<'_>,
+    status: u16,
+    filter: FilterName,
+    venue: &VenueError,
+) -> core::fmt::Result {
+    match filter.as_str() {
+        Some(name) => write!(f, "the venue refused the trade probe on its {name} filter")?,
+        None => f.write_str(
+            "the venue refused the trade probe on a filter this does not know, which its message \
+             names",
+        )?,
+    }
+    write!(
+        f,
+        " (HTTP {status}{}). The probe is the run's own order, so the run's own orders would meet \
+         the same filter, whether it judges the order's numbers or the account's open orders or \
+         position. {A_VERDICT_SUGGESTS_PERMISSION}",
+        Said(Some(venue)),
+    )
 }
 
 /// [`NotReady::TooFewClockReadings`], said: how many came back, how many of
@@ -638,12 +669,16 @@ impl core::fmt::Display for NotReady {
             ),
             Self::ProbeRefused { status, venue } => write!(
                 f,
-                "the venue refused the trade probe for a reason other than its numbers (HTTP \
-                 {status}{}). That proves the signature and this key's permission to trade, \
-                 because {WHY_A_VERDICT_PROVES_PERMISSION}; but an order of the run's may meet \
-                 the same refusal",
+                "the venue refused the trade probe for a reason other than a filter (HTTP \
+                 {status}{}), and an order of the run's may meet the same refusal. \
+                 {A_VERDICT_SUGGESTS_PERMISSION}",
                 Said(Some(venue)),
             ),
+            Self::ProbeFiltered {
+                status,
+                filter,
+                venue,
+            } => fmt_probe_filtered(f, *status, *filter, venue),
             Self::UnreadableOrderTest { status } => write!(
                 f,
                 "the venue answered the trade probe with HTTP {status}, but not with the JSON \
@@ -943,9 +978,10 @@ impl TradeClient {
         account_can_trade(&reply.body)
     }
 
-    /// Check that this API key may trade, by sending `probe` to
-    /// `POST /api/v3/order/test`, which *"Creates and validates a new order but
-    /// does not send it into the matching engine"* (rest-api.md:2321-2326).
+    /// Check that this API key may trade, and that the venue would take the
+    /// run's order, by sending `probe` to `POST /api/v3/order/test`, which
+    /// *"Creates and validates a new order but does not send it into the
+    /// matching engine"* (rest-api.md:2321-2326).
     ///
     /// Its security type is `TRADE`, which an API key lacks until trading is
     /// enabled for it in API Management (rest-api.md:186-196), so it tests
@@ -956,27 +992,39 @@ impl TradeClient {
     /// request to `/api/v3/order`. Stamped as `check_ready` stamps, the host's
     /// clock less `offset_ms`, and sent once.
     ///
+    /// `probe` is the run's own order, as `venue-check`'s is: its symbol,
+    /// side, type and size, encoded as the run encodes them. The venue checks
+    /// it against its rules and the account as they stand, so whatever it
+    /// refuses the probe for, the run's orders would meet too.
+    ///
     /// What the answer says:
     ///
     /// - **A 2xx with a JSON object**, `{}` as documented
-    ///   (rest-api.md:2349-2353): the key may trade.
-    /// - **A 401, or `-2015`**: it may not ([`NotReady::KeyCannotTrade`]).
+    ///   (rest-api.md:2349-2353): the key may trade, and the venue found
+    ///   nothing in the order to refuse. The only answer that is `Ok`.
+    /// - **A 401, or `-2015`**: the key may not trade
+    ///   ([`NotReady::KeyCannotTrade`]).
     /// - **A refusal of the order itself**, under `-1013`, the API refusing a
     ///   request before the matching engine, or `-2010`, an order refused
-    ///   (errors.md:36-38, 329-330, 367-368): the venue judged the probe,
-    ///   which proves the signature and the key's permission were accepted
-    ///   ([`WHY_A_VERDICT_PROVES_PERMISSION`]). The documentation makes a
-    ///   valid key and signature the condition of a `TRADE` endpoint at all
+    ///   (errors.md:36-38, 329-330, 367-368): not ready, because the run's
+    ///   orders would meet it. A filter failure is [`NotReady::ProbeFiltered`],
+    ///   naming the filter, and any other reason [`NotReady::ProbeRefused`].
+    ///   A filter is no more the probe's alone than any other reason: some
+    ///   judge an order's numbers, which are the run's, and some the
+    ///   account's open orders and position (filters.md:217-219, :253-260,
+    ///   :331-333; errors.md:436-446).
+    ///
+    ///   Either refusal's reason also says that the venue judged the order,
+    ///   which suggests it accepted the signature and the key's permission to
+    ///   trade. The documentation makes a valid key and signature the
+    ///   condition of a `TRADE` endpoint at all
     ///   (rest-api.md:186-189, 205-207), names validating the order as this
     ///   endpoint's work (rest-api.md:2326), and answers a key or signature
     ///   that fails with its own code, -2015 or -1022 (errors.md:57-58,
     ///   341-342), not with a verdict on the order. It does not spell out the
-    ///   order of the venue's checks, so that is a reading, and the testnet
-    ///   run is where it is confirmed. A filter failure is
-    ///   [`TradePermission::GrantedButFiltered`]: the probe's numbers are the
-    ///   caller's, not the run's, so a filter refusing them says nothing about
-    ///   the run. Any other reason is [`NotReady::ProbeRefused`], because an
-    ///   order of the run's may meet it.
+    ///   order of the venue's checks, so that is a reading, which the Spot
+    ///   Testnet rehearsal must confirm, and the reason calls it one. Nothing
+    ///   is ready on it.
     /// - **Anything else** as [`Self::check_ready`] reports a refusal: a
     ///   firewall, a rate limit or a ban, the venue's own failure, which decide
     ///   first whatever code comes with them; a bad signature or key format;
@@ -990,7 +1038,7 @@ impl TradeClient {
         &self,
         probe: &NewOrder,
         offset_ms: i64,
-    ) -> Result<TradePermission, NotReady> {
+    ) -> Result<(), NotReady> {
         let now = chrono_millis().saturating_sub(offset_ms);
         let reply = self
             .send_signed(reqwest::Method::POST, ORDER_TEST_PATH, probe.query(), now)
@@ -1153,16 +1201,13 @@ fn account_can_trade(body: &[u8]) -> Result<(), NotReady> {
     }
 }
 
-/// What an answer to `POST /api/v3/order/test` says about the key, sorted as
-/// [`TradeClient::check_trade_permission`] describes.
-fn read_order_test(
-    status: u16,
-    retry_after: Option<String>,
-    body: &[u8],
-) -> Result<TradePermission, NotReady> {
+/// What an answer to `POST /api/v3/order/test` says, sorted as
+/// [`TradeClient::check_trade_permission`] describes: `Ok` only for the
+/// venue's acceptance of the probe outright.
+fn read_order_test(status: u16, retry_after: Option<String>, body: &[u8]) -> Result<(), NotReady> {
     if (200..=299).contains(&status) {
         return match serde_json::from_slice::<serde_json::Value>(body) {
-            Ok(serde_json::Value::Object(_)) => Ok(TradePermission::Granted),
+            Ok(serde_json::Value::Object(_)) => Ok(()),
             _ => Err(NotReady::UnreadableOrderTest { status }),
         };
     }
@@ -1175,15 +1220,17 @@ fn read_order_test(
             status,
             venue: Some(venue),
         }),
+        // A verdict on the order, which is the run's: never ready, a filter
+        // failure included, since the run's orders would meet it too.
         (_, Some(venue)) if matches!(venue.code, -1013 | -2010) => {
-            match FilterName::in_message(&venue.msg) {
-                Some(filter) => Ok(TradePermission::GrantedButFiltered {
+            Err(match FilterName::in_message(&venue.msg) {
+                Some(filter) => NotReady::ProbeFiltered {
                     status,
                     filter,
                     venue,
-                }),
-                None => Err(NotReady::ProbeRefused { status, venue }),
-            }
+                },
+                None => NotReady::ProbeRefused { status, venue },
+            })
         }
         _ => Err(classify_refusal(status, retry_after, body)),
     }
@@ -1298,8 +1345,7 @@ mod tests {
     use super::{
         account_can_trade, bnb_discount_off, classify_refusal, midpoint_offset_ms, read_order_test,
         redact_signature, AccountFault, ClockSample, CommissionFault, NotReady, TradeClient,
-        TradePermission, VenueError, MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
-        WHY_A_VERDICT_PROVES_PERMISSION,
+        VenueError, A_VERDICT_SUGGESTS_PERMISSION, MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
     };
     use crate::credentials::fixture;
     use crate::orders::{
@@ -2067,6 +2113,11 @@ mod tests {
                 status: 400,
                 venue: venue.clone().expect("a venue error"),
             },
+            NotReady::ProbeFiltered {
+                status: 400,
+                filter: FilterName::Notional,
+                venue: venue.clone().expect("a venue error"),
+            },
         ]
         .iter()
         .map(ToString::to_string)
@@ -2597,7 +2648,7 @@ mod tests {
                 payload.starts_with(&format!("{}&timestamp=", probe.query())),
                 "{payload}"
             );
-            assert_eq!(answer, Ok(TradePermission::Granted), "{symbol:?}");
+            assert_eq!(answer, Ok(()), "{symbol:?}");
         }
     }
 
@@ -2631,7 +2682,7 @@ mod tests {
 
         let cannot = |status, venue| Err(NotReady::KeyCannotTrade { status, venue });
         let filtered = |filter, code, msg| {
-            Ok(TradePermission::GrantedButFiltered {
+            Err(NotReady::ProbeFiltered {
                 status: 400,
                 filter,
                 venue: read(code, msg),
@@ -2644,9 +2695,10 @@ mod tests {
             })
         };
         let unreadable = Err(NotReady::UnreadableOrderTest { status: 200 });
-        let cases: [(u16, String, Result<TradePermission, NotReady>); 11] = [
-            // Validated, and nothing to refuse (rest-api.md:2349-2353).
-            (200, "{}".to_owned(), Ok(TradePermission::Granted)),
+        let cases: [(u16, String, Result<(), NotReady>); 11] = [
+            // Validated, and nothing to refuse (rest-api.md:2349-2353): the
+            // one answer that is ready.
+            (200, "{}".to_owned(), Ok(())),
             // A 2xx that is not the venue's answer shows nothing either way.
             (200, "<html>Sign in".to_owned(), unreadable.clone()),
             (200, "[]".to_owned(), unreadable),
@@ -2655,7 +2707,8 @@ mod tests {
             (401, doc(-2015, key), cannot(401, Some(read(-2015, key)))),
             (401, String::new(), cannot(401, None)),
             (400, doc(-2015, key), cannot(400, Some(read(-2015, key)))),
-            // A verdict on the probe's numbers: the key may trade.
+            // A filter failure, under either code: not ready, and the filter
+            // the venue cited is kept.
             (
                 400,
                 doc(-1013, notional),
@@ -2666,7 +2719,7 @@ mod tests {
                 doc(-2010, lot),
                 filtered(FilterName::LotSize, -2010, lot),
             ),
-            // A verdict for any other reason: the key may trade, and the run
+            // A verdict for any other reason: not ready either, since the run
             // may meet the same refusal.
             (400, doc(-1013, closed), probe_refused(-1013, closed)),
             (400, doc(-2010, disabled), probe_refused(-2010, disabled)),
@@ -2792,7 +2845,7 @@ mod tests {
     }
 
     #[test]
-    fn what_the_trade_probe_says_names_the_remedy_and_why_a_refusal_proves_permission() {
+    fn what_the_trade_probe_says_names_the_remedy_and_calls_a_refusal_a_reading_of_permission() {
         let said = NotReady::KeyCannotTrade {
             status: 401,
             venue: Some(VenueError {
@@ -2819,12 +2872,91 @@ mod tests {
         .to_string();
         for needle in [
             "(HTTP 400, code -1013: Market is closed.)",
-            "proves the signature and this key's permission to trade",
-            WHY_A_VERDICT_PROVES_PERMISSION,
             "an order of the run's may meet the same refusal",
+            // What the refusal suggests about the key, and that it is a
+            // reading of the documentation, not a proof: nothing in it states
+            // the order of the venue's checks.
+            "suggests it accepted the signature and this key's permission to trade",
+            "does not state the order of its checks",
+            "the Spot Testnet rehearsal must confirm it",
+            A_VERDICT_SUGGESTS_PERMISSION,
         ] {
             assert!(said.contains(needle), "{needle:?} missing from: {said}");
         }
+        assert!(!said.contains("prove"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_filter_failure_on_the_trade_probe_is_not_ready_and_names_the_filter() {
+        // The probe is the run's own order, and nothing else of the caller's
+        // reaches the request, so a filter that refuses it refuses the run's
+        // orders too: one that judges the order's numbers, NOTIONAL
+        // (errors.md:433), and one that judges the account, MAX_NUM_ORDERS,
+        // too many orders open on the symbol (errors.md:437;
+        // filters.md:217-219), which no change to the probe would pass.
+        // Through the client, as venue-check meets it.
+        for (name, filter) in [
+            ("NOTIONAL", FilterName::Notional),
+            ("MAX_NUM_ORDERS", FilterName::MaxNumOrders),
+        ] {
+            let msg = format!("Filter failure: {name}");
+            let venue = TestVenue::start(vec![Reply::Bytes(http(
+                "400 Bad Request",
+                "",
+                &error_doc(-1013, &msg),
+            ))]);
+            let answer = client_at(&venue.base)
+                .check_trade_permission(&order_on("BTCUSDT"), 0)
+                .await;
+            assert_eq!(venue.stop().len(), 1, "{name}");
+            let Err(why) = answer else {
+                panic!("a failure of {name} was taken for ready")
+            };
+            assert_eq!(
+                why,
+                NotReady::ProbeFiltered {
+                    status: 400,
+                    filter,
+                    venue: error_read(-1013, &msg),
+                },
+                "{name}"
+            );
+            // The reason names the filter the venue cited, and why it stops
+            // the run and not only the probe.
+            let said = why.to_string();
+            for needle in [
+                format!("the venue refused the trade probe on its {name} filter (HTTP 400, "),
+                format!("code -1013: Filter failure: {name})"),
+                "The probe is the run's own order, so the run's own orders would meet the same \
+                 filter"
+                    .to_owned(),
+                "the Spot Testnet rehearsal must confirm it".to_owned(),
+            ] {
+                assert!(said.contains(&needle), "{needle:?} missing from: {said}");
+            }
+        }
+
+        // A filter this does not know is a filter failure all the same, and
+        // its reason does not pretend to a name: the venue's message has it.
+        let msg = "Filter failure: SOMETHING_NEW";
+        let why =
+            read_order_test(400, None, error_doc(-1013, msg).as_bytes()).expect_err("not ready");
+        assert_eq!(
+            why,
+            NotReady::ProbeFiltered {
+                status: 400,
+                filter: FilterName::Unrecognised,
+                venue: error_read(-1013, msg),
+            }
+        );
+        let said = why.to_string();
+        assert!(
+            said.starts_with(
+                "the venue refused the trade probe on a filter this does not know, which its \
+                 message names (HTTP 400, code -1013: Filter failure: SOMETHING_NEW)"
+            ),
+            "{said}"
+        );
     }
 
     /// A rate in the commission fixture distinctive enough that a reason which
