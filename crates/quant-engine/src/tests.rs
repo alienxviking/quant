@@ -16,7 +16,7 @@ use quant_core::instrument::{
 };
 use quant_core::source::{EventSource, SourceError};
 use quant_core::time::Ts;
-use quant_core::Notional;
+use quant_core::{Notional, Qty};
 
 use crate::{AllowAll, Context, Engine, ExecutionVenue, Refusal, RiskLayer, Strategy};
 
@@ -569,34 +569,170 @@ fn client_order_ids_are_unique_even_across_refusals() {
     assert_eq!(ids, &[ClientOrderId(1), ClientOrderId(2)]);
 }
 
-/// Everything the engine told an observer, in order.
+/// One thing the engine told an observer, in the words a test compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Heard {
+    Submitted(ClientOrderId, Ts),
+    Refused(ClientOrderId, RejectReason, crate::RefusedBy, Ts),
+    Accepted(ClientOrderId, Ts),
+    Rejected(ClientOrderId, RejectReason, Ts),
+    CancelRequested(ClientOrderId, Ts),
+    Cancelled(ClientOrderId, Qty, Ts),
+    Tripped(crate::risk::TripCause, Ts),
+    Blind(GapCause, Ts, Ts),
+    Note(&'static str, Ts),
+    Orphaned(ClientOrderId, Ts),
+    Filled(ClientOrderId, Qty, Ts),
+}
+
+/// Everything the engine told an observer, in the order it was told.
 ///
 /// The first `RunObserver` in a test: slices (a) through (c) built the hooks and
 /// pinned their *payloads* in `journal.rs`, which leaves the wiring — whether
 /// the engine calls them at all, and when — resting on the paper binary. That is
 /// the shape of defect M6 found in M5.c, where `FillObserver` was never invoked
 /// and the durability the slice claimed did not exist.
+///
+/// One log for every hook rather than a list per hook, because the order is
+/// most of what there is to check: a fill written down after the strategy
+/// acted on it is the defect the write-ahead rule exists to stop, and three
+/// separate lists could not show it. It heard three of the eleven hooks until
+/// the venue seam needed the rest.
 #[derive(Debug, Default)]
 struct Witness {
-    tripped: Vec<(crate::risk::TripCause, Ts)>,
-    blind: Vec<(GapCause, Ts, Ts)>,
-    notes: Vec<(&'static str, Ts)>,
+    heard: Vec<Heard>,
+}
+
+impl Witness {
+    fn tripped(&self) -> Vec<(crate::risk::TripCause, Ts)> {
+        self.heard
+            .iter()
+            .filter_map(|h| match h {
+                Heard::Tripped(cause, at) => Some((*cause, *at)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn blind(&self) -> Vec<(GapCause, Ts, Ts)> {
+        self.heard
+            .iter()
+            .filter_map(|h| match h {
+                Heard::Blind(cause, last_good, at) => Some((*cause, *last_good, *at)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn notes(&self) -> Vec<(&'static str, Ts)> {
+        self.heard
+            .iter()
+            .filter_map(|h| match h {
+                Heard::Note(kind, at) => Some((*kind, *at)),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 impl crate::RunObserver for std::sync::Arc<std::sync::Mutex<Witness>> {
+    fn on_submitted(
+        &mut self,
+        client_order_id: ClientOrderId,
+        _request: &OrderRequest,
+        _mark: Option<quant_core::Px>,
+        at: Ts,
+    ) {
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::Submitted(client_order_id, at));
+    }
+
+    fn on_refused(
+        &mut self,
+        client_order_id: ClientOrderId,
+        _request: &OrderRequest,
+        reason: RejectReason,
+        _bound: Option<crate::risk::Bound>,
+        by: crate::RefusedBy,
+        at: Ts,
+    ) {
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::Refused(client_order_id, reason, by, at));
+    }
+
+    fn on_accepted(&mut self, client_order_id: ClientOrderId, at: Ts) {
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::Accepted(client_order_id, at));
+    }
+
+    fn on_rejected(&mut self, client_order_id: ClientOrderId, reason: RejectReason, at: Ts) {
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::Rejected(client_order_id, reason, at));
+    }
+
+    fn on_cancel_requested(&mut self, client_order_id: ClientOrderId, at: Ts) {
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::CancelRequested(client_order_id, at));
+    }
+
+    fn on_cancelled(&mut self, client_order_id: ClientOrderId, remaining: Qty, at: Ts) {
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::Cancelled(client_order_id, remaining, at));
+    }
+
     fn on_tripped(&mut self, cause: crate::risk::TripCause, at: Ts) {
-        self.lock().expect("witness").tripped.push((cause, at));
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::Tripped(cause, at));
     }
 
     fn on_blind(&mut self, cause: GapCause, last_good_ts: Ts, at: Ts) {
         self.lock()
             .expect("witness")
-            .blind
-            .push((cause, last_good_ts, at));
+            .heard
+            .push(Heard::Blind(cause, last_good_ts, at));
     }
 
     fn on_note(&mut self, note: &crate::strategy::Note, at: Ts) {
-        self.lock().expect("witness").notes.push((note.kind, at));
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::Note(note.kind, at));
+    }
+
+    fn on_orphaned(&mut self, client_order_id: ClientOrderId, _fill: &Fill, at: Ts) {
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::Orphaned(client_order_id, at));
+    }
+
+    fn on_fill(
+        &mut self,
+        client_order_id: ClientOrderId,
+        _instrument: InstrumentId,
+        _side: Side,
+        fill: &Fill,
+        at: Ts,
+        _portfolio: &crate::Portfolio,
+    ) {
+        self.lock()
+            .expect("witness")
+            .heard
+            .push(Heard::Filled(client_order_id, fill.qty, at));
     }
 }
 
@@ -608,6 +744,170 @@ impl Strategy for Greedy {
     fn on_market_event(&mut self, _event: &MarketEvent, ctx: &mut Context<'_>) {
         ctx.submit(buy());
     }
+}
+
+/// A venue that says what it was scripted to, one batch per poll, whatever it
+/// was sent.
+///
+/// For a test about what the *engine* does with what a venue says. A venue
+/// that reacted to its orders would make the script depend on the behaviour
+/// under test.
+#[derive(Debug, Default)]
+struct Says {
+    batches: std::collections::VecDeque<Vec<ExecutionEvent>>,
+}
+
+impl Says {
+    fn new(batches: Vec<Vec<ExecutionEvent>>) -> Self {
+        Self {
+            batches: batches.into(),
+        }
+    }
+}
+
+impl ExecutionVenue for Says {
+    fn submit(&mut self, _id: ClientOrderId, _r: &OrderRequest, _now: Ts) {}
+
+    fn cancel(&mut self, _id: ClientOrderId, _now: Ts) {}
+
+    fn poll(&mut self, _now: Ts, out: &mut Vec<ExecutionEvent>) {
+        out.extend(self.batches.pop_front().unwrap_or_default());
+    }
+}
+
+/// A fill of `qty` at 100, free.
+fn fill_of(qty: &str) -> Fill {
+    Fill {
+        px: "100.00".parse().expect("px"),
+        qty: qty.parse().expect("qty"),
+        fee: Notional::from_raw(0),
+        is_maker: false,
+        fee_asset: quant_core::execution::FeeAsset::Quote,
+    }
+}
+
+/// Reaches every hook an observer has, over three events: on the first, an
+/// order, a malformed one, a cancel of the first and a note; on the second,
+/// two orders, the second of which a daily count of two refuses.
+#[derive(Debug, Default)]
+struct EveryHook {
+    notes: Vec<crate::strategy::Note>,
+}
+
+impl Strategy for EveryHook {
+    fn on_market_event(&mut self, event: &MarketEvent, ctx: &mut Context<'_>) {
+        match event.meta().ingest_seq {
+            1 => {
+                let first = ctx.submit(buy());
+                ctx.submit(OrderRequest {
+                    qty: "0".parse().expect("qty"),
+                    ..buy()
+                });
+                ctx.cancel(first);
+                self.notes.push(crate::strategy::Note::new(
+                    "decided",
+                    serde_json::Value::Null,
+                ));
+            }
+            2 => {
+                ctx.submit(buy());
+                ctx.submit(buy());
+            }
+            _ => {}
+        }
+    }
+
+    fn take_notes(&mut self, out: &mut Vec<crate::strategy::Note>) {
+        out.append(&mut self.notes);
+    }
+}
+
+/// What the venue says to [`EveryHook`]: nothing on the first event; on the
+/// second, order 1 accepted, part filled and cancelled; on the third, order 3
+/// declined, and a fill for order 99, which this engine never minted.
+fn every_hook_venue() -> Says {
+    let (t2, t3) = (meta(2).local_recv_ts, meta(3).local_recv_ts);
+    let qty = |s: &str| -> Qty { s.parse().expect("qty") };
+    Says::new(vec![
+        vec![],
+        vec![
+            ExecutionEvent::Accepted {
+                client_order_id: ClientOrderId(1),
+                venue_order_id: None,
+                ts: t2,
+            },
+            ExecutionEvent::Filled {
+                client_order_id: ClientOrderId(1),
+                fill: fill_of("0.4"),
+                remaining: qty("0.6"),
+                ts: t2,
+            },
+            ExecutionEvent::Cancelled {
+                client_order_id: ClientOrderId(1),
+                remaining: qty("0.6"),
+                ts: t2,
+            },
+        ],
+        vec![
+            ExecutionEvent::Rejected {
+                client_order_id: ClientOrderId(3),
+                reason: RejectReason::Venue,
+                ts: t3,
+            },
+            ExecutionEvent::Filled {
+                client_order_id: ClientOrderId(99),
+                fill: fill_of("1"),
+                remaining: qty("0"),
+                ts: t3,
+            },
+        ],
+    ])
+}
+
+#[test]
+fn an_observer_hears_every_hook_in_the_order_the_engine_calls_them() {
+    // The witness's own proof, and the order every later seam test reads it
+    // in: one run that reaches all eleven hooks, each once.
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![snapshot(1), trade(2, "100.75"), gap(3)]),
+        every_hook_venue(),
+        crate::risk::RiskEngine::new(crate::risk::Limits {
+            max_orders_per_day: Some(2),
+            ..crate::risk::Limits::default()
+        }),
+        EveryHook::default(),
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
+    engine.run().expect("no source failure");
+
+    let (t1, t2, t3) = (
+        meta(1).local_recv_ts,
+        meta(2).local_recv_ts,
+        meta(3).local_recv_ts,
+    );
+    let c = ClientOrderId;
+    let qty = |s: &str| -> Qty { s.parse().expect("qty") };
+    assert_eq!(
+        seen.lock().expect("witness").heard,
+        vec![
+            Heard::Submitted(c(1), t1),
+            Heard::Refused(c(2), RejectReason::Malformed, crate::RefusedBy::Seam, t1),
+            Heard::CancelRequested(c(1), t1),
+            Heard::Note("decided", t1),
+            Heard::Accepted(c(1), t2),
+            Heard::Filled(c(1), qty("0.4"), t2),
+            Heard::Cancelled(c(1), qty("0.6"), t2),
+            Heard::Submitted(c(3), t2),
+            Heard::Tripped(crate::risk::TripCause::OrderCount, t2),
+            Heard::Refused(c(4), RejectReason::RiskLimit, crate::RefusedBy::Risk, t2),
+            Heard::Blind(GapCause::Disconnect, Ts::from_nanos(1), t3),
+            Heard::Rejected(c(3), RejectReason::Venue, t3),
+            Heard::Orphaned(c(99), t3),
+        ],
+        "every hook, each once, in the order the engine reached it"
+    );
 }
 
 fn witnessed_run(events: Vec<MarketEvent>, limits: crate::risk::Limits) -> Witness {
@@ -642,13 +942,9 @@ fn a_trip_is_reported_at_the_instant_it_trips_not_at_shutdown() {
             ..crate::risk::Limits::default()
         },
     );
-    assert_eq!(
-        seen.tripped.len(),
-        1,
-        "exactly one trip: {:?}",
-        seen.tripped
-    );
-    let (cause, at) = seen.tripped[0];
+    let tripped = seen.tripped();
+    assert_eq!(tripped.len(), 1, "exactly one trip: {tripped:?}");
+    let (cause, at) = tripped[0];
     assert_eq!(cause, crate::risk::TripCause::OrderCount);
     // The instant of the *second* event, which is where the limit bound --
     // not the third, and not whenever the run happened to end.
@@ -678,11 +974,11 @@ fn a_switch_that_is_already_thrown_is_not_reported_again() {
             ..crate::risk::Limits::default()
         },
     );
+    let tripped = seen.tripped();
     assert_eq!(
-        seen.tripped.len(),
+        tripped.len(),
         1,
-        "one trip however many orders it refuses: {:?}",
-        seen.tripped
+        "one trip however many orders it refuses: {tripped:?}"
     );
 }
 
@@ -706,7 +1002,7 @@ fn a_switch_recovered_from_a_previous_session_reports_nothing() {
     .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
     engine.run().expect("no source failure");
     assert_eq!(
-        seen.lock().expect("witness").tripped,
+        seen.lock().expect("witness").tripped(),
         Vec::new(),
         "a recovered switch is not a new trip"
     );
@@ -721,8 +1017,9 @@ fn going_blind_is_reported_with_its_cause_and_how_long_it_lasted() {
         vec![trade(1, "100.00"), gap(2), trade(3, "100.00")],
         crate::risk::Limits::default(),
     );
-    assert_eq!(seen.blind.len(), 1, "one gap, one line: {:?}", seen.blind);
-    let (cause, last_good, at) = seen.blind[0];
+    let blind = seen.blind();
+    assert_eq!(blind.len(), 1, "one gap, one line: {blind:?}");
+    let (cause, last_good, at) = blind[0];
     assert_eq!(cause, GapCause::Disconnect);
     assert_eq!(
         last_good,
@@ -742,8 +1039,8 @@ fn a_run_that_never_goes_blind_says_nothing_about_blindness() {
         vec![trade(1, "100.00"), trade(2, "100.00")],
         crate::risk::Limits::default(),
     );
-    assert_eq!(seen.blind, Vec::new());
-    assert_eq!(seen.tripped, Vec::new(), "and no limit bound either");
+    assert_eq!(seen.blind(), Vec::new());
+    assert_eq!(seen.tripped(), Vec::new(), "and no limit bound either");
 }
 
 /// Writes one note per event, naming the event it saw.
@@ -783,7 +1080,7 @@ fn a_note_is_taken_in_the_same_event_the_strategy_wrote_it() {
     .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
     engine.run().expect("run");
 
-    let notes = std::mem::take(&mut seen.lock().expect("witness").notes);
+    let notes = seen.lock().expect("witness").notes();
     assert_eq!(
         notes,
         vec![
@@ -808,7 +1105,7 @@ fn a_strategy_that_keeps_no_diary_is_not_made_to_say_so() {
     )
     .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
     engine.run().expect("run");
-    assert_eq!(seen.lock().expect("witness").notes, Vec::new());
+    assert_eq!(seen.lock().expect("witness").notes(), Vec::new());
 }
 
 #[test]
@@ -832,7 +1129,7 @@ fn notes_cannot_reveal_which_venue_the_strategy_was_wired_to() {
         )
         .observing_fills(Box::new(std::sync::Arc::clone(&seen)));
         engine.run().expect("run");
-        let out = std::mem::take(&mut seen.lock().expect("witness").notes);
+        let out = seen.lock().expect("witness").notes();
         out
     }
 
