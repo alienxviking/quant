@@ -4,16 +4,29 @@
 //! backtest [DATA_ROOT] [--symbol SYM] [--cash N] [--fast N] [--slow N]
 //!          [--interval-secs N] [--qty N] [--equity-csv PATH] [--journal PATH]
 //!          [--realistic | --fee-rate R --latency-ms N --adverse P]
+//!          [--fee-asset quote|received]
 //!          [--max-order N] [--max-position N] [--max-daily-loss N] [--max-orders N]
 //! backtest data/acceptance --symbol BTCUSDT              # free and instant
 //! backtest data/acceptance --realistic                   # what it would cost
 //! backtest data/acceptance --fee-rate 0.001              # fees only
+//! backtest data/acceptance --realistic --fee-asset received   # as a spot venue takes fees
 //! ```
 //!
 //! Costs are **off by default**, so the default run is M3's. That is not
 //! laziness: `Costs::NONE` reproducing the M3 numbers to the last digit is the
 //! property that makes the cost models checkable at all, and it is easier to
 //! trust when it is the thing that runs when you type nothing.
+//!
+//! **`--fee-asset received` takes each fee in the asset the fill delivered**,
+//! as a spot venue does: a buy's in the base, so the position arrives a
+//! fraction smaller and the cash pays the gross alone, and a sell's in the
+//! quote. It is the setting the model replay for M8's criteria B and C runs
+//! with (`docs/live-run.md` §4). Live, the exit after a buy sells what the fee
+//! left, a lot less than `--qty`, and a model charging the quote would predict
+//! every exit a lot bigger than the one sent. Off by default (`--fee-asset
+//! quote`), so every result computed before it, M4's and M5's among them,
+//! still reproduces. `--realistic` says nothing about the asset and leaves
+//! whatever `--fee-asset` set, wherever on the line either of them appears.
 //!
 //! **Limits are off by default too, for a second reason on top of that one.**
 //! M5's criterion compares a paper session against a backtest over the same
@@ -48,7 +61,7 @@ use quant_core::time::Ts;
 use quant_engine::journal::{Journal, JournalEntry};
 use quant_engine::{Engine, EngineStats, Limits, Portfolio, RiskEngine};
 use quant_normalize::{discover_days, HistoricalSource};
-use quant_sim::{Costs, FeeSchedule, Latency, SimStats, SimulatedVenue};
+use quant_sim::{Costs, FeeIn, FeeSchedule, Latency, SimStats, SimulatedVenue};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -304,12 +317,14 @@ fn report(args: &Args, days: &[quant_core::time::UtcDate], stats: EngineStats, e
     // and the fills were free. A cost model that is configured but not wired
     // produces a confidently wrong number, which is the exact failure this
     // milestone exists to prevent. Asking the thing that did the work makes the
-    // two impossible to disagree.
+    // two impossible to disagree -- and that includes which asset the fees
+    // were taken in, which decides the size of every exit.
     let costs = engine.venue().costs();
     println!(
-        "costs     fee maker {} taker {}, latency {}ms out / {}ms in, adverse {}",
+        "costs     fee maker {} taker {} taken {}, latency {}ms out / {}ms in, adverse {}",
         costs.fees.maker,
         costs.fees.taker,
+        costs.fee_in,
         costs.latency.outbound / 1_000_000,
         costs.latency.inbound / 1_000_000,
         costs.adverse_per_fill,
@@ -472,7 +487,8 @@ fn parse_args() -> Result<Option<Args>, String> {
                     "usage: backtest [DATA_ROOT] [--symbol SYM] [--cash N] [--fast N] \
                      [--slow N] [--interval-secs N] [--qty N] [--equity-csv PATH] [--journal PATH] \
                      [--realistic] [--fee-rate R] [--latency-ms N] [--adverse P]\n\
-                     \x20               [--max-order N] [--max-position N] \
+                     \x20               [--fee-asset quote|received] \
+                     [--max-order N] [--max-position N] \
                      [--max-daily-loss N] [--max-orders N]"
                 );
                 return Ok(None);
@@ -492,7 +508,28 @@ fn parse_args() -> Result<Option<Args>, String> {
             // A preset rather than three flags, because the three belong
             // together: quoting a fee-only result as "realistic" would be
             // exactly the kind of half-costed number M4 exists to prevent.
-            "--realistic" => args.costs = Costs::retail(),
+            // It says nothing about which asset a fee is taken in, so it
+            // keeps what `--fee-asset` said, before it on the line or after.
+            "--realistic" => {
+                args.costs = Costs {
+                    fee_in: args.costs.fee_in,
+                    ..Costs::retail()
+                };
+            }
+            // Which asset each fee is taken in: `received` charges as a spot
+            // venue does, a buy's fee in the base. What the model replay for
+            // M8's criteria B and C runs with; see the module docs.
+            "--fee-asset" => {
+                args.costs.fee_in = match value()?.as_str() {
+                    "quote" => FeeIn::Quote,
+                    "received" => FeeIn::Received,
+                    other => {
+                        return Err(format!(
+                            "--fee-asset: `{other}` is neither `quote` nor `received`"
+                        ))
+                    }
+                };
+            }
             "--fee-rate" => {
                 let rate: Rate = value()?.parse().map_err(|e| format!("--fee-rate: {e}"))?;
                 args.costs.fees = FeeSchedule::flat(rate);
