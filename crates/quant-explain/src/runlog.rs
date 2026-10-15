@@ -40,7 +40,8 @@
 //! - a `stray` report about an order the engine was not working;
 //! - a `foreign` order from another run, or under our prefix and readable as
 //!   nothing we send, one finding per order however many lines it has;
-//! - a `doubt` raised and never cleared, about an order never seen to end.
+//! - a `doubt` raised and never cleared, about an order never seen to end,
+//!   before the doubt or after it.
 //!
 //! And a line torn by an interrupted write that a restart then wrote past is
 //! a finding, read by [`check_file`]: an entry was being written there and is
@@ -391,6 +392,11 @@ fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding
     let mut foreign = Foreigners::default();
     // Orders in doubt now, and since when.
     let mut doubts: BTreeMap<u64, (Ts, DoubtCause)> = BTreeMap::new();
+    // Orders already seen to end. A doubt raised about one of these is
+    // answered before it opens: a REST error can arrive after the stream has
+    // already reported the fill, and the end is no less known for coming
+    // first.
+    let mut ended: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
 
     // Several arms do the same thing for different reasons, and are kept
     // apart so each reason stays beside the lines it is about.
@@ -430,7 +436,9 @@ fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding
                 DoubtChange::Raised { cause, .. } => {
                     // The first raise is when the doubt began; a second
                     // before any clearing is the same doubt, still open.
-                    doubts.entry(client_order_id.0).or_insert((*at, *cause));
+                    if !ended.contains(&client_order_id.0) {
+                        doubts.entry(client_order_id.0).or_insert((*at, *cause));
+                    }
                 }
                 DoubtChange::Cleared { .. } => {
                     doubts.remove(&client_order_id.0);
@@ -446,6 +454,7 @@ fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding
             } => {
                 if remaining.is_some_and(|r| r.raw() == 0) {
                     doubts.remove(&client_order_id.0);
+                    ended.insert(client_order_id.0);
                 }
             }
             JournalEntry::Rejected {
@@ -458,6 +467,7 @@ fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding
                 client_order_id, ..
             } => {
                 doubts.remove(&client_order_id.0);
+                ended.insert(client_order_id.0);
             }
             // Not an end: an acceptance, a cancel asked for or refused, a
             // placement acknowledged, say nothing about how an order ends.
@@ -1655,5 +1665,30 @@ mod tests {
             .filter(|f| !matches!(f, Finding::MissingDecision { .. }))
             .collect();
         assert_eq!(left, Vec::new());
+    }
+
+    #[test]
+    fn a_doubt_raised_after_the_order_ended_is_answered_by_that_end() {
+        // A REST error can arrive after the stream already reported the
+        // fill, so the end comes first in the file. The order was seen to
+        // end, and saying otherwise fails a run over a record that is whole.
+        // The boundary's other side: a partial fill first is not an end, so
+        // a doubt raised after it is as open as one raised before.
+        let entries = vec![
+            submitted(1, 10),
+            submitted(2, 11),
+            filled_leaving(3000, 1, "0"),
+            raised(3600, 1),
+            filled_leaving(3000, 2, "0.5"),
+            raised(3600, 2),
+        ];
+        assert_eq!(
+            check(&entries).findings,
+            vec![Finding::LeftInDoubt {
+                client_order_id: 2,
+                since: Ts::from_nanos(3600),
+                cause: DoubtCause::NoAnswer,
+            }]
+        );
     }
 }

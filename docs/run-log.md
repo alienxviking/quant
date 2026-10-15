@@ -515,9 +515,11 @@ trades against the venue's balances.
 
 **What ends a doubt** is a `doubt` line clearing it, or the order's end: a
 `rejected`, `cancelled` or `never_landed` line, or a `filled` line with nothing
-`remaining`. An acceptance, a partial fill, a refused cancel and a placement say
-nothing about how the order ends, so none of them settles it, and a restart does
-not either. `anomaly` and `account` lines are not findings themselves: the venue
+`remaining`. An end that came first settles a doubt raised after it: a REST
+error can arrive after the stream has already reported the fill, and the order
+was still seen to end. An acceptance, a partial fill, a refused cancel and a
+placement say nothing about how the order ends, so none of them settles it,
+before the doubt or after it, and a restart does not either. `anomaly` and `account` lines are not findings themselves: the venue
 raises a doubt beside each, and that doubt is what is checked.
 
 **Findings come before the empty verdict.** A file with no decision and no claim
