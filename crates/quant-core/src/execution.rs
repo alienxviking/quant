@@ -416,6 +416,14 @@ impl ExecutionEvent {
 /// `Modelled`. A field added to an event therefore fails to compile until its
 /// type is argued into this list, here, where the argument is visible.
 ///
+/// That closes fields, and an enum a field carries has variants too. So the two
+/// enums an event carries, [`RejectReason`] and [`FeeAsset`], are not declared
+/// modelled on their own say-so: [`reject_reason_is_modelled`] and
+/// [`fee_asset_is_modelled`] match every variant, with no `_` arm, and an arm
+/// for a variant that carries a value passes every value to [`modelled`].
+/// `RejectReason::VenueCode(i64)`, a venue's error code that a simulator has
+/// none of, therefore fails to compile here rather than reaching a strategy.
+///
 /// There is deliberately no `impl<T: Modelled> Modelled for Option<T>`: an
 /// optional field is how a venue's order id got in, absent in one world and
 /// present in the other.
@@ -434,12 +442,36 @@ impl Modelled for RejectReason {}
 impl Modelled for FeeAsset {}
 impl Modelled for bool {}
 
+/// Requires `T` to be [`Modelled`], and does nothing else.
+const fn modelled<T: Modelled>(_: &T) {}
+
 /// Checked when the crate compiles, never called.
 const _: fn(&ExecutionEvent) = strategy_may_see;
+const _: fn(RejectReason) = reject_reason_is_modelled;
+const _: fn(FeeAsset) = fee_asset_is_modelled;
+
+/// Every variant, by name. None carries a value; one that did would bind it
+/// here and pass it to [`modelled`].
+const fn reject_reason_is_modelled(reason: RejectReason) {
+    match reason {
+        RejectReason::Malformed
+        | RejectReason::InsufficientFunds
+        | RejectReason::RiskLimit
+        | RejectReason::Venue
+        | RejectReason::NoMarket => {}
+    }
+}
+
+/// Every variant, by name. None carries a value; one that did would bind it
+/// here and pass it to [`modelled`].
+const fn fee_asset_is_modelled(asset: FeeAsset) {
+    match asset {
+        FeeAsset::Quote | FeeAsset::Base => {}
+    }
+}
 
 /// Every field of every variant, each required to be [`Modelled`].
 fn strategy_may_see(event: &ExecutionEvent) {
-    const fn modelled<T: Modelled>(_: &T) {}
     match event {
         ExecutionEvent::Accepted {
             client_order_id,
