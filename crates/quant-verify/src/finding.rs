@@ -80,7 +80,8 @@ pub mod code {
     pub const TRAILER_DISAGREES: &str = "trailer-disagrees";
     /// The file header and the path it sits under do not describe the same thing.
     pub const PATH_HEADER_MISMATCH: &str = "path-header-mismatch";
-    /// Something under `raw/` is not a capture file at the expected depth.
+    /// Something in a capture tree is not one of that tree's capture files at
+    /// the expected depth -- including the other stream's, moved there by hand.
     pub const STRAY_FILE: &str = "stray-file";
     /// A capture file could not be opened or read.
     pub const UNREADABLE_FILE: &str = "unreadable-file";
@@ -199,9 +200,14 @@ impl fmt::Display for Finding {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Totals {
     pub sessions: u64,
+    /// Of `sessions`, those of the account stream.
+    pub account_sessions: u64,
     pub segments: u64,
     pub frames: u64,
     pub stream_messages: u64,
+    /// Frames of the account stream, in account sessions. Counted and not
+    /// read: what they say is the translator's business, not the verifier's.
+    pub account_messages: u64,
     pub depth_deltas: u64,
     pub trades: u64,
     pub snapshots: u64,

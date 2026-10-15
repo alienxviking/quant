@@ -30,6 +30,16 @@
 //! An unexplained discontinuity is an error. That asymmetry is the point: it is
 //! never the verifier's job to decide that some missing data was probably fine.
 //!
+//! # Two streams
+//!
+//! From M8 a data root holds the account stream beside the market's, under
+//! `account/`: what the venue said about our own orders, recorded before it is
+//! parsed. It is walked by the same command and held to the checks that need only
+//! the container -- holes explained by the gap record after them, files closed
+//! with trailers, headers that agree with their paths -- and to none of the
+//! market's, because it has no depth deltas and no book. A frame of either stream
+//! found in the other's capture is an error. See [`session`].
+//!
 //! # Why it is venue-aware, and only just
 //!
 //! Three of the four checks need nothing but the container format. The update-id

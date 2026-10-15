@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! verify [DATA_ROOT] [--reconcile]
-//! verify data                  # every session under ./data
+//! verify data                  # every session under ./data: raw/ and account/
 //! verify data --reconcile      # also cross-check the metadata index
 //! ```
 //!
@@ -87,10 +87,13 @@ async fn main() -> ExitCode {
 fn print_report(report: &Report, root: &std::path::Path, reconciled: bool) {
     let t = report.totals;
     println!("root      {}", root.display());
-    println!("sessions  {} in {} segments", t.sessions, t.segments);
     println!(
-        "frames    {} ({} stream, {} snapshot, {} gap)",
-        t.frames, t.stream_messages, t.snapshots, t.gaps
+        "sessions  {} in {} segments ({} of the account stream)",
+        t.sessions, t.segments, t.account_sessions
+    );
+    println!(
+        "frames    {} ({} stream, {} snapshot, {} account, {} gap)",
+        t.frames, t.stream_messages, t.snapshots, t.account_messages, t.gaps
     );
     println!(
         "streams   {} depth deltas, {} trades",
