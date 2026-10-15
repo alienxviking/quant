@@ -1506,8 +1506,28 @@ pub fn recover_risk(
         #[allow(clippy::match_same_arms)]
         match entry {
             // The check passed it, and counted it, and rolled the day first.
-            JournalEntry::Submitted { at, .. } => risk.recount(*at, true),
-            JournalEntry::Refused { at, by, .. } => match by {
+            // Every field named, as `Filled`'s arm does: the count is global
+            // today, and a field added later (a notional a per-day notional
+            // limit would need, say) must be a decision here, not a `..`.
+            JournalEntry::Submitted {
+                at,
+                client_order_id: _,
+                instrument: _,
+                side: _,
+                qty: _,
+                limit: _,
+                mark: _,
+            } => risk.recount(*at, true),
+            JournalEntry::Refused {
+                at,
+                client_order_id: _,
+                instrument: _,
+                side: _,
+                qty: _,
+                reason: _,
+                bound: _,
+                by,
+            } => match by {
                 // The check ran, rolled the day, and turned it away uncounted.
                 RefusedBy::Risk => risk.recount(*at, false),
                 // Never reached the check: the seam is before it, and so is
