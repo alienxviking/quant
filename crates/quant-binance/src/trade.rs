@@ -220,12 +220,148 @@ pub enum NotReady {
         came_back: usize,
         usable: usize,
     },
-    /// The venue would not answer a signed request. Almost always a bad API
-    /// key, a private key that is not the registered one's, or a key without
-    /// trading permission.
-    Rejected { status: u16 },
+    /// The venue refused the credentials: HTTP 401, or under any status one of
+    /// -2014, *"API-key format invalid"*, -2015, *"Invalid API-key, IP, or
+    /// permissions for action"*, or -1022, *"Signature for this request is not
+    /// valid"* (errors.md:57-58, :338-342). A bad API key, a private key that
+    /// is not the registered one's, or a key restricted to other IP addresses.
+    BadCredentials {
+        status: u16,
+        venue: Option<VenueError>,
+    },
+    /// HTTP 403: the venue's web application firewall refused the request,
+    /// which it says can be a rate limit or a security block
+    /// (rest-api.md:112). Not a verdict on the key.
+    Firewall { venue: Option<VenueError> },
+    /// HTTP 429, a request rate limit broken, or 418, this IP banned for
+    /// carrying on after 429s (rest-api.md:114-115, :158-160).
+    ///
+    /// `retry_after` is the `Retry-After` header as the venue sent it, which it
+    /// documents as a number of seconds: to wait to avoid a ban after a 429, or
+    /// until the ban is over after a 418 (rest-api.md:161).
+    RateLimited {
+        status: u16,
+        retry_after: Option<String>,
+        venue: Option<VenueError>,
+    },
+    /// HTTP 5xx: the venue's own failure (rest-api.md:116-118), not a verdict
+    /// on anything that was sent.
+    VenueFailure {
+        status: u16,
+        venue: Option<VenueError>,
+    },
+    /// Any other refusal of a signed request.
+    Refused {
+        status: u16,
+        venue: Option<VenueError>,
+    },
+    /// The venue accepted the key and the signature, and says this account
+    /// cannot trade: `canTrade` is false (rest-api.md:4207).
+    ///
+    /// The venue's documentation shows the field without defining it. What it
+    /// does say is that an API key cannot trade until trading is enabled for it
+    /// (rest-api.md:194-196). Whichever of the key or the account the `false`
+    /// is about, an order would be refused, and this refuses first.
+    CannotTrade,
+    /// The venue answered 200, but not with the account document this reads.
+    /// Which way it was not is said; what it held is not, because it lists the
+    /// account's balances.
+    UnreadableAccount(AccountFault),
     /// We could not reach the venue at all.
     Unreachable(String),
+}
+
+/// The venue's own account of a refusal: its error document,
+/// `{"code": -2015, "msg": "..."}` (errors.md:3-10).
+///
+/// Codes are universal and messages vary (errors.md:3-4), so the code is what
+/// [`NotReady`] is sorted on, and both are printed as the venue sent them. The
+/// documented messages name parameters, limits and at most a symbol
+/// (errors.md:74-110, :284), never a key or a signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VenueError {
+    pub code: i64,
+    pub msg: String,
+}
+
+impl VenueError {
+    /// The venue's error document, if that is what `body` is. Anything else —
+    /// a firewall's HTML page, an empty body — is `None`, and none of it is
+    /// kept.
+    fn parse(body: &[u8]) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        struct Document {
+            code: i64,
+            msg: String,
+        }
+        serde_json::from_slice::<Document>(body).ok().map(|d| Self {
+            code: d.code,
+            msg: d.msg,
+        })
+    }
+}
+
+/// How a 200 answer to `GET /api/v3/account` failed to be the document
+/// [`TradeClient::check_ready`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountFault {
+    /// The body is not JSON.
+    NotJson,
+    /// There is no `canTrade` field.
+    NoCanTrade,
+    /// `canTrade` is neither `true` nor `false`.
+    CanTradeNotBool,
+}
+
+impl core::fmt::Display for AccountFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::NotJson => "the body is not JSON",
+            Self::NoCanTrade => "the body has no canTrade field",
+            Self::CanTradeNotBool => "canTrade is neither true nor false",
+        })
+    }
+}
+
+/// `, code -2015: Invalid API-key, IP, or permissions for action.`, or nothing.
+struct Said<'a>(Option<&'a VenueError>);
+
+impl core::fmt::Display for Said<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(VenueError { code, msg }) => write!(f, ", code {code}: {msg}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// [`NotReady::RateLimited`], said: a 418 is a ban and anything else a limit,
+/// with the venue's `Retry-After` when it sent one.
+fn fmt_rate_limited(
+    f: &mut core::fmt::Formatter<'_>,
+    status: u16,
+    retry_after: Option<&str>,
+    venue: Option<&VenueError>,
+) -> core::fmt::Result {
+    if status == 418 {
+        write!(
+            f,
+            "this IP is banned for carrying on after rate-limit refusals (HTTP 418{}). The \
+             venue's bans run from 2 minutes to 3 days, longer for repeat offenders",
+            Said(venue)
+        )?;
+    } else {
+        write!(
+            f,
+            "the venue is rate limiting this IP (HTTP {status}{}). Back off: carrying on after a \
+             429 gets the IP banned",
+            Said(venue)
+        )?;
+    }
+    match retry_after {
+        Some(wait) => write!(f, "; its Retry-After says {wait} (seconds)"),
+        None => Ok(()),
+    }
 }
 
 impl core::fmt::Display for NotReady {
@@ -274,11 +410,49 @@ impl core::fmt::Display for NotReady {
                 }
                 Ok(())
             }
-            Self::Rejected { status } => write!(
+            Self::BadCredentials { status, venue } => write!(
                 f,
-                "the venue refused a signed request with HTTP {status}. The API key, the private \
-                 key, or the key's trading permission is wrong -- note that a key restricted by IP \
-                 fails this way from a new address"
+                "the venue refused the credentials (HTTP {status}{}). The API key, the signature \
+                 or the key's IP restriction is wrong: {} must be the API key Binance issued for \
+                 the registered public key, that key must be the public half of {} (venue-check \
+                 prints it), a testnet pair is separate from a live one, and a key restricted by \
+                 IP fails this way from a new address",
+                Said(venue.as_ref()),
+                Credentials::KEY_VAR,
+                Credentials::PRIVATE_KEY_VAR,
+            ),
+            Self::Firewall { venue } => write!(
+                f,
+                "the venue's web application firewall refused the request (HTTP 403{}). That is \
+                 not a verdict on the key: the venue says a firewall block can be a rate limit or \
+                 a security rule",
+                Said(venue.as_ref()),
+            ),
+            Self::RateLimited {
+                status,
+                retry_after,
+                venue,
+            } => fmt_rate_limited(f, *status, retry_after.as_deref(), venue.as_ref()),
+            Self::VenueFailure { status, venue } => write!(
+                f,
+                "the venue failed on its own side (HTTP {status}{}). Not a verdict on the key or \
+                 the signature: try again",
+                Said(venue.as_ref()),
+            ),
+            Self::Refused { status, venue } => write!(
+                f,
+                "the venue refused a signed request (HTTP {status}{})",
+                Said(venue.as_ref()),
+            ),
+            Self::CannotTrade => f.write_str(
+                "the venue accepted the key and the signature, and says this account cannot \
+                 trade (canTrade is false). An API key cannot trade until trading is enabled for \
+                 it in Binance's API Management",
+            ),
+            Self::UnreadableAccount(fault) => write!(
+                f,
+                "the venue answered 200, but {fault}. Nothing of the body is printed: it lists \
+                 the account's balances"
             ),
             Self::Unreachable(why) => write!(f, "could not reach the venue: {why}"),
         }
@@ -355,6 +529,21 @@ impl TradeClient {
         params: &str,
         now_millis: i64,
     ) -> Result<Vec<u8>, SnapshotError> {
+        let reply = self.send_signed_get(path, params, now_millis).await?;
+        if !reply.status.is_success() {
+            return Err(SnapshotError::Status(reply.status.as_u16()));
+        }
+        Ok(reply.body)
+    }
+
+    /// Send a signed GET and return whatever the venue answered, refusals
+    /// included, so that a refusal can be read for what it says.
+    async fn send_signed_get(
+        &self,
+        path: &str,
+        params: &str,
+        now_millis: i64,
+    ) -> Result<SignedReply, SnapshotError> {
         let url = format!(
             "{}{path}?{}",
             self.base.trim_end_matches('/'),
@@ -368,39 +557,49 @@ impl TradeClient {
             .header("X-MBX-APIKEY", self.credentials.key())
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    SnapshotError::Timeout
-                } else {
-                    // `reqwest`'s error Display includes the URL, and the URL
-                    // carries the signature. A signature is not the private key
-                    // and cannot be reversed to it, but it is per-request
-                    // authentication material and has no business in a log that
-                    // survives the request.
-                    SnapshotError::Transport(redact_signature(&e.to_string()))
-                }
-            })?;
+            .map_err(transport_error)?;
         let status = response.status();
-        if !status.is_success() {
-            return Err(SnapshotError::Status(status.as_u16()));
-        }
-        response
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| SnapshotError::Body(redact_signature(&e.to_string())))
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = match response.bytes().await {
+            Ok(bytes) => bytes.to_vec(),
+            // A refusal is still a refusal when its explanation does not
+            // arrive: say what the status says rather than that the venue
+            // could not be reached.
+            Err(_) if !status.is_success() => Vec::new(),
+            Err(e) if e.is_timeout() => return Err(SnapshotError::Timeout),
+            Err(e) => return Err(SnapshotError::Body(describe(e))),
+        };
+        Ok(SignedReply {
+            status,
+            retry_after,
+            body,
+        })
     }
 
     /// Ask the venue whether this account can trade, and whether our clock
     /// agrees with its own.
     ///
-    /// `GET /api/v3/account` is the cheapest signed call there is, which makes
-    /// it the right probe: it proves the API key, the private key, the signature
-    /// construction and the clock in one round trip, and it places no order.
+    /// `GET /api/v3/account` is not the cheapest signed call: its weight is 20
+    /// (rest-api.md:4180-4181), where `GET /api/v3/openOrders` for one symbol
+    /// is 6 (rest-api.md:4293-4294). It is the probe because its answer says
+    /// whether this key may trade at all — `canTrade` (rest-api.md:4207) — as
+    /// well as proving the API key, the private key, the signature
+    /// construction and the clock in one round trip. It places no order.
+    ///
+    /// Its body also lists the account's balances (rest-api.md:4215-4226).
+    /// They are read for `canTrade` and nothing else, and nothing here ever
+    /// prints or logs the body.
     ///
     /// # Errors
     ///
-    /// [`NotReady`] with the reason, which is a thing to print and stop on.
+    /// [`NotReady`] with the reason, which is a thing to print and stop on. A
+    /// refusal is sorted by what the operator should do about it, from its
+    /// status and the venue's own code and message, which it carries; no
+    /// reason carries the URL or the signature.
     pub async fn check_ready(&self, offset_ms: i64) -> Result<(), NotReady> {
         // `unsigned_abs`, not `abs`. `i64::MIN` has no positive counterpart in
         // an `i64`, so `abs` panics on it in a debug build and hands it back
@@ -415,12 +614,99 @@ impl TradeClient {
         // The venue's clock, not ours: a signed request is checked against the
         // venue's, and the offset above is what reconciles them.
         let now = chrono_millis() - offset_ms;
-        match self.signed_get("/api/v3/account", "", now).await {
-            Ok(_) => Ok(()),
-            Err(SnapshotError::Status(status)) => Err(NotReady::Rejected { status }),
-            Err(other) => Err(NotReady::Unreachable(other.to_string())),
+        let reply = self
+            .send_signed_get("/api/v3/account", "", now)
+            .await
+            .map_err(|e| NotReady::Unreachable(e.to_string()))?;
+        if !reply.status.is_success() {
+            return Err(classify_refusal(
+                reply.status.as_u16(),
+                reply.retry_after,
+                &reply.body,
+            ));
         }
+        account_can_trade(&reply.body)
     }
+}
+
+/// What the venue answered a signed request with, whatever the status.
+///
+/// No `Debug`, derived or otherwise: the body of a successful account request
+/// lists balances, and a `{:?}` is how a body ends up in a log.
+struct SignedReply {
+    status: reqwest::StatusCode,
+    retry_after: Option<String>,
+    body: Vec<u8>,
+}
+
+/// Sort a refusal of a signed request by what it means for the operator.
+///
+/// The status decides first where it says the request was never judged on its
+/// credentials: a firewall (403), a rate limit or ban (418, 429), the venue's
+/// own failure (5xx). Otherwise a 401, or the venue's code for a bad key or a
+/// bad signature under any status, is the credentials. What is left is a
+/// refusal the venue explains for itself.
+fn classify_refusal(status: u16, retry_after: Option<String>, body: &[u8]) -> NotReady {
+    let venue = VenueError::parse(body);
+    let credential_code = matches!(venue.as_ref().map(|v| v.code), Some(-2014 | -2015 | -1022));
+    match status {
+        403 => NotReady::Firewall { venue },
+        418 | 429 => NotReady::RateLimited {
+            status,
+            retry_after,
+            venue,
+        },
+        500..=599 => NotReady::VenueFailure { status, venue },
+        401 => NotReady::BadCredentials { status, venue },
+        _ if credential_code => NotReady::BadCredentials { status, venue },
+        _ => NotReady::Refused { status, venue },
+    }
+}
+
+/// Whether the account document says this key may trade (`canTrade`,
+/// rest-api.md:4207).
+///
+/// The body is read as JSON for that one field. No error carries any of it: it
+/// lists the account's balances.
+fn account_can_trade(body: &[u8]) -> Result<(), NotReady> {
+    let document: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| NotReady::UnreadableAccount(AccountFault::NotJson))?;
+    match document.get("canTrade") {
+        Some(serde_json::Value::Bool(true)) => Ok(()),
+        Some(serde_json::Value::Bool(false)) => Err(NotReady::CannotTrade),
+        Some(_) => Err(NotReady::UnreadableAccount(AccountFault::CanTradeNotBool)),
+        None => Err(NotReady::UnreadableAccount(AccountFault::NoCanTrade)),
+    }
+}
+
+/// A request that got no answer, said without its URL.
+fn transport_error(e: reqwest::Error) -> SnapshotError {
+    if e.is_timeout() {
+        SnapshotError::Timeout
+    } else {
+        SnapshotError::Transport(describe(e))
+    }
+}
+
+/// `reqwest`'s error as text, without the URL and with what caused it.
+///
+/// `reqwest` writes the request's URL into its error's text, and this URL
+/// carries the signature: not the private key, and not reversible to it, but
+/// per-request authentication material with no business in a log that outlives
+/// the request. So the URL is dropped (`without_url`) rather than trusted to the
+/// redaction, which stays as a second line. What the URL leaves out is what
+/// went wrong — DNS, a refused connection, TLS — which `reqwest` keeps in the
+/// error's sources rather than its text, so those are said instead.
+fn describe(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut text = e.to_string();
+    let mut cause = std::error::Error::source(&e);
+    while let Some(c) = cause {
+        text.push_str(": ");
+        text.push_str(&c.to_string());
+        cause = c.source();
+    }
+    redact_signature(&text)
 }
 
 /// Wall-clock milliseconds.
@@ -471,8 +757,8 @@ fn redact_signature(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        midpoint_offset_ms, redact_signature, ClockSample, NotReady, TradeClient,
-        MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
+        account_can_trade, classify_refusal, midpoint_offset_ms, redact_signature, AccountFault,
+        ClockSample, NotReady, TradeClient, VenueError, MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
     };
     use crate::credentials::fixture;
     use base64::engine::general_purpose::STANDARD;
@@ -481,13 +767,61 @@ mod tests {
     use std::time::Duration;
 
     fn client() -> TradeClient {
-        TradeClient::new(
-            "https://example.invalid",
-            Duration::from_secs(5),
-            fixture::example(),
-        )
-        .expect("builds")
+        client_at("https://example.invalid")
     }
+
+    fn client_at(base: &str) -> TradeClient {
+        TradeClient::new(base, Duration::from_secs(5), fixture::example()).expect("builds")
+    }
+
+    /// An HTTP/1.1 response with a body, closing the connection after it.
+    fn http(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A one-shot HTTP server on this machine. It reads the first request,
+    /// answers it with `response` — or, when that is empty, hangs up without a
+    /// word — and hands back the request it was sent.
+    ///
+    /// The venue, as far as the client can tell, minus the network: what
+    /// `check_ready` makes of a status, a header and a body is tested on the
+    /// path it takes in production, with no credentials and nothing sent
+    /// beyond this machine.
+    fn serve_once(response: String) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).expect("read");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            stream.write_all(response.as_bytes()).expect("write");
+            String::from_utf8(request).expect("an HTTP request head is text")
+        });
+        (base, server)
+    }
+
+    /// The account document from the venue's documentation
+    /// (rest-api.md:4196-4229), cut down, with `canTrade` as given. Its
+    /// balance is distinctive, so a reason that quoted the body would show it.
+    fn account(can_trade: &str) -> String {
+        format!(
+            r#"{{"makerCommission":15,"takerCommission":15,"canTrade":{can_trade},"canWithdraw":true,"canDeposit":true,"accountType":"SPOT","balances":[{{"asset":"BTC","free":"{BALANCE}","locked":"0.00000000"}}],"permissions":["SPOT"],"uid":354937868}}"#
+        )
+    }
+
+    const BALANCE: &str = "4723846.89208129";
 
     /// A reading of a host clock `theta` ms ahead of the venue's (negative:
     /// behind), over a request that takes `out` ms to arrive and `back` ms to
@@ -841,5 +1175,280 @@ mod tests {
     #[test]
     fn text_with_no_signature_is_left_alone() {
         assert_eq!(redact_signature("dns error"), "dns error");
+    }
+
+    #[test]
+    fn a_refusal_is_sorted_by_its_status_and_then_by_the_venues_code() {
+        // The venue's error document as sent, and as read back.
+        let doc = |code: i64, msg: &str| format!(r#"{{"code":{code},"msg":"{msg}"}}"#);
+        let read = |code: i64, msg: &str| {
+            Some(VenueError {
+                code,
+                msg: msg.to_owned(),
+            })
+        };
+        let creds = |status, venue| NotReady::BadCredentials { status, venue };
+        let limited = |status, retry_after: Option<&str>, venue| NotReady::RateLimited {
+            status,
+            retry_after: retry_after.map(str::to_owned),
+            venue,
+        };
+        let failed = |status, venue| NotReady::VenueFailure { status, venue };
+        let refused = |status, venue| NotReady::Refused { status, venue };
+        // The venue's own messages for these codes (errors.md).
+        let key = "Invalid API-key, IP, or permissions for action.";
+        let format = "API-key format invalid.";
+        let signature = "Signature for this request is not valid.";
+        let weight = "Too much request weight used; current limit is 6000 request weight per 1 \
+                      MINUTE. Please use WebSocket Streams for live updates to avoid polling the \
+                      API.";
+        let busy = "Server is currently overloaded with other requests. Please try again in a few \
+                    minutes.";
+        let stale = "Timestamp for this request is outside of the recvWindow.";
+        let html = "<html><body>403 Forbidden</body></html>".to_owned();
+        let none = String::new();
+
+        let cases = [
+            // The credentials: 401 whatever the body says, and the three codes
+            // whatever the status.
+            (401, None, doc(-2015, key), creds(401, read(-2015, key))),
+            (401, None, none.clone(), creds(401, None)),
+            (
+                400,
+                None,
+                doc(-2014, format),
+                creds(400, read(-2014, format)),
+            ),
+            (400, None, doc(-2015, key), creds(400, read(-2015, key))),
+            (
+                400,
+                None,
+                doc(-1022, signature),
+                creds(400, read(-1022, signature)),
+            ),
+            // The firewall, whose body is not the venue's error document.
+            (403, None, html.clone(), NotReady::Firewall { venue: None }),
+            // Rate limits and bans, with the header when there is one.
+            (
+                429,
+                Some("37"),
+                doc(-1003, weight),
+                limited(429, Some("37"), read(-1003, weight)),
+            ),
+            (
+                418,
+                Some("120"),
+                none.clone(),
+                limited(418, Some("120"), None),
+            ),
+            (429, None, none.clone(), limited(429, None, None)),
+            // The venue's own failures.
+            (500, None, none.clone(), failed(500, None)),
+            (503, None, doc(-1008, busy), failed(503, read(-1008, busy))),
+            // The order of the rule rather than a thing seen: a status that
+            // says the request was never judged on its credentials decides
+            // before the code does.
+            (
+                503,
+                None,
+                doc(-1022, signature),
+                failed(503, read(-1022, signature)),
+            ),
+            // Anything else, explained by the venue or not.
+            (
+                400,
+                None,
+                doc(-1021, stale),
+                refused(400, read(-1021, stale)),
+            ),
+            (404, None, html, refused(404, None)),
+        ];
+        for (status, retry_after, body, expected) in cases {
+            assert_eq!(
+                classify_refusal(status, retry_after.map(str::to_owned), body.as_bytes()),
+                expected,
+                "{status} {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_kind_of_refusal_says_something_different_with_the_venues_own_words() {
+        let venue = Some(VenueError {
+            code: -9999,
+            msg: "the venue's own words".to_owned(),
+        });
+        let said: Vec<String> = [
+            NotReady::BadCredentials {
+                status: 401,
+                venue: venue.clone(),
+            },
+            NotReady::Firewall {
+                venue: venue.clone(),
+            },
+            NotReady::RateLimited {
+                status: 429,
+                retry_after: Some("37".to_owned()),
+                venue: venue.clone(),
+            },
+            NotReady::RateLimited {
+                status: 418,
+                retry_after: None,
+                venue: venue.clone(),
+            },
+            NotReady::VenueFailure {
+                status: 502,
+                venue: venue.clone(),
+            },
+            NotReady::Refused {
+                status: 400,
+                venue: venue.clone(),
+            },
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        for text in &said {
+            assert!(text.contains("code -9999: the venue's own words"), "{text}");
+        }
+        // What comes before the status is what the operator acts on, and no
+        // two kinds share it.
+        let openings: std::collections::HashSet<&str> = said
+            .iter()
+            .map(|s| s.split(" (HTTP").next().unwrap_or(s))
+            .collect();
+        assert_eq!(openings.len(), said.len(), "{said:#?}");
+        assert!(said[0].contains("BINANCE_API_KEY"), "{}", said[0]);
+        assert!(said[0].contains("IP"), "{}", said[0]);
+        assert!(said[1].contains("firewall"), "{}", said[1]);
+        assert!(said[2].contains("Retry-After says 37"), "{}", said[2]);
+        assert!(said[3].contains("banned"), "{}", said[3]);
+        assert!(!said[3].contains("Retry-After"), "{}", said[3]);
+        assert!(said[4].contains("own side"), "{}", said[4]);
+        // Without the venue's document, nothing stands in for it.
+        assert_eq!(
+            NotReady::Refused {
+                status: 400,
+                venue: None
+            }
+            .to_string(),
+            "the venue refused a signed request (HTTP 400)"
+        );
+    }
+
+    #[test]
+    fn can_trade_is_read_from_the_account_and_nothing_of_the_body_is_said() {
+        assert_eq!(account_can_trade(account("true").as_bytes()), Ok(()));
+        let refusals = [
+            (account("false"), NotReady::CannotTrade),
+            (
+                account("\"true\""),
+                NotReady::UnreadableAccount(AccountFault::CanTradeNotBool),
+            ),
+            (
+                format!(r#"{{"balances":[{{"asset":"BTC","free":"{BALANCE}"}}]}}"#),
+                NotReady::UnreadableAccount(AccountFault::NoCanTrade),
+            ),
+            (
+                format!("<html>{BALANCE}</html>"),
+                NotReady::UnreadableAccount(AccountFault::NotJson),
+            ),
+        ];
+        for (body, expected) in refusals {
+            let why = account_can_trade(body.as_bytes()).expect_err("not ready");
+            assert_eq!(why, expected, "{body}");
+            let said = why.to_string();
+            assert!(!said.contains(BALANCE), "{said}");
+            assert!(!format!("{why:?}").contains(BALANCE), "{why:?}");
+        }
+        // A key without trading permission has its own reason, which says
+        // what to do about it.
+        let said = NotReady::CannotTrade.to_string();
+        assert!(said.contains("canTrade is false"), "{said}");
+        assert!(said.contains("API Management"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_gets_no_answer_is_reported_without_its_url_or_signature() {
+        // The server reads the request and hangs up without a word, which
+        // `reqwest` reports with the URL in its text -- and this URL carries
+        // the signature.
+        let (base, server) = serve_once(String::new());
+        let why = client_at(&base)
+            .check_ready(0)
+            .await
+            .expect_err("no answer is not ready");
+        let request = server.join().expect("the server ran");
+        let request_line = request.lines().next().unwrap_or_default();
+        let signature = request_line
+            .split_once("&signature=")
+            .and_then(|(_, rest)| rest.split(' ').next())
+            .expect("the request carried a signature");
+        let NotReady::Unreachable(cause) = &why else {
+            panic!("expected unreachable, got {why:?}")
+        };
+        for text in [cause.clone(), why.to_string()] {
+            for absent in ["signature", "/api/v3/account", "http://", "timestamp="] {
+                assert!(!text.contains(absent), "{absent:?} in {text}");
+            }
+            for piece in fixture::eight_char_windows(signature) {
+                assert!(!text.contains(piece), "{piece} in {text}");
+            }
+        }
+        // And it still says what went wrong, from the error's own sources
+        // rather than from a URL.
+        assert!(
+            cause.starts_with("transport error: error sending request: "),
+            "{cause}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_is_read_from_its_status_its_retry_after_and_its_body() {
+        let body = r#"{"code":-1003,"msg":"Too much request weight used; current limit is 6000 request weight per 1 MINUTE."}"#;
+        let (base, server) = serve_once(http("429 Too Many Requests", "Retry-After: 37\r\n", body));
+        let why = client_at(&base).check_ready(0).await.expect_err("refused");
+        server.join().expect("the server ran");
+        assert_eq!(
+            why,
+            NotReady::RateLimited {
+                status: 429,
+                retry_after: Some("37".to_owned()),
+                venue: Some(VenueError {
+                    code: -1003,
+                    msg:
+                        "Too much request weight used; current limit is 6000 request weight per 1 \
+                          MINUTE."
+                            .to_owned(),
+                }),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_that_cannot_trade_is_not_ready_and_one_that_can_is_ready() {
+        let (base, server) = serve_once(http("200 OK", "", &account("false")));
+        let why = client_at(&base)
+            .check_ready(0)
+            .await
+            .expect_err("cannot trade");
+        let request = server.join().expect("the server ran");
+        assert_eq!(why, NotReady::CannotTrade);
+        assert!(!why.to_string().contains(BALANCE), "{why}");
+        // The request it answered was the signed account probe, with its key.
+        assert!(
+            request.starts_with("GET /api/v3/account?timestamp="),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-mbx-apikey: the-api-key\r\n"),
+            "{request}"
+        );
+
+        let (base, server) = serve_once(http("200 OK", "", &account("true")));
+        assert_eq!(client_at(&base).check_ready(0).await, Ok(()));
+        server.join().expect("the server ran");
     }
 }

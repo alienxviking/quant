@@ -2,9 +2,13 @@
 //!
 //! The preflight `docs/live-run.md` slice (b) names, and the only part of M8
 //! that can be run end to end before any money is at risk. It makes exactly one
-//! signed request, `GET /api/v3/account`, which is the cheapest there is: it
+//! signed request, `GET /api/v3/account`. That is not the cheapest signed call
+//! -- its weight is 20 (rest-api.md:4180-4181), where `GET /api/v3/openOrders`
+//! for one symbol is 6 (rest-api.md:4293-4294) -- but it is the one whose answer
+//! says whether this key may trade at all (`canTrade`, rest-api.md:4207), and it
 //! exercises the API key, the Ed25519 signature, the header and the clock in
-//! one round trip and places nothing.
+//! one round trip and places nothing. Its body also lists the account's
+//! balances, which this never prints.
 //!
 //! ```text
 //! export BINANCE_API_KEY=...
