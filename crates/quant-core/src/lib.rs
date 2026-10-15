@@ -45,6 +45,7 @@ pub mod event;
 pub mod execution;
 pub mod fixed;
 pub mod instrument;
+pub mod report;
 pub mod source;
 pub mod time;
 
@@ -53,12 +54,13 @@ pub use event::{
 };
 pub use execution::{
     ClientOrderId, ExecutionEvent, Fill, OrderKind, OrderRequest, RejectReason, TimeInForce,
-    VenueOrderId,
+    VenueOrderId, VenueTradeId,
 };
 pub use fixed::{Notional, ParseFixedError, Px, Qty, Rate, SCALE, SCALE_DECIMALS};
 pub use instrument::{
     Exchange, Instrument, InstrumentDef, InstrumentId, InstrumentKind, InstrumentRegistry,
 };
+pub use report::{Notice, OrderReport, VenueReport};
 pub use source::{EventSource, SourceError, Wake};
 pub use time::{Clock, ManualClock, SystemClock, Ts, UtcDate};
 

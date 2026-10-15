@@ -69,6 +69,25 @@ impl core::fmt::Display for VenueOrderId {
     }
 }
 
+/// The venue's identifier for one execution: Binance's `t` on a stream report,
+/// and `id` on a `myTrades` row.
+///
+/// A type of its own rather than a second [`VenueOrderId`], because the order
+/// id and the trade id are both integers on one `myTrades` row, and a swap must
+/// not compile. A `String` for the reason `VenueOrderId` is one: it is the
+/// venue's namespace, and pasting it into the venue's interface has to find the
+/// trade.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct VenueTradeId(pub String);
+
+impl core::fmt::Display for VenueTradeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// How an order is priced.
 ///
 /// Deliberately two variants. Every venue has more, and every extra one is a
