@@ -1,24 +1,34 @@
-//! Prove the credentials, the signature and the clock — without placing an order.
+//! Prove the credentials, the signature, the clock and the key's permission to
+//! trade — without placing an order.
 //!
 //! The preflight `docs/live-run.md` slice (b) names, and the only part of M8
-//! that can be run end to end before any money is at risk. It makes exactly one
-//! signed request, `GET /api/v3/account`, which exercises the API key, the
-//! Ed25519 signature, the header and the clock in one round trip and places
-//! nothing. That is not the cheapest signed call -- its weight is 20
-//! (rest-api.md:4180-4181), where `GET /api/v3/openOrders` for one symbol is 6
-//! (rest-api.md:4293-4294) -- but its answer carries the account's `canTrade`
-//! (rest-api.md:4207), which this reads. Its body also lists the account's
-//! balances, which this never prints.
+//! that can be run end to end before any money is at risk. It makes three
+//! signed requests, and none of them places anything:
 //!
-//! READY is not permission to trade, and says so. The account endpoint is
-//! `USER_DATA` (rest-api.md:4174), and an API key cannot `TRADE` until trading
-//! is enabled for it in API Management (rest-api.md:194-196), so a key without
-//! that permission passes this check all the same. Nor does `canTrade` settle
-//! it: the venue's documentation shows the field and never defines it. Only a
-//! request whose security type is `TRADE` tests the key's permission, and a
-//! later pull request adds one, `POST /api/v3/order/test`, which validates an
-//! order without sending it to the matching engine, at weight 1
-//! (rest-api.md:2321-2333).
+//! - **`GET /api/v3/account`** exercises the API key, the Ed25519 signature, the
+//!   header and the clock in one round trip. That is not the cheapest signed
+//!   call -- its weight is 20 (rest-api.md:4180-4181), where
+//!   `GET /api/v3/openOrders` for one symbol is 6 (rest-api.md:4293-4294) -- but
+//!   its answer carries the account's `canTrade` (rest-api.md:4207), which this
+//!   reads. Its body also lists the account's balances, which this never prints.
+//! - **`POST /api/v3/order/test`** proves the key may trade. The account
+//!   endpoint is `USER_DATA` (rest-api.md:4174), and an API key cannot `TRADE`
+//!   until trading is enabled for it in API Management (rest-api.md:194-196), so
+//!   a key without that permission passes the first request all the same, and
+//!   `canTrade` does not settle it either: the venue's documentation shows the
+//!   field and never defines it. This endpoint is `TRADE`, weight 1, and
+//!   *"Creates and validates a new order but does not send it into the matching
+//!   engine"* (rest-api.md:2321-2333). It is sent a market buy of the checked
+//!   symbol, encoded as the run's orders are; [`probe`] says what it holds, and
+//!   why a refusal of its numbers still proves the permission.
+//! - **`GET /api/v3/account/commission`** checks that the account does not pay
+//!   its fees in BNB (rest-api.md:4797-4846). A fee taken in BNB is in neither
+//!   asset of the pair, and the user-data translator refuses a fill whose fee
+//!   it cannot book, so the run needs the discount off. Its body holds the
+//!   account's commission rates, of which this prints the one flag it reads.
+//!
+//! READY means all of it: the key, the signature and the clock work, the
+//! account reports `canTrade`, the key may trade, and fees are not paid in BNB.
 //!
 //! ```text
 //! # bash
@@ -30,6 +40,7 @@
 //!
 //! cargo run -p quant-binance --bin venue-check               # the live venue
 //! cargo run -p quant-binance --bin venue-check -- --testnet  # Spot Testnet
+//! cargo run -p quant-binance --bin venue-check -- --symbol ETHUSDT
 //! ```
 //!
 //! The key's path is absolute and outside the repository, because `cargo run`
@@ -38,7 +49,8 @@
 //!
 //! `--testnet` checks against Spot Testnet instead ([`SPOT_TESTNET_REST`]),
 //! where `docs/live-run.md` §5 rehearses, with a key pair separate from the
-//! live one.
+//! live one. `--symbol` sets the symbol of the trade probe and of the
+//! commission rates, [`DEFAULT_SYMBOL`] when not given.
 //!
 //! It prints the loaded key's public half, which is not secret, so it can be
 //! compared with the one registered: a mismatch is otherwise a -1022 that says
@@ -53,10 +65,16 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use quant_binance::credentials::Credentials;
+use quant_binance::orders::{EncodeError, NewOrder};
 use quant_binance::rest::{SnapshotClient, SPOT_REST, SPOT_TESTNET_REST};
 use quant_binance::trade::{
-    ClockSample, NotReady, TradeClient, MAX_CLOCK_SKEW_MS, MIN_CLOCK_READINGS,
+    ClockSample, NotReady, TradeClient, TradePermission, MAX_CLOCK_SKEW_MS, MIN_CLOCK_READINGS,
+    WHY_A_VERDICT_PROVES_PERMISSION,
 };
+use quant_binance::user_data::RunTag;
+use quant_core::event::Side;
+use quant_core::execution::{ClientOrderId, OrderKind, OrderRequest, TimeInForce};
+use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
 
 /// How many readings of the venue's clock to try before believing one.
 ///
@@ -76,12 +94,30 @@ const CLOCK_READINGS: usize = 5;
 // would say so only at run time, every time.
 const _: () = assert!(MIN_CLOCK_READINGS <= CLOCK_READINGS);
 
+/// The symbol checked when `--symbol` is not given: the one M5 traded and M8
+/// will.
+const DEFAULT_SYMBOL: &str = "BTCUSDT";
+
+/// How much the trade probe asks to buy: M5's `--qty`, the size the run trades
+/// (`docs/live-run.md` §2), so that the venue validates the order the run would
+/// send rather than one it never will.
+const PROBE_QTY: &str = "0.001";
+
+/// The run tag the probe's id is written under, `q-venuecheck-0`. The probe is
+/// never an order, but its id is sent all the same, and under this tag no run
+/// of ours would ever have sent it.
+const PROBE_RUN: &str = "venuecheck";
+
 /// The help text. A raw string, so the commands in it read exactly as they are
 /// to be typed, quotes and backslashes included.
-const USAGE: &str = r#"usage: venue-check [--testnet]
+const USAGE: &str = r#"usage: venue-check [--testnet] [--symbol SYMBOL]
 
-Makes one signed request, GET /api/v3/account, and places nothing. It reads two
-variables, which the shell that runs it must export:
+Makes three signed requests and places nothing: GET /api/v3/account, for the
+key, the signature, the clock and the account's canTrade; POST
+/api/v3/order/test, which validates a market buy without sending it to the
+matching engine, for this key's permission to trade; and GET
+/api/v3/account/commission, for whether the account pays its fees in BNB. It
+reads two variables, which the shell that runs it must export:
 
   bash:        export BINANCE_API_KEY=...
                export BINANCE_ED25519_PRIVATE_KEY="$(cat "$HOME/.binance/ed25519.pem")"
@@ -105,24 +141,24 @@ The last command prints the public key, which is what to register with Binance.
   --testnet   check Spot Testnet, https://testnet.binance.vision, instead of the
               live venue. A testnet key pair is separate from the live one:
               register one with the testnet and load that instead.
+  --symbol SYMBOL
+              the symbol the trade probe names and the fee check reads, spelled
+              as the venue spells it, in capital letters and digits: BTCUSDT
+              when not given.
 
 Exit 0 ready, 1 not ready, 2 for an argument it does not take.
 "#;
 
-/// What a pass prints.
+/// What a pass prints, after a line for each of the three requests.
 ///
-/// It names what was proved and, as plainly, what was not: the request is
-/// `USER_DATA`, which a key with no permission to trade passes all the same,
-/// so READY must not read as that permission. See the module docs.
+/// It names what was proved and that nothing was ordered. Balances and
+/// commission rates were read and are not printed.
 const READY: &str = "\
-venue        a signed request was accepted, and the account reports canTrade true
-
 verdict      READY: the API key, the Ed25519 key, the signature and the clock work,
-             and the account reports canTrade. NOT checked: whether this API key
-             may trade. GET /api/v3/account needs only USER_DATA permission, and
-             a key cannot TRADE until trading is enabled for it in Binance's API
-             Management. Nothing was ordered, and nothing is said of balances,
-             which are not printed.
+             the account reports canTrade, this API key may trade, and the account
+             does not pay its fees in BNB. Nothing was ordered: the trade probe went
+             to /api/v3/order/test, which validates an order without sending it to
+             the matching engine. Balances and commission rates are not printed.
 ";
 
 /// Which venue to check.
@@ -144,7 +180,7 @@ impl Venue {
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Check(Venue),
+    Check { venue: Venue, symbol: String },
     Help,
 }
 
@@ -155,8 +191,9 @@ struct UnknownArgument;
 impl core::fmt::Display for UnknownArgument {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(
-            "venue-check takes --testnet and --help, and was given something else. It is not \
-             repeated here, in case it was a key pasted in the wrong place.",
+            "venue-check takes --testnet, --symbol followed by a symbol in capital letters and \
+             digits, and --help, and was given something else. It is not repeated here, in case \
+             it was a key pasted in the wrong place.",
         )
     }
 }
@@ -167,23 +204,52 @@ impl core::fmt::Display for UnknownArgument {
 /// key pasted where an argument goes would otherwise be printed straight back,
 /// to a terminal and whatever is recording it. Arguments are read as `OsString`
 /// so one that is not valid text is refused too, rather than panicking the way
-/// `std::env::args` does.
+/// `std::env::args` does. A symbol is printed and sent, so it is held to the
+/// same rule: see [`parse_symbol`].
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, UnknownArgument> {
     let mut venue = Venue::Live;
-    for arg in args {
+    let mut symbol = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--testnet") => venue = Venue::Testnet,
+            Some("--symbol") => symbol = Some(parse_symbol(args.next().as_ref())?),
             Some("-h" | "--help") => return Ok(Command::Help),
             _ => return Err(UnknownArgument),
         }
     }
-    Ok(Command::Check(venue))
+    Ok(Command::Check {
+        venue,
+        symbol: symbol.unwrap_or_else(|| DEFAULT_SYMBOL.to_owned()),
+    })
+}
+
+/// The value given after `--symbol`, if it is spelled as the venue spells the
+/// symbols this project trades: capital letters and digits, `BTCUSDT`.
+///
+/// Anything else, a missing value included, is an argument this does not take,
+/// and is refused without being echoed. A symbol is printed, so a key pasted
+/// after `--symbol` would otherwise be printed back like any other; and the
+/// alphabets a key comes in, an API key's mixed case and a PEM body's `+`, `/`
+/// and `=`, all fail this.
+fn parse_symbol(given: Option<&OsString>) -> Result<String, UnknownArgument> {
+    match given.and_then(|value| value.to_str()) {
+        Some(text)
+            if !text.is_empty()
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) =>
+        {
+            Ok(text.to_owned())
+        }
+        _ => Err(UnknownArgument),
+    }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let venue = match parse_args(std::env::args_os().skip(1)) {
-        Ok(Command::Check(venue)) => venue,
+    let (venue, symbol) = match parse_args(std::env::args_os().skip(1)) {
+        Ok(Command::Check { venue, symbol }) => (venue, symbol),
         Ok(Command::Help) => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -202,6 +268,7 @@ async fn main() -> ExitCode {
             println!("             a testnet key pair is separate from the live one");
         }
     }
+    println!("symbol       {symbol}, which the trade probe names and the fee check reads");
 
     let credentials = match Credentials::from_env() {
         Ok(c) => c,
@@ -224,7 +291,7 @@ async fn main() -> ExitCode {
         Ok(offset) => offset,
         Err(code) => return code,
     };
-    check(venue, credentials, offset).await
+    check(venue, &symbol, credentials, offset).await
 }
 
 /// How far this host's clock is from the venue's, printed, or the exit code
@@ -296,8 +363,48 @@ async fn clock_offset(venue: Venue) -> Result<i64, ExitCode> {
     Ok(offset)
 }
 
-/// The signed request, and the verdict.
-async fn check(venue: Venue, credentials: Credentials, offset: i64) -> ExitCode {
+/// The order `POST /api/v3/order/test` is asked to validate: a market buy of
+/// [`PROBE_QTY`] of `symbol`, the shape `MaCrossover` sends, written by the
+/// encoder the run's orders go through.
+///
+/// The instrument is built from literals, because nothing here reads the
+/// venue's `exchangeInfo` yet; a sibling pull request adds it, and this is where
+/// it plugs in. The encoder reads the instrument's symbol, exchange and kind,
+/// and leaves every venue rule to the venue (`quant_binance::orders`), so the
+/// rules below go nowhere. They are `BTCUSDT`'s as `paper` and `backtest`
+/// register them, there because an instrument must have some, and the asset
+/// names stay empty because nothing reads them.
+///
+/// The venue does check the probe's quantity, against its current rules, and
+/// may refuse it on a filter: rules that changed, or another symbol's. That
+/// answer still proves what the probe is for, because
+/// [`WHY_A_VERDICT_PROVES_PERMISSION`]: the venue judges the order only once
+/// the request has passed the checks a key without permission to trade fails.
+/// `TradeClient::check_trade_permission` gives the documentation behind it.
+fn probe(symbol: &str) -> Result<NewOrder, EncodeError> {
+    let instrument = InstrumentDef {
+        exchange: Exchange::Binance,
+        symbol: symbol.to_owned(),
+        base: String::new(),
+        quote: String::new(),
+        kind: InstrumentKind::Spot,
+        tick_size: "0.01".parse().expect("a valid literal"),
+        lot_size: "0.00001".parse().expect("a valid literal"),
+        min_notional: "5".parse().expect("a valid literal"),
+    };
+    let request = OrderRequest {
+        instrument: InstrumentRegistry::new().register(instrument.clone()),
+        side: Side::Buy,
+        qty: PROBE_QTY.parse().expect("a valid literal"),
+        kind: OrderKind::Market,
+        time_in_force: TimeInForce::Gtc,
+    };
+    let run = RunTag::new(PROBE_RUN).expect("a valid run tag");
+    NewOrder::encode(&request, ClientOrderId(0), &run, &instrument)
+}
+
+/// The three signed requests, a line for each, and the verdict.
+async fn check(venue: Venue, symbol: &str, credentials: Credentials, offset: i64) -> ExitCode {
     let client = match TradeClient::new(venue.base(), Duration::from_secs(10), credentials) {
         Ok(c) => c,
         Err(e) => {
@@ -305,23 +412,63 @@ async fn check(venue: Venue, credentials: Credentials, offset: i64) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
-    match client.check_ready(offset).await {
-        Ok(()) => {
-            print!("{READY}");
-            ExitCode::SUCCESS
-        }
-        Err(why) => {
-            println!();
-            eprintln!("verdict      NOT READY: {why}");
-            if venue == Venue::Testnet && matches!(why, NotReady::BadCredentials { .. }) {
-                eprintln!(
-                    "             this was Spot Testnet, whose key pairs are registered with the \
-                     testnet ({SPOT_TESTNET_REST}), not with the live venue"
-                );
-            }
-            ExitCode::FAILURE
-        }
+    if let Err(why) = client.check_ready(offset).await {
+        return not_ready(venue, &why);
     }
+    println!("account      a signed request was accepted, and the account reports canTrade true");
+
+    let probe = match probe(symbol) {
+        Ok(probe) => probe,
+        Err(why) => {
+            eprintln!("permission   could not write the trade probe: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match client.check_trade_permission(&probe, offset).await {
+        Ok(TradePermission::Granted) => println!(
+            "permission   POST /api/v3/order/test accepted a market buy of {PROBE_QTY} {symbol}: \
+             this API key may trade"
+        ),
+        Ok(TradePermission::GrantedButFiltered {
+            status,
+            venue: said,
+            ..
+        }) => {
+            println!(
+                "permission   POST /api/v3/order/test refused the probe on its numbers (HTTP \
+                 {status}, code {}: {}), and this API key may trade all the same, because \
+                 {WHY_A_VERDICT_PROVES_PERMISSION}",
+                said.code, said.msg
+            );
+            println!(
+                "             the probe's numbers are literals, not the venue's current rules, \
+                 so the filter says nothing about the run"
+            );
+        }
+        Err(why) => return not_ready(venue, &why),
+    }
+
+    if let Err(why) = client.check_bnb_discount_off(symbol, offset).await {
+        return not_ready(venue, &why);
+    }
+    println!(
+        "fees         the account does not pay its fees in BNB (discount.enabledForAccount false)"
+    );
+    print!("{READY}");
+    ExitCode::SUCCESS
+}
+
+/// Print why, and the exit code for it.
+fn not_ready(venue: Venue, why: &NotReady) -> ExitCode {
+    println!();
+    eprintln!("verdict      NOT READY: {why}");
+    if venue == Venue::Testnet && matches!(why, NotReady::BadCredentials { .. }) {
+        eprintln!(
+            "             this was Spot Testnet, whose key pairs are registered with the \
+             testnet ({SPOT_TESTNET_REST}), not with the live venue"
+        );
+    }
+    ExitCode::FAILURE
 }
 
 fn millis() -> i64 {
@@ -333,19 +480,34 @@ fn millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, Command, UnknownArgument, Venue, READY, USAGE};
+    use super::{parse_args, probe, Command, UnknownArgument, Venue, READY, USAGE};
     use std::ffi::OsString;
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
     }
 
+    fn check(venue: Venue, symbol: &str) -> Command {
+        Command::Check {
+            venue,
+            symbol: symbol.to_owned(),
+        }
+    }
+
     #[test]
     fn the_flags_it_takes_are_understood() {
-        assert_eq!(parse_args(args(&[])), Ok(Command::Check(Venue::Live)));
+        assert_eq!(parse_args(args(&[])), Ok(check(Venue::Live, "BTCUSDT")));
         assert_eq!(
             parse_args(args(&["--testnet"])),
-            Ok(Command::Check(Venue::Testnet))
+            Ok(check(Venue::Testnet, "BTCUSDT"))
+        );
+        assert_eq!(
+            parse_args(args(&["--symbol", "ETHUSDT"])),
+            Ok(check(Venue::Live, "ETHUSDT"))
+        );
+        assert_eq!(
+            parse_args(args(&["--symbol", "1000SATSUSDT", "--testnet"])),
+            Ok(check(Venue::Testnet, "1000SATSUSDT"))
         );
         assert_eq!(parse_args(args(&["--help"])), Ok(Command::Help));
         assert_eq!(parse_args(args(&["--testnet", "-h"])), Ok(Command::Help));
@@ -357,12 +519,18 @@ mod tests {
     fn an_argument_it_does_not_take_is_refused_without_being_repeated() {
         // The likeliest unknown argument worth worrying about: the private
         // key, pasted where an argument goes. Binance's published example key
-        // stands in for it.
+        // stands in for it. A symbol is printed, so the same goes for a key
+        // pasted after --symbol, and for an API key's mixed case there.
         let key = "MC4CAQAwBQYDK2VwBCIEIIJEYWtGBrhACmb9Dvy+qa8WEf0lQOl1s4CLIAB9m89u";
+        // Binance's example API key (rest-api.md:563): mixed case.
+        let api_key = "4yNzx3yWC5bS6YTwEkSRaC0nRmSQIIStAUOh1b6kqaBrTLIhjCpI5lJH8q8R8WNO";
         for (given, unknown) in [
             (args(&[key]), key),
             (args(&["--testnet", key]), key),
             (args(&["--live"]), "--live"),
+            (args(&["--symbol", key]), key),
+            (args(&["--symbol", api_key]), api_key),
+            (args(&["--symbol", "btcusdt"]), "btcusdt"),
         ] {
             let why = parse_args(given).expect_err("refused");
             assert_eq!(why, UnknownArgument);
@@ -376,7 +544,19 @@ mod tests {
                 assert!(!said.contains(piece), "{piece} in {said}");
             }
         }
-        // Text that is not valid text is refused rather than panicking.
+        // And a symbol that is missing, empty, or spelled with anything but
+        // capital letters and digits.
+        for given in [
+            args(&["--symbol"]),
+            args(&["--symbol", ""]),
+            args(&["--symbol", "BTC-USDT"]),
+            args(&["--symbol", "BTCUSDT "]),
+            args(&["--symbol", "--testnet"]),
+        ] {
+            assert_eq!(parse_args(given.clone()), Err(UnknownArgument), "{given:?}");
+        }
+        // Text that is not valid text is refused rather than panicking, as an
+        // argument and as a symbol.
         #[cfg(windows)]
         let odd = {
             use std::os::windows::ffi::OsStringExt;
@@ -387,30 +567,54 @@ mod tests {
             use std::os::unix::ffi::OsStringExt;
             OsString::from_vec(vec![0xff])
         };
-        assert_eq!(parse_args([odd]), Err(UnknownArgument));
+        assert_eq!(parse_args([odd.clone()]), Err(UnknownArgument));
+        assert_eq!(
+            parse_args([OsString::from("--symbol"), odd]),
+            Err(UnknownArgument)
+        );
     }
 
     #[test]
-    fn ready_says_what_it_proved_and_that_permission_to_trade_is_not_part_of_it() {
-        // `GET /api/v3/account` is USER_DATA, which a key that cannot TRADE
-        // passes all the same. A pass that read as "this key may trade" would
-        // be the check vouching for the one thing it never tested.
+    fn the_trade_probe_is_a_market_buy_of_the_symbol_at_the_runs_size() {
+        // The run's shape and size, under an id no run of ours would send,
+        // written by the encoder every order goes through.
+        assert_eq!(
+            probe("BTCUSDT").expect("encodes").query(),
+            "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.001&newClientOrderId=q-venuecheck-0\
+             &newOrderRespType=ACK"
+        );
+        assert!(probe("ETHUSDT")
+            .expect("encodes")
+            .query()
+            .starts_with("symbol=ETHUSDT&"));
+    }
+
+    #[test]
+    fn ready_says_what_it_proved_and_that_nothing_was_ordered() {
+        // Each of the three requests has its clause, the permission to trade
+        // among them now that a TRADE request proves it, and the pass says
+        // where the probe went: an order that was only validated.
         let said = READY.split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
             "READY: the API key, the Ed25519 key, the signature and the clock work",
             "the account reports canTrade",
-            "NOT checked: whether this API key may trade",
-            "GET /api/v3/account needs only USER_DATA permission",
-            "cannot TRADE until trading is enabled for it in Binance's API Management",
+            "this API key may trade",
+            "the account does not pay its fees in BNB",
             "Nothing was ordered",
+            "/api/v3/order/test, which validates an order without sending it to the matching \
+             engine",
+            "Balances and commission rates are not printed",
         ] {
             assert!(said.contains(needle), "{needle:?} missing from: {said}");
         }
+        // canTrade is the account's, and undefined; that the key may trade is
+        // what the probe proves, and READY must not run the two together.
         assert!(!said.contains("the account can trade"), "{said}");
+        assert!(!said.contains("NOT checked"), "{said}");
     }
 
     #[test]
-    fn the_usage_shows_both_shells_how_to_make_a_key_and_the_testnet() {
+    fn the_usage_shows_both_shells_how_to_make_a_key_the_testnet_and_the_symbol() {
         // Every path to the key absolute and outside the repository, in both
         // shells: these lines are run where `cargo run` runs, inside the
         // workspace, so a relative path would put the private key in it.
@@ -430,6 +634,11 @@ mod tests {
             "--testnet",
             "https://testnet.binance.vision",
             "A testnet key pair is separate from the live one",
+            "usage: venue-check [--testnet] [--symbol SYMBOL]\n",
+            "\n  --symbol SYMBOL\n",
+            "in capital letters and digits: BTCUSDT",
+            "places nothing",
+            "/api/v3/order/test",
         ] {
             assert!(USAGE.contains(needle), "{needle:?} missing from the usage");
         }
