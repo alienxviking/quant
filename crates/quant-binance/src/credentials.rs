@@ -104,6 +104,8 @@
 //! to do what is already linked. `base64` 0.22 is in the graph already as well,
 //! through `reqwest`, so naming it adds no crate to the build either.
 
+use std::ffi::OsString;
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
@@ -236,6 +238,20 @@ impl Credentials {
     /// `export BINANCE_ED25519_PRIVATE_KEY=` is a mistake that should say so,
     /// not surface as some other refusal nobody could trace back to the shell.
     pub fn from_env() -> Result<Self, CredentialError> {
+        Self::from_lookup(std::env::var_os)
+    }
+
+    /// [`Self::from_env`], with `lookup` in place of the process environment:
+    /// `lookup(name)` is what is set under `name`, or `None` when nothing is.
+    ///
+    /// Everything `from_env` does but the one call that reads the environment,
+    /// so a test can drive the real wiring -- which variable is read, and
+    /// where each result goes -- without setting a variable every other test
+    /// in the process would see.
+    fn from_lookup(
+        lookup: impl Fn(&'static str) -> Option<OsString>,
+    ) -> Result<Self, CredentialError> {
+        let read = |name| read_value(name, lookup(name));
         let key = read(Self::KEY_VAR)?;
         let text = private_key_text(
             read(Self::PRIVATE_KEY_VAR),
@@ -463,11 +479,14 @@ impl core::fmt::Debug for Credentials {
     }
 }
 
-fn read(name: &'static str) -> Result<String, CredentialError> {
-    match std::env::var(name) {
-        Ok(value) => non_empty(name, &value),
-        Err(std::env::VarError::NotPresent) => Err(CredentialError::Missing(name)),
-        Err(std::env::VarError::NotUnicode(_)) => Err(CredentialError::NotText(name)),
+/// What is set under `name`, given as `value`, read the way `std::env::var`
+/// reads it: absent is [`CredentialError::Missing`], and set but not Unicode
+/// is [`CredentialError::NotText`]. Text then goes through [`non_empty`].
+fn read_value(name: &'static str, value: Option<OsString>) -> Result<String, CredentialError> {
+    match value.map(OsString::into_string) {
+        Some(Ok(value)) => non_empty(name, &value),
+        Some(Err(_)) => Err(CredentialError::NotText(name)),
+        None => Err(CredentialError::Missing(name)),
     }
 }
 
@@ -582,6 +601,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     use ring::signature::{KeyPair as _, UnparsedPublicKey, ED25519};
+    use std::ffi::OsString;
 
     /// The payload of Binance's own Ed25519 example (fix-api.md:287-312): the
     /// FIX Logon's `MsgType`, `SenderCompID`, `TargetCompID`, `MsgSeqNum` and
@@ -939,6 +959,84 @@ mod tests {
         );
         let not_text = CredentialError::NotText(Credentials::PRIVATE_KEY_VAR);
         assert_eq!(private_key_text(Err(not_text.clone()), true), Err(not_text));
+    }
+
+    #[test]
+    fn from_env_reads_each_variable_and_hands_each_where_it_belongs() {
+        // `from_env`'s own wiring, run over a lookup that stands in for the
+        // process environment: setting real variables here would race every
+        // other test that reads them. The cases above test `private_key_text`
+        // on its own; these test that `from_env` reads the retired secret's
+        // variable, and nothing else, to decide whether it is set.
+        fn load(vars: &[(&'static str, &str)]) -> Result<(), CredentialError> {
+            let vars: Vec<(&'static str, OsString)> = vars
+                .iter()
+                .map(|&(name, value)| (name, OsString::from(value)))
+                .collect();
+            Credentials::from_lookup(move |name| {
+                vars.iter()
+                    .find(|(set, _)| *set == name)
+                    .map(|(_, value)| value.clone())
+            })
+            .map(|_| ())
+        }
+        let key = Credentials::KEY_VAR;
+        let private = Credentials::PRIVATE_KEY_VAR;
+        let retired = Credentials::RETIRED_SECRET_VAR;
+
+        // The HMAC hint when the retired secret is set and the key is not...
+        assert_eq!(
+            load(&[(key, "k"), (retired, "s")]),
+            Err(CredentialError::HmacSecretInstead)
+        );
+        // ...and the plain missing variable when it is not set, whatever else
+        // is: the API key being set is not the retired secret being set.
+        assert_eq!(load(&[(key, "k")]), Err(CredentialError::Missing(private)));
+        // A retired secret that is only whitespace is not set, as
+        // `ops/preflight.sh` reads it too.
+        assert_eq!(
+            load(&[(key, "k"), (retired, " \r\n")]),
+            Err(CredentialError::Missing(private))
+        );
+        // A key that is there is used, the retired secret notwithstanding.
+        assert_eq!(
+            load(&[(key, "k"), (private, EXAMPLE_KEY_PEM), (retired, "s")]),
+            Ok(())
+        );
+        // The API key is read first, and its absence named as itself.
+        assert_eq!(
+            load(&[(private, EXAMPLE_KEY_PEM), (retired, "s")]),
+            Err(CredentialError::Missing(key))
+        );
+
+        // Each value goes where it belongs: the API key, less what a shell
+        // left around it, to the header, and the private key to the signer.
+        let creds = Credentials::from_lookup(|name| match name {
+            n if n == key => Some(OsString::from(" the-api-key\r\n")),
+            n if n == private => Some(OsString::from(EXAMPLE_KEY_PEM)),
+            _ => None,
+        })
+        .expect("loads");
+        assert_eq!(creds.key(), "the-api-key");
+        assert_eq!(creds.sign(FIX_PAYLOAD), FIX_SIGNATURE);
+
+        // A key that is set but is not text is said to be that, and is not
+        // turned into the HMAC hint, which is for a key that is missing.
+        #[cfg(windows)]
+        let odd = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        #[cfg(unix)]
+        let odd = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        let not_text = Credentials::from_lookup(|name| match name {
+            n if n == private => Some(odd.clone()),
+            _ => Some(OsString::from("set")),
+        });
+        assert_eq!(not_text.map(|_| ()), Err(CredentialError::NotText(private)));
     }
 
     #[test]
