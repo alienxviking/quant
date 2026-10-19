@@ -41,12 +41,49 @@
 //! be *readable* while the thing that owns it is borrowed for the lifetime of
 //! the run. `saturating` arithmetic for the same reason M1.e settled on it: a
 //! metric must never be able to take down a capture.
+//!
+//! # Why the last drop is marked as well as counted
+//!
+//! A consumer finds a hole when the record after it arrives. The market never
+//! stops, so for the market that is soon. The account stream can say nothing
+//! for hours, and the record a quiet consumer missed can be a fill. So a tee
+//! can also mark the last record its secondary did not get ([`LastDropped`]),
+//! and a consumer that finds its channel empty can see that something after
+//! its last record was lost without waiting for a record to reveal it. The
+//! mark is written only on a drop, so the path every record takes is
+//! unchanged.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use quant_core::time::Ts;
 
 use crate::record::CaptureRecord;
 use crate::sink::{RecordSink, SinkError};
+
+/// The last record a tee's secondary was not handed: its `ingest_seq` and its
+/// `local_recv_ts`, shared with whoever reads the secondary.
+///
+/// Set on every drop, so it names the latest. The mark is set after every
+/// record before it has been handed over or dropped, and the lock orders the
+/// two, so a reader that reads the mark first and then finds its channel empty
+/// knows every record up to the mark that it does not hold is lost to it.
+#[derive(Debug, Default)]
+pub struct LastDropped(Mutex<Option<(u64, Ts)>>);
+
+impl LastDropped {
+    /// The last record dropped, if any has been.
+    #[must_use]
+    pub fn get(&self) -> Option<(u64, Ts)> {
+        // A panic while the lock was held cannot have left a half-written
+        // pair, and a mark must never be able to take down a capture.
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set(&self, ingest_seq: u64, local_recv_ts: Ts) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((ingest_seq, local_recv_ts));
+    }
+}
 
 /// Sends every record to two sinks, favouring the first.
 #[derive(Debug, Clone)]
@@ -54,6 +91,7 @@ pub struct TeeSink<P, S> {
     primary: P,
     secondary: S,
     secondary_dropped: Arc<AtomicU64>,
+    last_dropped: Option<Arc<LastDropped>>,
     secondary_gone: bool,
 }
 
@@ -65,6 +103,7 @@ impl<P: RecordSink, S: RecordSink> TeeSink<P, S> {
             primary,
             secondary,
             secondary_dropped: Arc::new(AtomicU64::new(0)),
+            last_dropped: None,
             secondary_gone: false,
         }
     }
@@ -74,6 +113,14 @@ impl<P: RecordSink, S: RecordSink> TeeSink<P, S> {
     #[must_use]
     pub fn counting_into(mut self, drops: Arc<AtomicU64>) -> Self {
         self.secondary_dropped = drops;
+        self
+    }
+
+    /// Mark the last record the secondary did not get in a handle the caller
+    /// keeps, for a consumer that may go quiet ([`LastDropped`]).
+    #[must_use]
+    pub fn marking_into(mut self, mark: Arc<LastDropped>) -> Self {
+        self.last_dropped = Some(mark);
         self
     }
 
@@ -96,10 +143,13 @@ impl<P: RecordSink, S: RecordSink> TeeSink<P, S> {
     /// Saturating, because a metric must never be able to take down a capture
     /// — M1.e's literal recorded lesson, where an unsigned queue depth wrapped
     /// below zero and killed the recorder.
-    fn count_drop(&mut self) {
+    fn count_drop(&mut self, ingest_seq: u64, local_recv_ts: Ts) {
         let seen = self.secondary_dropped.load(Ordering::Relaxed);
         self.secondary_dropped
             .store(seen.saturating_add(1), Ordering::Relaxed);
+        if let Some(mark) = &self.last_dropped {
+            mark.set(ingest_seq, local_recv_ts);
+        }
     }
 
     /// Whether the secondary consumer has hung up for good.
@@ -128,23 +178,24 @@ impl<P: RecordSink, S: RecordSink> RecordSink for TeeSink<P, S> {
         // record back and we must return *that* one -- `Ingress` is entitled to
         // look at what it could not send.
         let copy = record.clone();
+        let (ingest_seq, local_recv_ts) = (record.ingest_seq(), record.local_recv_ts());
         // The primary first, and its failure is the failure. Nothing goes to the
         // secondary in that case: the capture does not have the record, so a
         // hole exists on both sides and the two views stay consistent.
         self.primary.try_send(record)?;
 
         if self.secondary_gone {
-            self.count_drop();
+            self.count_drop(ingest_seq, local_recv_ts);
             return Ok(());
         }
         match self.secondary.try_send(copy) {
             Ok(()) => {}
-            Err(SinkError::Full(_)) => self.count_drop(),
+            Err(SinkError::Full(_)) => self.count_drop(ingest_seq, local_recv_ts),
             Err(SinkError::Disconnected) => {
                 // Latched, so a dead engine costs one failed send rather than
                 // one per message for the rest of a two-week run.
                 self.secondary_gone = true;
-                self.count_drop();
+                self.count_drop(ingest_seq, local_recv_ts);
             }
         }
         Ok(())
@@ -271,6 +322,33 @@ mod tests {
             drops.load(Ordering::Relaxed),
             "and both views agree"
         );
+    }
+
+    #[test]
+    fn the_last_drop_is_marked_and_nothing_else_is() {
+        let mark = Arc::new(LastDropped::default());
+        let mut tee = TeeSink::new(TestSink::with_capacity(8), TestSink::with_capacity(2))
+            .marking_into(Arc::clone(&mark));
+        for seq in 1..=2 {
+            tee.try_send(record(seq)).expect("room");
+        }
+        assert_eq!(mark.get(), None, "nothing dropped, nothing marked");
+        for seq in 3..=4 {
+            tee.try_send(record(seq)).expect("the capture has room");
+        }
+        assert_eq!(
+            mark.get(),
+            Some((4, record(4).local_recv_ts())),
+            "the latest drop, with its own stamp"
+        );
+        // A record the capture refused never reached the secondary, so it is
+        // not the secondary's drop either.
+        let fresh = Arc::new(LastDropped::default());
+        let mut tee = TeeSink::new(TestSink::with_capacity(1), TestSink::with_capacity(8))
+            .marking_into(Arc::clone(&fresh));
+        tee.try_send(record(1)).expect("room for one");
+        let _ = tee.try_send(record(2)).expect_err("the capture is full");
+        assert_eq!(fresh.get(), None);
     }
 
     #[test]

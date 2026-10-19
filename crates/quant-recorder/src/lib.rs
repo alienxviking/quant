@@ -136,5 +136,5 @@ pub use segment::{
 pub use sink::{
     channel, CaptureReceiver, CaptureSender, RecordSink, SinkError, DEFAULT_CHANNEL_CAPACITY,
 };
-pub use tee::TeeSink;
+pub use tee::{LastDropped, TeeSink};
 pub use writer::{run_writer, WriterOutcome, DEFAULT_FLUSH_INTERVAL};

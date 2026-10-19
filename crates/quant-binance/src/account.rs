@@ -189,7 +189,8 @@
 //! [`AccountFeed`], which hands it [`AccountRecord`]s: each frame with the
 //! bytes, stamp and sequence number the file has for it, and a
 //! [`AccountRecord::Blind`] for each recorded gap and for each hole in
-//! `ingest_seq` the tee left when the consumer fell behind. That is the
+//! `ingest_seq` the tee left when the consumer fell behind, whether or not a
+//! record has come since to reveal it (below). That is the
 //! interface `LiveVenue` (`docs/live-run.md` §4 item 7) is built against. It
 //! runs [`classify`] on a frame's bytes to tell an event from the
 //! subscription's answer, and hands events to the translator in
@@ -202,6 +203,14 @@
 //! costs a book that the next snapshot rebuilds; a dropped account record can
 //! be a fill, and nothing will send it again. So the consumer must never be
 //! handed a frame after a hole without first being told the hole is there.
+//!
+//! Nor left waiting for that frame to learn of the hole. The market feed finds
+//! a hole when the record after it arrives, which on the market is soon; an
+//! account that trades nothing sends nothing for hours, and the probes'
+//! answers are never recorded, so a fill the consumer missed could stay unseen
+//! that long. So the tee also marks the last record it did not hand over
+//! ([`LastDropped`](quant_recorder::LastDropped)), and the feed, finding its
+//! channel empty, reads the mark and reports the hole at once.
 
 use core::fmt;
 use core::time::Duration;
@@ -1129,6 +1138,8 @@ pub struct FeedStats {
 #[derive(Debug)]
 pub struct AccountFeed {
     records: std::sync::mpsc::Receiver<quant_recorder::CaptureRecord>,
+    /// The tee's mark of the last record it did not hand over.
+    mark: std::sync::Arc<quant_recorder::LastDropped>,
     last_seq: Option<u64>,
     /// The record that came after a hole, held while the hole is reported.
     pending: Option<AccountRecord>,
@@ -1136,10 +1147,21 @@ pub struct AccountFeed {
 }
 
 impl AccountFeed {
+    /// Read `records`, the tee's secondary channel, with `mark`, the handle the
+    /// same tee marks its drops in
+    /// ([`TeeSink::marking_into`](quant_recorder::TeeSink::marking_into)).
+    ///
+    /// Both are required, so a feed cannot be wired that waits for a record to
+    /// reveal a hole: a mark nobody sets reports nothing, which is the feed of
+    /// a tee that never drops.
     #[must_use]
-    pub fn new(records: std::sync::mpsc::Receiver<quant_recorder::CaptureRecord>) -> Self {
+    pub fn new(
+        records: std::sync::mpsc::Receiver<quant_recorder::CaptureRecord>,
+        mark: std::sync::Arc<quant_recorder::LastDropped>,
+    ) -> Self {
         Self {
             records,
+            mark,
             last_seq: None,
             pending: None,
             stats: FeedStats::default(),
@@ -1152,6 +1174,12 @@ impl AccountFeed {
     /// the record that revealed it, and that record next. The first record is
     /// expected to be the session's first, `ingest_seq` 1; a feed that starts
     /// later has missed the start and says so.
+    ///
+    /// A hole no record has revealed yet comes out when the channel is empty
+    /// (or closed) and the tee's mark is past the last record handed over: a
+    /// `Blind` stamped with the receive time of the record the mark names,
+    /// before `Empty` or `Closed`. The hole is then the feed's to account for,
+    /// so the record that later follows it brings no second `Blind`.
     pub fn poll(&mut self) -> Polled {
         use quant_recorder::CaptureRecord;
         use std::sync::mpsc::TryRecvError;
@@ -1160,10 +1188,19 @@ impl AccountFeed {
             return Polled::Record(record);
         }
         loop {
+            // The mark is read before the channel. Every record before the one
+            // the mark names was handed over or dropped before the mark was
+            // set, so if the channel is then empty, every record up to the
+            // mark that this feed has not had is lost to it, not on its way.
+            let mark = self.mark.get();
             let record = match self.records.try_recv() {
                 Ok(record) => record,
-                Err(TryRecvError::Empty) => return Polled::Empty,
-                Err(TryRecvError::Disconnected) => return Polled::Closed,
+                Err(TryRecvError::Empty) => {
+                    return self.unrevealed(mark).map_or(Polled::Empty, Polled::Record);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    return self.unrevealed(mark).map_or(Polled::Closed, Polled::Record);
+                }
             };
             let ingest_seq = record.ingest_seq();
             let local_recv_ts = record.local_recv_ts();
@@ -1216,6 +1253,23 @@ impl AccountFeed {
                 return Polled::Record(record);
             }
         }
+    }
+
+    /// The hole the tee's mark shows past the last record handed over, if
+    /// there is one, taken as revealed: counted, and `last_seq` moved to it.
+    fn unrevealed(&mut self, mark: Option<(u64, Ts)>) -> Option<AccountRecord> {
+        let (dropped, local_recv_ts) = mark?;
+        let last = self.last_seq.unwrap_or(0);
+        if dropped <= last {
+            return None;
+        }
+        self.stats.holes += 1;
+        self.stats.missed += dropped - last;
+        self.last_seq = Some(dropped);
+        Some(AccountRecord::Blind {
+            local_recv_ts,
+            cause: GapCause::LocalOverflow,
+        })
     }
 
     #[must_use]
@@ -1492,7 +1546,7 @@ mod tests {
 
         use quant_core::event::GapCause;
         use quant_core::time::{ManualClock, Ts};
-        use quant_recorder::{channel, CaptureRecord, Ingress, Metrics, TeeSink};
+        use quant_recorder::{channel, CaptureRecord, Ingress, LastDropped, Metrics, TeeSink};
         use quant_storage::{ControlRecord, SnapshotFailure, SnapshotPurpose};
 
         use super::super::{AccountFeed, AccountRecord, FeedStats, Polled};
@@ -1535,7 +1589,7 @@ mod tests {
         #[test]
         fn frames_and_gaps_come_out_in_order_as_recorded() {
             let (tx, rx) = sync_channel(16);
-            let mut feed = AccountFeed::new(rx);
+            let mut feed = AccountFeed::new(rx, Arc::default());
             assert_eq!(feed.poll(), Polled::Empty, "nothing yet is not the end");
             for record in [
                 gap(1, GapCause::RecorderRestart),
@@ -1574,7 +1628,7 @@ mod tests {
             // A missed record on this stream can be a fill. The frame after
             // the hole must not reach the consumer before the hole does.
             let (tx, rx) = sync_channel(16);
-            let mut feed = AccountFeed::new(rx);
+            let mut feed = AccountFeed::new(rx, Arc::default());
             for record in [frame(1), frame(2), frame(5), frame(6)] {
                 tx.send(record).expect("open");
             }
@@ -1594,7 +1648,7 @@ mod tests {
         #[test]
         fn a_feed_that_missed_the_start_says_so() {
             let (tx, rx) = sync_channel(4);
-            let mut feed = AccountFeed::new(rx);
+            let mut feed = AccountFeed::new(rx, Arc::default());
             tx.send(frame(3)).expect("open");
             assert_eq!(
                 feed.poll(),
@@ -1607,7 +1661,7 @@ mod tests {
         #[test]
         fn what_is_not_the_account_stream_is_never_handed_on() {
             let (tx, rx) = sync_channel(8);
-            let mut feed = AccountFeed::new(rx);
+            let mut feed = AccountFeed::new(rx, Arc::default());
             for record in [
                 frame(1),
                 CaptureRecord::Venue {
@@ -1634,46 +1688,73 @@ mod tests {
             assert_eq!(feed.stats().foreign, 2);
         }
 
-        #[test]
-        fn what_the_tee_drops_the_feed_reports_and_the_counts_agree() {
-            // The real path: an account ingress behind a tee whose consumer
-            // side holds one record, so the second and third are the
-            // consumer's loss and not the capture's.
+        /// The live wiring's ingress: the capture primary, the consumer second.
+        type Teed = Ingress<
+            TeeSink<quant_recorder::CaptureSender, std::sync::mpsc::SyncSender<CaptureRecord>>,
+        >;
+
+        /// An account ingress behind a tee whose consumer side holds one
+        /// record, with the tee's count and mark both kept: the live wiring.
+        fn wired() -> (
+            Teed,
+            quant_recorder::CaptureReceiver,
+            AccountFeed,
+            Arc<std::sync::atomic::AtomicU64>,
+        ) {
             let clock = Arc::new(ManualClock::new(Ts::from_millis(1_000)));
             let metrics = Metrics::new(16);
             let (capture, capture_rx) = channel(16, Arc::clone(&metrics));
             let (consumer, consumer_rx) = sync_channel(1);
-            let tee = TeeSink::new(capture, consumer);
             let drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let mut ingress = Ingress::new(
-                tee.counting_into(Arc::clone(&drops)),
-                clock.clone(),
-                metrics,
-            );
-            let mut feed = AccountFeed::new(consumer_rx);
-            for n in 1..=3_i64 {
-                ingress
-                    .accept_account_at(
-                        format!("frame {n}").into_bytes(),
-                        Ts::from_millis(1_000 + n),
-                    )
-                    .expect("the writer is there");
+            let mark = Arc::new(LastDropped::default());
+            let tee = TeeSink::new(capture, consumer)
+                .counting_into(Arc::clone(&drops))
+                .marking_into(Arc::clone(&mark));
+            let ingress = Ingress::new(tee, clock, metrics);
+            (
+                ingress,
+                capture_rx,
+                AccountFeed::new(consumer_rx, mark),
+                drops,
+            )
+        }
+
+        fn accept<S: quant_recorder::RecordSink>(ingress: &mut Ingress<S>, n: i64) {
+            ingress
+                .accept_account_at(
+                    format!("frame {n}").into_bytes(),
+                    Ts::from_millis(1_000 + n),
+                )
+                .expect("the writer is there");
+        }
+
+        fn dropped(drops: &std::sync::atomic::AtomicU64) -> u64 {
+            drops.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        #[test]
+        fn what_the_tee_drops_while_the_account_is_quiet_is_reported_at_once() {
+            // The second and third are the consumer's loss and not the
+            // capture's, and then the account goes quiet: nothing comes after
+            // them to reveal the hole, which on this stream can be hours.
+            let (mut ingress, capture_rx, mut feed, drops) = wired();
+            for n in 1..=3 {
+                accept(&mut ingress, n);
             }
             assert_eq!(feed.poll(), as_frame(1));
-            assert_eq!(feed.poll(), Polled::Empty);
-            ingress
-                .accept_account_at(b"frame 4".to_vec(), Ts::from_millis(1_004))
-                .expect("the writer is there");
             assert_eq!(
                 feed.poll(),
-                blind(Ts::from_millis(1_004), GapCause::LocalOverflow)
+                blind(Ts::from_millis(1_003), GapCause::LocalOverflow),
+                "told now, stamped by the last record lost"
             );
+            assert_eq!(feed.poll(), Polled::Empty);
+            assert_eq!(feed.stats().missed, dropped(&drops), "the counts agree");
+            assert_eq!(feed.stats().holes, 1);
+            // The record that follows the hole is not a second hole.
+            accept(&mut ingress, 4);
             assert_eq!(feed.poll(), as_frame(4));
-            assert_eq!(
-                feed.stats().missed,
-                drops.load(std::sync::atomic::Ordering::Relaxed),
-                "the tee's count and the feed's agree"
-            );
+            assert_eq!(feed.poll(), Polled::Empty);
+            assert_eq!((feed.stats().holes, feed.stats().missed), (1, 2));
             // And the capture has all four.
             drop(ingress);
             let mut captured = 0;
@@ -1684,6 +1765,39 @@ mod tests {
                 captured += 1;
             }
             assert_eq!(captured, 4);
+        }
+
+        #[test]
+        fn a_hole_a_record_reveals_first_is_told_once() {
+            // The other order: the record after the hole arrives before the
+            // feed finds its channel empty.
+            let (mut ingress, _capture_rx, mut feed, drops) = wired();
+            accept(&mut ingress, 1);
+            accept(&mut ingress, 2);
+            assert_eq!(feed.poll(), as_frame(1));
+            accept(&mut ingress, 3);
+            assert_eq!(
+                feed.poll(),
+                blind(Ts::from_millis(1_003), GapCause::LocalOverflow)
+            );
+            assert_eq!(feed.poll(), as_frame(3));
+            assert_eq!(feed.poll(), Polled::Empty, "and not again from the mark");
+            assert_eq!(feed.stats().missed, dropped(&drops));
+            assert_eq!(feed.stats().holes, 1);
+        }
+
+        #[test]
+        fn a_hole_at_the_end_is_told_before_the_feed_closes() {
+            let (mut ingress, _capture_rx, mut feed, _drops) = wired();
+            accept(&mut ingress, 1);
+            accept(&mut ingress, 2);
+            drop(ingress);
+            assert_eq!(feed.poll(), as_frame(1));
+            assert_eq!(
+                feed.poll(),
+                blind(Ts::from_millis(1_002), GapCause::LocalOverflow)
+            );
+            assert_eq!(feed.poll(), Polled::Closed);
         }
     }
 
