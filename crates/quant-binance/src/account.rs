@@ -19,7 +19,7 @@
 //! what to do next; whatever reads the recording later, `LiveVenue` or a
 //! replay of the file, needs the same answer from the same bytes, and two
 //! classifiers that had to agree forever would sooner or later not. M5 drew the
-//! same line for market data in [`crate::decode`].
+//! same line for market data in [`crate::decode`](mod@crate::decode).
 //!
 //! # Why our request ids name the request
 //!
@@ -59,10 +59,131 @@
 //! guard should never fire, and if it does it is logged as the anomaly it is.
 //! It is the one check here that does not depend on our reading of the
 //! venue's JSON being right.
+//!
+//! # One connection, start to finish
+//!
+//! [`listen`] connects, sends `session.logon` signed with the Ed25519 key and a
+//! timestamp read from the injected clock at that moment, waits for the answer,
+//! sends `userDataStream.subscribe`, waits for that answer, and then drains.
+//! *"A single connection to the API is only valid for 24 hours"*
+//! (web-socket-api.md:105), a subscription belongs to the connection it was
+//! made on, and nothing is replayed after a reconnect (`docs/live-run.md` §5),
+//! so every new connection does all three again, with a fresh timestamp: a
+//! logon is signed once and used once. The backoff between connections is
+//! [`ConnectionPolicy`]'s, seeded by [`ACCOUNT_STREAM`] so that a venue
+//! restart does not make this socket retry in step with the market's.
+//!
+//! The backoff resets on a **subscription**, not on a connection. The market
+//! socket is useful the moment it connects; this one is useful only once the
+//! venue has said yes twice, and a venue that takes the TCP connection and
+//! then refuses the logon, again and again, must be retried on a curve, not
+//! at the floor of one.
+//!
+//! A connection ends on any of the things the venue documents as ending a
+//! subscription: the socket closing (the 24-hour limit among them), a
+//! `serverShutdown` event (web-socket-api.md:106, :368-381), an
+//! `eventStreamTerminated` event (user-data-stream.md:325-341), and
+//! `session.status` saying no subscription is active. `serverShutdown` asks for
+//! a new connection *"as soon as possible"*, and gets one: this side leaves at
+//! once, without waiting for the venue to hang up. Opening the new connection
+//! before closing the old would avoid the gap, at the price of both
+//! subscriptions delivering the same events for a moment; that is a
+//! deduplication `LiveVenue` would own, and is not attempted here.
+//!
+//! # Liveness: what the venue answers, not what the account does
+//!
+//! The market socket gives up after 120 s without a frame
+//! ([`ConnectionPolicy::idle_timeout`]). Applied to *events*, that rule would
+//! be wrong here in the worst way: an account that trades nothing sends
+//! nothing for hours, so it would reconnect a healthy quiet account every two
+//! minutes and record a gap each time, a blindness that never happened, on the
+//! one stream where a gap puts every working order in doubt.
+//!
+//! The market rule never was about events: it counts every frame, pings
+//! included, and the venue pings every 20 seconds (web-socket-api.md:111). So
+//! pings would keep a quiet account's socket open. But a ping proves the
+//! socket, not the subscription (`docs/live-run.md` §5): a connection that
+//! still pings and has lost its subscription, or whose API has stopped
+//! answering, looks healthy from the ping alone. What the venue documents for
+//! the subscription is `session.status`, whose `userDataStream` field says
+//! whether one is active (web-socket-api.md:8192-8195, :8213).
+//!
+//! So liveness is a question, asked every [`AccountPolicy::probe_interval`]
+//! once subscribed: `session.status`, which must be answered within
+//! [`AccountPolicy::probe_timeout`] and answered `true`. An unanswered probe
+//! ends the connection, as a silent socket ends the market's, and `false` ends
+//! it as a lost subscription. Neither depends on the account doing anything,
+//! and each costs weight 2 (web-socket-api.md:3442-3443) against a limit of
+//! 6000 a minute in the venue's own example (web-socket-api.md:416). Pings are
+//! still answered at once with their own payload (web-socket-api.md:111-114),
+//! because a connection that does not answer them is cut within a minute; they
+//! are just not taken as evidence of anything.
+//!
+//! The logon and the subscription are held to [`AccountPolicy::answer_timeout`]
+//! the same way, and the connect itself too, so no step of a connection can
+//! wait without a bound.
+//!
+//! # Recording, in the order M1.e requires
+//!
+//! Each text or binary frame is stamped from the ingress clock first, then
+//! classified, then either recorded through [`Ingress::accept_account_at`] or
+//! withheld, and only then acted on. Stamp before parse is the data contract's
+//! §2; record before act means that whatever this listener decides about a
+//! frame, the frame it decided on is already in the capture. Recording is
+//! also how a frame reaches its consumer (below), so a consumer can never be
+//! handed a frame the capture does not have.
+//!
+//! A connection that ended after its subscription was accepted records one
+//! `Gap{Disconnect}`, whatever ended it, a stop included. One that never got
+//! that far records nothing more: the stream was already dark, since the last
+//! gap or since the session's opening `RecorderRestart`, and failed retries are
+//! all the same hole, as they are for the market. The gap's `last_good_ts` is
+//! the last frame recorded, which for a quiet account can be long before the
+//! last probe that was answered; the gap claims less sight than we had, which
+//! is the direction to be wrong in.
+//!
+//! # Stopping, and what does not stop
+//!
+//! [`listen`] returns only when listening has stopped for good, and says why
+//! ([`Stopped`]): the writer is gone, the venue refused something in a way
+//! that will not clear by itself ([`is_transient`]), or the venue's answer says
+//! account subscriptions do not exist there or is not one we can read. A
+//! refusal is stopped on whichever request it answered, the subscription's
+//! included, and a refusal nobody asked for, like the revocation notice, stops
+//! it too. Everything else, a connect refused, a reset, a timeout, a 5xx or
+//! a busy venue, is a connection that ended: logged, backed off, and retried.
+//!
+//! # Who reads the records
+//!
+//! Whatever sink the [`Ingress`] was built with. For a live run that is a
+//! [`TeeSink`](quant_recorder::TeeSink) with the capture channel as its
+//! primary, the market path's shape: the capture is the artifact that cannot
+//! be recreated, and a consumer that falls behind loses its copy, never the
+//! file's. The consumer reads [`CaptureRecord`](quant_recorder::CaptureRecord)s
+//! off the tee's secondary channel: `Account` records carrying the frame's
+//! bytes, stamp and sequence number exactly as the file has them, and
+//! `Control` gaps. It runs [`classify`] on the bytes to tell an event from the
+//! subscription's answer, and hands events to the translator in
+//! [`crate::user_data`]. A recorded subscription answer is the record that the
+//! account is heard from again; a gap, or a hole in `ingest_seq` left by the
+//! tee, is the record that it was not.
 
 use core::fmt;
+use core::time::Duration;
 
-use serde_json::Value;
+use futures_util::{SinkExt as _, StreamExt as _};
+use quant_core::event::GapCause;
+use quant_core::time::Ts;
+use quant_recorder::{Backoff, BackoffPolicy, Ingress, RecordSink, ACCOUNT_STREAM};
+use serde_json::{json, Value};
+use tokio::time::{sleep, sleep_until, timeout, Instant};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tracing::{error, info, warn};
+
+use crate::connection::ConnectionPolicy;
+use crate::credentials::Credentials;
+use crate::trade::VENUE_TIMEOUT;
 
 /// The requests the account listener sends.
 ///
@@ -331,6 +452,523 @@ pub fn is_transient(status: u16, code: Option<i64>) -> bool {
     code.is_some_and(|code| TRANSIENT_CODES.contains(&code))
 }
 
+/// Binance's WebSocket API, where the account stream is subscribed
+/// (web-socket-api.md:102).
+pub const SPOT_WS_API: &str = "wss://ws-api.binance.com:443/ws-api/v3";
+
+/// Spot Testnet's WebSocket API (web-socket-api.md:104), for the rehearsal
+/// `docs/live-run.md` §5 runs before any real order, with a key pair of its
+/// own.
+pub const SPOT_TESTNET_WS_API: &str = "wss://ws-api.testnet.binance.vision/ws-api/v3";
+
+/// How the account listener behaves around a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountPolicy {
+    /// Between connections. The market socket's curve, by default.
+    pub backoff: BackoffPolicy,
+    /// How long after one `session.status` is answered the next is asked.
+    pub probe_interval: Duration,
+    /// How long a `session.status` may go unanswered before the connection is
+    /// taken for dead.
+    pub probe_timeout: Duration,
+    /// How long the connect, the logon and the subscription may each take.
+    pub answer_timeout: Duration,
+}
+
+impl Default for AccountPolicy {
+    /// The market's backoff; a probe every 30 s, and ten seconds for any answer.
+    ///
+    /// # Why ten seconds
+    ///
+    /// It is the venue's own: its API gives a request ten seconds before it
+    /// answers `-1007` (web-socket-api.md:124, [`VENUE_TIMEOUT`]). `session.status`
+    /// and `session.logon` are served from memory (web-socket-api.md:3408-3409,
+    /// :3448-3449), so an answer that has not come in the time the venue allows
+    /// its slowest path is not coming.
+    ///
+    /// # Why every 30 s
+    ///
+    /// The probe's interval plus its timeout is how long a dead connection can
+    /// go unnoticed: forty seconds here, against the market socket's 120. That
+    /// is tighter than the market's on purpose. A blind market costs a book that
+    /// a snapshot re-anchors; a blind account stream is a fill nobody hears
+    /// about, and every second of it is a second the run must refuse to trade
+    /// through. Faster than this buys little: at weight 2 a probe every 30 s is
+    /// four in a minute's thousands, and the gap a reconnect records costs more
+    /// than a missed probe would.
+    fn default() -> Self {
+        Self {
+            backoff: ConnectionPolicy::default().backoff,
+            probe_interval: Duration::from_secs(30),
+            probe_timeout: VENUE_TIMEOUT,
+            answer_timeout: VENUE_TIMEOUT,
+        }
+    }
+}
+
+/// A request the venue refused, as the venue put it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The request refused, or `None` for a refusal nobody asked for, like the
+    /// revocation notice (web-socket-api.md:1317-1330).
+    pub request: Option<Request>,
+    pub status: u16,
+    pub code: Option<i64>,
+    /// The venue's message, with the API key cut out of it should it ever
+    /// appear there.
+    pub msg: String,
+}
+
+impl Refusal {
+    fn from_answer(answer: &Answer, request: Option<Request>, api_key: &str) -> Self {
+        let (code, msg) = answer
+            .error
+            .as_ref()
+            .map_or((None, String::new()), |e| (e.code, e.msg.clone()));
+        let msg = if api_key.is_empty() {
+            msg
+        } else {
+            msg.replace(api_key, "<api key>")
+        };
+        Self {
+            request,
+            status: answer.status,
+            code,
+            msg,
+        }
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.request {
+            Some(request) => write!(f, "{request} refused")?,
+            None => f.write_str("the venue refused the session unasked")?,
+        }
+        write!(f, ": status {}", self.status)?;
+        if let Some(code) = self.code {
+            write!(f, ", code {code}")?;
+        }
+        if !self.msg.is_empty() {
+            write!(f, ", {:?}", self.msg)?;
+        }
+        Ok(())
+    }
+}
+
+/// Why the account listener stopped for good.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stopped {
+    /// The capture writer is gone, so nothing heard could be recorded.
+    WriterGone,
+    /// A refusal that will not clear by itself ([`is_transient`]).
+    Refused(Refusal),
+    /// `session.status` answered `userDataStream: null`: *"User Data Stream
+    /// subscriptions are **not available** on this WebSocket API"*
+    /// (web-socket-api.md:8193).
+    Unavailable,
+    /// An answer this module cannot read the way it must, which means our
+    /// model of the venue is wrong (invariant 5).
+    NotUnderstood(String),
+}
+
+impl fmt::Display for Stopped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WriterGone => f.write_str("the capture writer is gone"),
+            Self::Refused(refusal) => write!(f, "{refusal}"),
+            Self::Unavailable => {
+                f.write_str("account subscriptions are not available on this WebSocket API")
+            }
+            Self::NotUnderstood(what) => write!(f, "an answer not understood: {what}"),
+        }
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// Why one connection ended, when it is worth making another.
+///
+/// All of them are the same `Gap{Disconnect}` on disk once the subscription had
+/// been accepted; they are kept apart for the log, because a `ServerClosed`
+/// once a day is the venue's documented 24-hour limit and an `Unanswered`
+/// every few minutes is something wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ended {
+    /// The socket closed.
+    ServerClosed,
+    /// The transport failed.
+    Transport(String),
+    /// A pong could not be sent, so the venue is about to hang up.
+    KeepaliveFailed(String),
+    /// `serverShutdown`: the venue asked for a new connection.
+    ServerShutdown,
+    /// `eventStreamTerminated`: the subscription ended.
+    StreamTerminated,
+    /// `session.status` answered that no subscription is active.
+    SubscriptionLost,
+    /// A request went unanswered past its deadline.
+    Unanswered(Request),
+    /// A refusal that may clear by itself.
+    Refused(Refusal),
+}
+
+impl fmt::Display for Ended {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ServerClosed => f.write_str("the venue closed the connection"),
+            Self::Transport(e) => write!(f, "transport error: {e}"),
+            Self::KeepaliveFailed(e) => write!(f, "could not send a pong: {e}"),
+            Self::ServerShutdown => {
+                f.write_str("serverShutdown: the venue asked for a new connection")
+            }
+            Self::StreamTerminated => f.write_str("eventStreamTerminated: the subscription ended"),
+            Self::SubscriptionLost => f.write_str("session.status says no subscription is active"),
+            Self::Unanswered(request) => write!(f, "{request} went unanswered"),
+            Self::Refused(refusal) => write!(f, "{refusal}, which may clear by itself"),
+        }
+    }
+}
+
+type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Listen to the account until listening has stopped for good, recording
+/// every frame the venue sends that may be recorded.
+///
+/// Returns only then, and says why. Everything short of that is a connection
+/// that ended, which is logged, recorded as a gap when the subscription had
+/// been accepted, and followed by another after the backoff. Cancellation is
+/// the caller's, as for [`crate::connection::run`]: drop this future and the
+/// borrowed `ingress` is free to be dropped, which closes the channel and
+/// seals the capture.
+///
+/// The caller records the session's opening `Gap{RecorderRestart}`, as
+/// `capture::run` does for the market, before the first call.
+pub async fn listen<S: RecordSink>(
+    url: &str,
+    credentials: &Credentials,
+    ingress: &mut Ingress<S>,
+    policy: &AccountPolicy,
+) -> Stopped {
+    let mut backoff = Backoff::for_key(policy.backoff, ACCOUNT_STREAM);
+    let mut requests = 0_u64;
+    info!(%url, "account listener starting");
+
+    loop {
+        match timeout(policy.answer_timeout, connect_async(url)).await {
+            Ok(Ok((socket, _response))) => {
+                let mut heard = false;
+                let outcome = converse(
+                    socket,
+                    credentials,
+                    ingress,
+                    policy,
+                    &mut requests,
+                    &mut heard,
+                )
+                .await;
+                if heard {
+                    // The venue said yes to the logon and the subscription, so
+                    // the next failure starts short again.
+                    backoff.reset();
+                    if ingress.record_gap(GapCause::Disconnect).is_err() {
+                        return Stopped::WriterGone;
+                    }
+                }
+                match outcome {
+                    Ok(ended) => warn!(%ended, heard, "account connection ended"),
+                    Err(stopped) => {
+                        error!(%stopped, "account listener stopped; the account is not being heard");
+                        return stopped;
+                    }
+                }
+            }
+            Ok(Err(e)) => warn!(attempt = backoff.attempt(), error = %e, "account connect failed"),
+            Err(_elapsed) => warn!(attempt = backoff.attempt(), "account connect timed out"),
+        }
+
+        let delay = backoff.next_delay();
+        // About to wait anyway, and a disconnect means the writer is draining:
+        // where a deferred gap record lands, as on the market socket.
+        if ingress.pump().is_err() {
+            return Stopped::WriterGone;
+        }
+        sleep(delay).await;
+    }
+}
+
+/// A request sent and not yet answered.
+#[derive(Debug)]
+struct Waiting {
+    request: Request,
+    id: String,
+    deadline: Instant,
+}
+
+/// What one frame means for the conversation.
+enum Step {
+    Continue,
+    /// The logon was accepted: subscribe.
+    Subscribe,
+    /// The subscription was accepted.
+    Heard,
+    /// A probe was answered `true`.
+    Probed,
+    End(Ended),
+    Stop(Stopped),
+}
+
+/// One connection, from the logon to whatever ends it.
+///
+/// `heard` is set the moment the subscription is accepted, and left set
+/// however the connection ends, so the caller knows to record the gap.
+async fn converse<S: RecordSink>(
+    mut socket: Socket,
+    credentials: &Credentials,
+    ingress: &mut Ingress<S>,
+    policy: &AccountPolicy,
+    requests: &mut u64,
+    heard: &mut bool,
+) -> Result<Ended, Stopped> {
+    let logon = {
+        // A fresh timestamp for every logon, read from the one clock: a logon
+        // is signed once and sent once.
+        let now = ingress.clock().now();
+        Outbound::logon(credentials, now)
+    };
+    let mut waiting = match send(&mut socket, logon, requests, policy.answer_timeout).await {
+        Ok(waiting) => Some(waiting),
+        Err(ended) => return Ok(ended),
+    };
+    let mut next_probe: Option<Instant> = None;
+
+    loop {
+        let wake = waiting.as_ref().map(|w| w.deadline).or(next_probe);
+        let next = match wake {
+            Some(at) => tokio::select! {
+                biased;
+                next = socket.next() => Some(next),
+                () = sleep_until(at) => None,
+            },
+            None => Some(socket.next().await),
+        };
+
+        let Some(next) = next else {
+            // A deadline passed: an answer that did not come, or a probe due.
+            if let Some(unanswered) = waiting.take() {
+                return Ok(Ended::Unanswered(unanswered.request));
+            }
+            next_probe = None;
+            match send(
+                &mut socket,
+                Outbound::Status,
+                requests,
+                policy.probe_timeout,
+            )
+            .await
+            {
+                Ok(probe) => waiting = Some(probe),
+                Err(ended) => return Ok(ended),
+            }
+            continue;
+        };
+
+        let message = match next {
+            None => return Ok(Ended::ServerClosed),
+            Some(Err(e)) => return Ok(Ended::Transport(e.to_string())),
+            Some(Ok(message)) => message,
+        };
+        match message {
+            message @ (Message::Text(_) | Message::Binary(_)) => {
+                // Stamp, classify, record, and only then act.
+                let local_recv_ts = ingress.clock().now();
+                let payload = message.into_data().to_vec();
+                let frame = classify(&payload);
+                record(&frame, payload, local_recv_ts, credentials.key(), ingress)?;
+                match step(&frame, &mut waiting, credentials.key()) {
+                    Step::Continue => {}
+                    Step::Subscribe => {
+                        match send(
+                            &mut socket,
+                            Outbound::Subscribe,
+                            requests,
+                            policy.answer_timeout,
+                        )
+                        .await
+                        {
+                            Ok(subscribing) => waiting = Some(subscribing),
+                            Err(ended) => return Ok(ended),
+                        }
+                    }
+                    Step::Heard => {
+                        *heard = true;
+                        info!("account subscribed; the account is being heard");
+                        next_probe = Some(Instant::now() + policy.probe_interval);
+                    }
+                    Step::Probed => next_probe = Some(Instant::now() + policy.probe_interval),
+                    Step::End(ended) => return Ok(ended),
+                    Step::Stop(stopped) => return Err(stopped),
+                }
+            }
+            // Answered at once with its own payload (web-socket-api.md:113),
+            // explicitly, for the reason `connection.rs` gives: the one thing
+            // that keeps a connection open is not left to library internals.
+            Message::Ping(payload) => {
+                if let Err(e) = socket.send(Message::Pong(payload)).await {
+                    return Ok(Ended::KeepaliveFailed(e.to_string()));
+                }
+            }
+            Message::Close(_) => return Ok(Ended::ServerClosed),
+            Message::Pong(_) | Message::Frame(_) => {}
+        }
+    }
+}
+
+/// Put a frame in the capture, or keep it out, by [`keep`]'s rule.
+fn record<S: RecordSink>(
+    frame: &AccountFrame,
+    payload: Vec<u8>,
+    local_recv_ts: Ts,
+    api_key: &str,
+    ingress: &mut Ingress<S>,
+) -> Result<(), Stopped> {
+    match keep(frame, &payload, api_key) {
+        Keep::Record => {
+            ingress
+                .accept_account_at(payload, local_recv_ts)
+                .map_err(|_| Stopped::WriterGone)?;
+        }
+        Keep::Withhold(Withheld::SessionAnswer(_)) => {}
+        Keep::Withhold(Withheld::EchoesKey) => error!(
+            bytes = payload.len(),
+            "an account frame holding the API key was kept out of the capture"
+        ),
+    }
+    Ok(())
+}
+
+/// What a classified frame means, given what we are waiting for.
+fn step(frame: &AccountFrame, waiting: &mut Option<Waiting>, api_key: &str) -> Step {
+    let answer = match frame {
+        AccountFrame::Event { kind } => {
+            return match kind.as_str() {
+                "serverShutdown" => Step::End(Ended::ServerShutdown),
+                "eventStreamTerminated" => Step::End(Ended::StreamTerminated),
+                _ => Step::Continue,
+            }
+        }
+        AccountFrame::Unrecognised(why) => {
+            warn!(why, "an account frame not understood; recorded as it came");
+            return Step::Continue;
+        }
+        AccountFrame::Answer(answer) => answer,
+    };
+
+    let awaited = waiting
+        .as_ref()
+        .is_some_and(|w| answer.id.as_deref() == Some(w.id.as_str()));
+    let request = if awaited {
+        waiting.take().map(|w| w.request)
+    } else {
+        // Nothing we are waiting for: the revocation notice, with its `null`
+        // id, or an answer to nothing we sent. A failure stops or ends the
+        // connection by the same rule as any other; a success is noise.
+        if answer.ok() {
+            warn!(id = ?answer.id, "an answer to no request in flight");
+            return Step::Continue;
+        }
+        answer.request
+    };
+    if !answer.ok() {
+        let refusal = Refusal::from_answer(answer, request, api_key);
+        return if is_transient(refusal.status, refusal.code) {
+            Step::End(Ended::Refused(refusal))
+        } else {
+            Step::Stop(Stopped::Refused(refusal))
+        };
+    }
+    match request {
+        Some(Request::Logon) => Step::Subscribe,
+        Some(Request::Subscribe) => Step::Heard,
+        Some(Request::Status) => match answer.stream {
+            StreamFlag::Active => Step::Probed,
+            StreamFlag::Inactive => Step::End(Ended::SubscriptionLost),
+            StreamFlag::Unavailable => Step::Stop(Stopped::Unavailable),
+            StreamFlag::Absent => Step::Stop(Stopped::NotUnderstood(
+                "session.status answered without result.userDataStream".to_owned(),
+            )),
+        },
+        None => Step::Continue,
+    }
+}
+
+/// A request, before it has an id.
+enum Outbound {
+    /// The params, already signed.
+    Logon {
+        params: Value,
+    },
+    Subscribe,
+    Status,
+}
+
+impl Outbound {
+    /// `session.logon`'s params, signed (web-socket-api.md:3399-3406).
+    ///
+    /// `recvWindow` is left to the venue's default, the same five seconds
+    /// every REST request sends ([`crate::trade::RECV_WINDOW_MS`]).
+    fn logon(credentials: &Credentials, now: Ts) -> Self {
+        let timestamp = now.as_millis();
+        let text = timestamp.to_string();
+        let signature = credentials
+            .sign_ws_params(&[("apiKey", credentials.key()), ("timestamp", &text)])
+            .expect("apiKey and timestamp are two different names");
+        Self::Logon {
+            params: json!({
+                "apiKey": credentials.key(),
+                "signature": signature,
+                "timestamp": timestamp,
+            }),
+        }
+    }
+
+    const fn request(&self) -> Request {
+        match self {
+            Self::Logon { .. } => Request::Logon,
+            Self::Subscribe => Request::Subscribe,
+            Self::Status => Request::Status,
+        }
+    }
+}
+
+/// Send a request, minting its id, and say when its answer is due.
+async fn send(
+    socket: &mut Socket,
+    outbound: Outbound,
+    requests: &mut u64,
+    within: Duration,
+) -> Result<Waiting, Ended> {
+    *requests += 1;
+    let request = outbound.request();
+    let id = request.id(*requests);
+    let text = match outbound {
+        Outbound::Logon { params } => {
+            json!({ "id": id, "method": request.method(), "params": params })
+        }
+        Outbound::Subscribe | Outbound::Status => json!({ "id": id, "method": request.method() }),
+    }
+    .to_string();
+    socket
+        .send(Message::text(text))
+        .await
+        .map_err(|e| Ended::Transport(e.to_string()))?;
+    Ok(Waiting {
+        request,
+        id,
+        deadline: Instant::now() + within,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +1191,721 @@ mod tests {
             (400, Some(-2042)),
         ] {
             assert!(is_transient(status, code), "{status} {code:?}");
+        }
+    }
+
+    /// The listener end to end, against [`crate::fake_venue`] on a local port.
+    ///
+    /// Real time at test scale ([`quick_policy`]): every wait is bounded, so
+    /// a wedged listener fails a test rather than hanging the suite.
+    ///
+    /// [`quick_policy`]: crate::fake_venue::quick_policy
+    mod listening {
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        use quant_core::time::Ts;
+        use quant_recorder::CaptureRecord;
+        use quant_storage::{ControlRecord, FrameKind, RawFrame};
+
+        use super::super::{classify, AccountFrame, Refusal, Request, Stopped};
+        use crate::fake_venue::{
+            account_file_bytes, account_frames, quick_policy, FakeVenue, Listening, Log, Reply,
+            Said, Script, StatusReply,
+        };
+
+        /// Long enough for anything that should happen; a test that waits this
+        /// long has failed.
+        const WAIT: Duration = Duration::from_secs(10);
+
+        const EXECUTION: &str = r#"{"subscriptionId":0,"event":{"e":"executionReport","E":1499405658658,"s":"BTCUSDT","c":"q-run-1","x":"NEW"}}"#;
+        const POSITION: &str = r#"{"subscriptionId":0,"event":{"e":"outboundAccountPosition","E":1564034571105,"u":1564034571073,"B":[{"a":"ETH","f":"10000.000000","l":"0.000000"}]}}"#;
+        const BALANCE: &str = r#"{"subscriptionId":0,"event":{"e":"balanceUpdate","E":1573200697110,"a":"BTC","d":"100.00000000","T":1573200697068}}"#;
+        const TERMINATED: &str =
+            r#"{"subscriptionId":0,"event":{"e":"eventStreamTerminated","E":1728973001334}}"#;
+        const REVOKED: &str = r#"{"id":null,"status":401,"error":{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}}"#;
+
+        /// A data root of this test's own, removed when it ends.
+        struct Root(PathBuf);
+
+        impl Root {
+            fn new(name: &str) -> Self {
+                let path = std::env::temp_dir()
+                    .join(format!("quant-account-{}-{name}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&path);
+                Self(path)
+            }
+        }
+
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn start(root: &Root, venue: &FakeVenue) -> Listening {
+            Listening::start(&root.0, venue.url(), venue.credentials(), quick_policy())
+        }
+
+        /// One word per frame, for asserting the shape of a capture.
+        fn shape(frames: &[RawFrame]) -> Vec<String> {
+            frames
+                .iter()
+                .map(|frame| match frame.kind {
+                    FrameKind::Control => match frame.control().expect("a control record") {
+                        Some(ControlRecord::Gap { cause, .. }) => format!("gap {cause:?}"),
+                        other => format!("control {other:?}"),
+                    },
+                    FrameKind::AccountPayload => match classify(&frame.payload) {
+                        AccountFrame::Event { kind } => kind,
+                        AccountFrame::Answer(answer) => answer
+                            .request
+                            .map_or_else(|| "unasked".to_owned(), |r| r.method().to_owned()),
+                        AccountFrame::Unrecognised(_) => "unrecognised".to_owned(),
+                    },
+                    other => panic!("an account tree holding {other:?}"),
+                })
+                .collect()
+        }
+
+        fn shape_of(words: &[&str]) -> Vec<String> {
+            words.iter().map(|w| (*w).to_owned()).collect()
+        }
+
+        fn payloads(frames: &[RawFrame]) -> Vec<&[u8]> {
+            frames
+                .iter()
+                .filter(|f| f.kind == FrameKind::AccountPayload)
+                .map(|f| f.payload.as_slice())
+                .collect()
+        }
+
+        fn assert_contiguous(frames: &[RawFrame]) {
+            let seqs: Vec<u64> = frames.iter().map(|f| f.ingest_seq).collect();
+            let expected: Vec<u64> = (1..=seqs.len() as u64).collect();
+            assert_eq!(seqs, expected, "ingest_seq contiguous from 1");
+        }
+
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+        }
+
+        /// What the consumer was handed, in the reader's terms.
+        fn consumed(records: &[CaptureRecord]) -> Vec<(u64, Ts, Vec<u8>)> {
+            records
+                .iter()
+                .map(|record| match record {
+                    CaptureRecord::Account {
+                        local_recv_ts,
+                        ingest_seq,
+                        payload,
+                    } => (*ingest_seq, *local_recv_ts, payload.clone()),
+                    CaptureRecord::Control {
+                        local_recv_ts,
+                        ingest_seq,
+                        record,
+                    } => (
+                        *ingest_seq,
+                        *local_recv_ts,
+                        record.to_json().expect("serializes"),
+                    ),
+                    other => panic!("not an account record: {other:?}"),
+                })
+                .collect()
+        }
+
+        fn on_disk(frames: &[RawFrame]) -> Vec<(u64, Ts, Vec<u8>)> {
+            frames
+                .iter()
+                .map(|f| (f.ingest_seq, f.local_recv_ts, f.payload.clone()))
+                .collect()
+        }
+
+        /// Whether the listener has certainly read `text`, which the fake sent:
+        /// it has asked a probe after one answered behind it on the same
+        /// connection. It sends a probe only once the last is answered, and
+        /// one connection's frames arrive in order, so by then it has read
+        /// everything up to that answer.
+        fn read_by_listener(log: &Log, text: &str) -> bool {
+            let Some(at) = log.sent.iter().position(|s| s.text == text) else {
+                return false;
+            };
+            let connection = log.sent[at].connection;
+            let answers_before = log.sent[..at]
+                .iter()
+                .filter(|s| s.connection == connection && s.said == Said::StatusAnswer)
+                .count();
+            let asked = log
+                .asked
+                .iter()
+                .filter(|a| a.connection == connection && a.method == "session.status")
+                .count();
+            asked >= answers_before + 2
+        }
+
+        async fn read(venue: &FakeVenue, text: &str) {
+            venue
+                .until("the listener to read a frame", WAIT, |log| {
+                    read_by_listener(log, text)
+                })
+                .await;
+        }
+
+        async fn subscriptions(venue: &FakeVenue, n: usize) {
+            venue
+                .until("a subscription", WAIT, |log| log.subscribed == n)
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_account_is_recorded_byte_for_byte_and_the_key_never_is() {
+            let root = Root::new("recorded");
+            let venue = FakeVenue::start(Script {
+                ping_every: Some(Duration::from_millis(20)),
+                ..Script::default()
+            })
+            .await;
+            let listening = start(&root, &venue);
+            subscriptions(&venue, 1).await;
+            for event in [EXECUTION, POSITION, BALANCE] {
+                venue.event(event);
+            }
+            read(&venue, BALANCE).await;
+            venue
+                .until("pongs and probes", WAIT, |log| {
+                    log.pongs >= 2 && log.asked("session.status") >= 3
+                })
+                .await;
+            let heard = listening.stop(WAIT).await;
+            assert_eq!(heard.stopped, None);
+
+            let log = venue.log();
+            let frames = account_frames(&root.0);
+            // Byte for byte and in order: the subscription's answer and the
+            // three events, from the venue's side of the conversation.
+            assert_eq!(payloads(&frames), log.recordable());
+            assert_eq!(
+                shape(&frames),
+                shape_of(&[
+                    "gap RecorderRestart",
+                    "userDataStream.subscribe",
+                    "executionReport",
+                    "outboundAccountPosition",
+                    "balanceUpdate",
+                ])
+            );
+            assert_contiguous(&frames);
+
+            // The answers that echo the key were sent, so their absence is the
+            // rule at work and not an accident of the script.
+            let key = venue.api_key();
+            for said in [Said::LogonAnswer, Said::StatusAnswer] {
+                assert!(
+                    log.sent
+                        .iter()
+                        .any(|s| s.said == said && s.text.contains(key)),
+                    "{said:?} sent, holding the key"
+                );
+            }
+            assert!(log.asked("session.status") >= 3, "probes were answered");
+            // No key, no signature, and no answer to a logon or a status: in
+            // what the frames hold, and in the files as stored.
+            let decoded: Vec<u8> = frames.iter().flat_map(|f| f.payload.clone()).collect();
+            let stored = account_file_bytes(&root.0);
+            let signatures = log.signatures();
+            assert_eq!(signatures.len(), 1);
+            for haystack in [&decoded, &stored] {
+                assert!(!contains(haystack, key.as_bytes()), "the API key");
+                for signature in &signatures {
+                    assert!(!contains(haystack, signature.as_bytes()), "a signature");
+                }
+                for method in ["session.logon", "session.status"] {
+                    assert!(!contains(haystack, method.as_bytes()), "{method}");
+                }
+            }
+            // And the consumer was handed exactly what the file holds.
+            assert_eq!(consumed(&heard.consumed), on_disk(&frames));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_dropped_connection_is_a_gap_a_reconnect_and_a_second_logon_and_subscribe() {
+            let root = Root::new("dropped");
+            let venue = FakeVenue::start(Script::default()).await;
+            let listening = start(&root, &venue);
+            subscriptions(&venue, 1).await;
+            venue.event(EXECUTION);
+            read(&venue, EXECUTION).await;
+            venue.drop_connection();
+            subscriptions(&venue, 2).await;
+            venue.event(BALANCE);
+            read(&venue, BALANCE).await;
+            let heard = listening.stop(WAIT).await;
+            assert_eq!(heard.stopped, None);
+
+            let log = venue.log();
+            let frames = account_frames(&root.0);
+            assert_eq!(
+                shape(&frames),
+                shape_of(&[
+                    "gap RecorderRestart",
+                    "userDataStream.subscribe",
+                    "executionReport",
+                    "gap Disconnect",
+                    "userDataStream.subscribe",
+                    "balanceUpdate",
+                ])
+            );
+            assert_eq!(payloads(&frames), log.recordable());
+            assert_contiguous(&frames);
+            assert_eq!(log.connections, 2);
+            assert_eq!(log.asked("session.logon"), 2);
+            assert_eq!(log.asked("userDataStream.subscribe"), 2);
+            // Each logon signed afresh: a later timestamp and its own signature.
+            let logons: Vec<_> = log
+                .asked
+                .iter()
+                .filter(|a| a.method == "session.logon")
+                .collect();
+            assert!(logons[1].timestamp > logons[0].timestamp, "{logons:#?}");
+            assert_ne!(logons[0].signature, logons[1].signature);
+            assert_eq!(consumed(&heard.consumed), on_disk(&frames));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn server_shutdown_is_recorded_and_answered_with_a_new_connection() {
+            let root = Root::new("shutdown");
+            let venue = FakeVenue::start(Script::default()).await;
+            let listening = start(&root, &venue);
+            subscriptions(&venue, 1).await;
+            // The venue sends it and keeps the connection open; leaving is
+            // the listener's job.
+            venue.server_shutdown();
+            subscriptions(&venue, 2).await;
+            venue.event(EXECUTION);
+            read(&venue, EXECUTION).await;
+            let heard = listening.stop(WAIT).await;
+            assert_eq!(heard.stopped, None);
+
+            let log = venue.log();
+            let frames = account_frames(&root.0);
+            assert_eq!(
+                shape(&frames),
+                shape_of(&[
+                    "gap RecorderRestart",
+                    "userDataStream.subscribe",
+                    "serverShutdown",
+                    "gap Disconnect",
+                    "userDataStream.subscribe",
+                    "executionReport",
+                ])
+            );
+            assert_eq!(payloads(&frames), log.recordable());
+            assert_contiguous(&frames);
+            assert_eq!(log.connections, 2);
+            assert_eq!(log.asked("session.logon"), 2);
+            assert_eq!(log.asked("userDataStream.subscribe"), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_quiet_account_is_not_a_dead_one() {
+            // No events at all, and no pings either: the venue answering its
+            // probes is the only sign of life, and it is enough. Five seconds
+            // is five times the probe's deadline and over a hundred probe
+            // intervals, and in real time a quiet account is quiet for hours.
+            // A rule that waited for the account to say something, scaled to
+            // the same deadline, would have reconnected four times over a
+            // stream that never went dark, and recorded a gap each time.
+            let root = Root::new("quiet");
+            let venue = FakeVenue::start(Script::default()).await;
+            let listening = start(&root, &venue);
+            subscriptions(&venue, 1).await;
+            let quiet = Duration::from_secs(5);
+            assert!(quiet >= quick_policy().probe_timeout * 5);
+            tokio::time::sleep(quiet).await;
+            let heard = listening.stop(WAIT).await;
+            assert_eq!(heard.stopped, None);
+
+            let log = venue.log();
+            assert_eq!(log.connections, 1, "no reconnect");
+            assert_eq!(log.asked("session.logon"), 1);
+            assert_eq!(log.asked("userDataStream.subscribe"), 1);
+            assert!(
+                log.asked("session.status") >= 20,
+                "probed throughout: {}",
+                log.asked("session.status")
+            );
+            assert!(log.sent.iter().all(|s| s.said != Said::Event));
+            assert_eq!(
+                shape(&account_frames(&root.0)),
+                shape_of(&["gap RecorderRestart", "userDataStream.subscribe"]),
+                "no gap"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_venue_that_stops_answering_is_found_even_while_it_still_pings() {
+            let root = Root::new("dead");
+            let venue = FakeVenue::start(Script {
+                ping_every: Some(Duration::from_millis(20)),
+                ..Script::default()
+            })
+            .await;
+            let listening = start(&root, &venue);
+            subscriptions(&venue, 1).await;
+            // Still pinging, answering nothing: a socket that is alive and an
+            // API that is not.
+            venue.stop_answering();
+            let pongs = venue.log().pongs;
+            subscriptions(&venue, 2).await;
+            assert!(
+                venue.log().pongs > pongs,
+                "the dead connection kept pinging, and was answered"
+            );
+            // And one that says nothing at all.
+            venue.go_dark();
+            subscriptions(&venue, 3).await;
+            let heard = listening.stop(WAIT).await;
+            assert_eq!(heard.stopped, None);
+
+            let log = venue.log();
+            let frames = account_frames(&root.0);
+            assert_eq!(
+                shape(&frames),
+                shape_of(&[
+                    "gap RecorderRestart",
+                    "userDataStream.subscribe",
+                    "gap Disconnect",
+                    "userDataStream.subscribe",
+                    "gap Disconnect",
+                    "userDataStream.subscribe",
+                ])
+            );
+            assert_contiguous(&frames);
+            assert_eq!(log.connections, 3);
+            assert_eq!(log.asked("session.logon"), 3);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_subscription_the_venue_says_is_gone_is_made_again() {
+            let root = Root::new("lost");
+            let venue = FakeVenue::start(Script::default()).await;
+            let listening = start(&root, &venue);
+            subscriptions(&venue, 1).await;
+            venue.script(|s| s.status.push_back(StatusReply::Inactive));
+            subscriptions(&venue, 2).await;
+            let heard = listening.stop(WAIT).await;
+            assert_eq!(heard.stopped, None);
+            assert_eq!(
+                shape(&account_frames(&root.0)),
+                shape_of(&[
+                    "gap RecorderRestart",
+                    "userDataStream.subscribe",
+                    "gap Disconnect",
+                    "userDataStream.subscribe",
+                ])
+            );
+            assert_eq!(venue.log().connections, 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_terminated_event_stream_is_recorded_and_made_again() {
+            let root = Root::new("terminated");
+            let venue = FakeVenue::start(Script::default()).await;
+            let listening = start(&root, &venue);
+            subscriptions(&venue, 1).await;
+            venue.event(TERMINATED);
+            subscriptions(&venue, 2).await;
+            let heard = listening.stop(WAIT).await;
+            assert_eq!(heard.stopped, None);
+            let frames = account_frames(&root.0);
+            assert_eq!(
+                shape(&frames),
+                shape_of(&[
+                    "gap RecorderRestart",
+                    "userDataStream.subscribe",
+                    "eventStreamTerminated",
+                    "gap Disconnect",
+                    "userDataStream.subscribe",
+                ])
+            );
+            assert_eq!(payloads(&frames), venue.log().recordable());
+        }
+
+        /// A logon refused for a reason that will not fix itself.
+        struct Permanent {
+            name: &'static str,
+            script: Script,
+            another_key: bool,
+            status: u16,
+            code: i64,
+        }
+
+        fn refused_logon(reply: Reply) -> Script {
+            Script {
+                logon: [reply].into(),
+                ..Script::default()
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_logon_that_will_never_be_accepted_stops_the_listener_loudly() {
+            // A bad key, a ban, a clock outside recvWindow in either
+            // direction, and a signature by the wrong key: each is refused on
+            // the first logon, and the listener stops there rather than
+            // asking again forever.
+            let cases = [
+                Permanent {
+                    name: "revoked",
+                    script: refused_logon(Reply::refuse(
+                        401,
+                        -2015,
+                        "Invalid API-key, IP, or permissions for action.",
+                    )),
+                    another_key: false,
+                    status: 401,
+                    code: -2015,
+                },
+                Permanent {
+                    name: "banned",
+                    script: refused_logon(Reply::refuse(
+                        418,
+                        -1003,
+                        "Way too much request weight used",
+                    )),
+                    another_key: false,
+                    status: 418,
+                    code: -1003,
+                },
+                Permanent {
+                    name: "stale",
+                    script: Script {
+                        clock_ahead_ms: 10_000,
+                        ..Script::default()
+                    },
+                    another_key: false,
+                    status: 400,
+                    code: -1021,
+                },
+                Permanent {
+                    name: "early",
+                    script: Script {
+                        clock_ahead_ms: -2_000,
+                        ..Script::default()
+                    },
+                    another_key: false,
+                    status: 400,
+                    code: -1021,
+                },
+                Permanent {
+                    name: "wrong-key",
+                    script: Script::default(),
+                    another_key: true,
+                    status: 400,
+                    code: -1022,
+                },
+            ];
+            for case in cases {
+                let root = Root::new(&format!("refused-{}", case.name));
+                let venue = FakeVenue::start(case.script).await;
+                let credentials = if case.another_key {
+                    venue.credentials_with_another_key()
+                } else {
+                    venue.credentials()
+                };
+                let listening = Listening::start(&root.0, venue.url(), credentials, quick_policy());
+                let heard = listening.stopped_by_itself(WAIT).await;
+                let Some(Stopped::Refused(Refusal {
+                    request,
+                    status,
+                    code,
+                    ..
+                })) = heard.stopped
+                else {
+                    panic!("{}: {:?}", case.name, heard.stopped);
+                };
+                assert_eq!(
+                    (request, status, code),
+                    (Some(Request::Logon), case.status, Some(case.code)),
+                    "{}",
+                    case.name
+                );
+                assert_eq!(venue.log().connections, 1, "{}: not retried", case.name);
+                // The refusal answered a logon, so it is not recorded either.
+                assert_eq!(
+                    shape(&account_frames(&root.0)),
+                    shape_of(&["gap RecorderRestart"]),
+                    "{}",
+                    case.name
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refusal_that_may_clear_is_retried_on_the_backoff_as_one_hole() {
+            let root = Root::new("transient");
+            let venue = FakeVenue::start(Script::default()).await;
+            let listening = start(&root, &venue);
+            subscriptions(&venue, 1).await;
+            venue.script(|s| {
+                s.logon
+                    .push_back(Reply::refuse(503, -1008, "Server is currently overloaded"));
+                s.logon
+                    .push_back(Reply::refuse(429, -1003, "Too much request weight used"));
+            });
+            venue.drop_connection();
+            subscriptions(&venue, 2).await;
+            let heard = listening.stop(WAIT).await;
+            assert_eq!(heard.stopped, None);
+
+            let log = venue.log();
+            assert_eq!(log.connections, 4, "two refused, then accepted");
+            assert_eq!(log.asked("session.logon"), 4);
+            // Blind from the drop until the second subscription, and that is
+            // one hole however many attempts it took.
+            assert_eq!(
+                shape(&account_frames(&root.0)),
+                shape_of(&[
+                    "gap RecorderRestart",
+                    "userDataStream.subscribe",
+                    "gap Disconnect",
+                    "userDataStream.subscribe",
+                ])
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_connection_that_fails_is_retried_rather_than_fatal() {
+            // A port that takes the TCP connection and drops it at once, so
+            // every attempt fails before the WebSocket handshake ends: the
+            // reset a venue restart produces. Counted on this side, so the
+            // retries are seen rather than inferred. (A port with nothing on
+            // it would do as well, except that on Windows a refused connect
+            // takes about two seconds to come back, which a test would have
+            // to wait out on every attempt.)
+            let root = Root::new("reset");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let url = format!("ws://{}", listener.local_addr().expect("address"));
+            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = std::sync::Arc::clone(&attempts);
+            let resetting = tokio::spawn(async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    drop(tcp);
+                }
+            });
+            let venue = FakeVenue::start(Script::default()).await;
+            let listening = Listening::start(&root.0, &url, venue.credentials(), quick_policy());
+            let deadline = tokio::time::Instant::now() + WAIT;
+            while attempts.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "gave up waiting for three attempts"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let heard = listening.stop(WAIT).await;
+            resetting.abort();
+            assert_eq!(heard.stopped, None, "still trying");
+            // Never heard, so nothing more than the session's opening gap.
+            assert_eq!(
+                shape(&account_frames(&root.0)),
+                shape_of(&["gap RecorderRestart"])
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_subscription_is_recorded_and_stops_the_listener() {
+            let root = Root::new("unsubscribed");
+            let venue = FakeVenue::start(Script {
+                subscribe: [Reply::refuse(
+                    400,
+                    -2035,
+                    "User Data Stream subscription already active.",
+                )]
+                .into(),
+                ..Script::default()
+            })
+            .await;
+            let listening = start(&root, &venue);
+            let heard = listening.stopped_by_itself(WAIT).await;
+            let Some(Stopped::Refused(refusal)) = heard.stopped else {
+                panic!("{:?}", heard.stopped);
+            };
+            assert_eq!(refusal.request, Some(Request::Subscribe));
+            assert_eq!(refusal.code, Some(-2035));
+            assert_eq!(venue.log().connections, 1);
+            // The subscription's answer is recorded whatever it said.
+            let frames = account_frames(&root.0);
+            assert_eq!(
+                shape(&frames),
+                shape_of(&["gap RecorderRestart", "userDataStream.subscribe"])
+            );
+            assert_eq!(payloads(&frames), venue.log().recordable());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_key_revoked_mid_session_is_recorded_and_stops_the_listener_blind() {
+            let root = Root::new("revoked");
+            let venue = FakeVenue::start(Script::default()).await;
+            let listening = start(&root, &venue);
+            subscriptions(&venue, 1).await;
+            venue.unsolicited(REVOKED);
+            let heard = listening.stopped_by_itself(WAIT).await;
+            let Some(Stopped::Refused(refusal)) = heard.stopped else {
+                panic!("{:?}", heard.stopped);
+            };
+            assert_eq!((refusal.request, refusal.code), (None, Some(-2015)));
+            // Recorded, and followed by the gap that says the account is no
+            // longer being heard.
+            assert_eq!(
+                shape(&account_frames(&root.0)),
+                shape_of(&[
+                    "gap RecorderRestart",
+                    "userDataStream.subscribe",
+                    "unasked",
+                    "gap Disconnect",
+                ])
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_status_without_subscriptions_or_without_the_flag_stops_the_listener() {
+            for (name, reply, expected) in [
+                (
+                    "unavailable",
+                    StatusReply::Unavailable,
+                    Stopped::Unavailable,
+                ),
+                (
+                    "missing",
+                    StatusReply::Missing,
+                    Stopped::NotUnderstood(
+                        "session.status answered without result.userDataStream".to_owned(),
+                    ),
+                ),
+            ] {
+                let root = Root::new(&format!("status-{name}"));
+                let venue = FakeVenue::start(Script {
+                    status: [reply].into(),
+                    ..Script::default()
+                })
+                .await;
+                let listening = start(&root, &venue);
+                let heard = listening.stopped_by_itself(WAIT).await;
+                assert_eq!(heard.stopped, Some(expected), "{name}");
+                assert_eq!(venue.log().connections, 1, "{name}");
+                assert_eq!(
+                    shape(&account_frames(&root.0)),
+                    shape_of(&[
+                        "gap RecorderRestart",
+                        "userDataStream.subscribe",
+                        "gap Disconnect",
+                    ]),
+                    "{name}"
+                );
+            }
         }
     }
 }

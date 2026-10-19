@@ -18,7 +18,9 @@ quant-storage = { workspace = true }
 # Async only on this side of the seam. The read path is pure waiting on a
 # network, which is what async is actually good for; the write path is blocking
 # CPU and file I/O and stays on a thread. See quant-recorder's crate docs.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+# `net` and `sync` were already on through tokio-tungstenite and reqwest; named
+# because the account listener's socket type and the fake venue use them.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net", "sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 # rustls rather than native-tls: no OpenSSL, no C toolchain, no build script, and
@@ -95,6 +97,13 @@ uuid = { version = "1", features = ["v4"] }
 # nothing about books -- that stays venue-agnostic in quant-book.
 [dev-dependencies]
 quant-book = { workspace = true }
+
+# `fake_venue`: a local stand-in for the WebSocket API's account side, which the
+# account listener's tests run against, here and in quant-verify. Never on in a
+# build that ships: it is a server that accepts any client, and nothing outside
+# a test has a reason to start one.
+[features]
+fake-venue = []
 
 [lints]
 workspace = true

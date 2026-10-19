@@ -61,6 +61,8 @@ pub mod connection;
 pub mod credentials;
 pub mod decode;
 pub mod exchange_info;
+#[cfg(any(test, feature = "fake-venue"))]
+pub mod fake_venue;
 pub mod live;
 pub mod orders;
 pub mod parse;
