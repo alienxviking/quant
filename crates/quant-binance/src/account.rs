@@ -63,7 +63,7 @@
 //! # One connection, start to finish
 //!
 //! [`listen`] connects, sends `session.logon` signed with the Ed25519 key and a
-//! timestamp read from the injected clock at that moment, waits for the answer,
+//! timestamp read from the venue's clock at that moment, waits for the answer,
 //! sends `userDataStream.subscribe`, waits for that answer, and then drains.
 //! *"A single connection to the API is only valid for 24 hours"*
 //! (web-socket-api.md:105), a subscription belongs to the connection it was
@@ -72,6 +72,19 @@
 //! logon is signed once and used once. The backoff between connections is
 //! [`ConnectionPolicy`]'s, seeded by [`ACCOUNT_STREAM`] so that a venue
 //! restart does not make this socket retry in step with the market's.
+//!
+//! The venue's clock is the one every order is stamped on
+//! ([`crate::trade`]): the injected clock with the offset measured at startup
+//! taken off. The injected clock itself stays the host's, because it also
+//! stamps `local_recv_ts` (invariant 2), so the correction is made on the
+//! logon's stamp alone. Stamped with the host's clock as it stands, a logon
+//! would be held to a tighter rule than the orders it exists to hear about: a
+//! host 900 ms ahead passes the order path's gate
+//! ([`crate::trade::MAX_CLOCK_SKEW_MS`]) and its orders land on time, while its
+//! logons sit 100 ms inside the venue's one second (web-socket-api.md:678-681).
+//! A few hundred ms of drift later, the 24-hour reconnect is refused `-1021`,
+//! which does not clear by itself, and the account goes unheard while orders
+//! are still accepted.
 //!
 //! The backoff resets on a **subscription**, not on a connection. The market
 //! socket is useful the moment it connects; this one is useful only once the
@@ -561,6 +574,15 @@ impl fmt::Display for Refusal {
         if !self.msg.is_empty() {
             write!(f, ", {:?}", self.msg)?;
         }
+        // The venue's words name its window and not our clock, and the clock
+        // is what has to be fixed. The order path reads -1021 the same way
+        // (`orders.rs`, `RefusalCause::Timestamp`).
+        if self.code == Some(-1021) {
+            f.write_str(
+                "; the host clock, less the offset measured at startup, is outside the \
+                 venue's recvWindow: measure it again with venue-check",
+            )?;
+        }
         Ok(())
     }
 }
@@ -653,11 +675,18 @@ type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 ///
 /// The caller records the session's opening `Gap{RecorderRestart}`, as
 /// `capture::run` does for the market, before the first call.
+///
+/// `offset_ms` is the host clock's offset from the venue's, positive when the
+/// host is ahead: the same measured number the order path takes off its own
+/// stamps ([`crate::trade::TradeClient::check_ready`]). Every logon is stamped
+/// with the ingress clock less this, and nothing else is: `local_recv_ts` stays
+/// the host's.
 pub async fn listen<S: RecordSink>(
     url: &str,
     credentials: &Credentials,
     ingress: &mut Ingress<S>,
     policy: &AccountPolicy,
+    offset_ms: i64,
 ) -> Stopped {
     let mut backoff = Backoff::for_key(policy.backoff, ACCOUNT_STREAM);
     let mut requests = 0_u64;
@@ -672,6 +701,7 @@ pub async fn listen<S: RecordSink>(
                     credentials,
                     ingress,
                     policy,
+                    offset_ms,
                     &mut requests,
                     &mut heard,
                 )
@@ -736,14 +766,16 @@ async fn converse<S: RecordSink>(
     credentials: &Credentials,
     ingress: &mut Ingress<S>,
     policy: &AccountPolicy,
+    offset_ms: i64,
     requests: &mut u64,
     heard: &mut bool,
 ) -> Result<Ended, Stopped> {
     let logon = {
-        // A fresh timestamp for every logon, read from the one clock: a logon
-        // is signed once and sent once.
-        let now = ingress.clock().now();
-        Outbound::logon(credentials, now)
+        // A fresh timestamp for every logon, read from the one clock and put
+        // on the venue's as the order path puts its own: a logon is signed
+        // once and sent once.
+        let venue_millis = ingress.clock().now().as_millis().saturating_sub(offset_ms);
+        Outbound::logon(credentials, venue_millis)
     };
     let mut waiting = match send(&mut socket, logon, requests, policy.answer_timeout).await {
         Ok(waiting) => Some(waiting),
@@ -933,8 +965,9 @@ impl Outbound {
     /// signature's 64, on a method that takes Ed25519 keys only. The same
     /// kind of example slice (c) found on the REST page, and read the same
     /// way: as an example of the request's shape, not of its signature.
-    fn logon(credentials: &Credentials, now: Ts) -> Self {
-        let timestamp = now.as_millis();
+    ///
+    /// `timestamp` is on the venue's clock, in milliseconds.
+    fn logon(credentials: &Credentials, timestamp: i64) -> Self {
         let text = timestamp.to_string();
         let signature = credentials
             .sign_ws_params(&[("apiKey", credentials.key()), ("timestamp", &text)])
@@ -1353,6 +1386,25 @@ mod tests {
         ] {
             assert!(is_transient(status, code), "{status} {code:?}");
         }
+    }
+
+    #[test]
+    fn a_timestamp_refusal_names_the_clock() {
+        // The venue's message names its window; what has to be fixed is our
+        // clock, and the operator reading the stop should be told so.
+        let refusal = |code| Refusal {
+            request: Some(Request::Logon),
+            status: 400,
+            code: Some(code),
+            msg: "Timestamp for this request is outside of the recvWindow.".to_owned(),
+        };
+        let said = refusal(-1021).to_string();
+        assert!(said.contains("host clock"), "{said}");
+        assert!(said.contains("venue-check"), "{said}");
+        assert!(!said.contains("  "), "one line, one space: {said}");
+        // And only for that code.
+        let said = refusal(-1022).to_string();
+        assert!(!said.contains("host clock"), "{said}");
     }
 
     /// The consumer's side of the tee.
@@ -2078,6 +2130,46 @@ mod tests {
                     "{}",
                     case.name
                 );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_logon_is_stamped_on_the_venue_clock_the_orders_are() {
+            // A host 1.5 s ahead of the venue, whose offset was measured at
+            // 900 ms, inside the order path's gate, and has drifted 600 ms
+            // since. An order stamped with the offset taken off lands 600 ms
+            // ahead, inside the venue's one second; so must the logon. The
+            // same host with no offset taken off is refused -1021, which is
+            // what the listener did before the correction, and which stops
+            // it for good.
+            let measured = 900;
+            assert!(measured <= crate::trade::MAX_CLOCK_SKEW_MS);
+            for (name, offset_ms, accepted) in [("corrected", measured, true), ("raw", 0, false)] {
+                let root = Root::new(&format!("offset-{name}"));
+                let venue = FakeVenue::start(Script {
+                    clock_ahead_ms: -1_500,
+                    ..Script::default()
+                })
+                .await;
+                let listening = Listening::start_with_offset(
+                    &root.0,
+                    venue.url(),
+                    venue.credentials(),
+                    quick_policy(),
+                    offset_ms,
+                );
+                if accepted {
+                    subscriptions(&venue, 1).await;
+                    let heard = listening.stop(WAIT).await;
+                    assert_eq!(heard.stopped, None, "{name}");
+                } else {
+                    let heard = listening.stopped_by_itself(WAIT).await;
+                    let Some(Stopped::Refused(refusal)) = heard.stopped else {
+                        panic!("{name}: {:?}", heard.stopped);
+                    };
+                    assert_eq!(refusal.code, Some(-1021), "{name}");
+                    assert_eq!(venue.log().subscribed, 0, "{name}");
+                }
             }
         }
 

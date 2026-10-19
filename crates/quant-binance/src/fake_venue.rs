@@ -756,9 +756,23 @@ pub struct Heard {
 }
 
 impl Listening {
-    /// Start listening to `url`, recording under `root`'s account tree.
+    /// Start listening to `url`, recording under `root`'s account tree, on a
+    /// host whose clock was measured on time.
     #[must_use]
     pub fn start(root: &Path, url: &str, credentials: Credentials, policy: AccountPolicy) -> Self {
+        Self::start_with_offset(root, url, credentials, policy, 0)
+    }
+
+    /// [`Self::start`], with the host clock measured `offset_ms` ahead of the
+    /// venue's: the number [`listen`] takes off every logon's stamp.
+    #[must_use]
+    pub fn start_with_offset(
+        root: &Path,
+        url: &str,
+        credentials: Credentials,
+        policy: AccountPolicy,
+        offset_ms: i64,
+    ) -> Self {
         let (stop, stopped) = oneshot::channel();
         let (consumer_tx, consumer) = sync_channel(DEFAULT_CHANNEL_CAPACITY);
         let task = tokio::spawn(capture(
@@ -766,6 +780,7 @@ impl Listening {
             url.to_owned(),
             credentials,
             policy,
+            offset_ms,
             stopped,
             consumer_tx,
         ));
@@ -809,6 +824,7 @@ async fn capture(
     url: String,
     credentials: Credentials,
     policy: AccountPolicy,
+    offset_ms: i64,
     stop: oneshot::Receiver<()>,
     consumer: SyncSender<CaptureRecord>,
 ) -> Heard {
@@ -831,7 +847,7 @@ async fn capture(
         .expect("the writer is running");
 
     let stopped = tokio::select! {
-        stopped = listen(&url, &credentials, &mut ingress, &policy) => Some(stopped),
+        stopped = listen(&url, &credentials, &mut ingress, &policy, offset_ms) => Some(stopped),
         _ = stop => None,
     };
     drop(ingress);
