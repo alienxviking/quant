@@ -25,12 +25,20 @@
 //!
 //! *"Request `id` is truly arbitrary ... The server does not interpret `id` in
 //! any way, simply echoing it back in the response"* (web-socket-api.md:162-163).
-//! So each id is the method and a counter, `userDataStream.subscribe-3`, and an
+//! So each id is a word for the method and a counter, `subscribe-3`, and an
 //! answer says which request it answers by itself. A listener that remembered
 //! the ids it sent would know the same thing, but only while it was running;
 //! a recorded answer read back next month would not. The subscription's answer
 //! is the record that the account was being heard from then on, so it has to
 //! be recognisable from the file alone.
+//!
+//! A word, not the method's own name. The live API is remembered refusing an
+//! id outside `^[a-zA-Z0-9-_]{1,36}$` with `-1100`, which the pinned pages do
+//! not say (they call ids arbitrary, and the only such pattern in them is the
+//! FIX API's, fix-api.md:394); `session.logon` has a `.` in it. Whether the
+//! memory is right is for the testnet rehearsal to settle. An id inside the
+//! pattern costs nothing either way, and the longest, `subscribe-` and a
+//! `u64`, is 30 characters.
 //!
 //! # What is recorded, and what never is
 //!
@@ -239,22 +247,32 @@ impl Request {
         }
     }
 
-    /// The id for the `n`th request this listener sends: the method, a `-`,
-    /// and the counter. No method name has a `-` in it, so the last one splits
-    /// the two unambiguously.
+    /// The word for this request in its ids: one per method, letters only.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Logon => "logon",
+            Self::Subscribe => "subscribe",
+            Self::Status => "status",
+        }
+    }
+
+    /// The id for the `n`th request this listener sends: the request's
+    /// [`token`](Self::token), a `-`, and the counter. No token has a `-` in
+    /// it, so the last one splits the two unambiguously.
     #[must_use]
     pub fn id(self, n: u64) -> String {
-        format!("{}-{n}", self.method())
+        format!("{}-{n}", self.token())
     }
 
     /// Which request an id names, if it is one of ours.
     #[must_use]
     pub fn of_id(id: &str) -> Option<Self> {
-        let (method, n) = id.rsplit_once('-')?;
+        let (token, n) = id.rsplit_once('-')?;
         if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        Self::ALL.into_iter().find(|r| r.method() == method)
+        Self::ALL.into_iter().find(|r| r.token() == token)
     }
 
     /// Whether the venue's answer to this request may be recorded.
@@ -1171,14 +1189,14 @@ mod tests {
 
     /// The venue's documented answer to `session.logon` (web-socket-api.md:3411-3425),
     /// with one of our ids.
-    const LOGON_ANSWER: &str = r#"{"id":"session.logon-1","status":200,"result":{"apiKey":"vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A","authorizedSince":1649729878532,"connectedSince":1649729873021,"returnRateLimits":false,"serverTime":1649729878630,"userDataStream":false}}"#;
+    const LOGON_ANSWER: &str = r#"{"id":"logon-1","status":200,"result":{"apiKey":"vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A","authorizedSince":1649729878532,"connectedSince":1649729873021,"returnRateLimits":false,"serverTime":1649729878630,"userDataStream":false}}"#;
 
     /// `session.status`'s (web-socket-api.md:3451-3466).
-    const STATUS_ANSWER: &str = r#"{"id":"session.status-7","status":200,"result":{"apiKey":"vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A","authorizedSince":1649729878532,"connectedSince":1649729873021,"returnRateLimits":false,"serverTime":1649730611671,"userDataStream":true}}"#;
+    const STATUS_ANSWER: &str = r#"{"id":"status-7","status":200,"result":{"apiKey":"vmPUZE6mv9SD5VNHk4HlWFsOr6aKE2zvsw0MuIgwCIPy6utIco14y7Ju91duEh8A","authorizedSince":1649729878532,"connectedSince":1649729873021,"returnRateLimits":false,"serverTime":1649730611671,"userDataStream":true}}"#;
 
     /// `userDataStream.subscribe`'s (web-socket-api.md:8222-8230).
     const SUBSCRIBE_ANSWER: &str =
-        r#"{"id":"userDataStream.subscribe-2","status":200,"result":{"subscriptionId":0}}"#;
+        r#"{"id":"subscribe-2","status":200,"result":{"subscriptionId":0}}"#;
 
     /// The revocation notice (web-socket-api.md:1317-1330).
     const REVOKED: &str = r#"{"id":null,"status":401,"error":{"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}}"#;
@@ -1199,15 +1217,33 @@ mod tests {
         }
         for stranger in [
             "",
-            "session.logon",
-            "session.logon-",
-            "session.logon-1x",
-            "session.logon-+1",
-            "order.place-1",
+            "logon",
+            "logon-",
+            "logon-1x",
+            "logon-+1",
+            "order-1",
             "c174a2b1-3f51-4580-b200-8528bd237cb7",
-            "Session.logon-1",
+            "Logon-1",
+            // The method's own name is not the token.
+            "session.logon-1",
         ] {
             assert_eq!(Request::of_id(stranger), None, "{stranger:?}");
+        }
+    }
+
+    #[test]
+    fn every_id_is_inside_the_pattern_the_venue_is_remembered_to_enforce() {
+        // `^[a-zA-Z0-9-_]{1,36}$`, at both ends of the counter.
+        for request in Request::ALL {
+            for n in [0, 1, u64::MAX] {
+                let id = request.id(n);
+                assert!((1..=36).contains(&id.len()), "{id}");
+                assert!(
+                    id.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                    "{id}"
+                );
+            }
         }
     }
 
@@ -1259,7 +1295,7 @@ mod tests {
     #[test]
     fn the_subscription_flag_keeps_all_four_states_apart() {
         let flag = |result: &str| match classify(
-            format!(r#"{{"id":"session.status-1","status":200,"result":{result}}}"#).as_bytes(),
+            format!(r#"{{"id":"status-1","status":200,"result":{result}}}"#).as_bytes(),
         ) {
             AccountFrame::Answer(answer) => answer.stream,
             other => panic!("not an answer: {other:?}"),
@@ -1310,12 +1346,12 @@ mod tests {
         }
         // A refused logon or status is withheld too, key or no key: the rule
         // is on the request answered, not on what the answer happens to hold.
-        let refused = r#"{"id":"session.logon-3","status":400,"error":{"code":-1022,"msg":"Signature for this request is not valid."}}"#;
+        let refused = r#"{"id":"logon-3","status":400,"error":{"code":-1022,"msg":"Signature for this request is not valid."}}"#;
         assert_eq!(
             rule(refused),
             Keep::Withhold(Withheld::SessionAnswer(Request::Logon))
         );
-        let refused = r#"{"id":"session.status-3","status":503,"error":{"code":-1001,"msg":"x"}}"#;
+        let refused = r#"{"id":"status-3","status":503,"error":{"code":-1001,"msg":"x"}}"#;
         assert_eq!(
             rule(refused),
             Keep::Withhold(Withheld::SessionAnswer(Request::Status))
@@ -1329,9 +1365,7 @@ mod tests {
         for text in [
             format!(r#"{{"subscriptionId":0,"event":{{"e":"executionReport","k":"{KEY}"}}}}"#),
             format!(r#"{{"id":null,"status":401,"error":{{"code":-2015,"msg":"{KEY}"}}}}"#),
-            format!(
-                r#"{{"id":"userDataStream.subscribe-9","status":200,"result":{{"apiKey":"{KEY}"}}}}"#
-            ),
+            format!(r#"{{"id":"subscribe-9","status":200,"result":{{"apiKey":"{KEY}"}}}}"#),
             format!("not json at all {KEY}"),
         ] {
             assert_eq!(
@@ -1812,8 +1846,11 @@ mod tests {
                 for signature in &signatures {
                     assert!(!contains(haystack, signature.as_bytes()), "a signature");
                 }
-                for method in ["session.logon", "session.status"] {
-                    assert!(!contains(haystack, method.as_bytes()), "{method}");
+                // An answer to either is known by its id, which opens with
+                // the request's token.
+                for request in [Request::Logon, Request::Status] {
+                    let id = format!("\"{}-", request.token());
+                    assert!(!contains(haystack, id.as_bytes()), "{request}");
                 }
             }
             // And the consumer was handed exactly what the file holds.
