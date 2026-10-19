@@ -199,6 +199,31 @@ impl Log {
             .collect()
     }
 
+    /// Whether the listener has certainly read `text`, the last frame of that
+    /// text the fake sent: it has asked a probe after one answered behind that
+    /// frame on the same connection. It asks a probe only once the last is
+    /// answered, and one connection's frames arrive in order, so by then it
+    /// has read everything up to that answer. A test waits on this before
+    /// stopping, so that a frame still in flight is not mistaken for one the
+    /// listener lost.
+    #[must_use]
+    pub fn read_by_listener(&self, text: &str) -> bool {
+        let Some(at) = self.sent.iter().rposition(|s| s.text == text) else {
+            return false;
+        };
+        let connection = self.sent[at].connection;
+        let answers_before = self.sent[..at]
+            .iter()
+            .filter(|s| s.connection == connection && s.said == Said::StatusAnswer)
+            .count();
+        let asked = self
+            .asked
+            .iter()
+            .filter(|a| a.connection == connection && a.method == "session.status")
+            .count();
+        asked >= answers_before + 2
+    }
+
     /// Every signature the listener sent.
     #[must_use]
     pub fn signatures(&self) -> Vec<&str> {

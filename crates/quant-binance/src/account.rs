@@ -1566,8 +1566,8 @@ mod tests {
 
         use super::super::{classify, AccountFrame, Refusal, Request, Stopped};
         use crate::fake_venue::{
-            account_file_bytes, account_frames, quick_policy, FakeVenue, Listening, Log, Reply,
-            Said, Script, StatusReply,
+            account_file_bytes, account_frames, quick_policy, FakeVenue, Listening, Reply, Said,
+            Script, StatusReply,
         };
 
         /// Long enough for anything that should happen; a test that waits this
@@ -1677,32 +1677,10 @@ mod tests {
                 .collect()
         }
 
-        /// Whether the listener has certainly read `text`, which the fake sent:
-        /// it has asked a probe after one answered behind it on the same
-        /// connection. It sends a probe only once the last is answered, and
-        /// one connection's frames arrive in order, so by then it has read
-        /// everything up to that answer.
-        fn read_by_listener(log: &Log, text: &str) -> bool {
-            let Some(at) = log.sent.iter().position(|s| s.text == text) else {
-                return false;
-            };
-            let connection = log.sent[at].connection;
-            let answers_before = log.sent[..at]
-                .iter()
-                .filter(|s| s.connection == connection && s.said == Said::StatusAnswer)
-                .count();
-            let asked = log
-                .asked
-                .iter()
-                .filter(|a| a.connection == connection && a.method == "session.status")
-                .count();
-            asked >= answers_before + 2
-        }
-
         async fn read(venue: &FakeVenue, text: &str) {
             venue
                 .until("the listener to read a frame", WAIT, |log| {
-                    read_by_listener(log, text)
+                    log.read_by_listener(text)
                 })
                 .await;
         }
