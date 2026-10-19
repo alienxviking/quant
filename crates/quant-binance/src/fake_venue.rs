@@ -49,7 +49,7 @@ use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -174,6 +174,10 @@ pub struct Asked {
 pub struct Log {
     /// Connections accepted.
     pub connections: usize,
+    /// When each connection's WebSocket was accepted, in order.
+    pub opened: Vec<Instant>,
+    /// When each connection ended on this side, by connection number.
+    pub closed: Vec<(usize, Instant)>,
     pub sent: Vec<Sent>,
     pub asked: Vec<Asked>,
     /// Pongs received, on any connection.
@@ -222,6 +226,27 @@ impl Log {
             .filter(|a| a.connection == connection && a.method == "session.status")
             .count();
         asked >= answers_before + 2
+    }
+
+    /// For each connection after the first, how long after the one before it
+    /// ended it was opened: the listener's backoff, as the venue sees it.
+    ///
+    /// # Panics
+    ///
+    /// If a connection before the last has not ended.
+    #[must_use]
+    pub fn waits(&self) -> Vec<Duration> {
+        (1..self.opened.len())
+            .map(|n| {
+                let ended = self
+                    .closed
+                    .iter()
+                    .find(|(number, _)| *number == n)
+                    .unwrap_or_else(|| panic!("connection {n} ended"))
+                    .1;
+                self.opened[n].saturating_duration_since(ended)
+            })
+            .collect()
     }
 
     /// Every signature the listener sent.
@@ -439,6 +464,21 @@ async fn accept_loop(
     }
 }
 
+/// Writes down when a connection ended, however `serve` returns.
+struct Ending {
+    shared: Arc<Mutex<Shared>>,
+    number: usize,
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        lock(&self.shared)
+            .log
+            .closed
+            .push((self.number, Instant::now()));
+    }
+}
+
 /// One connection's state, as the venue would hold it.
 struct Session {
     number: usize,
@@ -471,8 +511,13 @@ async fn serve(
     let (number, ping_every) = {
         let mut shared = lock(&shared);
         shared.log.connections += 1;
+        shared.log.opened.push(Instant::now());
         shared.current = Some(tx);
         (shared.log.connections, shared.script.ping_every)
+    };
+    let _ending = Ending {
+        shared: Arc::clone(&shared),
+        number,
     };
     let mut session = Session {
         number,

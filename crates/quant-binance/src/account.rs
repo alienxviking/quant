@@ -1891,7 +1891,9 @@ mod tests {
         use quant_recorder::CaptureRecord;
         use quant_storage::{ControlRecord, FrameKind, RawFrame};
 
-        use super::super::{classify, AccountFrame, Refusal, Request, Stopped};
+        use quant_recorder::BackoffPolicy;
+
+        use super::super::{classify, AccountFrame, AccountPolicy, Refusal, Request, Stopped};
         use crate::fake_venue::{
             account_file_bytes, account_frames, quick_policy, FakeVenue, Listening, Reply, Said,
             Script, StatusReply,
@@ -2548,6 +2550,59 @@ mod tests {
                     "gap Disconnect",
                     "userDataStream.subscribe",
                 ])
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_backoff_resets_on_a_subscription_not_on_a_connection() {
+            // A venue that takes the TCP connection and refuses the logon,
+            // again and again, must be retried on a curve: each connection
+            // costs weight (web-socket-api.md:516) out of 300 a five minutes
+            // (:389). But a connection the venue subscribed is a success, and
+            // the next failure after it starts short again.
+            //
+            // The curve is wide enough to tell apart on a loaded machine:
+            // with equal jitter, attempt 0 waits 100-200 ms, attempt 1
+            // 400-800 ms, attempt 2 1.6-3.2 s.
+            let policy = AccountPolicy {
+                backoff: BackoffPolicy {
+                    initial: Duration::from_millis(200),
+                    max: Duration::from_millis(3_200),
+                    multiplier: 4,
+                },
+                ..quick_policy()
+            };
+            let busy = || Reply::refuse(503, -1008, "Server is currently overloaded");
+            let root = Root::new("backoff");
+            let venue = FakeVenue::start(Script {
+                logon: [busy(), busy()].into(),
+                ..Script::default()
+            })
+            .await;
+            let listening = Listening::start(&root.0, venue.url(), venue.credentials(), policy);
+            subscriptions(&venue, 1).await;
+            venue.script(|s| s.logon.extend([busy(), busy()]));
+            venue.drop_connection();
+            subscriptions(&venue, 2).await;
+            let heard = listening.stop(WAIT).await;
+            assert_eq!(heard.stopped, None);
+
+            let log = venue.log();
+            assert_eq!(
+                log.connections, 6,
+                "refused twice, heard, refused twice, heard"
+            );
+            let waits = log.waits();
+            let ms = |d: Duration| d.as_millis();
+            // Refused twice before ever being heard: the curve climbs.
+            assert!(ms(waits[1]) >= 300, "the second wait grew: {waits:?}");
+            // Heard, then dropped: the next failure starts short again.
+            assert!(ms(waits[2]) < 1_000, "reset by the subscription: {waits:?}");
+            // And climbs again, though every refused attempt connected.
+            assert!(ms(waits[3]) >= 300, "not reset by a connection: {waits:?}");
+            assert!(
+                ms(waits[4]) >= 1_200,
+                "not reset by a connection: {waits:?}"
             );
         }
 
