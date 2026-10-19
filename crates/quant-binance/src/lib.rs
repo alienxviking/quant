@@ -55,6 +55,7 @@
 //! we are writing down, and they belong to the normalizer at M2 where a mistake
 //! can be fixed by re-deriving rather than by re-recording a week.
 
+pub mod account;
 pub mod capture;
 pub mod connection;
 pub mod credentials;
