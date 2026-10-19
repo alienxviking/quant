@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 720 tests green in debug
-and release, clippy and fmt clean, ~56,400 lines across 12 crates.
+same window exactly, on both symbols, to the satoshi. 742 tests green in debug
+and release, clippy and fmt clean, ~58,700 lines across 12 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -124,8 +124,9 @@ and release, clippy and fmt clean, ~56,400 lines across 12 crates.
 > things this machine still needs before a live run.
 
 M7.5, the run log, shipped over seven slices (2026-10-05 → 2026-10-06) and its
-three criteria are measured in `docs/run-log.md` §7. `JournalEntry` now holds
-fourteen variants behind an exhaustive `match` with no `_` arm, so a future
+three criteria are measured in `docs/run-log.md` §7. `JournalEntry` held
+fourteen variants then and holds twenty-four since journal schema 3
+(`m8c-journal-live`), behind an exhaustive `match` with no `_` arm, so a future
 variant **cannot silently fail to move money** — a compile error rather than a
 paragraph, and it earned that twice during the milestone itself. `runlog check`
 reads a journal and says whether it accounts for every decision it implies;
@@ -2341,9 +2342,19 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   about one exit in ten at this size, not every exit, as #64's first draft
   claimed.
 
-  **What remains in (c) is items 4, 6, 7 and 8 of `docs/live-run.md` §4**: what
-  a live run writes down (journal schema 3), listening to the account,
-  `LiveVenue`, and the `live` binary with its testnet rehearsal.
+  **Item 4's entries landed as journal schema 3** (`m8c-journal-live`): every
+  `Notice` has a line through one exhaustive match, the market's return is a
+  `sighted` line rather than an inference, `balances` is the baseline
+  criterion A needs, and a strict writer withholds every order after its first
+  failed append. Two ids a venue or a caller can name without the engine
+  minting them, `orphaned` and `cancel_requested`, stopped moving the restart
+  id counter, beyond what the design asked.
+
+  **What remains in (c) is item 4's reader debts** (`m8c-journal-readers`:
+  loud orphans in `runlog check`, torn lines where an operator looks, the risk
+  tally recounted on restart) **and items 6, 7 and 8 of `docs/live-run.md`
+  §4**: listening to the account, `LiveVenue`, and the `live` binary with its
+  testnet rehearsal.
   Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
   shipped code, which went first, each on its own branch (#52 to #56, and see
   *Still open*), and eighteen design questions. The ones that block code are

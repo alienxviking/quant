@@ -417,7 +417,11 @@ checkpoints, a kill-switch trip and a stop. M7.5 took it to fourteen, adding the
 order lifecycle (`Submitted`, `Refused`, `Accepted`, `Rejected`,
 `CancelRequested`, `Cancelled`, `Orphaned`), blindness (`Blind`) and the
 strategy's own notes (`Note`) — behind an exhaustive `match` with no `_` arm, so
-a fifteenth cannot silently fail to move money.
+a fifteenth cannot silently fail to move money. Schema 3 (M8 slice (c)) took it
+to twenty-four, with what a live venue says on its own (`Placed`,
+`NeverLanded`, `Doubt`, `CancelRefused`, `Foreign`, `Account`, `Anomaly`,
+`Stray`), the market's return (`Sighted`) and the account's `Balances`; each was
+decided at every exhaustive site, and none moves money (`docs/run-log.md` §8).
 
 What has **not** changed is the sentence this paragraph exists for: there is
 still no entry from which in-memory strategy state could be rebuilt, and
@@ -686,8 +690,10 @@ later submission in the process is refused the same way before the venue is
 asked — a record that failed to hold one line cannot be trusted with the next.
 The withheld order has already passed risk and spent one of the day's count;
 that can happen once per process. `JournalWriter::new` always answers `Proceed`,
-which keeps paper's never-fatal journalling exactly as it was; the strict writer
-a live run needs is the journal pull request's.
+which keeps paper's never-fatal journalling exactly as it was.
+`JournalWriter::strict`, the live run's, answers `Withhold` from its first
+failed append on, and writes nothing more, because a line appended after a torn
+one would leave the journal unreadable.
 
 ### Reports and notices
 
@@ -761,9 +767,24 @@ nothing has moved, so a report still in flight stays undelivered.
       Every one of those tests was seen red under its break before it was
       trusted.
 
-What this slice does **not** do is give the new facts lines of their own: the
-journal writer logs each detail and notice it cannot yet write as an error, and
-schema 3's entries are the next pull request's. Nothing produces any of them
-until `LiveVenue` exists. Recounting the risk tally after a restart is the one
-after that.
+### What the record writes: journal schema 3
+
+The seam's slice left the new facts without lines of their own, logging each as
+an error; `m8c-journal-live` gave them lines (`docs/run-log.md` §8). Detail goes
+on the line of the event it describes: the venue's ids on `accepted`, `filled`,
+`cancelled` and `orphaned`, what the venue cited on `rejected`, the orders still
+working on `stopped`. Each `Notice` maps to an entry of its own through one
+exhaustive `match` in the writer, a request that never landed is
+`never_landed` rather than `rejected`, and a stray is `stray`.
+
+`RunObserver::on_sighted(at)` is the fourteenth hook, **required** for
+`on_notice`'s reason. The engine calls it in step 2 when `Book::apply` takes a
+book from not live to live, and the journal writes it as `sighted`: the
+market's return, written down, which `explain` reads in place of inferring it
+from any later line once a session is schema 3. Nothing produces the venue's
+lines until `LiveVenue` exists; `sighted` is in every new backtest and paper
+journal, one each time a book goes from not live to live: after every gap,
+and also when a book re-anchors after its own update chain broke, which writes
+no `blind` line. Recounting the risk tally after a restart
+is the readers' pull request.
 
