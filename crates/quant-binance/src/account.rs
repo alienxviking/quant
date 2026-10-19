@@ -171,8 +171,11 @@
 //! account subscriptions do not exist there or is not one we can read. A
 //! refusal is stopped on whichever request it answered, the subscription's
 //! included, and a refusal nobody asked for, like the revocation notice, stops
-//! it too. Everything else, a connect refused, a reset, a timeout, a 5xx or
-//! a busy venue, is a connection that ended: logged, backed off, and retried.
+//! it too. So does an HTTP status that refuses the WebSocket upgrade itself, by
+//! the same rule: a 418 is a ban wherever it turns up, and the pinned pages do
+//! not say a banned address is refused only after the upgrade. Everything else,
+//! a connect refused, a reset, a timeout, a 5xx or a busy venue, is a
+//! connection that ended: logged, backed off, and retried.
 //!
 //! # Who reads the records
 //!
@@ -207,7 +210,7 @@ use quant_core::time::Ts;
 use quant_recorder::{Backoff, BackoffPolicy, Ingress, RecordSink, ACCOUNT_STREAM};
 use serde_json::{json, Value};
 use tokio::time::{sleep, sleep_until, timeout, Instant};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{error, info, warn};
 
@@ -616,6 +619,9 @@ pub enum Stopped {
     WriterGone,
     /// A refusal that will not clear by itself ([`is_transient`]).
     Refused(Refusal),
+    /// The venue answered the WebSocket upgrade with this HTTP status, and it
+    /// is not one that clears by itself ([`is_transient`]).
+    UpgradeRefused(u16),
     /// `session.status` answered `userDataStream: null`: *"User Data Stream
     /// subscriptions are **not available** on this WebSocket API"*
     /// (web-socket-api.md:8193).
@@ -630,6 +636,9 @@ impl fmt::Display for Stopped {
         match self {
             Self::WriterGone => f.write_str("the capture writer is gone"),
             Self::Refused(refusal) => write!(f, "{refusal}"),
+            Self::UpgradeRefused(status) => {
+                write!(f, "the WebSocket upgrade was refused: HTTP {status}")
+            }
             Self::Unavailable => {
                 f.write_str("account subscriptions are not available on this WebSocket API")
             }
@@ -743,6 +752,17 @@ pub async fn listen<S: RecordSink>(
                         return stopped;
                     }
                 }
+            }
+            // A status refusing the upgrade is held to the rule an answer is:
+            // a ban, a forbidden address or a wrong path will not clear by
+            // itself, and asking again every 30 s is what extends a ban. The
+            // body is not logged, for the reason no payload is.
+            Ok(Err(tungstenite::Error::Http(response)))
+                if !is_transient(response.status().as_u16(), None) =>
+            {
+                let stopped = Stopped::UpgradeRefused(response.status().as_u16());
+                error!(%stopped, "account listener stopped; the account is not being heard");
+                return stopped;
             }
             Ok(Err(e)) => warn!(attempt = backoff.attempt(), error = %e, "account connect failed"),
             Err(_elapsed) => warn!(attempt = backoff.attempt(), "account connect timed out"),
@@ -2288,6 +2308,85 @@ mod tests {
                 shape(&account_frames(&root.0)),
                 shape_of(&["gap RecorderRestart"])
             );
+        }
+
+        /// A port that answers every WebSocket upgrade with `status`, and
+        /// counts the attempts.
+        async fn refusing_upgrades(
+            status: &'static str,
+        ) -> (
+            String,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let url = format!("ws://{}", listener.local_addr().expect("address"));
+            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = std::sync::Arc::clone(&attempts);
+            let refusing = tokio::spawn(async move {
+                while let Ok((mut tcp, _)) = listener.accept().await {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Read the request through its blank line, then refuse it.
+                    let mut request = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match tcp.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let answer = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = tcp.write_all(answer.as_bytes()).await;
+                    let _ = tcp.shutdown().await;
+                }
+            });
+            (url, attempts, refusing)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_upgrade_refused_for_good_stops_the_listener_and_one_that_may_clear_does_not() {
+            // A ban, or a forbidden address, answered at the upgrade rather
+            // than inside the connection: the same rule as an answer's.
+            for (status, code) in [("418 I'm a teapot", 418), ("403 Forbidden", 403)] {
+                let root = Root::new(&format!("upgrade-{code}"));
+                let (url, attempts, refusing) = refusing_upgrades(status).await;
+                let venue = FakeVenue::start(Script::default()).await;
+                let listening =
+                    Listening::start(&root.0, &url, venue.credentials(), quick_policy());
+                let heard = listening.stopped_by_itself(WAIT).await;
+                refusing.abort();
+                assert_eq!(
+                    heard.stopped,
+                    Some(Stopped::UpgradeRefused(code)),
+                    "{status}"
+                );
+                assert_eq!(
+                    attempts.load(std::sync::atomic::Ordering::Relaxed),
+                    1,
+                    "{status}: not retried"
+                );
+            }
+            // A busy venue at the upgrade is retried, as a busy answer is.
+            let root = Root::new("upgrade-503");
+            let (url, attempts, refusing) = refusing_upgrades("503 Service Unavailable").await;
+            let venue = FakeVenue::start(Script::default()).await;
+            let listening = Listening::start(&root.0, &url, venue.credentials(), quick_policy());
+            let deadline = tokio::time::Instant::now() + WAIT;
+            while attempts.load(std::sync::atomic::Ordering::Relaxed) < 3 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "gave up waiting for three attempts"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let heard = listening.stop(WAIT).await;
+            refusing.abort();
+            assert_eq!(heard.stopped, None, "still trying");
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
