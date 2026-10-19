@@ -82,7 +82,8 @@ pub mod user_data;
 /// [`SnapshotClient`] in a unit test brings the test down.
 ///
 /// Hence one function, called from both the binary's startup and
-/// [`SnapshotClient::new`]. Calling it from a constructor is a global side effect
+/// [`SnapshotClient::new`], and from the trade client and the account
+/// listener for the same reason. Calling it from a constructor is a global side effect
 /// and worth a second thought, but the alternative is a library whose constructor
 /// panics unless its caller knew to install a cryptography backend first. It is
 /// idempotent and never overrides a choice already made: `install_default`

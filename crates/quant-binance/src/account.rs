@@ -721,6 +721,12 @@ pub async fn listen<S: RecordSink>(
     policy: &AccountPolicy,
     offset_ms: i64,
 ) -> Stopped {
+    // Not the caller's problem, as for `SnapshotClient::new` and
+    // `TradeClient`: a `wss://` handshake reads the process-global rustls
+    // provider. Today only `ring` is in the build, so rustls would pick it by
+    // itself; a dependency that adds `aws-lc-rs` would make that first
+    // handshake panic instead. See `crate::install_crypto_provider`.
+    crate::install_crypto_provider();
     let mut backoff = Backoff::for_key(policy.backoff, ACCOUNT_STREAM);
     let mut requests = 0_u64;
     info!(%url, "account listener starting");
