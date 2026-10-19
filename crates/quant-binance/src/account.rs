@@ -926,6 +926,13 @@ impl Outbound {
     ///
     /// `recvWindow` is left to the venue's default, the same five seconds
     /// every REST request sends ([`crate::trade::RECV_WINDOW_MS`]).
+    ///
+    /// The signature goes as base64 (web-socket-api.md:1161-1164), whatever
+    /// the method's own example shows: its `signature` (:3383) is 64 hex
+    /// characters, which is an HMAC-SHA256's 32 bytes and not an Ed25519
+    /// signature's 64, on a method that takes Ed25519 keys only. The same
+    /// kind of example slice (c) found on the REST page, and read the same
+    /// way: as an example of the request's shape, not of its signature.
     fn logon(credentials: &Credentials, now: Ts) -> Self {
         let timestamp = now.as_millis();
         let text = timestamp.to_string();

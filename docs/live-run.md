@@ -376,7 +376,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`) and item 4's readers (`m8c-journal-readers`); items 6, 7 and 8 below remain |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`); items 7 and 8 below remain |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -564,6 +564,62 @@ feature.
    translated. Accepted against a local WebSocket server: recorded bytes equal sent
    bytes, and a dropped connection produces a `Gap`, a reconnect and a second
    subscribe.
+
+   **Built** as `m8c-account-stream`, the argument in `quant-binance::account`'s
+   module docs. `account::listen` connects to the WebSocket API, sends
+   `session.logon` signed by the Ed25519 key over a timestamp read from the
+   clock at that moment, subscribes, and drains, recording every frame it may
+   through `Ingress::accept_account_at` before it acts on the frame. Every new
+   connection logs on and subscribes again, after the market's backoff seeded
+   by the account stream's name. Accepted against `quant-binance::fake_venue`,
+   a local WebSocket API that verifies the logon's signature with a payload
+   builder of its own and judges its timestamp. The recorded frames, read back
+   with `quant-storage`'s reader, equal the venue's byte for byte and in order,
+   with `ingest_seq` contiguous. Neither the key, nor a signature, nor an
+   answer to a logon or a status is in the files. A dropped connection and a
+   `serverShutdown` each produce a `Gap`, a reconnect, a second logon and a
+   second subscribe. And `quant-verify` passes the tree with no findings
+   (`crates/quant-verify/tests/account_stream.rs`). Four things differ from
+   the plan.
+
+   - **Liveness is a question the venue answers, not a timeout.** The plan
+     named none, and the market's rule, applied to events, would reconnect a
+     quiet account every two minutes and record a gap each time that is not
+     real. The market's rule counts every frame, pings included, so the
+     venue's 20-second pings would hold the socket open, but a ping proves the
+     socket and not the subscription (§5). So once subscribed the listener
+     asks `session.status` every 30 s and needs `userDataStream: true` within
+     ten seconds, the venue's own request timeout. An unanswered probe ends
+     the connection, and so does `false`. Tested both ways: a quiet account,
+     with no events and no pings, is never reconnected, and a venue that stops
+     answering while it still pings is found.
+   - **A failure has one of two outcomes.** A refusal that will not clear by
+     itself stops the listener and says why: a bad or revoked key, a bad
+     signature, a timestamp outside `recvWindow` in either direction, a ban, a
+     refused subscription, or no account subscriptions on that API. Anything
+     else (a reset, a timeout, a 5xx, a 429, a busy venue) ends the connection
+     and is retried, and a subscribed connection's end is one gap however many
+     attempts the reconnect takes. `eventStreamTerminated` and a status of
+     `false` end a connection as a closed socket does.
+   - **The consumer reads an `AccountFeed`.** The plan named the recording and
+     not its reader. The listener writes through a `TeeSink` with the capture
+     primary, as paper's market path does, and `AccountFeed` reads the
+     secondary: each frame as the file holds it, and a `Blind` for each
+     recorded gap and for each hole the tee left, always before the frame
+     that revealed the hole. Item 7 is built against it.
+   - **§5's recording rule is applied by request.** No outbound frame and no
+     answer to `session.logon` or `session.status` is recorded. An answer is
+     known by the request it answers, read from its id, which names the
+     method, so a recorded answer says what it answers without the listener's
+     memory. A refused subscription and the unsolicited revocation notice are
+     recorded. And under the rule, a guard on the bytes withholds any frame
+     that contains the API key, whatever it claims to be.
+
+   Not done, and named: opening the new connection before closing the old on
+   `serverShutdown`, which would avoid the gap at the price of both
+   subscriptions delivering the same events for a moment, a deduplication
+   item 7 would own; and waiting out a 429's `retryAfter` beyond the backoff.
+   No binary runs the listener yet (item 8), and none of it has met the venue.
 7. **`LiveVenue`.** A state machine merging REST outcomes with stream reports: one
    terminal event per order, fills deduplicated by trade id, the in-doubt state
    (§5). Behind it, `impl ExecutionVenue`. Accepted by a permutation test over
@@ -786,12 +842,16 @@ every in-flight order's outcome unknown at the same instant.
 `eventStreamTerminated` is sent when a listen token expires, when a logon
 subscription is ended by `session.logout`, and when we unsubscribe, and we cause
 none of those involuntarily. A lost subscription shows up as transport instead:
-the socket closing, the idle timeout firing, a `serverShutdown` event, a
-resubscribe that fails. A subscription belongs to one connection and nothing is
-replayed after a reconnect, so every reconnect resubscribes, and an order working
-across the blind stretch is in doubt (below) until slice (d)'s lookup settles it.
-The venue's pings every 20 seconds prove the socket, not the subscription;
-`session.status` reports whether we still hold one.
+the socket closing, a `session.status` probe unanswered or answering `false`, a
+`serverShutdown` event, a resubscribe that fails. A subscription belongs to one
+connection and nothing is replayed after a reconnect, so every reconnect
+resubscribes, and an order working across the blind stretch is in doubt (below)
+until slice (d)'s lookup settles it. The venue's pings every 20 seconds prove
+the socket, not the subscription; `session.status` reports whether we still
+hold one, and is what item 6 built liveness on: asked every 30 s, answered
+`true` within ten, or the connection is over. This said "the idle timeout
+firing" before item 6, which would have meant a timeout over a stream that is
+silent for hours whenever the account trades nothing.
 
 **The adapter refuses before an order is journalled, not after.** By the time
 `ExecutionVenue::submit` runs, `on_submitted` has written the order down and the
