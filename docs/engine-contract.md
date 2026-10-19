@@ -430,12 +430,16 @@ still no entry from which in-memory strategy state could be rebuilt, and
 checkpoint to resume from — `docs/run-log.md` §2 refuses that in writing. So a restarted paper process comes
 back up with the right cash and the right position — which is exactly what
 criterion 4 asks for, and it is worth having — and with **empty `MaCrossover`
-windows, a zeroed equity sampler and a zeroed daily risk tally**.
-`RiskEngine::recover` carries the switch across and deliberately not the day's
-counters, per §10.
+windows and a zeroed equity sampler**. When this was written it came back with
+a zeroed daily risk tally too, because `RiskEngine::recover` carried the
+switch across and nothing else; since `m8c-journal-readers` the tally is
+recounted from the journal (`journal::recover_risk`, §10), so the risk layer
+comes back as far as the journal holds it. §10 lists where that stops: an order
+in flight at the cut, a schema-1 journal's order count, a withheld order's
+count, and the refusal total.
 
-The judging backtest has no such boundary. It runs the indicator, the sampler and
-the risk tally continuously across the same instant, so after a restart the two
+The judging backtest has no such boundary. It runs the indicator and the sampler
+continuously across the same instant, so after a restart the two
 sides are not the same system in the same state: the crossings differ, therefore
 the fill counts differ, therefore criterion 2 fails — **for a reason that is not
 live-versus-replay**, which is the only thing it was asked to test. And it cannot
@@ -605,20 +609,21 @@ have. The latter lets every order through right up to the one that mattered.
 Exposure is absolute, so a short counts: a limit that only looked at longs would
 permit an unlimited short, which is the more dangerous direction.
 
-**The position limit never blocks a reduction of a position the risk layer has
-seen — and after a restart it has seen none.** Risk judges an order against its own
-tally, built from the fills it has been told about since the process started, and
-`RiskEngine::recover` brings back the switch but not the holdings. So an exit from
-a position held across a restart reads as opening the opposite position, and is
-refused if that position would be over the limit, however much the exit really
-reduces. Within what it has seen, an order that leaves the position on the same
-side, or flat, and strictly smaller is exempt from the limit, because a risk layer
-that trapped a position it considered too large would be the most dangerous thing
-in the system. A flip is not a reduction: the position it opens is checked like any
+**The position limit never blocks a reduction of a position.** Risk judges an
+order against its own tally, built from every fill it has been told about, and
+after a restart from every fill the journal holds (below). An order that leaves
+the position on the same side, or flat, and strictly smaller is exempt from the
+limit, because a risk layer that trapped a position it considered too large
+would be the most dangerous thing in the system. A flip is not a reduction: the position it opens is checked like any
 other. The exemption is from that one limit. A reducing order still meets the
 per-order limit (a fat finger on the way out is still a fat finger, and an exit can
 be split), the no-price refusal and the daily limits, and a tripped switch refuses
-even a flattening order, as below.
+even a flattening order, as below. "Never" is about the position risk has been
+told of. An orphaned fill moves real exposure that neither the portfolio nor
+the tally holds, so live the limit can misjudge a position an orphan changed;
+that is why a single orphan fails criterion A and `runlog check`, and why an
+order in flight at a restart is slice (d)'s to recover (criterion E) rather
+than an orphan to live with.
 
 **Fees count against the daily loss budget.** A limit ignoring them would be
 reached late by exactly the amount a high-turnover strategy pays — which §8 showed
@@ -635,6 +640,35 @@ process, so a switch held only in memory would be re-armed by the machinery mean
 to keep things running. Whether to resume tomorrow is a decision, not a timeout.
 The day never rolls backwards either, so an NTP step cannot hand a stopped
 strategy a fresh budget.
+
+**A restart recounts the tally from the journal, and the switch with it.**
+`journal::recover_risk` starts from `RiskEngine::recover(limits, last_trip)`
+and folds the journal through the risk layer the way the earlier process
+counted it: a `submitted` line is an order the check passed, recounted with
+`RiskEngine::recount(at, true)`, which rolls the day and counts it; a risk
+refusal is one the check ran on and turned away, `recount(at, false)`, which
+rolls the day and counts nothing; a `filled` line goes to `on_fill`, which
+moves the holding and the day's realized P&L, fees included; and every other
+line does nothing, listed by name in an exhaustive `match`. Until
+`m8c-journal-readers` a restart brought back the switch and nothing else, so an
+addition to a real position was checked as if from flat, a real exit could be
+refused as if it opened the opposite position, and the day's loss budget and
+order count started fresh: an NTP step could not hand a stopped strategy a
+fresh budget, and a restart could. A new UTC day in the file still resets the
+counters and never the switch, because the recount rolls the day exactly where
+the live check did. The limits are the restarted process's own; the counts
+are facts about the day.
+
+The recount is as complete as the journal and no more, and four things fall
+outside it. An order in flight at the cut: in paper its fill never comes,
+because the new `SimulatedVenue` never heard of the order, and live it arrives
+as an orphan, which risk is never told of; the uninterrupted tally would hold
+it, and recovering it is criterion E's lookup in slice (d)
+(`docs/live-run.md` §3). A schema-1 journal, the fortnight's, has no
+`submitted` lines, so its order count recounts to zero. An order a strict
+writer withheld after its first failed append did spend a count in the
+earlier process, and the file does not hold it. And `refusals()`, a reporting
+total rather than a limit, starts again at zero.
 
 **A tripped switch refuses everything, including a flattening order.** A real
 trade-off, written down: closing out becomes a manual act, which is the right
@@ -785,6 +819,8 @@ from any later line once a session is schema 3. Nothing produces the venue's
 lines until `LiveVenue` exists; `sighted` is in every new backtest and paper
 journal, one each time a book goes from not live to live: after every gap,
 and also when a book re-anchors after its own update chain broke, which writes
-no `blind` line. Recounting the risk tally after a restart
-is the readers' pull request.
+no `blind` line. The readers' pull request, `m8c-journal-readers`, recounts
+the risk tally after a restart (§10), and reads the new lines: an `orphaned`,
+`stray` or other-run `foreign` line and a doubt left raised are findings in
+`runlog check`, and a line torn before a restart is said on the verdict line.
 

@@ -176,10 +176,9 @@ pub struct Limits {
     /// the position is over by more than `max_order_notional` no order could:
     /// the two limits together would hold it at the size this one objects to.
     ///
-    /// The position meant is risk's own tally, which starts flat after a
-    /// restart: [`RiskEngine::recover`] brings back the switch but not the
-    /// holdings, so an exit from a position held across one is checked as if
-    /// it opened the opposite position.
+    /// The position meant is risk's own tally, which a restart brings back
+    /// from the journal with the day's counters (`journal::recover_risk`), so
+    /// an exit from a position held across one is checked as the exit it is.
     pub max_position_notional: Option<Notional>,
     /// Realized loss in one UTC day that stops trading for that day.
     ///
@@ -294,6 +293,14 @@ impl RiskEngine {
     ///
     /// The supervisor restarts a dead process, so a switch held only in memory
     /// would be re-armed by the machinery meant to keep things running.
+    ///
+    /// The switch and nothing else: the holdings and the day's counters start
+    /// empty. A restart that stopped here would check an addition to a real
+    /// position as if from flat, refuse a real exit as if it opened the
+    /// opposite position, and hand the strategy a fresh loss budget and
+    /// order count for a day it had already spent. `journal::recover_risk`
+    /// is the restart: this, then the journal's decisions and fills recounted
+    /// through [`Self::recount`] and [`RiskLayer::on_fill`].
     #[must_use]
     pub fn recover(limits: Limits, tripped: Option<TripCause>) -> Self {
         Self {
@@ -303,6 +310,22 @@ impl RiskEngine {
             // make the log claim the limit fired repeatedly.
             pending_trip: None,
             ..Self::new(limits)
+        }
+    }
+
+    /// An order that reached [`RiskLayer::check`] at `at` in an earlier
+    /// process: roll the day as the check did (never back), and count the
+    /// order if it passed.
+    ///
+    /// The check's bookkeeping without its judgement. The verdict is already
+    /// on file, as a `submitted` line or a risk refusal, and judging it again
+    /// against limits that may have changed since would count a different
+    /// day from the one that happened. Nothing here can trip: a trip the
+    /// check threw is on file too, and [`Self::recover`] brings it back.
+    pub fn recount(&mut self, at: Ts, passed: bool) {
+        self.roll(at);
+        if passed {
+            self.today.orders += 1;
         }
     }
 
@@ -325,6 +348,16 @@ impl RiskEngine {
     #[must_use]
     pub const fn orders_today(&self) -> u64 {
         self.today.orders
+    }
+
+    /// The UTC day [`Self::orders_today`] and [`Self::realized_today`]
+    /// belong to: the last one an order or a fill rolled to, never the
+    /// clock's. After a restart that is the journal's last day, which may be
+    /// yesterday; the first check today rolls both to zero. `None` before
+    /// anything was counted.
+    #[must_use]
+    pub const fn counted_day(&self) -> Option<UtcDate> {
+        self.today.date
     }
 
     /// Throw the switch by hand.
@@ -472,11 +505,10 @@ impl RiskLayer for RiskEngine {
                 // none could, trapping the very position this limit thinks
                 // too large. A flip is not a reduction; see `only_reduces`.
                 //
-                // Judged on risk's own tally of this instrument, which starts
-                // empty after a restart -- `recover` brings back the switch,
-                // not the holdings -- so an exit from a position held before
-                // the restart reads as opening the opposite one, and is
-                // checked as one.
+                // Judged on risk's own tally of this instrument, which a
+                // restart recounts from the journal's fills
+                // (`journal::recover_risk`), so an exit from a position held
+                // before the restart is judged as the exit it is.
                 //
                 // Exempt from this limit and nothing else. A reduction has
                 // already met everything above, deliberately: the tripped
@@ -1040,6 +1072,28 @@ mod tests {
             "the switch is still thrown, and says so by name"
         );
         assert_eq!(risk.realized_today(), Notional::ZERO, "but the day rolled");
+    }
+
+    #[test]
+    fn the_counts_say_which_day_they_belong_to() {
+        // A restarted `paper` prints the recounted tally before its first
+        // order, and a journal that ended yesterday leaves yesterday's counts
+        // in place until a check rolls them. So the counts carry their day,
+        // and the day moves only when they do: forward, never back.
+        let mut risk = RiskEngine::new(Limits::default());
+        assert_eq!(risk.counted_day(), None, "nothing counted yet");
+        risk.recount(NOW, true);
+        assert_eq!(risk.counted_day(), Some(NOW.utc_date()));
+        risk.recount(Ts::from_nanos(NOW.as_nanos() - DAY), true);
+        assert_eq!(
+            risk.counted_day(),
+            Some(NOW.utc_date()),
+            "an order stamped yesterday is counted on the day it rolled to"
+        );
+        let tomorrow = Ts::from_nanos(NOW.as_nanos() + DAY);
+        risk.recount(tomorrow, false);
+        assert_eq!(risk.counted_day(), Some(tomorrow.utc_date()));
+        assert_eq!(risk.orders_today(), 0, "tomorrow's count starts at zero");
     }
 
     #[test]

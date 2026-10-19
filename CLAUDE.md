@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 742 tests green in debug
-and release, clippy and fmt clean, ~58,700 lines across 12 crates.
+same window exactly, on both symbols, to the satoshi. 756 tests green in debug
+and release, clippy and fmt clean, ~60,400 lines across 12 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -1775,9 +1775,12 @@ every document says it is.** Every one of them frames a mid-run restart as a
 *reader* problem, which is what M2.e was for. It is a **state** problem.
 `JournalEntry` has no strategy entry and `Engine::resuming` replaces only the
 portfolio, so a restarted `paper` process comes back with the right cash and
-position and with **empty `MaCrossover` windows, a zeroed `Recorded` sampler and
-a zeroed daily risk tally**. The judging backtest runs all of that *continuously*
-across the same boundary: different crossings, different fill counts, and the
+position and with **empty `MaCrossover` windows and a zeroed `Recorded`
+sampler**. It also came back with a zeroed daily risk tally until
+`m8c-journal-readers`, which recounts the tally from the journal as far as the
+journal holds it (`docs/engine-contract.md` §10 lists what it cannot); the
+strategy's windows and the sampler are still lost. The judging backtest runs all
+of that *continuously* across the same boundary: different crossings, different fill counts, and the
 exact comparison fails for reasons unrelated to live-versus-replay. It cannot be
 repaired after the fact, and the fallback — compare per-segment *between*
 restarts rather than end to end — is written down now, before there is a number
@@ -2350,10 +2353,24 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   minting them, `orphaned` and `cancel_requested`, stopped moving the restart
   id counter, beyond what the design asked.
 
-  **What remains in (c) is item 4's reader debts** (`m8c-journal-readers`:
-  loud orphans in `runlog check`, torn lines where an operator looks, the risk
-  tally recounted on restart) **and items 6, 7 and 8 of `docs/live-run.md`
-  §4**: listening to the account, `LiveVenue`, and the `live` binary with its
+  **Item 4's reader debts are paid** (`m8c-journal-readers`): `runlog check`
+  fails on an orphaned fill, a stray, another run's order, a doubt left raised
+  about an order never seen to end, and an anomaly, and counts a stranger's
+  order; a line torn before a restart rides on `reconcile`'s verdict line and
+  is a `runlog check` finding; a restart recounts the risk tally from the
+  journal (`journal::recover_risk`), so the holding, the day's order count and
+  its loss come back as far as the journal holds them, and only a new UTC day
+  resets the counters; and `explain --at` reads `backtest --journal` files
+  again, which a wall-clock `started` line had stopped. The journal's reach is
+  the limit: an order in flight at the cut is criterion E's to recover in
+  slice (d), and a schema-1 journal has no `submitted` lines to count
+  (`docs/engine-contract.md` §10). An anomaly is flagged rather than trusted
+  to a doubt beside it, because no venue code has that duty; the one an
+  `account` line rests on, a doubt on every order working when the stream is
+  lost, is now item 7's acceptance criterion.
+
+  **What remains in (c) is items 6, 7 and 8 of `docs/live-run.md` §4**:
+  listening to the account, `LiveVenue`, and the `live` binary with its
   testnet rehearsal.
   Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
   shipped code, which went first, each on its own branch (#52 to #56, and see

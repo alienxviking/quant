@@ -129,6 +129,11 @@ fn print_decisions(journal: &std::path::Path, at: quant_core::time::Ts, span: i6
         // Already reported by the `ours` block, which reads the same file.
         return;
     };
+    // A lost entry may be a decision this block would have shown, so the
+    // loss is said beside it rather than left to `reconcile`'s full report.
+    if let Some(torn) = recovered.torn_note() {
+        outln!("torn      {torn}");
+    }
     let d = quant_explain::runlog::decisions_at(&recovered.entries, at.as_nanos(), span);
     match &d.blind {
         Some((stamp, cause, recovered_since)) if !recovered_since => {
@@ -176,6 +181,12 @@ fn check_journal(path: &std::path::Path) -> ExitCode {
         }
         Ok(agreement) => {
             outln!("journal   {}", path.display());
+            // Before any verdict, and whatever it is: the checkpoints cannot
+            // see an entry a torn write lost, because the restarted engine
+            // resumed from the same short file.
+            if let Some(torn) = &agreement.torn {
+                outln!("torn      {torn}");
+            }
             match agreement.divergence {
                 Some(why) => {
                     outln!(
