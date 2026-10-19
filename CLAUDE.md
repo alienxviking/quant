@@ -1919,7 +1919,13 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   And the claim that `TeeSink::secondary_dropped` and the engine's `blind` lines
   were **two independent counts of one fact** was wrong: the tee counts dropped
   *records*, `LiveSource` emits one gap per *hole*. The pair that should agree is
-  `secondary_dropped` against `LiveStats::records_missed`.
+  `secondary_dropped` against `LiveStats::records_missed`, and even that is true
+  only while the capture keeps up (`m8c-account-stream`'s review). A record the
+  capture refuses never reaches the tee's second consumer, so the tee never
+  counts it, and the consumer's hole is there all the same: `records_missed`
+  equals `secondary_dropped` plus ingress's own `dropped`. Asserted as the
+  shorter pair, the check would fire exactly when the system is overloaded,
+  which is the one time it matters.
 
 - **A doc comment can drift onto a different item entirely, and the compiler is
   fine with it.** Two M7.5 insertions landed *inside* existing doc blocks, so
