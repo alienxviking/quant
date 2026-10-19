@@ -61,7 +61,10 @@ use quant_recorder::{
     account_catalog, channel, run_writer, BackoffPolicy, CaptureRecord, CaptureSession, FileStore,
     Ingress, Metrics, TeeSink, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
 };
-use quant_storage::{RawFrame, RawReader, WriterOptions};
+use quant_storage::{
+    RawFrame, RawReader, WriterOptions, BLOCK_HEADER_LEN, BLOCK_SYNC, FILE_HEADER_LEN, TRAILER_LEN,
+    TRAILER_SYNC,
+};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
 use serde_json::{json, Value};
@@ -933,14 +936,65 @@ pub fn account_frames(root: &Path) -> Vec<RawFrame> {
     frames
 }
 
-/// Every byte of every file in the account tree under `root`, as stored.
+/// Every byte of every file in the account tree under `root`, as stored,
+/// with each block's zstd payload decompressed in place.
+///
+/// Decompressed, because a search of compressed bytes proves nothing: zstd
+/// need not keep a string it was given as the same bytes. Searched as stored
+/// and nothing more, a capture holding the key in every logon and status
+/// answer went unfound. Everything else (the file header, each block's header, the
+/// trailer) is kept as it is, so a key that found its way into any part of a
+/// file outside a frame's payload would be found too.
+///
+/// Walked with the layout in `quant-storage`'s crate docs rather than its
+/// reader, which hands back frames and would hide whatever lies between them.
+///
+/// # Panics
+///
+/// On anything that is not that layout.
 #[must_use]
 pub fn account_file_bytes(root: &Path) -> Vec<u8> {
     let mut bytes = Vec::new();
     for session in &account_catalog(root).sessions {
         for entry in &session.segments {
-            bytes.extend(std::fs::read(&entry.path).expect("read a capture file"));
+            let file = std::fs::read(&entry.path).expect("read a capture file");
+            bytes.extend(decompressed_in_place(&file));
         }
     }
     bytes
+}
+
+fn decompressed_in_place(file: &[u8]) -> Vec<u8> {
+    let word = |at: usize| {
+        u32::from_le_bytes(
+            file.get(at..at + 4)
+                .expect("a whole word")
+                .try_into()
+                .expect("four bytes"),
+        )
+    };
+    let mut out = file[..FILE_HEADER_LEN].to_vec();
+    let mut at = FILE_HEADER_LEN;
+    while at < file.len() {
+        match word(at) {
+            BLOCK_SYNC => {
+                let raw = usize::try_from(word(at + 4)).expect("fits");
+                let compressed = usize::try_from(word(at + 8)).expect("fits");
+                let body = at + BLOCK_HEADER_LEN;
+                out.extend_from_slice(&file[at..body]);
+                out.extend(
+                    zstd::bulk::decompress(&file[body..body + compressed], raw)
+                        .expect("a block that decompresses"),
+                );
+                at = body + compressed;
+            }
+            TRAILER_SYNC => {
+                assert_eq!(file.len() - at, TRAILER_LEN, "the trailer ends the file");
+                out.extend_from_slice(&file[at..]);
+                at = file.len();
+            }
+            other => panic!("neither a block nor the trailer at byte {at}: {other:#x}"),
+        }
+    }
+    out
 }

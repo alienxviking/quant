@@ -2072,7 +2072,8 @@ mod tests {
             }
             assert!(log.asked("session.status") >= 3, "probes were answered");
             // No key, no signature, and no answer to a logon or a status: in
-            // what the frames hold, and in the files as stored.
+            // what the frames hold, and in the files, every byte of them with
+            // each block decompressed.
             let decoded: Vec<u8> = frames.iter().flat_map(|f| f.payload.clone()).collect();
             let stored = account_file_bytes(&root.0);
             let signatures = log.signatures();
