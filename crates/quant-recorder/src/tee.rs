@@ -127,8 +127,12 @@ impl<P: RecordSink, S: RecordSink> TeeSink<P, S> {
     /// Records the secondary consumer did not get.
     ///
     /// Counted **per record**, not per hole: the live source turns a run of
-    /// consecutive missing sequence numbers into one gap, so this is the width
-    /// and `LiveStats::records_missed` is the figure it should equal.
+    /// consecutive missing sequence numbers into one gap, so this is the width.
+    /// It is not the whole width. A record the capture refused never reaches
+    /// the secondary, so the tee never counts it, and the consumer's hole is
+    /// there all the same: what `LiveStats::records_missed` equals is this
+    /// plus ingress's own `dropped`. The two agree alone only while the
+    /// capture keeps up.
     ///
     /// Read at shutdown today, which is honest but late — the paper binary
     /// prints it once the capture has returned. Reading it on the metrics tick

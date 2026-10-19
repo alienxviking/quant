@@ -1121,9 +1121,17 @@ pub struct FeedStats {
     pub gaps: u64,
     /// Holes in this consumer's `ingest_seq`, each handed over as a `Blind`.
     pub holes: u64,
-    /// Records lost to those holes. The tee counts the same records from its
-    /// side ([`TeeSink::secondary_dropped`](quant_recorder::TeeSink::secondary_dropped)),
-    /// so the two should agree.
+    /// Records lost to those holes.
+    ///
+    /// Two counts make it up, and neither alone does. The tee counts what it
+    /// could not hand this consumer
+    /// ([`TeeSink::secondary_dropped`](quant_recorder::TeeSink::secondary_dropped)),
+    /// and ingress counts what the capture itself had no room for
+    /// ([`IngressStats::dropped`](quant_recorder::IngressStats::dropped)): a
+    /// record the capture refused reaches neither side, so the tee never sees
+    /// it, and the hole is the consumer's all the same. Once the feed has
+    /// caught up, this is their sum. A check built on the tee's count alone
+    /// would fire exactly when the capture is overloaded.
     pub missed: u64,
     /// Records that are not the account stream's, which a correctly wired
     /// feed never sees. Dropped, counted, and the first is logged.
@@ -1784,6 +1792,63 @@ mod tests {
             assert_eq!(feed.poll(), Polled::Empty, "and not again from the mark");
             assert_eq!(feed.stats().missed, dropped(&drops));
             assert_eq!(feed.stats().holes, 1);
+        }
+
+        #[test]
+        fn what_the_capture_drops_is_missed_too_and_the_tee_never_counts_it() {
+            // The capture holds two and nothing drains it, so the third is
+            // refused by the capture itself: it reaches neither side of the
+            // tee. The consumer has room for everything.
+            let clock = Arc::new(ManualClock::new(Ts::from_millis(1_000)));
+            let metrics = Metrics::new(2);
+            let (capture, capture_rx) = channel(2, Arc::clone(&metrics));
+            let (consumer, consumer_rx) = sync_channel(16);
+            let drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mark = Arc::new(LastDropped::default());
+            let tee = TeeSink::new(capture, consumer)
+                .counting_into(Arc::clone(&drops))
+                .marking_into(Arc::clone(&mark));
+            let mut ingress = Ingress::new(tee, clock, metrics);
+            let mut feed = AccountFeed::new(consumer_rx, mark);
+            for n in 1..=3 {
+                accept(&mut ingress, n);
+            }
+            // The writer catches up; the held gap record goes out ahead of
+            // the next frame, taking the next number.
+            while capture_rx
+                .recv_timeout(std::time::Duration::from_millis(10))
+                .is_ok()
+            {}
+            accept(&mut ingress, 5);
+            assert_eq!(feed.poll(), as_frame(1));
+            assert_eq!(feed.poll(), as_frame(2));
+            let Polled::Record(AccountRecord::Blind {
+                cause: GapCause::LocalOverflow,
+                ..
+            }) = feed.poll()
+            else {
+                panic!("the hole first");
+            };
+            let Polled::Record(AccountRecord::Blind {
+                cause: GapCause::LocalOverflow,
+                ..
+            }) = feed.poll()
+            else {
+                panic!("then the gap ingress recorded for it");
+            };
+            assert!(matches!(
+                feed.poll(),
+                Polled::Record(AccountRecord::Frame { ingest_seq: 5, .. })
+            ));
+            assert_eq!(feed.poll(), Polled::Empty);
+
+            let ingress_dropped = ingress.stats().dropped;
+            assert_eq!((dropped(&drops), ingress_dropped), (0, 1));
+            assert_eq!(
+                feed.stats().missed,
+                dropped(&drops) + ingress_dropped,
+                "the tee's drops and the capture's together"
+            );
         }
 
         #[test]
