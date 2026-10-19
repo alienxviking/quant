@@ -567,20 +567,21 @@ feature.
 
    **Built** as `m8c-account-stream`, the argument in `quant-binance::account`'s
    module docs. `account::listen` connects to the WebSocket API, sends
-   `session.logon` signed by the Ed25519 key over a timestamp read from the
-   clock at that moment, subscribes, and drains, recording every frame it may
-   through `Ingress::accept_account_at` before it acts on the frame. Every new
-   connection logs on and subscribes again, after the market's backoff seeded
-   by the account stream's name. Accepted against `quant-binance::fake_venue`,
-   a local WebSocket API that verifies the logon's signature with a payload
-   builder of its own and judges its timestamp. The recorded frames, read back
-   with `quant-storage`'s reader, equal the venue's byte for byte and in order,
-   with `ingest_seq` contiguous. Neither the key, nor a signature, nor an
-   answer to a logon or a status is in the files. A dropped connection and a
-   `serverShutdown` each produce a `Gap`, a reconnect, a second logon and a
-   second subscribe. And `quant-verify` passes the tree with no findings
-   (`crates/quant-verify/tests/account_stream.rs`). Four things differ from
-   the plan.
+   `session.logon` signed by the Ed25519 key over a timestamp on the venue's
+   clock (the host's less the measured offset, as every order is stamped, which
+   `listen` takes as an argument), subscribes, and drains, recording every frame
+   it may through `Ingress::accept_account_at` before it acts on the frame.
+   Every new connection logs on and subscribes again, after the market's backoff
+   seeded by the account stream's name. Accepted against
+   `quant-binance::fake_venue`, a local WebSocket API that verifies the logon's
+   signature with a payload builder of its own and judges its timestamp. The
+   recorded frames, read back with `quant-storage`'s reader, equal the venue's
+   byte for byte and in order, with `ingest_seq` contiguous. Neither the key,
+   nor a signature, nor an answer to a logon or a status is in the files. A
+   dropped connection and a `serverShutdown` each produce a `Gap`, a reconnect,
+   a second logon and a second subscribe. And `quant-verify` passes the tree
+   with no findings (`crates/quant-verify/tests/account_stream.rs`). Four things
+   differ from the plan.
 
    - **Liveness is a question the venue answers, not a timeout.** The plan
      named none, and the market's rule, applied to events, would reconnect a
@@ -596,30 +597,44 @@ feature.
    - **A failure has one of two outcomes.** A refusal that will not clear by
      itself stops the listener and says why: a bad or revoked key, a bad
      signature, a timestamp outside `recvWindow` in either direction, a ban, a
-     refused subscription, or no account subscriptions on that API. Anything
-     else (a reset, a timeout, a 5xx, a 429, a busy venue) ends the connection
-     and is retried, and a subscribed connection's end is one gap however many
-     attempts the reconnect takes. `eventStreamTerminated` and a status of
+     refused subscription, `-1016` (*"This service is no longer available"*),
+     an HTTP status refusing the WebSocket upgrade itself (a 418 or a 403), or
+     no account subscriptions on that API. Anything else (a reset, a timeout,
+     a 5xx, a 429, a busy venue) ends the connection and is retried, and a
+     subscribed connection's end is one gap however many attempts the
+     reconnect takes. The backoff resets on a subscription, not a connection,
+     so a venue that accepts the TCP connection and refuses the logon is
+     retried on a curve. `eventStreamTerminated` and a status of
      `false` end a connection as a closed socket does.
    - **The consumer reads an `AccountFeed`.** The plan named the recording and
      not its reader. The listener writes through a `TeeSink` with the capture
      primary, as paper's market path does, and `AccountFeed` reads the
      secondary: each frame as the file holds it, and a `Blind` for each
      recorded gap and for each hole the tee left, always before the frame
-     that revealed the hole. Item 7 is built against it.
+     that revealed the hole, and at once when no frame comes to reveal it:
+     the tee marks the last record it dropped, and the feed reads the mark
+     when its channel is empty. A gap record held for a full capture goes out
+     on the next probe rather than with the next frame. What the consumer
+     misses is the tee's drops and the capture's own together. Item 7 is
+     built against it.
    - **§5's recording rule is applied by request.** No outbound frame and no
      answer to `session.logon` or `session.status` is recorded. An answer is
-     known by the request it answers, read from its id, which names the
-     method, so a recorded answer says what it answers without the listener's
-     memory. A refused subscription and the unsolicited revocation notice are
-     recorded. And under the rule, a guard on the bytes withholds any frame
-     that contains the API key, whatever it claims to be.
+     known by the request it answers, read from its id, which names it in a word
+     (`logon-1`, `subscribe-2`, `status-3`), so a recorded answer says what it
+     answers without the listener's memory. A refused subscription and the
+     unsolicited revocation notice are recorded. And under the rule, a guard on
+     the bytes withholds any frame that contains the API key, whatever it claims
+     to be.
 
    Not done, and named: opening the new connection before closing the old on
    `serverShutdown`, which would avoid the gap at the price of both
    subscriptions delivering the same events for a moment, a deduplication
    item 7 would own; and waiting out a 429's `retryAfter` beyond the backoff.
-   No binary runs the listener yet (item 8), and none of it has met the venue.
+   For the testnet rehearsal to settle: the live API is remembered refusing an
+   id outside `^[a-zA-Z0-9-_]{1,36}$` with `-1100`, which the pinned pages do
+   not say. The ids keep inside it either way. No binary runs the listener yet
+   (item 8), which must hand it the same measured offset the order path takes
+   off, and none of it has met the venue.
 7. **`LiveVenue`.** A state machine merging REST outcomes with stream reports: one
    terminal event per order, fills deduplicated by trade id, the in-doubt state
    (§5). Behind it, `impl ExecutionVenue`. Accepted by a permutation test over

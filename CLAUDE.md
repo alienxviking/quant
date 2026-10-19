@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 787 tests green in debug
-and release, clippy and fmt clean, ~64,000 lines across 12 crates.
+same window exactly, on both symbols, to the satoshi. 797 tests green in debug
+and release, clippy and fmt clean, ~64,700 lines across 12 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -2370,19 +2370,22 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   lost, is now item 7's acceptance criterion.
 
   **Item 6, listening to the account, is built** (`m8c-account-stream`):
-  `quant-binance::account::listen` logs on with `session.logon`, subscribes,
-  and records every frame it may before acting on it, over again on every
-  reconnect, against a local fake of the WebSocket API
-  (`quant-binance::fake_venue`, behind the `fake-venue` feature) that checks
-  the signature and the timestamp itself. Liveness is `session.status`, asked
-  every 30 s and answered `true` within ten, because an account that trades
-  nothing is silent for hours and a ping proves the socket, not the
-  subscription. A refusal that will not clear stops the listener and says
-  why; anything else is retried as one gap. The consumer reads an
-  `AccountFeed`, which reports every recorded gap and every hole the tee left
-  before the frame after it. Recorded frames equal the venue's byte for byte,
-  no key or signature reaches the file, and `quant-verify` passes the tree.
-  Nothing runs it yet, and none of it has met the venue.
+  `quant-binance::account::listen` logs on with `session.logon`, stamped on the
+  venue's clock as every order is, subscribes, and records every frame it may
+  before acting on it, over again on every reconnect, against a local fake of
+  the WebSocket API (`quant-binance::fake_venue`, behind the `fake-venue`
+  feature) that checks the signature and the timestamp itself. Liveness is
+  `session.status`, asked every 30 s and answered `true` within ten, because an
+  account that trades nothing is silent for hours and a ping proves the socket,
+  not the subscription. A refusal that will not clear stops the listener and
+  says why, a refused WebSocket upgrade included; anything else is retried as
+  one gap, on a backoff that resets on a subscription and not a connection. The
+  consumer reads an `AccountFeed`, which reports every recorded gap and every
+  hole the tee left before the frame after it, or at once from the tee's mark
+  of its last drop when the account is quiet and no frame comes. Recorded
+  frames equal the venue's byte for byte, no key or signature reaches the file,
+  and `quant-verify` passes the tree. Nothing runs it yet, and none of it has
+  met the venue.
 
   **What remains in (c) is items 7 and 8 of `docs/live-run.md` §4**:
   `LiveVenue`, and the `live` binary with its testnet rehearsal.
