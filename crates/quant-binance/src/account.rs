@@ -470,19 +470,23 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// by the backoff (web-socket-api.md:519-522); and the codes that describe the
 /// venue's state rather than the request's: -1000 unknown, -1001 disconnected
 /// (*"Please try again"*), -1003 too many requests, -1006 and -1007 (no
-/// answer from the matching engine), -1008 server busy, -1016 shutting down,
-/// -1034 too many connections, and -2042, which ends a connection's
-/// subscriptions until a new one is made (errors.md:13-66, :359-360;
-/// web-socket-api.md:8190-8191).
+/// answer from the matching engine), -1008 server busy, -1034 too many
+/// connections, and -2042, which ends a connection's subscriptions until a new
+/// one is made (errors.md:13-66, :359-360; web-socket-api.md:8190-8191).
+///
+/// Not -1016, though its name, `SERVICE_SHUTTING_DOWN`, sounds like a restart.
+/// Its words are *"This service is no longer available."* (errors.md:44-45),
+/// which describes a method that has gone, not a server that is busy; a
+/// restart the venue announces is `serverShutdown`, and a busy one answers
+/// 5xx, -1001 or -1008. Methods do go: listen keys did (CHANGELOG.md:405-418).
+/// Retried, a retired method would be asked again every 30 s forever.
 ///
 /// Except a 418. It is an IP ban (web-socket-api.md:318, :522-523), and a ban
 /// is extended by exactly what a retry loop does, so it stops the listener
 /// whatever code comes with it, -1003 included.
 #[must_use]
 pub fn is_transient(status: u16, code: Option<i64>) -> bool {
-    const TRANSIENT_CODES: [i64; 9] = [
-        -1000, -1001, -1003, -1006, -1007, -1008, -1016, -1034, -2042,
-    ];
+    const TRANSIENT_CODES: [i64; 8] = [-1000, -1001, -1003, -1006, -1007, -1008, -1034, -2042];
     if status == 418 {
         return false;
     }
@@ -1393,6 +1397,8 @@ mod tests {
             (400, Some(-1102)),
             (400, Some(-2035)),
             (400, Some(-2036)),
+            // The service is gone, not busy.
+            (400, Some(-1016)),
             (403, None),
             (401, None),
             (400, None),
@@ -1414,7 +1420,6 @@ mod tests {
             (400, Some(-1001)),
             (400, Some(-1006)),
             (400, Some(-1007)),
-            (400, Some(-1016)),
             (400, Some(-1034)),
             (400, Some(-2042)),
         ] {
