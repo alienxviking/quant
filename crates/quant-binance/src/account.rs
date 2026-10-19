@@ -142,7 +142,9 @@
 //!
 //! The logon and the subscription are held to [`AccountPolicy::answer_timeout`]
 //! the same way, and the connect itself too, so no step of a connection can
-//! wait without a bound.
+//! wait without a bound. A request's deadline starts before it is written,
+//! not after, so a send that stalls on a socket the venue has stopped reading
+//! is the same unanswered request; a pong is held to the answer timeout too.
 //!
 //! # Recording, in the order M1.e requires
 //!
@@ -209,7 +211,7 @@ use quant_core::event::GapCause;
 use quant_core::time::Ts;
 use quant_recorder::{Backoff, BackoffPolicy, Ingress, RecordSink, ACCOUNT_STREAM};
 use serde_json::{json, Value};
-use tokio::time::{sleep, sleep_until, timeout, Instant};
+use tokio::time::{sleep, sleep_until, timeout, timeout_at, Instant};
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{error, info, warn};
@@ -897,8 +899,15 @@ async fn converse<S: RecordSink>(
             // explicitly, for the reason `connection.rs` gives: the one thing
             // that keeps a connection open is not left to library internals.
             Message::Ping(payload) => {
-                if let Err(e) = socket.send(Message::Pong(payload)).await {
-                    return Ok(Ended::KeepaliveFailed(e.to_string()));
+                match timeout(policy.answer_timeout, socket.send(Message::Pong(payload))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Ok(Ended::KeepaliveFailed(e.to_string())),
+                    Err(_elapsed) => {
+                        return Ok(Ended::KeepaliveFailed(format!(
+                            "not written within {:?}",
+                            policy.answer_timeout
+                        )))
+                    }
                 }
             }
             Message::Close(_) => return Ok(Ended::ServerClosed),
@@ -1032,7 +1041,9 @@ impl Outbound {
     }
 }
 
-/// Send a request, minting its id, and say when its answer is due.
+/// Send a request, minting its id, and say when its answer is due: `within`
+/// of starting to write it, so a write that stalls counts against the same
+/// deadline as an answer that does not come.
 async fn send(
     socket: &mut Socket,
     outbound: Outbound,
@@ -1049,14 +1060,16 @@ async fn send(
         Outbound::Subscribe | Outbound::Status => json!({ "id": id, "method": request.method() }),
     }
     .to_string();
-    socket
-        .send(Message::text(text))
-        .await
-        .map_err(|e| Ended::Transport(e.to_string()))?;
+    let deadline = Instant::now() + within;
+    match timeout_at(deadline, socket.send(Message::text(text))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(Ended::Transport(e.to_string())),
+        Err(_elapsed) => return Err(Ended::Unanswered(request)),
+    }
     Ok(Waiting {
         request,
         id,
-        deadline: Instant::now() + within,
+        deadline,
     })
 }
 
