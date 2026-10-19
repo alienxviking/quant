@@ -7,7 +7,10 @@
 //! ```
 //!
 //! Exit code 0 means every session is trustworthy for what it claims to cover;
-//! non-zero means at least one error finding. That is what makes this runnable from
+//! 1 means at least one error finding; 2 means `--reconcile` could not run; and
+//! 3 means nothing was found to verify, no market frame under the root. Clean
+//! and empty are different answers, and a cron job reads the code, not the
+//! verdict line. That is what makes this runnable from
 //! cron during the seven-day acceptance run, and from CI, rather than something a
 //! person reads and forms an impression about.
 //!
@@ -77,10 +80,12 @@ async fn main() -> ExitCode {
 
     print_report(&report, &root, want_reconcile);
 
-    if report.is_clean() {
-        ExitCode::SUCCESS
-    } else {
+    if !report.is_clean() {
         ExitCode::FAILURE
+    } else if report.verified_nothing() {
+        ExitCode::from(3)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
