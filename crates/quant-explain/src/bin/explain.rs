@@ -52,7 +52,7 @@ use quant_core::execution::FeeAsset;
 use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
 use quant_core::time::Ts;
 use quant_explain::ours::FillAt;
-use quant_explain::{market_at, ours_at, MarketAt, OurState};
+use quant_explain::{market_at, ours_at, Entry, MarketAt, OurState};
 
 fn main() -> ExitCode {
     let args = match parse_args() {
@@ -367,13 +367,36 @@ fn print_window(market: &MarketAt) {
         // A fact, not a zero: nothing traded is different from a price of zero.
         outln!("          nothing traded in this span");
     }
-    if window.gaps.is_empty() {
-        outln!("          no gaps -- we could see the whole span");
-    } else {
+    // What held as the span opened comes first: a blindness that began before
+    // it leaves no gap inside it, and "no gaps" alone would read as sight.
+    match &window.on_entry {
+        Entry::Seeing => {}
+        Entry::Blind(gap) => outln!(
+            "          blind as it opened: since {} ({:?}), with no snapshot re-anchoring the book",
+            gap.at.to_rfc3339(),
+            gap.cause
+        ),
+        Entry::Unanchored => outln!("          the book had not been anchored as it opened"),
+        Entry::Unreadable(kind) => {
+            outln!("          the archive was discontinuous as it opened ({kind})");
+        }
+        Entry::NotReached => outln!(
+            "          it opens before the first event read, so what could be seen at its start is not shown"
+        ),
+    }
+    if !window.gaps.is_empty() {
         outln!("          {} gaps inside the span:", window.gaps.len());
         for gap in &window.gaps {
             outln!("            {:?} at {}", gap.cause, gap.at.to_rfc3339());
         }
+    }
+    if window.breaks > 0 {
+        outln!("          {} archive breaks inside the span", window.breaks);
+    }
+    if window.saw_whole_span() {
+        outln!("          no gaps -- we could see the whole span");
+    } else if window.gaps.is_empty() && window.breaks == 0 {
+        outln!("          no gaps inside it");
     }
 }
 

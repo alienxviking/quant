@@ -337,6 +337,18 @@ whole. A window reaching back before the data is *not* an error: asking for the
 last hour of a run that started ten minutes ago is ordinary, and the honest
 answer is the ten minutes.
 
+**A window says it was seen whole only when it was.** It used to count the gaps
+inside the span and, finding none, print *"no gaps -- we could see the whole
+span"*. From any hour inside the fortnight's twelve-hour outage that is the
+answer it gave: the gap was recorded at 18:35, before the span, and nothing
+arrived during it, so there was no gap inside it to count. The market block one
+line above said blind. So the window now records what held **as it opened**:
+the book live, blind since a gap, never anchored, the archive discontinuous, or
+not reached, when the span begins before the first event read. It claims the
+whole span only when the book was live as it opened and no gap or archive break
+fell inside it. A window reaching before the data says its start is not shown,
+rather than either claim.
+
 ---
 
 ## 6. Three defects found while scoping
