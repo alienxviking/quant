@@ -156,6 +156,12 @@
 //! also how a frame reaches its consumer (below), so a consumer can never be
 //! handed a frame the capture does not have.
 //!
+//! A frame the capture had no room for leaves a hole and a `LocalOverflow` gap
+//! record that ingress holds until there is room, and sends ahead of the next
+//! frame. On a quiet account there may be no next frame for hours, so each
+//! probe also sends what is held: the hole is in the capture, and in front of
+//! its consumer, within a probe interval of the writer catching up.
+//!
 //! A connection that ended after its subscription was accepted records one
 //! `Gap{Disconnect}`, whatever ended it, a stop included. One that never got
 //! that far records nothing more: the stream was already dark, since the last
@@ -859,6 +865,11 @@ async fn converse<S: RecordSink>(
                 return Ok(Ended::Unanswered(unanswered.request));
             }
             next_probe = None;
+            // A gap record held because the capture was full goes out ahead
+            // of the next frame; on a quiet account there may be no next
+            // frame for hours, and until it goes out the consumer cannot know
+            // of the hole it explains. The probe is this loop's own tick.
+            ingress.pump().map_err(|_| Stopped::WriterGone)?;
             match send(
                 &mut socket,
                 Outbound::Status,
@@ -2157,6 +2168,80 @@ mod tests {
             assert_eq!(log.connections, 2);
             assert_eq!(log.asked("session.logon"), 2);
             assert_eq!(log.asked("userDataStream.subscribe"), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_gap_held_for_a_full_capture_goes_out_while_the_account_is_quiet() {
+            use std::sync::Arc;
+
+            use quant_core::time::{Clock, SystemClock};
+            use quant_recorder::{channel, Ingress, Metrics, TeeSink};
+            use quant_storage::ControlRecord;
+
+            use super::super::listen;
+
+            // A capture of two that nothing drains yet, and a consumer with
+            // room for everything.
+            let venue = FakeVenue::start(Script::default()).await;
+            let metrics = Metrics::new(2);
+            let (capture, capture_rx) = channel(2, Arc::clone(&metrics));
+            let (consumer, consumer_rx) = std::sync::mpsc::sync_channel(16);
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let mut ingress = Ingress::new(TeeSink::new(capture, consumer), clock, metrics);
+            let (url, credentials) = (venue.url().to_owned(), venue.credentials());
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                let policy = quick_policy();
+                tokio::select! {
+                    stopped = listen(&url, &credentials, &mut ingress, &policy, 0) => Some(stopped),
+                    _ = stopped => None,
+                }
+            });
+
+            // The subscription's answer and the first event fill the
+            // capture, so it refuses the second.
+            subscriptions(&venue, 1).await;
+            venue.event(EXECUTION);
+            venue.event(BALANCE);
+            read(&venue, BALANCE).await;
+            // Then the writer catches up, and the account says nothing more.
+            while capture_rx.recv_timeout(Duration::from_millis(10)).is_ok() {}
+
+            let deadline = tokio::time::Instant::now() + WAIT;
+            let mut handed = Vec::new();
+            loop {
+                handed.extend(consumer_rx.try_iter());
+                let told = handed.iter().any(|record| {
+                    matches!(
+                        record,
+                        CaptureRecord::Control {
+                            record: ControlRecord::Gap {
+                                cause: quant_core::event::GapCause::LocalOverflow,
+                                ..
+                            },
+                            ..
+                        }
+                    )
+                });
+                if told {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the held gap never went out: {handed:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = stop.send(());
+            let ended = tokio::time::timeout(WAIT, task)
+                .await
+                .expect("the listener stops")
+                .expect("the listening task");
+            assert_eq!(ended, None);
+            // The answer, the event the capture took, and the gap for the one
+            // it refused, which took the next number after the hole.
+            let seqs: Vec<u64> = handed.iter().map(CaptureRecord::ingest_seq).collect();
+            assert_eq!(seqs, [1, 2, 4]);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
