@@ -1217,22 +1217,53 @@ venue's words. None changes the order, and an `Unknown` cancel puts nothing in
 doubt, because the stream decides whether the order ended and is still
 listening. A cancel the shell did not send is `cancel_refused { not_sent }`.
 
-**The account.** The stream is **down** from construction until the first
-recorded subscription answer accepting it (the only answer recorded,
-`account.rs:303-308`).
+**The account.** Every recorded account frame is routed by `account::classify`
+(`account.rs:388`) before anything reaches the translator, which reads only
+execution reports; a frame sent to it otherwise would come back unreadable and
+unattributable, and put every working order in doubt for nothing. What is
+recorded is set by `keep` (`account.rs:456-470`): every event, every answer but
+the logon's and the probe's, and every frame `classify` cannot read.
+
+| Recorded frame | Becomes |
+|---|---|
+| an `executionReport` event | the translator, then `Report` or `Unreadable` |
+| `serverShutdown`, `eventStreamTerminated` | `ServerShutdown`, `StreamTerminated` |
+| any other event (`outboundAccountPosition`, `balanceUpdate`, ...) | counted, not journalled; and, after an overflow while down, the sign the account is heard (below) |
+| the subscription's answer, accepting | `Subscribed` |
+| the subscription's answer refusing, or an answer to no request we sent | counted and logged. No transition: the listener ends or stops the connection on a failure (`account.rs:1000-1006`), and the gap it records next is the loss |
+| a frame `classify` calls `Unrecognised` | `Unreadable` with no order: `anomaly { unreadable }`, and `fills_missed` on every working order, deferred where REST has not answered. Not JSON, or an event with no `e`, could have been a fill (invariant 5) |
+
+The stream is **down** from construction until it is heard.
 
 - Down to heard: `account { regained }`, the record's mark that the account is
-  heard from here.
+  heard from here. The evidence is the accepting subscription answer, or, after
+  a `Blind { LocalOverflow }` while down, the first account event of any kind,
+  because that hole may have swallowed the answer: with the answer as the only
+  evidence, a lost answer left `StreamDown` on a healthy stream until the next
+  reconnect, possibly a day later. An event is enough because the venue sends
+  account events only on an active subscription, and the probe's answers, the
+  other evidence, are never recorded (`account.rs:298-308`).
 - Heard to down: `account { lost }`, and `account_blind` on every working order,
   deferred where REST has not answered (above). The cause is the first evidence:
   `serverShutdown` gives `server_shutdown`, `eventStreamTerminated`
   `stream_terminated`, and otherwise the feed's `Blind`, a `Disconnect` being
-  `socket_closed`. The feed does not carry why the listener ended a connection
-  (`account.rs:670-693` names it in the log only), so an unanswered probe is
-  `socket_closed` here too.
-- `Blind { LocalOverflow }`, a hole the tee left in our copy, is
-  `lost { local_overflow }`, the doubts, and `regained` at once: the
-  subscription never ended, only our copy of it, and the next frame is heard.
+  `socket_closed`.
+- **`socket_closed` means the connection ended, for a reason the record does not
+  carry**, and item 7 writes that on the variant, which has no doc today
+  (`report.rs:602`). The listener knows why it ended a connection (`Ended`,
+  `account.rs:670-693`) and logs it, but the capture holds only
+  `Gap { Disconnect }`, and the machine reads what is recorded, so that item 8's
+  replay reproduces it. `idle_timeout` would be as much a guess in the other
+  direction for a socket the venue did close, so it stays for a source that can
+  tell, and nothing produces it yet.
+- `Blind { LocalOverflow }` while heard, a hole the tee left in our copy, is
+  `lost { local_overflow }`, the doubts, and `regained` at once: in the ordinary
+  case the subscription never ended, only our copy of it.
+- A `Subscribed` while heard is a loss we did not see: an accepting answer comes
+  only on a new connection, so the hole of an overflow hid a disconnect, and
+  orders sent since may have been reported in the dark. It writes
+  `lost { local_overflow }`, `account_blind` on every working order, and
+  `regained`, at its stamp.
 - A `Blind` while down, the session's opening `RecorderRestart` among them, is no
   transition and writes nothing.
 - The feed `Closed` means the listener stopped for good (`account.rs:174-186`):
@@ -1295,7 +1326,7 @@ nothing else, and changes nothing (`&self`, `venue.rs:99-100`).
 |---|---|
 | `Diverged` | Latched by every `contradiction` (two venue ids for one of ours, REST and the stream disagreeing about whether an order exists, a second `NEW`, a `z` behind what is booked), every orphaned fill (a fill after an order's end, a fill about an id of this run this machine never sent), a foreign trade on our symbol, and `IdInUse` in any phase. Never cleared in the process (`venue.rs:65-75`), and not cleared by a restart either: item 8 reads it back off the journal (§6, duty 8). |
 | `Unchecked` | False at construction, which takes a `Checked`: minted only by the checks `venue-check` runs (`trade.rs:986`, `:1070`, `:1104`), and carrying the measured offset every order and logon is stamped with. True after a failing `Check`, false after a passing one. **Not** set by an order refused `-1021` or for its key: that is a rejection with the venue's code on its line, every later order would be refused the same way and harmlessly, and a latch on `-1021` would also fire on an order that only waited too long in the queue. |
-| `StreamDown` | From construction until the subscription is accepted, and from each loss until the next. Never across a `LocalOverflow`. |
+| `StreamDown` | From construction until the account is heard, and from each loss until it is heard again (§2, *The account*). Never across a `LocalOverflow` while heard. |
 | `InDoubt` | While any order has an open doubt cause, a deferred one, or a held report. |
 | `QueueFull` | `orders` has no room, or is closed. Closed cannot happen in a release build, where `panic = "abort"` (`Cargo.toml:86`) takes the process with a worker that panics; a closed queue takes nothing, which is what the variant says. |
 | `NoFilters` | For any instrument but the one the venue was wired for, which is that variant's own meaning (`venue.rs:47-49`): this venue holds venue-sourced filters for one instrument and none for another. `wire` takes the `InstrumentId` beside the `VenueInstrument` (`exchange_info.rs:229-239`), because an `InstrumentDef` carries no id to check `request.instrument` against (`orders.rs:184-186`) and `NewOrder::encode` writes `symbol` from whatever definition it is handed (`orders.rs:206`). Without the check, an order for instrument B passes `ready` and risk and goes out as the wired symbol, with real money. For the wired instrument, never: `wire` cannot be called without its filters. A `submit` for another instrument, which only a `ready` that lied could let through, is `never_landed { not_sent }` and is sent nowhere. |
@@ -1419,6 +1450,9 @@ The coverage half and the permutation test share `quant-explain`'s tests.
 | a trade as an order's first report brings an `Accepted` before it | omit it |
 | each `WhyUnknown` maps to its cause, with what the venue said | map two to one |
 | a foreign trade paid in BNB is a `foreign` line and `Diverged`; a foreign acceptance only a line | refuse the BNB fee |
+| an overflow while down, then an account event: `regained` and ready; no overflow, then an event: still down | take only the subscription answer as heard, or take any event |
+| a `Subscribed` while heard: `lost`, `account_blind` on each working order, `regained` | ignore it as a repeat |
+| a refused subscription answer and an `Unrecognised` frame never reach the translator | route by `e` alone |
 | the readiness order, one test per pair | swap two |
 | every output's stamp is its input's | stamp from a clock |
 
