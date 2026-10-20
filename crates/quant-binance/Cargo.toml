@@ -18,7 +18,9 @@ quant-storage = { workspace = true }
 # Async only on this side of the seam. The read path is pure waiting on a
 # network, which is what async is actually good for; the write path is blocking
 # CPU and file I/O and stays on a thread. See quant-recorder's crate docs.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+# `net` and `sync` were already on through tokio-tungstenite and reqwest; named
+# because the account listener's socket type and the fake venue use them.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net", "sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 # rustls rather than native-tls: no OpenSSL, no C toolchain, no build script, and
@@ -90,11 +92,25 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # recorders started in the same millisecond must not collide.
 uuid = { version = "1", features = ["v4"] }
 
+# `fake_venue` reads the account files it checks with each block decompressed,
+# because a search of zstd's output for a string proves nothing. Optional, and
+# on only with `fake-venue` and in this crate's tests: the same 0.13 that
+# quant-storage writes with, so it adds no crate to the build.
+zstd = { version = "0.13", optional = true }
+
 # For the `replay` example only: it feeds a recorded capture through a
 # reconstructed book to check the invariants hold. The library itself knows
 # nothing about books -- that stays venue-agnostic in quant-book.
 [dev-dependencies]
 quant-book = { workspace = true }
+zstd = "0.13"
+
+# `fake_venue`: a local stand-in for the WebSocket API's account side, which the
+# account listener's tests run against, here and in quant-verify. Never on in a
+# build that ships: it is a server that accepts any client, and nothing outside
+# a test has a reason to start one.
+[features]
+fake-venue = ["dep:zstd"]
 
 [lints]
 workspace = true

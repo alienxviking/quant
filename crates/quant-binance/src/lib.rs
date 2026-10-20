@@ -55,11 +55,14 @@
 //! we are writing down, and they belong to the normalizer at M2 where a mistake
 //! can be fixed by re-deriving rather than by re-recording a week.
 
+pub mod account;
 pub mod capture;
 pub mod connection;
 pub mod credentials;
 pub mod decode;
 pub mod exchange_info;
+#[cfg(any(test, feature = "fake-venue"))]
+pub mod fake_venue;
 pub mod live;
 pub mod orders;
 pub mod parse;
@@ -79,7 +82,8 @@ pub mod user_data;
 /// [`SnapshotClient`] in a unit test brings the test down.
 ///
 /// Hence one function, called from both the binary's startup and
-/// [`SnapshotClient::new`]. Calling it from a constructor is a global side effect
+/// [`SnapshotClient::new`], and from the trade client and the account
+/// listener for the same reason. Calling it from a constructor is a global side effect
 /// and worth a second thought, but the alternative is a library whose constructor
 /// panics unless its caller knew to install a cryptography backend first. It is
 /// idempotent and never overrides a choice already made: `install_default`

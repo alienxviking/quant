@@ -30,5 +30,12 @@ uuid = { version = "1" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# The account listener's capture, verified: `tests/account_stream.rs` records
+# an account tree against quant-binance's fake venue and runs the verifier
+# over it. Dev-only, so the feature never reaches the verify binary.
+[dev-dependencies]
+quant-binance = { workspace = true, features = ["fake-venue"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
 [lints]
 workspace = true
