@@ -641,7 +641,8 @@ feature.
    every interleaving of the REST reply and the stream's reports, and by a test
    that losing the account stream puts every working order in doubt
    (`account_blind`): `runlog check` treats an `account` line as covered by
-   those doubts and does not flag it.
+   those doubts and does not flag it. Designed before the code in §5, *LiveVenue,
+   decided before the code*.
 8. **The `live` binary and a rehearsal.** Paper's session extracted so any venue
    can run it; a startup that records first and trades last; a refusal of any
    size whose floored exit would fall below the minimum notional at the current
@@ -804,7 +805,9 @@ that fetch fails — is wrong: at M8 one process both captures and trades
 irreplaceable capture over a filter table. `quant-meta`'s rule applies, that
 nothing optional may stop a recording. So: **refuse to submit** without
 venue-sourced filters, and record regardless. The same shape as a money limit
-refusing when there is no mark.
+refusing when there is no mark. Item 7's design keeps the rule and moves where it
+is enforced: without venue-sourced filters no `LiveVenue` is built, and the run
+records without trading (*LiveVenue, decided before the code*, question 2).
 
 **The engine clock becomes forward-only.** `now = max(now, ts)`, with the clamps
 counted. Two asynchronous inputs can deliver out of order; `HistoricalSource` is
@@ -873,8 +876,8 @@ silent for hours whenever the account trades nothing.
 engine's ledger holds it, so the only way back would be a `Rejected` through
 `poll`, recorded as *"the venue declined an order it had been told about"*, which
 is false for an order that never left. So every refusal that starts in the
-adapter (no venue filters, a full outbound queue, the account stream down, an
-order in doubt, a failed clock check) is a readiness check the engine consults
+adapter (a full outbound queue, the account stream down, an order in doubt, a
+failed clock recheck) is a readiness check the engine consults
 in `Context::submit`, after the seam check and before the risk layer. It is
 refused as `RefusedBy::Venue`, one of four kinds of refusal, which
 `Context::submit` asks in this order: the seam's, the record's, the venue's and
@@ -943,6 +946,470 @@ tag refuses to trade and records anyway.
 `wss://ws-api.testnet.binance.vision/ws-api/v3` with no money at risk, and with
 its own key pair. Its market is not the real one, so it cannot stand in for
 criteria A, C or D; it is where adapter bugs are supposed to surface first.
+
+### LiveVenue, decided before the code
+
+Written before item 7's code, for the reason `docs/engine-contract.md` was
+written before the engine. The seam is fixed (`docs/engine-contract.md` §11,
+built in #65). What goes behind it is settled here, because merging two
+asynchronous accounts of one order is the part a live run cannot debug. Code is
+cited at `f676e6d`, the venue's documentation at `0556f1a`.
+
+**Two pieces, on purpose.** A **merge machine**, `Merge`: no socket, no clock,
+no runtime, only a function from what was heard to what the engine is told, and
+a readiness answer. Every decision that touches money is in it, so a test can
+drive it through every interleaving in milliseconds. And a **shell**,
+`LiveVenue`, which owns the machine, implements `ExecutionVenue`, and moves
+inputs in and requests out without ever waiting. It is the split `orders.rs`
+and `user_data.rs` already make, pure logic with the transport elsewhere
+(`orders.rs:1-11`, `user_data.rs:5-8`), one level up.
+
+Both go in `quant-binance`, as `live_venue`, which then depends on
+`quant-engine` for `ExecutionVenue` and `Unready`, as `quant-sim` already does
+(`crates/quant-sim/Cargo.toml:18`). There is no cycle: `quant-engine` depends on
+`quant-core` and `quant-book` alone (`crates/quant-engine/Cargo.toml:17-18`). The
+machine's inputs are `Placement`, `CancelReply` and the translator's `Inbound`,
+all `quant-binance`'s; a crate of its own would hold one module.
+
+#### 1. Tasks and channels
+
+```text
+  engine thread (sync)                        tokio runtime (the binary's)
+  ────────────────────                        ────────────────────────────
+  Engine ─submit/cancel─► LiveVenue ─orders, bounded─► request worker ─REST─► venue
+         ◄─────poll────── │  ▲                              │
+                          │  └───────inbox, bounded◄────────┘ answers, stamped
+                          └◄─ AccountFeed ◄─ tee ◄─ account listener ◄─WS API─ venue
+```
+
+| | Decided | Why, and what breaks the other way |
+|---|---|---|
+| Runtime | The binary's, as paper's is (`paper.rs:257-266`). `LiveVenue` lives on the engine's own thread (`paper.rs:248-254`), owns no runtime, spawns nothing and awaits nothing. `wire(..)` returns the venue and the request worker's future, and the binary spawns the future. | A runtime inside the venue is a second set of threads the binary's shutdown cannot see. A runtime handle in the venue spawning a task per request sends requests in no particular order, and a cancel can then reach the venue before the order it names. |
+| Requests | One **request worker**: one REST request in flight, first in first out, through `TradeClient::place_order` and `cancel_order` (`trade.rs:913`, `:925`). | A cancel sent beside its order can arrive first, come back `-2011` *"Unknown order sent."* (`orders.rs:141-153`), and leave the order resting with nobody cancelling it. One at a time also keeps the venue's `ORDERS` limits out of reach. The cost is head-of-line blocking behind a request that times out, at most `ORDER_TIMEOUT`, 20 s (`trade.rs:108`): nothing at one order a minute, and it shows as `QueueFull` rather than as silence. |
+| `orders` | `tokio::sync::mpsc`, bounded at **4**. The engine thread is its only producer, with `try_send`, which needs no runtime. | Full is `Unready::QueueFull`, refused before anything is written (`venue.rs:62-64`). It cannot race: `ready` (`strategy.rs:179`) and `submit` (`:243`) run on one thread with no poll between them. Four, because depth buys nothing: an order queued behind a request that times out leaves more than 20 s after the `timestamp` it carries, past the 5 s `recvWindow` (`trade.rs:82`), and the venue refuses it on arrival (rest-api.md:225-241). Unbounded would hide a stalled worker behind a growing queue, every order in it journalled `submitted`. |
+| `submit`, `cancel` | Encode, tell the machine, `try_send`, return. | The engine thread is the market's only reader. Blocked for one 20 s timeout it books nothing and tallies nothing, and once the tee's channel fills it loses market records as `LocalOverflow`, after which the book waits for the next snapshot, up to an hour. §5's *does not await* is the rule; that is what breaking it costs. |
+| An order's `timestamp` | The engine's `now`, less the offset measured at startup. No clock is read in `submit`. | The stamp is when the strategy decided, so that the venue refuses an order that waited too long (`trade.rs:58-61`, `:901-906`). `now` is the stamp of the input the strategy was acting on, the invariant-4 reading of that instant; a wall-clock read here would be the only one on the engine's path. |
+| `inbox` | `tokio::sync::mpsc`, bounded at 8; the worker awaits `send` and never drops. | A dropped answer is an order whose outcome nobody holds, and a dropped `Unknown` is an order nobody doubts. The worker can wait only while the engine is not polling, and the engine polls on every wake (`lib.rs:837-838`), an idle one at least every `IDLE_TICK` (`lib.rs:522`). Answers number at most the four queued and the one in flight, so the bound is not reached, and if it were, the cost would be a delay and never a loss. |
+| Account | `AccountFeed`, as #70 built it, read with `poll`, which never blocks (`account.rs:1155-1157`). | Its channel is the tee's secondary with the capture primary, so a consumer that falls behind loses its own copy, as a `Blind { LocalOverflow }`, and never the file's. |
+| `poll` | Drain `inbox` with `try_recv` and the feed until `Empty` or `Closed`; merge the two by stamp as a **two-way merge**, each source kept in its own order; step the machine; append what it says. | A sort would reorder one source's own frames whenever the host clock steps back, since `local_recv_ts` is wall-clock time (CLAUDE.md, M2.e). Order within a source is evidence. Order across the two decides only the order of lines, and the permutation test (5) shows it changes nothing else. |
+
+**Shutdown, and every holder of a sender.** M1.c2's recorder hung at shutdown
+because a forgotten clone kept a channel open. Here:
+
+| | Senders | Receiver | Closed by |
+|---|---|---|---|
+| `orders` | `LiveVenue`, alone | the worker | dropping the engine, which owns the venue |
+| `inbox` | the worker; item 8's `Control`, if it keeps one for rechecks (3) | `LiveVenue` | nothing waits for it to close |
+| account feed | the listener's `TeeSink` | `LiveVenue`'s `AccountFeed` | dropping the listener's future (`account.rs:718-722`), last |
+| stop | an `Arc<AtomicBool>`, set by `LiveVenue`, read by the worker | | not a channel |
+
+The stop flag exists because a tokio receiver still yields what is buffered after
+every sender is gone. Without it, an order queued when the engine was dropped
+would still be sent, by a worker with nobody left to hear the answer: an order
+on the venue that no journal holds. With it, the worker answers every request it
+has not yet sent with `NotSent { why: "stopping" }`, sends nothing, and the
+machine records each as `never_landed`. `LiveVenue::stop_sending(&self)` sets it,
+`Drop` sets it too so that a careless drop cannot release the queue, and
+`LiveVenue::outstanding(&self)` counts requests handed to the worker and not yet
+answered. Both take `&self`, because the binary reaches the venue only through
+`Engine::venue` (`lib.rs:1090`).
+
+`Engine::settle` (`lib.rs:708-714`) is how a run ends, in item 8's order:
+
+1. `run()` returns when the market source ends.
+2. `settle()` until nothing is working or a deadline longer than `ORDER_TIMEOUT`
+   passes (`lib.rs:700-704`), pausing `IDLE_TICK` when nothing came.
+3. `stop_sending()`, then `settle()` until `outstanding()` is zero, which the one
+   request in flight bounds at `ORDER_TIMEOUT`.
+4. The closing checkpoint, `stopped { working }`, `balances`.
+5. Drop the engine: `orders` closes, the worker returns, and its `inbox` sender
+   goes with it.
+6. Stop the listener, which seals the account capture.
+
+Nothing in that sequence waits for a channel to close, which is what keeps it
+from hanging.
+
+#### 2. The merge machine
+
+**Inputs**, each carrying the stamp of when it was heard (4).
+
+| Input | From | Values |
+|---|---|---|
+| `Submitted` | the shell's `submit` | id, side, quantity |
+| `Placement` | the worker | `Placed`, `Refused`, `Unknown`, `NotSent` (`orders.rs:585-614`) |
+| `CancelReply` | the worker | `Acknowledged`, `NotOpen`, `Refused`, `Unknown`, `NotSent` (`orders.rs:641-661`) |
+| `Unsent` | the shell | an order that would not encode, or reached `submit` unready (a bug); a cancel for an order ended or never sent, or with the queue full, or after `stop_sending` |
+| `Report` | the translator | `Ours`: an acceptance, a trade, or an end (`CANCELED`, `EXPIRED`, `TRADE_PREVENTION`); `Foreign`; `StreamTerminated` |
+| `Unreadable` | the translator's error | with the order it concerns, when the translator got that far |
+| `Subscribed`, `ServerShutdown` | `account::classify` on a recorded frame | the subscription's accepting answer; the venue's `serverShutdown` |
+| `Blind` | the feed | its `GapCause` |
+| `Check` | item 8, if it rechecks | a passing check, with its offset, or a failing one |
+
+**Per order** the machine keeps the request's side and quantity; what REST said
+(`Pending`, `Placed`, `Unknown`, `Refused`, `NotSent`); the venue's order id, from
+whichever names it first; whether the stream has reported on it (*heard*); the
+quantity booked and the trade ids booked; whether it has ended; its open doubt
+causes, a set; and any reports held behind a hole.
+
+**The rules.**
+
+1. **One authority per fact** (§5). An acceptance and every fill come from the
+   stream alone, a rejection from REST alone, an end from the stream alone.
+   `Placed` is a notice, never an acceptance.
+2. **Cumulative order.** Every execution report carries `z`, the quantity filled
+   so far (user-data-stream.md:100), which the translator hands over as
+   `remaining`, so `z` is the request's quantity less `remaining`. A report is
+   **released** only if it continues what is booked: a trade when `z` is what is
+   booked plus its own `l`, anything else when `z` is what is booked. A report
+   whose `z` runs ahead follows fills we never heard: it is **held**, with every
+   later report about that order, and the order is in doubt for `fills_missed`.
+   One whose `z` runs behind says less traded than we booked, a contradiction.
+   This is the book's rule while unanchored (M2.b) for an order: apply nothing
+   past a hole, and keep what came after it.
+3. **Fills deduplicated by trade id**, `t` (user-data-stream.md:105), which the
+   translator reads in place of the execution id `I` (`user_data.rs:622-630`). A
+   trade id already booked is `anomaly { duplicate_trade }` and books nothing.
+   Nothing produces one today, since the listener never overlaps two
+   subscriptions (item 6, *not done*); if a later listener does, this is what makes
+   it safe, and the anomaly is what moves to counted.
+4. **One terminal per order.** A second end is `anomaly { second_end }`. A fill
+   after an end is `anomaly { after_end }`, `Diverged`, and the fill itself
+   handed over as an order report, which the engine, no longer working the
+   order, writes down as `orphaned` with its ids and books nowhere
+   (`lib.rs:1053-1082`). That is the only report handed over after an end. The
+   trait asks for none before an order's last fill (`venue.rs:159-161`) so that
+   the engine never books a fill for an order it has forgotten, and here it does
+   not; a contract written for a venue that is right must not make the record
+   drop money when the venue is wrong. The trait's docs say so in item 7's pull
+   request.
+5. **An acceptance comes first.** If the first released report about an order is
+   not `NEW`, which happens only when `NEW` fell in a hole, an `Accepted` naming
+   the report's venue order id is emitted before it, at its stamp. A trade proves
+   the venue had the order, and every lifecycle the engine tells, from either
+   venue, then begins with an acceptance (`quant-sim/src/lib.rs:650-660`).
+6. **The venue's id for an order is checked, not trusted.** The first `orderId`
+   heard, from `Placed` or the stream's `i` (user-data-stream.md:98), is the
+   order's. A later one that differs is `anomaly { contradiction }` and
+   `Diverged`: two orders answering to one name of ours, which `RunTag` exists to
+   prevent (`user_data.rs:115-121`).
+7. **A cancel names the order in `C`, not `c`.** On a `CANCELED` report `c` is the
+   cancel request's id, which the venue generates because we send none
+   (`orders.rs:331-344`), and which replaces the order's own (web-socket-api.md:4181).
+   The translator reads `C` there (`user_data.rs:445-454`), so the machine, keyed
+   by our `ClientOrderId`, never sees the replacement. It relies on two
+   consequences. Nothing about an order can follow its `CANCELED`, so rule 4
+   holds. And `Placed`'s order id is the one name that still finds a cancelled
+   order, which is why `placed` is journalled (`report.rs:396-401`) and what slice
+   (d)'s lookup will use.
+
+**Doubt**, which is where interleavings could disagree, so its rules are written
+to make them agree.
+
+- A doubt is a set of causes per order, each raised once while open, one `doubt`
+  line each. `Unknown` raises the cause its `WhyUnknown` mirrors
+  (`report.rs:471-503`, `orders.rs:839-887`) with what the venue said. Losing the
+  stream raises `account_blind` on every working order. An unreadable report
+  raises `fills_missed` on the order it concerns, or on every working order when
+  it cannot be attributed, since it could have been any of theirs. A hole (rule
+  2) raises `fills_missed`.
+- **Only the stream clears it.** The first released report about the order
+  clears every open cause, one `cleared { reported }` line per cause, before the
+  report itself: one per cause, so every raised doubt has its clearing in
+  whatever order they came. REST never clears one: what REST did not know, the
+  stream may already have answered, and not the reverse. `cleared { looked_up }`
+  is slice (d)'s.
+- **`Unknown` about an order the stream has already reported on is raised and
+  cleared at once.** The stream has said the order exists and what happened to
+  it, and whatever a later blind stretch may hide has its own `account_blind`.
+  This is what makes "REST answered first" and "the stream answered first" write
+  the same lines.
+- **A doubt about an order REST has not answered for and the stream has never
+  mentioned is deferred.** Losing the stream, or an unreadable report, marks it,
+  and the REST answer decides: `Placed` or `Unknown` raises the marked causes,
+  because the order may have been live in the dark; `Refused` or `NotSent` drops
+  them, because an order that never existed missed nothing. Otherwise an order
+  the venue refused would be in doubt or not according to whether the stream
+  dropped before or after the refusal came back.
+- An order in doubt is never rejected on that account (§5, *an unknown outcome is
+  not a rejection*).
+
+**REST against the stream.** A refusal is certain only because the classifier
+calls nothing refused that may have been placed (`orders.rs:80-89`). If the
+stream reports on an order REST refused or never sent, before that answer or
+after it, the classifier was wrong about the venue: an order exists that our
+record says does not, and it may trade with nobody watching. That is
+`anomaly { contradiction }` and `Diverged`, never a second terminal, and a fill
+on it is an orphan (rule 4).
+
+**Cancels.** `Acknowledged` emits nothing; the stream says how the order ended.
+`NotOpen`, `Refused`, `Unknown` and `NotSent` each emit `cancel_refused` with the
+venue's words. None changes the order, and an `Unknown` cancel puts nothing in
+doubt, because the stream decides whether the order ended and is still
+listening. A cancel the shell did not send is `cancel_refused { not_sent }`.
+
+**The account.** The stream is **down** from construction until the first
+recorded subscription answer accepting it (the only answer recorded,
+`account.rs:303-308`).
+
+- Down to heard: `account { regained }`, the record's mark that the account is
+  heard from here.
+- Heard to down: `account { lost }`, and `account_blind` on every working order,
+  deferred where REST has not answered (above). The cause is the first evidence:
+  `serverShutdown` gives `server_shutdown`, `eventStreamTerminated`
+  `stream_terminated`, and otherwise the feed's `Blind`, a `Disconnect` being
+  `socket_closed`. The feed does not carry why the listener ended a connection
+  (`account.rs:670-693` names it in the log only), so an unanswered probe is
+  `socket_closed` here too.
+- `Blind { LocalOverflow }`, a hole the tee left in our copy, is
+  `lost { local_overflow }`, the doubts, and `regained` at once: the
+  subscription never ended, only our copy of it, and the next frame is heard.
+- A `Blind` while down, the session's opening `RecorderRestart` among them, is no
+  transition and writes nothing.
+- The feed `Closed` means the listener stopped for good (`account.rs:174-186`):
+  down for the rest of the process.
+
+**Other people's orders.** The translator's `Orphan` and `NotOurs` become one
+`Inbound::Foreign`, read leniently so that a stranger's trade paid in BNB is
+recorded rather than refused (`report.rs:567-579`), and every one is a `foreign`
+line. A foreign **trade** on our symbol also latches `Diverged`, the owner's rule
+(`venue.rs:65-75`), whoever made it. A foreign acceptance or end does not; it
+moves no balance. A report about an id of this run that this machine never sent,
+which only an earlier process of the same run can leave, goes to the engine as
+an order report and is withheld there as a stray or an orphan
+(`lib.rs:1062-1082`); a fill there latches `Diverged` too. Other symbols, and
+account events the machine does not read (`outboundAccountPosition`,
+`balanceUpdate`), are counted and not journalled.
+
+**The state table.** Phases: **Sent** (the stream has not reported on it, not
+ended), **Live** (the stream has, not ended), **Ended**. Doubts and held reports
+lie across them.
+
+| Phase | Heard | Emits | Next |
+|---|---|---|---|
+| Sent | `Placed` | `placed`; deferred doubts raised | Sent |
+| Sent | `Refused(r)` | `Rejected { reason, declined { cited, breach } }`; deferred doubts dropped | Ended |
+| Sent | `Unknown(w)` | `doubt raised { cause, said }`; deferred doubts raised; `IdInUse` latches `Diverged` too (`orders.rs:855-870`: "that needs a person") | Sent |
+| Sent | `NotSent`, or an `Unsent` order | `Rejected { Venue, never_landed { not_sent } }`; deferred doubts dropped | Ended |
+| Sent | released `NEW` | open causes cleared; `Accepted` | Live |
+| Sent | released trade or end | cleared; `Accepted` (rule 5); the fill or the end | Live or Ended |
+| Sent, Live | a report past a hole | `doubt raised { fills_missed }`, once; held | unchanged |
+| Sent, Live | the stream lost | `account_blind` raised, or deferred | unchanged |
+| Live | `Placed` | `placed` | Live |
+| Live | `Unknown` | raised and cleared at once | Live |
+| Live | `Refused`, `NotSent` | `anomaly { contradiction }`; `Diverged` | Live |
+| Live | released trade, `remaining` above zero | cleared; `Filled` with its ids | Live |
+| Live | released trade, `remaining` zero | cleared; `Filled` with its ids | Ended |
+| Live | released end | cleared; `Cancelled` with how it ended | Ended |
+| Live | a trade id already booked | `anomaly { duplicate_trade }` | Live |
+| Live | `z` behind, or another `orderId` | `anomaly { contradiction }`; `Diverged` | Live |
+| Live | a second `NEW` | `anomaly { contradiction }` | Live |
+| Ended | `Placed` | `placed` | Ended |
+| Ended | `Unknown` | raised and cleared at once | Ended |
+| Ended, by the stream | `Refused`, `NotSent` | `anomaly { contradiction }`; `Diverged` | Ended |
+| Ended | a trade | `anomaly { after_end }`; the fill, as an orphan; `Diverged` | Ended |
+| Ended | an end | `anomaly { second_end }` | Ended |
+| Ended, by the stream | `NEW` | `anomaly { after_end }` | Ended |
+| Ended, by REST | `NEW` | `anomaly { after_end }`; `Diverged` | Ended |
+| any | a `CancelReply` but `Acknowledged`, or an `Unsent` cancel | `cancel_refused` | unchanged |
+
+`reason` is `RefusalCause::reject_reason` (`orders.rs:727-736`); item 7 adds
+`RefusalCause::breach`, `Refusal::cited` and `WhyUnknown`'s cause and words, so
+that the mapping onto `quant-core`'s types is written once, in `orders.rs`.
+
+#### 3. Readiness
+
+`ready` reads the machine and the queue's capacity and nothing else, and changes
+nothing (`&self`, `venue.rs:99-100`).
+
+| `Unready` | When `LiveVenue` answers it |
+|---|---|
+| `Diverged` | Latched by a foreign trade on our symbol, a fill after an order's end, REST and the stream disagreeing about whether an order exists, two venue ids for one of ours, or `IdInUse`. Never cleared in the process (`venue.rs:65-75`). |
+| `Unchecked` | False at construction, which takes a `Checked`: minted only by the checks `venue-check` runs (`trade.rs:986`, `:1070`, `:1104`), and carrying the measured offset every order and logon is stamped with. True after a failing `Check`, false after a passing one. **Not** set by an order refused `-1021` or for its key: that is a rejection with the venue's code on its line, every later order would be refused the same way and harmlessly, and a latch on `-1021` would also fire on an order that only waited too long in the queue. |
+| `StreamDown` | From construction until the subscription is accepted, and from each loss until the next. Never across a `LocalOverflow`. |
+| `InDoubt` | While any order has an open doubt cause, a deferred one, or a held report. |
+| `QueueFull` | `orders` has no room, or is closed. Closed cannot happen in a release build, where `panic = "abort"` (`Cargo.toml:86`) takes the process with a worker that panics; a closed queue takes nothing, which is what the variant says. |
+| `NoFilters`, `Untagged`, `NoBaseline` | **Never.** They are preconditions of building one. `wire` takes a `VenueInstrument` (`exchange_info.rs:229-239`), whose definition both the encoder and the translator need (`orders.rs:198-203`, `user_data.rs:384`), and a `RunTag`. A run whose `exchangeInfo` fetch failed, whose journal is non-empty and untagged, or (question 1 below) whose start balances were not written down, builds no `LiveVenue`: item 8 records and does not trade. They stay in the set because the set is serialized (`venue.rs:38-40`). |
+
+When more than one holds, a refusal names one, in this order: `Diverged`,
+`Unchecked`, `StreamDown`, `InDoubt`, `QueueFull`. What needs a person, then what
+needs a check, then what clears by itself, so that a `refused` line points its
+reader at the cause that will last longest.
+
+#### 4. Time
+
+Every report the machine emits carries the stamp of the input that caused it,
+and the machine has no clock to give it another.
+
+| Report from | Stamped |
+|---|---|
+| a stream frame | its `local_recv_ts`, taken by ingress before the frame is parsed (`account.rs:149-156`) and copied by the translator (`user_data.rs:401-403`) |
+| a `Blind` | the `Blind`'s stamp: when the gap was recorded or the hole revealed (`account.rs:1102-1115`) |
+| a REST answer | `Clock::now()`, read by the worker when the request's future resolves, from an injected `Arc<dyn Clock>` |
+| the shell (`Unsent`) | the engine's `now`, handed to `submit` or `cancel` |
+| an immediate clearing, an implied acceptance | the stamp of the input that caused it |
+
+The worker's clock is the clock that stamps `local_recv_ts`, as the poll contract
+requires (`venue.rs:155-158`), and injected, so a test drives it with
+`ManualClock`. `capture::run` makes its own `SystemClock` today (`capture.rs:264`);
+item 8 hands one clock to the market ingress, the account ingress and the worker.
+
+**A report cannot move the engine's clock backwards.** The engine moves only to a
+stamp later than its clock (`lib.rs:855`, `:884`), through `advance_to`, which
+never moves back (`lib.rs:738-744`). A REST answer that sat in `inbox` while
+market events carried the clock past its stamp is written down at its own stamp
+and moves nothing. What the merge can do is put a line after one stamped later,
+when a stream frame overtakes a stamped answer into the next poll: a window of
+the worker's stamp-to-send gap, which the readers tolerate because they filter by
+stamp (`docs/run-log.md` §9). The machine orders nothing by stamp. It decides on
+arrival order alone, so a host clock that steps cannot change what it decides.
+
+#### 5. Tests, and the acceptance
+
+**The permutation test**, item 7's acceptance. A scenario is one order's truth:
+what REST answered, a cancel's answer if there is a cancel, and the stream's
+records for it in socket order, `Blind` and `Subscribed` included. Every
+interleaving of the REST answers among those records, stamped by position so the
+engine's clock moves sanely, is driven through the machine, wrapped as an
+`ExecutionVenue`, into a real `Engine` with the real `JournalWriter`. For every
+interleaving:
+
+- the strategy is told the same events, compared without their stamps;
+- the journal holds the same lines as a multiset, compared without `at`;
+- the portfolio, `working()` and `ready` end the same;
+- no order has two terminals, and no trade id is booked twice.
+
+Scenarios: a market buy filled in one trade, and in three (a walk); filled in
+part, then `EXPIRED`; a resting limit cancelled, answered `Acknowledged` and
+answered `NotOpen`; a cancel that lost the race; each `WhyUnknown`, with the
+stream reporting and with it silent; `Refused` and `NotSent` with the stream
+silent; and each with a `Blind` and `Subscribed` placed before, among and after
+the order's records. A contradiction is not a consistent truth and is tested on
+its own. It lives in `quant-backtest`'s tests, which already link the engine, the
+writer and `quant-binance` (`crates/quant-backtest/Cargo.toml:14-25`).
+
+Breaks that must redden it: `Placed` emitted as an acceptance; deduplicating by
+`I`; `Unknown` raised without the immediate clearing when the stream came first;
+one `cleared` line for several causes; `account_blind` raised on an order REST
+has not answered for; a REST refusal emitted after the stream reported.
+
+**`account_blind`**, item 7's second acceptance: two working orders and the stream
+lost give `account { lost }` and one `doubt raised { account_blind }` each;
+`ready` answers `StreamDown`, then after the resubscribe `InDoubt`, then nothing
+once each order's next report clears it. The journal is then read by
+`runlog::check` (`crates/quant-explain/src/runlog.rs:301`), which must not flag
+the `account` line and must flag `in doubt` when a doubt is never cleared. That
+half lives in `quant-explain`'s tests, with `quant-backtest` and `quant-binance`
+as dev-dependencies: `quant-explain` sits at the top of the graph, and nothing
+comes to depend on it.
+
+**The machine's own tests**, each seen red under its break first:
+
+| Asserts | Break |
+|---|---|
+| a duplicate trade id books once, beside an anomaly | deduplicate by `I`, or not at all |
+| a hole holds every later report and raises `fills_missed` once | release past the hole |
+| a fill after an end is an orphan, an anomaly and `Diverged`; a second end only an anomaly | emit the second end |
+| `Refused` after `NEW`, and `NEW` after `Refused`: `Diverged`, no second terminal | emit the refusal |
+| `Placed` and `NEW` naming different order ids: `Diverged` | keep the later id |
+| a trade as an order's first report brings an `Accepted` before it | omit it |
+| each `WhyUnknown` maps to its cause, with what the venue said | map two to one |
+| a foreign trade paid in BNB is a `foreign` line and `Diverged`; a foreign acceptance only a line | refuse the BNB fee |
+| the readiness order, one test per pair | swap two |
+| every output's stamp is its input's | stamp from a clock |
+
+**The shell's tests**, against a scripted local HTTP server as `trade.rs`'s tests
+use one (`trade.rs:1467`), and a `ManualClock`: a cancel goes after the answer to
+the order it names; an answer is stamped when it arrived; the `timestamp` sent is
+the engine's `now` less the offset, read back off the request the server
+received, which is the sign `venue-check` once had wrong
+(`m8b-venue-check-offset`); with the worker stalled, `submit` returns, `ready`
+answers `QueueFull` and a cancel is `cancel_refused { not_sent }`; after
+`stop_sending` nothing reaches the server, every queued order comes back
+`never_landed`, and `outstanding` reaches zero.
+
+**And one end to end**, through the real listener: `fake_venue` (#70) as the
+account side and a scripted REST server for orders; a market buy acknowledged,
+its `NEW` and trade pushed with `FakeVenue::event` (`fake_venue.rs:400`); then
+`drop_connection` (`:417`) and the `account_blind` path through the real feed.
+
+**`fake_venue` is not extended into an exchange.** It stays a stand-in for the
+account side's transport, and each test says what the venue does on both
+channels. A fake that matched orders and wrote its own reports would be a second
+model of the venue, to agree with the simulator and with Binance forever with
+nothing to notice when it stopped: the argument that there is no `PaperVenue`
+(`docs/engine-contract.md` §9).
+
+#### 6. Not in item 7, and what item 8 must enforce
+
+Not in item 7:
+
+- **Lookup and adoption**, slice (d): `GET /api/v3/order` by `origClientOrderId`
+  or by `Placed`'s order id, `cleared { looked_up }`, `never_landed { not_found }`,
+  `DoubtCause::Restart`, releasing held reports once the fills they wait for are
+  found, and taking over a previous process's working orders. Until then every
+  doubt and every held report is loud and stuck, as §5 decided.
+- **The binary**, item 8: the gates, the settle loop, the strict writer,
+  `balances`, the live mode in `ops/`.
+- Overlapping two subscriptions across `serverShutdown`; waiting out a 429's
+  `retryAfter`; refetching `exchangeInfo` or rechecking the clock during a run
+  (the `Check` input is there for item 8 to use); anything read from
+  `outboundAccountPosition`.
+- **A gap in the simulator this design found**, for slice (e). `SimulatedVenue`
+  announces every order `Accepted` before it judges its filters or its market
+  (`quant-sim/src/lib.rs:650-690`), so a filter breach or `NoMarket` reaches a
+  strategy as an acceptance and then a rejection, where live a refused request
+  is a rejection alone (rule 1). The seam's guarantee covers fields and types
+  (`docs/engine-contract.md` §11), not the shape of a lifecycle, and criterion B,
+  which pairs accepted-or-rejected, will see it.
+
+Item 8 must enforce:
+
+1. **The gates before the engine starts**: the `venue-check` checks, giving a
+   `Checked`; `exchangeInfo`, giving a `VenueInstrument`; the run tag from the
+   journal, refusing a non-empty journal without one; and the start `balances`
+   line. If one fails, record and do not trade. The gates go before the capture
+   starts, so the engine's market channel never fills unread: an engine started
+   late begins on a book that waits up to an hour for a snapshot.
+2. **One `Arc<dyn Clock>`** for the market ingress, the account ingress and the
+   worker, and the `Checked` offset to the listener as to the worker (item 6).
+3. **The account tee built with `marking_into`**, which `AccountFeed::new`
+   requires (`account.rs:1174-1186`).
+4. **`JournalWriter::strict`.**
+5. **The shutdown order of (1)**, and the engine never dropped while
+   `outstanding()` is above zero.
+6. **Until slice (d), no trading** when the last session has no `stopped` line or
+   its `stopped.working` is not empty.
+7. **Its acceptance's replay, read precisely.** REST answers are not in the raw
+   tier (`report.rs:326-329`), so replaying the recorded account frames can
+   reproduce only the entries the stream produced. The REST answers come back off
+   their own journal lines, and the machine being pure is what makes the two
+   together replayable at all.
+
+**As commits**, each green: the helpers in `orders.rs` and `user_data.rs`
+(`Inbound::Foreign`, attributed errors, `Checked`); the machine and its tests;
+the shell and the worker with theirs; the permutation and `account_blind` tests;
+the end-to-end test; the docs, then a grep for what they replace.
+
+#### 7. For the owner
+
+1. **Refuse to trade without a start balances snapshot (`NoBaseline`)?** Open
+   since the seam's design. *Recommended: yes.* Criterion A's baseline cannot be
+   taken afterwards, and refusing costs one REST call at startup.
+2. **When a gate fails at startup, record only, or run the strategy against a
+   venue that refuses everything**, so its decisions are journalled as
+   `refused { venue: .. }`? *Recommended: record only.* No order could go, and a
+   run of refusals is noise criterion B would have to exclude. The other way
+   needs a `LiveVenue` that starts without its instrument and holds account
+   frames it cannot yet translate.
+3. **At a stop, cancel resting orders before settling, or leave them** in
+   `stopped.working`? Open since the seam's design. *Recommended: cancel them,*
+   then settle until their ends arrive. Cancelling is not flattening (§5), and an
+   order left resting can fill after the record has stopped.
+4. **A stranger's trade on another symbol** spends the quote asset criterion A
+   marks. Latch `Diverged` for it too? *Recommended: no.* The rule names our
+   symbol, and §2's one account is the defence; revisit if the account is shared.
+5. **`quant-binance` depends on `quant-engine`.** *Recommended: yes*, as
+   `quant-sim` does, rather than a crate of one module.
 
 ---
 
