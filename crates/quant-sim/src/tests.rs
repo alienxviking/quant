@@ -338,6 +338,84 @@ fn a_market_order_with_no_book_is_refused_not_guessed() {
 }
 
 #[test]
+fn a_declined_order_is_never_announced_and_a_kept_one_always_is() {
+    // A live venue refuses a breach, or an order it will not take, in its REST
+    // answer, and its account stream never reports a NEW for it: the strategy
+    // hears a rejection alone. The simulator used to announce an order on
+    // arrival and judge it a line later, so a backtest's strategy heard
+    // "accepted, then rejected" for one order -- a lifecycle no live run
+    // produces, and a way to tell which venue it was wired to.
+    let accepted = |events: &[ExecutionEvent]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, ExecutionEvent::Accepted { .. }))
+            .count()
+    };
+    let rejected = |events: &[ExecutionEvent]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, ExecutionEvent::Rejected { .. }))
+            .count()
+    };
+
+    // Declined by the venue's rules: 1.00 against a minimum notional of 5.
+    let filters = quant_core::instrument::Filters {
+        tick_size: "0.01".parse().expect("tick"),
+        lot_size: "0.00001".parse().expect("lot"),
+        min_notional: "5".parse().expect("notional"),
+    };
+    let mut venue = SimulatedVenue::new().enforcing(instrument(), filters);
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "0.01", limit("100.0")),
+        &tick(),
+        &book(),
+    );
+    assert_eq!(rejected(&events), 1, "{events:?}");
+    assert_eq!(
+        accepted(&events),
+        0,
+        "a breach is never acknowledged: {events:?}"
+    );
+    assert_eq!(venue.stats().accepted, 0);
+
+    // Declined for want of a market.
+    let mut venue = SimulatedVenue::new();
+    let gap = MarketEvent::Gap(Gap {
+        meta: meta(),
+        cause: GapCause::Disconnect,
+        last_good_ts: Ts::from_nanos(1),
+    });
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "1", OrderKind::Market),
+        &gap,
+        &dark_book(),
+    );
+    assert_eq!(rejected(&events), 1, "{events:?}");
+    assert_eq!(
+        accepted(&events),
+        0,
+        "nor is an order with no market: {events:?}"
+    );
+
+    // Kept: announced once, and before anything else is said about it.
+    let mut venue = SimulatedVenue::new();
+    let events = run(
+        &mut venue,
+        order(Side::Buy, "1", OrderKind::Market),
+        &tick(),
+        &book(),
+    );
+    assert_eq!(accepted(&events), 1, "{events:?}");
+    assert!(
+        matches!(events.first(), Some(ExecutionEvent::Accepted { .. })),
+        "an order the venue keeps opens with its acceptance: {events:?}"
+    );
+    assert_eq!(rejected(&events), 0, "{events:?}");
+}
+
+#[test]
 fn an_ioc_limit_that_cannot_fill_immediately_is_cancelled() {
     let mut venue = SimulatedVenue::new();
     let request = OrderRequest {

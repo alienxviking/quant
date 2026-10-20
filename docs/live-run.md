@@ -1146,9 +1146,8 @@ recorded as rejected, in doubt for ever and with nothing latched.
    not `NEW`, which happens only when `NEW` fell in a hole, an `Accepted` naming
    the report's venue order id is emitted before it, at its stamp. A trade proves
    the venue had the order. So every lifecycle `LiveVenue` tells begins with an
-   acceptance or is a rejection alone, which is the simulator's shape too once
-   §6's simulator change lands (`quant-sim/src/lib.rs:650-690` announces first
-   today).
+   acceptance or is a rejection alone, which is the simulator's shape too since
+   `m8c-sim-declines-unannounced` (§6).
 6. **The venue's id for an order is checked, not trusted.** The first `orderId`
    any input names is the order's: `Placed`'s (`orders.rs:592-598`), a stream
    report's `i` (user-data-stream.md:98), held reports included, or a cancel's
@@ -1544,24 +1543,24 @@ Not in item 7:
   (the `Check` input is there for item 8 to use); anything read from
   `outboundAccountPosition`.
 
-**Owed before item 8: the simulator announces only what it will not refuse.**
-`SimulatedVenue` announces every order `Accepted` before it judges its filters or
-its market (`quant-sim/src/lib.rs:647-690`), so a filter breach or `NoMarket`
-reaches a strategy as an acceptance and then a rejection, where live a refused
-request is a rejection alone (rule 1). The first draft filed this for slice (e)
+**Done before item 8: the simulator announces only what it will not refuse.**
+`SimulatedVenue` announced every order `Accepted` before it judged its filters or
+its market (`quant-sim/src/lib.rs:647-690` at `f676e6d`), so a filter breach or
+`NoMarket` reached a strategy as an acceptance and then a rejection, where live a
+refused request is a rejection alone (rule 1). The first draft filed this for slice (e)
 on the ground that the seam's guarantee covers fields and types and not the
 shape of a lifecycle. That was wrong twice over. `docs/engine-contract.md` §11
 ticks "a strategy's view of a lifecycle is identical whichever venue produced
 it", naming the declined order; and CLAUDE.md calls a strategy that can tell
 which pair it is wired to a bug, whatever a checkbox says. So the simulator
-judges filters and market first and announces only an order it will fill or
-rest, in its own pull request, before item 8's rehearsal runs a strategy
-against `LiveVenue`. Its acceptance is M5's money check, 824 fills and cash
-31.64743842, byte-identical in its report; a backtest journal that held
-rejections loses exactly their `accepted` lines, and nothing else moves:
-`MaCrossover` reads only an order's terminal event (`ma.rs:472-475`). §11's box
-stays ticked for what its test drove, two venues of the same shape, and gains a
-line saying it does not yet hold between the simulator and `LiveVenue`.
+now judges filters and market first and announces only an order it will fill or
+rest (`m8c-sim-declines-unannounced`). As predicted, M5's money check is
+unchanged, 824 fills and cash 31.64743842, because that run refused nothing;
+and ETHUSDT over the fortnight, where every order is below the minimum
+notional, writes its 413 rejections without their 413 `accepted` lines and is
+otherwise byte-identical. `MaCrossover` reads only an order's terminal event
+(`ma.rs:472-475`), so no decision moves. No test had pinned the lifecycle's
+shape either way; one does now, in both directions.
 
 Item 8 must enforce:
 
