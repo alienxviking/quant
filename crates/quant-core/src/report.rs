@@ -599,6 +599,12 @@ pub enum AccountChange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountCause {
+    /// The connection ended, for a reason the record does not carry.
+    ///
+    /// The listener knows why it ended a connection and logs it, but the
+    /// capture holds only a `Gap { Disconnect }`, and the live venue reads
+    /// what is recorded so that a replay of the capture reproduces it. Not
+    /// necessarily the venue closing the socket.
     SocketClosed,
     /// The socket stayed open and stopped delivering.
     IdleTimeout,

@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 797 tests green in debug
-and release, clippy and fmt clean, ~64,700 lines across 12 crates.
+same window exactly, on both symbols, to the satoshi. 835 tests green in debug
+and release, clippy and fmt clean, ~69,500 lines across 13 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -2393,8 +2393,27 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   and `quant-verify` passes the tree. Nothing runs it yet, and none of it has
   met the venue.
 
-  **What remains in (c) is items 7 and 8 of `docs/live-run.md` §4**:
-  `LiveVenue`, and the `live` binary with its testnet rehearsal.
+  **Item 7's merge machine is built** (`m8c-live-machine`), the pure half of
+  `LiveVenue`: the crate `quant-live` and its `Merge`, a function from what
+  was heard to what the engine is told, with the readiness answer, and no
+  socket, clock or runtime. It follows `docs/live-run.md` §5, *LiveVenue,
+  decided before the code*, and its §8 records what the code corrected. Beside
+  it: the translator reads a stranger's report leniently and says whose order
+  an unreadable report concerned; `journal::diverged` reads the latch back off
+  the journal; and `runlog check` has a seventh finding, `unwatched`, an order
+  working when the stream was lost and never in doubt for it. Accepted by a
+  permutation test in `quant-explain`, 1,547 interleavings of 47 truths through
+  the real engine and journal writer, by `account_blind`, by the latch
+  agreeing with `journal::diverged`, and by the machine's own table, every
+  test seen red under its break. Its first run found `runlog check`'s doubt
+  fold reading a clearing as the end of every cause, so the check's verdict
+  depended on which socket spoke first; a clearing now answers the latest
+  open cause, and each open cause is a finding.
+
+  **What remains in (c) is item 7's shell and item 8 of `docs/live-run.md`
+  §4**: `LiveVenue` itself, with its request worker, channels, `wire`,
+  shutdown and the `Unheard` timer, and then the `live` binary with its
+  testnet rehearsal.
   Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
   shipped code, which went first, each on its own branch (#52 to #56, and see
   *Still open*), and eighteen design questions. The ones that block code are

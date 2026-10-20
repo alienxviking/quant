@@ -376,7 +376,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`); items 7 and 8 below remain |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`) and item 7's merge machine (`m8c-live-machine`); item 7's shell and item 8 below remain |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -643,6 +643,22 @@ feature.
    (`account_blind`), which `runlog check` learns to verify: an order working
    when the stream was lost and never put in doubt for it is a finding.
    Designed before the code in §5, *LiveVenue, decided before the code*.
+
+   **The machine is built; the shell is next.** `m8c-live-machine` is the pure
+   half: the crate `quant-live` and its `Merge`, which takes what was heard and
+   appends what the engine is told, with the readiness answer; the
+   translator's and the order classifier's mappings onto the record's types;
+   `journal::diverged`, which reads the latch back off the journal; and
+   `runlog check`'s seventh finding, `unwatched`. Accepted by the permutation
+   test, 1,547 interleavings of 47 truths, every one telling the strategy the
+   same events and writing the same lines; by `account_blind`; by a test that
+   the machine's latch and `journal::diverged` agree; and by the machine's own
+   table, every row seen red under its break. What building it corrected is in
+   §5, *LiveVenue, decided before the code*, §8: among it, the permutation
+   test's first run found `runlog check`'s doubt fold disagreeing with itself.
+   The shell, `LiveVenue` with its request worker, channels, `wire` and
+   shutdown, and the timer behind decision 6's `Unheard`, is the next pull
+   request; the machine already takes `Unheard` as an input.
 8. **The `live` binary and a rehearsal.** Paper's session extracted so any venue
    can run it; a startup that records first and trades last; a refusal of any
    size whose floored exit would fall below the minimum notional at the current

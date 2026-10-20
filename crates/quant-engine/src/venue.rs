@@ -65,13 +65,12 @@ pub enum Unready {
     /// The account and our record no longer describe the same thing: a fill
     /// nobody can attribute to an order, or a stranger's trade on our symbol.
     ///
-    /// A latch, not a passing condition. `LiveVenue` will set it on the first
-    /// such report and never clear it in-process: carrying on would trade
-    /// against a position nobody knows. Clearing it is a person's act --
-    /// reconciling the account by hand, then starting a new journal under a
-    /// new run tag. Nothing produces it yet; it is in the set now because the
-    /// set is serialized, and a variant that arrived with `LiveVenue` would
-    /// arrive as a schema change.
+    /// A latch, not a passing condition. `quant-live`'s merge machine sets it
+    /// on the first such report, on every contradiction and on `IdInUse`, and
+    /// never clears it in-process: carrying on would trade against a position
+    /// nobody knows. Clearing it is a person's act -- reconciling the account
+    /// by hand, then starting a new journal under a new run tag. A restart
+    /// reads it back with `journal::diverged`, from the lines that latched it.
     Diverged,
 }
 
@@ -158,7 +157,12 @@ pub trait ExecutionVenue {
     ///   does next by that clock.
     /// - **At most one terminal report per order, and none before its last
     ///   fill.** The engine forgets an order on its terminal report, and a fill
-    ///   after that could not be booked.
+    ///   after that could not be booked. One report may follow it: a venue
+    ///   that reports a fill after an order's end hands that fill over all the
+    ///   same, beside an anomaly, and the engine, no longer working the order,
+    ///   writes it down as `orphaned` and books it nowhere. A contract written
+    ///   for a venue that is right must not make the record drop money when
+    ///   the venue is wrong.
     /// - **[`VenueReport::Order`] only for this run's orders.** Anything about an
     ///   order this run did not send is a notice.
     /// - **Never drop a report silently.** One that cannot be read becomes an
