@@ -2014,9 +2014,31 @@ mod tests {
                 .await;
         }
 
+        /// Until the venue has made `n` subscriptions and the listener has read
+        /// the answer to the last.
+        ///
+        /// The count alone is not enough. The fake counts a subscription when it
+        /// answers the request, before the listener has read that answer, so a
+        /// test that stopped the listener on the count could find the file one
+        /// subscription short of what it asserts: a race in the test, not a loss
+        /// in the listener. It was seen once in thirty runs with six copies of
+        /// this suite at once, and only under that load.
         async fn subscriptions(venue: &FakeVenue, n: usize) {
             venue
                 .until("a subscription", WAIT, |log| log.subscribed == n)
+                .await;
+            venue
+                .until(
+                    "the listener to read that subscription's answer",
+                    WAIT,
+                    |log| {
+                        log.sent
+                            .iter()
+                            .rev()
+                            .find(|s| s.said == Said::SubscribeAnswer)
+                            .is_some_and(|s| log.read_by_listener(&s.text))
+                    },
+                )
                 .await;
         }
 
