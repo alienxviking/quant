@@ -1689,6 +1689,24 @@ for a reader to find.
   `wire` will take a `Checked`.
 - **`ready` takes the queue's state from the shell** (`Queue`), so the whole
   order of §3 is in one function and tested pair by pair.
+- **`runlog check`'s doubt fold read a clearing as the end of every cause**,
+  and named only an order's first; the permutation test found the check
+  reporting different findings for two interleavings of one truth. The venue
+  writes one `cleared` line per cause and a raise-and-clear as an adjacent
+  pair, so a clearing now answers the latest open cause, and each cause still
+  open is a finding (`docs/run-log.md` §9). The design had foreseen the fold
+  seeing order through a `cleared` before its `raised`, which the machine
+  never writes, and not through this.
+- **A report held behind a hole is tested in two shapes, not one:** the hole
+  after the order's `NEW`, so the order is heard and then held, and the hole
+  swallowing the `NEW`, so the order is mentioned and never heard. Only the
+  second can tell the two words apart, and "a held report counted as heard"
+  reddened the test only once it was there.
+- **The permutation test**, `crates/quant-explain/tests/live_merge.rs`, runs
+  1,547 interleavings over 313 scenario variants: 47 truths (including
+  every `WhyUnknown` reporting, silent and held, and four contradictions held
+  to the invariants alone), each as it is and with a disconnect and its
+  resubscribe, and an overflow, at every position among the order's records.
 
 ---
 

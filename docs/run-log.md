@@ -524,6 +524,19 @@ was still seen to end. An acceptance, a partial fill, a refused cancel and a
 placement say nothing about how the order ends, so none of them settles it,
 before the doubt or after it, and a restart does not either.
 
+**A `cleared` line answers one cause, the latest still open, and each cause
+left open is a finding of its own** (item 7, `m8c-live-machine`). The venue
+writes one `cleared` line per cause, and a cause raised and cleared at once
+(an unknown REST answer about an order the stream has already reported) as a
+pair. This read every clearing as the end of every cause, and named only an
+order's first, until item 7's permutation test showed the check disagreeing
+with itself: an order held behind a hole whose REST answer came after the hole
+wrote `raised fills_missed`, `raised server_error`, `cleared`, and the doubt
+the hole left open vanished, where the same answer arriving first left it
+standing; and an order in doubt for two causes was named for whichever was
+raised first. Read the old way, a venue that wrote one clearing for several
+causes also read clean.
+
 **An anomaly is a finding in its own right; a lost account stream is not.**
 The first draft let both through on the ground that the venue raises a doubt
 beside each. For an anomaly no venue code has that duty, and most kinds could

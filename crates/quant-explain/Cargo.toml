@@ -37,6 +37,13 @@ serde_json = "1"
 # are pinned to each other rather than to a fixture someone wrote by hand.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
+# Item 7's permutation test (`tests/live_merge.rs`): the merge machine, the
+# real engine, the real journal writer and `runlog::check`, linked together
+# here because this is the one crate at the top of the graph that may. Tests
+# only: nothing here may depend on a venue or a binary's crate.
+quant-live = { workspace = true, features = ["fixtures"] }
+quant-backtest = { workspace = true }
+quant-binance = { workspace = true }
 
 [lints]
 workspace = true

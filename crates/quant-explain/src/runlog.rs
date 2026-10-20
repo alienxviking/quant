@@ -395,8 +395,8 @@ pub fn check(entries: &[JournalEntry]) -> Report {
 #[derive(Default)]
 struct Watched {
     life: Life,
-    /// In doubt for `account_blind`: raised, and not cleared since.
-    blind: bool,
+    /// The causes it is in doubt for, read as `in doubt` reads them.
+    open: Open,
     /// A `placed` line: the venue acknowledged it.
     placed: bool,
     /// A line only the stream produces: `accepted`, `filled`, `cancelled`.
@@ -453,7 +453,9 @@ fn unwatched(entries: &[JournalEntry]) -> Vec<Finding> {
             JournalEntry::Account { at, change } => match change {
                 AccountChange::Lost { .. } => {
                     for (&id, order) in &orders {
-                        if order.life == Life::Working && !order.blind {
+                        if order.life == Life::Working
+                            && !order.open.holds(DoubtCause::AccountBlind)
+                        {
                             owed.push(Owed {
                                 client_order_id: id,
                                 lost_at: *at,
@@ -472,8 +474,8 @@ fn unwatched(entries: &[JournalEntry]) -> Vec<Finding> {
                 let order = orders.entry(client_order_id.0).or_default();
                 match change {
                     DoubtChange::Raised { cause, .. } => {
+                        order.open.raise(Ts::from_nanos(0), *cause);
                         if *cause == DoubtCause::AccountBlind {
-                            order.blind = true;
                             for debt in owed
                                 .iter_mut()
                                 .filter(|debt| debt.client_order_id == client_order_id.0)
@@ -482,9 +484,7 @@ fn unwatched(entries: &[JournalEntry]) -> Vec<Finding> {
                             }
                         }
                     }
-                    // The venue clears every open cause of an order at once,
-                    // one line each, so any clearing ends this one.
-                    DoubtChange::Cleared { .. } => order.blind = false,
+                    DoubtChange::Cleared { .. } => order.open.clear(),
                 }
             }
             JournalEntry::Placed {
@@ -605,11 +605,42 @@ impl Foreigners {
     }
 }
 
+/// The causes an order is in doubt for, in the order they were raised.
+///
+/// **A `cleared` line answers one cause, the latest still open.** The venue
+/// writes one `cleared` line per cause (`docs/live-run.md` §5), so a release
+/// that settles three causes writes three; and a cause raised and cleared at
+/// once, an `Unknown` about an order the stream has already reported, is
+/// written as a pair, its clearing straight after its raise. So the latest
+/// open cause is the one a clearing answers. This read every clearing as the
+/// end of every cause until item 7's permutation test showed it disagreeing
+/// with itself: an order held behind a hole whose REST answer came after the
+/// hole wrote `raised fills_missed`, `raised server_error`, `cleared`, and
+/// the doubt the hole left open vanished, where the same answer arriving
+/// first left it standing. A venue that wrote one clearing for several causes
+/// read clean the same way.
+#[derive(Debug, Default)]
+struct Open(Vec<(Ts, DoubtCause)>);
+
+impl Open {
+    fn raise(&mut self, at: Ts, cause: DoubtCause) {
+        self.0.push((at, cause));
+    }
+
+    fn clear(&mut self) {
+        self.0.pop();
+    }
+
+    fn holds(&self, cause: DoubtCause) -> bool {
+        self.0.iter().any(|&(_, open)| open == cause)
+    }
+}
+
 /// Orders in doubt, folded against how each order ends.
 #[derive(Default)]
 struct Doubts {
-    /// Orders in doubt now, and since when.
-    open: BTreeMap<u64, (Ts, DoubtCause)>,
+    /// Orders in doubt now, for which causes.
+    open: BTreeMap<u64, Open>,
     /// Orders already seen to end. A doubt raised about one of these is
     /// answered before it opens: a REST error can arrive after the stream has
     /// already reported the fill, and the end is no less known for coming
@@ -621,14 +652,14 @@ impl Doubts {
     fn change(&mut self, at: Ts, id: u64, change: &DoubtChange) {
         match change {
             DoubtChange::Raised { cause, .. } => {
-                // The first raise is when the doubt began; a second before
-                // any clearing is the same doubt, still open.
                 if !self.ended.contains(&id) {
-                    self.open.entry(id).or_insert((at, *cause));
+                    self.open.entry(id).or_default().raise(at, *cause);
                 }
             }
             DoubtChange::Cleared { .. } => {
-                self.open.remove(&id);
+                if let Some(open) = self.open.get_mut(&id) {
+                    open.clear();
+                }
             }
         }
     }
@@ -639,14 +670,22 @@ impl Doubts {
         self.ended.insert(id);
     }
 
+    /// One finding per cause still open, each since it was raised.
+    ///
+    /// Per cause rather than per order: an order in doubt for two causes,
+    /// raised in either order, is the same record, and naming only the
+    /// first would make the check's verdict depend on which of two sockets
+    /// spoke first (item 7's permutation test).
     fn findings(self) -> impl Iterator<Item = Finding> {
-        self.open
-            .into_iter()
-            .map(|(client_order_id, (since, cause))| Finding::LeftInDoubt {
-                client_order_id,
-                since,
-                cause,
-            })
+        self.open.into_iter().flat_map(|(client_order_id, open)| {
+            open.0
+                .into_iter()
+                .map(move |(since, cause)| Finding::LeftInDoubt {
+                    client_order_id,
+                    since,
+                    cause,
+                })
+        })
     }
 }
 
@@ -2054,6 +2093,59 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_cleared_line_answers_the_latest_open_cause_and_each_open_cause_is_a_finding() {
+        // Item 7's permutation test found the fold disagreeing with itself:
+        // the venue writes one `cleared` line per cause, and a cause raised
+        // and cleared at once as an adjacent pair. Seen red four ways: a
+        // clearing that ends every cause, one that ends the oldest, one that
+        // ends none, and one finding per order rather than per cause.
+        let raised_for = |at: i64, cause| doubt(at, 1, DoubtChange::Raised { cause, said: None });
+        let in_doubt = |since: i64, cause| Finding::LeftInDoubt {
+            client_order_id: 1,
+            since: Ts::from_nanos(since),
+            cause,
+        };
+        // REST's unknown answer after a hole: raised and cleared at once,
+        // and the hole's doubt stands.
+        let after = vec![
+            submitted(1, 10),
+            raised_for(100, DoubtCause::FillsMissed),
+            raised_for(200, DoubtCause::ServerError),
+            cleared(200, 1),
+        ];
+        // The same answer first, cleared by the report before the hole.
+        let before = vec![
+            submitted(1, 10),
+            raised_for(100, DoubtCause::ServerError),
+            cleared(150, 1),
+            raised_for(200, DoubtCause::FillsMissed),
+        ];
+        assert_eq!(
+            check(&after).findings,
+            [in_doubt(100, DoubtCause::FillsMissed)]
+        );
+        assert_eq!(
+            check(&before).findings,
+            [in_doubt(200, DoubtCause::FillsMissed)]
+        );
+        // Two causes open: a finding each. Both cleared: none.
+        let mut two = vec![
+            submitted(1, 10),
+            raised_for(100, DoubtCause::AccountBlind),
+            raised_for(200, DoubtCause::NoAnswer),
+        ];
+        assert_eq!(
+            check(&two).findings,
+            [
+                in_doubt(100, DoubtCause::AccountBlind),
+                in_doubt(200, DoubtCause::NoAnswer)
+            ]
+        );
+        two.extend([cleared(300, 1), cleared(300, 1)]);
+        assert_eq!(check(&two).findings, []);
     }
 
     #[test]
