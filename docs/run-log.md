@@ -494,9 +494,10 @@ and one older reader had stopped reading backtest journals at all.
 
 ### `runlog check`: what the venue said that the record cannot account for
 
-Six new findings, each failing the check (exit 1) as every finding before them
-does. The check asks whether the record is complete, and each is a place where
-it is not: what was decided, what happened to it, or what it cost.
+Six new findings, and a seventh from item 7, each failing the check (exit 1) as
+every finding before them does. The check asks whether the record is complete,
+and each is a place where it is not: what was decided, what happened to it, or
+what it cost.
 
 | label | finding | from |
 |---|---|---|
@@ -506,6 +507,7 @@ it is not: what was decided, what happened to it, or what it cost.
 | `in doubt` | a doubt raised and never cleared, about an order never seen to end | a fold of `doubt` lines against the order's end |
 | `anomaly` | a report the run could not take at its word: unreadable, a trade id already booked, a report after an order's end, a second end, a contradiction | each `anomaly` line |
 | `torn` | a line an interrupted write tore and a restart wrote past: the entry on it is lost | `read`'s `torn_before_restart` |
+| `unwatched` | an order working when the account stream was lost that was never in doubt for it: what happened to it in the dark is recorded as known | each `account { lost }` line, against every order with a `submitted` line before it and no end before it (item 7, `m8c-live-machine`) |
 
 **A stranger's order is counted, not flagged.** A `foreign` line whose
 provenance is `not_ours`, a person's order or another program's on the same
@@ -535,9 +537,15 @@ every order working across the blind stretch is in doubt (`account_blind`;
 `docs/live-run.md` §5 and §4 item 7's acceptance), and with nothing working
 nothing of this run's could have changed. Written down is not checked, though:
 the check reads no `account` line, so a venue that skipped the doubt would read
-*cleaner*, with nothing left in doubt. Item 7 adds a seventh finding,
+*cleaner*, with nothing left in doubt. So item 7 added a seventh finding,
 `unwatched`, for an order working at a `lost` line and never put in doubt for it
-(`docs/live-run.md` §5, *LiveVenue, decided before the code*).
+(`docs/live-run.md` §5, *LiveVenue, decided before the code*). An order passes
+when it is in doubt for `account_blind` at the line or is raised for it
+afterwards, which is how the venue raises a cause it deferred, or when it ends
+in `rejected` or `never_landed` with no `placed` line and no line the stream
+produced: an order REST refused never existed, and missed nothing. Seen red
+both ways: a check that skips `lost` lines misses an order never raised, and
+one that ignores the raise flags an order that was.
 
 **Findings come before the empty verdict.** A file with no decision and no claim
 used to read NOTHING TO CHECK, exit 2, before anything else was looked at; a

@@ -48,7 +48,14 @@
 //!   which invariant 5 says is loud, and the record holds the venue's text
 //!   but cannot fold it into its account. No doubt has to stand beside one
 //!   for the check to see it: most kinds have no doubt cause that fits, and
-//!   an unreadable report may name no order to doubt.
+//!   an unreadable report may name no order to doubt;
+//! - an order **unwatched**: working when an `account { lost }` line was
+//!   written, and never in doubt for it (`account_blind`), so what happened to
+//!   it while the stream was dark is recorded as known. The venue owes that
+//!   doubt (`docs/live-run.md` §5), and without this finding a venue that
+//!   forgot it would leave a record that read *cleaner*, with nothing in
+//!   doubt. An order REST refused or never sent, with no placement and
+//!   nothing the stream said about it, never existed and missed nothing.
 //!
 //! And a line torn by an interrupted write that a restart then wrote past is
 //! a finding, read by [`check_file`]: an entry was being written there and is
@@ -73,7 +80,7 @@ use std::collections::BTreeMap;
 
 use quant_core::execution::VenueOrderId;
 use quant_core::report::{
-    AnomalyKind, DoubtCause, DoubtChange, ForeignOutcome, Provenance, VenueText,
+    AccountChange, AnomalyKind, DoubtCause, DoubtChange, ForeignOutcome, Provenance, VenueText,
 };
 use quant_core::time::Ts;
 use quant_engine::journal::{JournalEntry, Recovered, StrayKind};
@@ -137,6 +144,10 @@ pub enum Finding {
     /// A line an interrupted write tore and a restart then wrote past, so
     /// the entry on it is lost. Numbered from 1, as an editor numbers them.
     TornBeforeRestart { line: usize },
+    /// An order working when the account stream was lost at `lost_at`, and
+    /// never in doubt for it: what happened to it in the dark is recorded as
+    /// known.
+    Unwatched { client_order_id: u64, lost_at: Ts },
 }
 
 impl Finding {
@@ -154,11 +165,14 @@ impl Finding {
             Self::LeftInDoubt { .. } => "in doubt",
             Self::Anomaly { .. } => "anomaly",
             Self::TornBeforeRestart { .. } => "torn",
+            Self::Unwatched { .. } => "unwatched",
         }
     }
 }
 
 impl core::fmt::Display for Finding {
+    // One arm per finding, each a sentence an operator reads.
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::UnattributedFill {
@@ -220,6 +234,16 @@ impl core::fmt::Display for Finding {
                 f,
                 "line {line} was torn by an interrupted write and a restart wrote past \
                  it, so the entry on it is lost and nothing here can say what it was"
+            ),
+            Self::Unwatched {
+                client_order_id,
+                lost_at,
+            } => write!(
+                f,
+                "order {client_order_id} was working when the account stream was lost at {} \
+                 and was never in doubt for it (account_blind), so what happened to it in \
+                 the dark is recorded as known",
+                lost_at.to_rfc3339()
             ),
             Self::LeftInDoubt {
                 client_order_id,
@@ -363,7 +387,172 @@ pub fn check(entries: &[JournalEntry]) -> Report {
     report
         .findings
         .extend(venue_findings(entries, &mut report.not_ours));
+    report.findings.extend(unwatched(entries));
     report
+}
+
+/// What the `unwatched` fold knows about one order.
+#[derive(Default)]
+struct Watched {
+    life: Life,
+    /// In doubt for `account_blind`: raised, and not cleared since.
+    blind: bool,
+    /// A `placed` line: the venue acknowledged it.
+    placed: bool,
+    /// A line only the stream produces: `accepted`, `filled`, `cancelled`.
+    streamed: bool,
+}
+
+/// Where an order is, as far as the `unwatched` fold reads it.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Life {
+    /// No `submitted` line seen for it.
+    #[default]
+    Unseen,
+    /// Submitted, and not seen to end.
+    Working,
+    /// Ended by the stream: cancelled, or filled with nothing left.
+    Ended,
+    /// Ended in `rejected` or `never_landed`: REST's end, not the stream's.
+    Refused,
+}
+
+/// One order owed a doubt by one `lost` line.
+struct Owed {
+    client_order_id: u64,
+    lost_at: Ts,
+    /// Put in doubt for it after the line.
+    raised: bool,
+}
+
+/// Orders working at each `account { lost }` line, against the
+/// `account_blind` doubt each is owed.
+///
+/// An order passes when it is in doubt for `account_blind` at the line or is
+/// raised for it afterwards, or when it ends in `rejected` or `never_landed`
+/// with no `placed` line and no line the stream produced: an order REST
+/// refused never existed, so the doubt it was owed was dropped, as the venue
+/// drops a deferred cause (`docs/live-run.md` §5).
+///
+/// Exhaustive over every entry, with no `_` arm, so a line added to the
+/// journal does not build here until somebody has said whether it starts an
+/// order, ends one or answers a loss.
+// One exhaustive match over every entry, read top to bottom.
+#[allow(clippy::too_many_lines)]
+fn unwatched(entries: &[JournalEntry]) -> Vec<Finding> {
+    let mut orders: BTreeMap<u64, Watched> = BTreeMap::new();
+    let mut owed: Vec<Owed> = Vec::new();
+    // Several arms do the same thing for different reasons, and are kept
+    // apart so each reason stays beside the lines it is about.
+    for entry in entries {
+        #[allow(clippy::match_same_arms)]
+        match entry {
+            JournalEntry::Submitted {
+                client_order_id, ..
+            } => orders.entry(client_order_id.0).or_default().life = Life::Working,
+            JournalEntry::Account { at, change } => match change {
+                AccountChange::Lost { .. } => {
+                    for (&id, order) in &orders {
+                        if order.life == Life::Working && !order.blind {
+                            owed.push(Owed {
+                                client_order_id: id,
+                                lost_at: *at,
+                                raised: false,
+                            });
+                        }
+                    }
+                }
+                AccountChange::Regained => {}
+            },
+            JournalEntry::Doubt {
+                client_order_id,
+                change,
+                ..
+            } => {
+                let order = orders.entry(client_order_id.0).or_default();
+                match change {
+                    DoubtChange::Raised { cause, .. } => {
+                        if *cause == DoubtCause::AccountBlind {
+                            order.blind = true;
+                            for debt in owed
+                                .iter_mut()
+                                .filter(|debt| debt.client_order_id == client_order_id.0)
+                            {
+                                debt.raised = true;
+                            }
+                        }
+                    }
+                    // The venue clears every open cause of an order at once,
+                    // one line each, so any clearing ends this one.
+                    DoubtChange::Cleared { .. } => order.blind = false,
+                }
+            }
+            JournalEntry::Placed {
+                client_order_id, ..
+            } => orders.entry(client_order_id.0).or_default().placed = true,
+            JournalEntry::Accepted {
+                client_order_id, ..
+            } => orders.entry(client_order_id.0).or_default().streamed = true,
+            JournalEntry::Filled {
+                client_order_id,
+                remaining,
+                ..
+            } => {
+                let order = orders.entry(client_order_id.0).or_default();
+                order.streamed = true;
+                if remaining.is_some_and(|r| r.raw() == 0) {
+                    order.life = Life::Ended;
+                }
+            }
+            JournalEntry::Cancelled {
+                client_order_id, ..
+            } => {
+                let order = orders.entry(client_order_id.0).or_default();
+                order.streamed = true;
+                order.life = Life::Ended;
+            }
+            JournalEntry::Rejected {
+                client_order_id, ..
+            }
+            | JournalEntry::NeverLanded {
+                client_order_id, ..
+            } => {
+                orders.entry(client_order_id.0).or_default().life = Life::Refused;
+            }
+            // Never a decision of this run's that reached a venue, or a
+            // report about an order it is not working: neither starts,
+            // ends nor answers for one of its orders.
+            JournalEntry::Refused { .. }
+            | JournalEntry::Orphaned { .. }
+            | JournalEntry::Stray { .. }
+            | JournalEntry::Foreign { .. } => {}
+            // Says nothing about how an order ends or whether it was doubted.
+            JournalEntry::CancelRequested { .. }
+            | JournalEntry::CancelRefused { .. }
+            | JournalEntry::Anomaly { .. } => {}
+            // The record's own lines, and the market's.
+            JournalEntry::Started { .. }
+            | JournalEntry::Checkpoint { .. }
+            | JournalEntry::Tripped { .. }
+            | JournalEntry::Blind { .. }
+            | JournalEntry::Note { .. }
+            | JournalEntry::Stopped { .. }
+            | JournalEntry::Sighted { .. }
+            | JournalEntry::Balances { .. } => {}
+        }
+    }
+    owed.into_iter()
+        .filter(|debt| !debt.raised)
+        .filter(|debt| {
+            orders.get(&debt.client_order_id).is_none_or(|order| {
+                !(order.life == Life::Refused && !order.placed && !order.streamed)
+            })
+        })
+        .map(|debt| Finding::Unwatched {
+            client_order_id: debt.client_order_id,
+            lost_at: debt.lost_at,
+        })
+        .collect()
 }
 
 /// Orders this run did not send, one entry per order however many lines.
@@ -549,8 +738,9 @@ fn venue_findings(entries: &[JournalEntry], not_ours: &mut usize) -> Vec<Finding
             // The account stream lost or regained. Not a finding itself: an
             // order working across the blind stretch is put in doubt
             // (`account_blind`; `docs/live-run.md` §5, and an acceptance
-            // criterion of §4 item 7), and that doubt is what is checked. With
-            // no order working, nothing of this run's could have changed.
+            // criterion of §4 item 7), and that doubt is what is checked,
+            // here and, that it was raised at all, by `unwatched`. With no
+            // order working, nothing of this run's could have changed.
             JournalEntry::Account { .. } => {}
             // The record's own lines, and the market's: nothing a venue said.
             // A restart does not settle a doubt, so `started` leaves them.
@@ -1802,5 +1992,140 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn lost(at: i64) -> JournalEntry {
+        JournalEntry::Account {
+            at: Ts::from_nanos(at),
+            change: AccountChange::Lost {
+                cause: quant_core::report::AccountCause::SocketClosed,
+            },
+        }
+    }
+
+    fn blind_raised(at: i64, id: u64) -> JournalEntry {
+        doubt(
+            at,
+            id,
+            DoubtChange::Raised {
+                cause: DoubtCause::AccountBlind,
+                said: None,
+            },
+        )
+    }
+
+    fn cleared(at: i64, id: u64) -> JournalEntry {
+        doubt(
+            at,
+            id,
+            DoubtChange::Cleared {
+                how: quant_core::report::Clearance::Reported,
+            },
+        )
+    }
+
+    fn placed(at: i64, id: u64) -> JournalEntry {
+        JournalEntry::Placed {
+            at: Ts::from_nanos(at),
+            client_order_id: ClientOrderId(id),
+            venue_order_id: VenueOrderId(format!("{}", 100 + id)),
+            transact_ms: 1,
+        }
+    }
+
+    fn rejected(at: i64, id: u64) -> JournalEntry {
+        JournalEntry::Rejected {
+            at: Ts::from_nanos(at),
+            client_order_id: ClientOrderId(id),
+            reason: quant_core::execution::RejectReason::Venue,
+            cited: None,
+            breach: None,
+        }
+    }
+
+    fn unwatched(findings: &[Finding]) -> Vec<(u64, i64)> {
+        findings
+            .iter()
+            .filter_map(|f| match f {
+                Finding::Unwatched {
+                    client_order_id,
+                    lost_at,
+                } => Some((*client_order_id, lost_at.as_nanos())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_order_working_when_the_stream_was_lost_and_never_doubted_for_it_is_unwatched() {
+        // Seen red both ways: a check that skips `lost` lines misses order 1
+        // here, and one that ignores the raise flags order 2.
+        let entries = vec![
+            submitted(1, 10),
+            placed(20, 1),
+            submitted(2, 30),
+            placed(40, 2),
+            lost(100),
+            blind_raised(100, 2),
+        ];
+        let report = check(&entries);
+        assert_eq!(unwatched(&report.findings), [(1, 100)]);
+        assert_eq!(
+            report.findings.last().map(Finding::label),
+            Some("unwatched")
+        );
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn a_doubt_owed_by_a_loss_may_come_later_or_already_be_open() {
+        let entries = vec![
+            // Raised afterwards: a deferred cause, raised when REST answered.
+            submitted(1, 10),
+            lost(100),
+            placed(150, 1),
+            blind_raised(150, 1),
+            // Already open at a second loss: the venue does not raise a
+            // cause twice while it is open.
+            lost(200),
+            // Ended before the loss: not working.
+            submitted(2, 210),
+            filled_leaving(220, 2, "0"),
+            lost(300),
+        ];
+        assert_eq!(unwatched(&check(&entries).findings), []);
+
+        // Cleared, then lost again with no new raise: owed again.
+        let entries = vec![
+            submitted(1, 10),
+            placed(20, 1),
+            lost(100),
+            blind_raised(100, 1),
+            cleared(150, 1),
+            lost(200),
+        ];
+        assert_eq!(unwatched(&check(&entries).findings), [(1, 200)]);
+    }
+
+    #[test]
+    fn an_order_rest_refused_with_nothing_from_the_venue_missed_nothing_in_the_dark() {
+        // Its deferred cause was dropped: the order never existed.
+        let entries = vec![submitted(1, 10), lost(100), rejected(150, 1)];
+        assert_eq!(unwatched(&check(&entries).findings), []);
+        // With a placement, or anything the stream said, it existed, and a
+        // rejection after it does not excuse the missing doubt.
+        let entries = vec![submitted(1, 10), placed(20, 1), lost(100), rejected(150, 1)];
+        assert_eq!(unwatched(&check(&entries).findings), [(1, 100)]);
+        let entries = vec![
+            submitted(1, 10),
+            lost(100),
+            JournalEntry::Accepted {
+                at: Ts::from_nanos(120),
+                client_order_id: ClientOrderId(1),
+                venue_order_id: None,
+            },
+            rejected(150, 1),
+        ];
+        assert_eq!(unwatched(&check(&entries).findings), [(1, 100)]);
     }
 }
