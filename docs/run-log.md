@@ -533,7 +533,11 @@ kind is routine, it moves to counted with an argument, as a stranger's order
 did. A lost account stream does rest on a doubt, and that duty is written down:
 every order working across the blind stretch is in doubt (`account_blind`;
 `docs/live-run.md` §5 and §4 item 7's acceptance), and with nothing working
-nothing of this run's could have changed.
+nothing of this run's could have changed. Written down is not checked, though:
+the check reads no `account` line, so a venue that skipped the doubt would read
+*cleaner*, with nothing left in doubt. Item 7 adds a seventh finding,
+`unwatched`, for an order working at a `lost` line and never put in doubt for it
+(`docs/live-run.md` §5, *LiveVenue, decided before the code*).
 
 **Findings come before the empty verdict.** A file with no decision and no claim
 used to read NOTHING TO CHECK, exit 2, before anything else was looked at; a

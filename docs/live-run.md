@@ -640,9 +640,9 @@ feature.
    (§5). Behind it, `impl ExecutionVenue`. Accepted by a permutation test over
    every interleaving of the REST reply and the stream's reports, and by a test
    that losing the account stream puts every working order in doubt
-   (`account_blind`): `runlog check` treats an `account` line as covered by
-   those doubts and does not flag it. Designed before the code in §5, *LiveVenue,
-   decided before the code*.
+   (`account_blind`), which `runlog check` learns to verify: an order working
+   when the stream was lost and never put in doubt for it is a finding.
+   Designed before the code in §5, *LiveVenue, decided before the code*.
 8. **The `live` binary and a rehearsal.** Paper's session extracted so any venue
    can run it; a startup that records first and trades last; a refusal of any
    size whose floored exit would fall below the minimum notional at the current
@@ -1347,7 +1347,13 @@ interleaving:
 
 - the strategy is told the same events, compared without their stamps;
 - the journal holds the same lines as a multiset, compared without `at`;
-- the portfolio, `working()` and `ready` end the same;
+- the portfolio, `working()` and `ready` end the same, and `ready` ends
+  `Diverged` exactly when `journal::diverged` holds over the journal (§6, duty 8);
+- `runlog::check` (`crates/quant-explain/src/runlog.rs:301`) reports the same
+  findings. The multiset comparison cannot see order, and the check's doubt fold
+  can: a `cleared` written before its `raised` leaves the doubt open
+  (`runlog.rs:432-446`), so it shows as `in doubt` in one interleaving and not
+  in another;
 - no order has two terminals, and no trade id is booked twice.
 
 Scenarios: a market buy filled in one trade, and in three (a walk); filled in
@@ -1358,8 +1364,11 @@ silent; a report held behind a hole, against each REST answer but a refusal; and
 each with a `Blind` and `Subscribed` placed before, among and after the order's
 records, which is where a deferred cause meets a stream report before its REST
 answer. A contradiction is not a consistent truth and is tested on its own, and
-so is `IdInUse`, as a latch in each of the three phases. It lives in `quant-backtest`'s tests, which already link the engine, the
-writer and `quant-binance` (`crates/quant-backtest/Cargo.toml:14-25`).
+so is `IdInUse`, as a latch in each of the three phases. It lives in
+`quant-explain`'s tests, the one crate that may link the machine, the engine,
+the writer and `runlog::check` together: it sits at the top of the graph and
+nothing depends on it (`crates/quant-explain/Cargo.toml:10-15`), so taking the
+machine's crate as a dev-dependency costs nothing.
 
 Breaks that must redden it: `Placed` emitted as an acceptance; deduplicating by
 `I`; `Unknown` raised without the immediate clearing when the stream came first;
@@ -1372,11 +1381,28 @@ as heard.
 lost give `account { lost }` and one `doubt raised { account_blind }` each;
 `ready` answers `StreamDown`, then after the resubscribe `InDoubt`, then nothing
 once each order's next report clears it. The journal is then read by
-`runlog::check` (`crates/quant-explain/src/runlog.rs:301`), which must not flag
-the `account` line and must flag `in doubt` when a doubt is never cleared. That
-half lives in `quant-explain`'s tests, with `quant-backtest` and `quant-binance`
-as dev-dependencies: `quant-explain` sits at the top of the graph, and nothing
-comes to depend on it.
+`runlog::check`, which must flag `in doubt` when a doubt is never cleared.
+
+That check could not fail as first written. It asked that `runlog check` not
+flag the `account` line, and the check ignores `account` lines entirely
+(`runlog.rs:549-554`), so it held for any `LiveVenue`; worse, a `LiveVenue` that
+forgot to raise `account_blind` made the check *cleaner*, since no doubt means
+nothing left in doubt. So item 7 gives `runlog check` the coverage the
+`account` arm's comment already claims, as a seventh finding beside
+`docs/run-log.md` §9's six:
+
+| label | finding | from |
+|---|---|---|
+| `unwatched` | an order working when the account stream was lost that was never in doubt for it: what happened to it in the dark is recorded as known | each `account { lost }` line, against every order with a `submitted` line before it and no end before it |
+
+Such an order passes when it is in doubt for `account_blind` at the `lost` line
+or is raised for it afterwards, or when it ends in `rejected` or `never_landed`
+with no `placed` line and no line the stream produced (`accepted`, `filled`,
+`cancelled`): an order REST refused never existed, so its deferred cause was
+dropped (§2). Both directions are seen red before either is trusted: a
+`LiveVenue` that skips the raise makes the finding appear in the acceptance, and
+a check that skips `lost` lines misses it on a hand-built journal with no raise.
+The coverage half and the permutation test share `quant-explain`'s tests.
 
 **The machine's own tests**, each seen red under its break first:
 
@@ -1486,7 +1512,8 @@ Item 8 must enforce:
 **As commits**, each green: the helpers in `orders.rs` and `user_data.rs`
 (`Inbound::Foreign`, attributed errors, `Checked`); `journal::diverged`, with
 its own tests; the machine and its tests;
-the shell and the worker with theirs; the permutation and `account_blind` tests;
+the shell and the worker with theirs; `runlog check`'s `unwatched` finding,
+with its fixtures; the permutation and `account_blind` tests;
 the end-to-end test; the docs, then a grep for what they replace.
 
 #### 7. For the owner
