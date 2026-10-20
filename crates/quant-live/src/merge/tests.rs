@@ -10,8 +10,9 @@
 use super::*;
 use crate::fixtures::{self, btcusdt, ours, run};
 use quant_binance::orders::{FilterName, Refusal, RefusalCause, VenueError, WhyUnknown};
-use quant_core::instrument::{InstrumentDef, InstrumentRegistry};
-use quant_core::report::{Cited, EndedBy, Provenance};
+use quant_core::execution::RejectReason;
+use quant_core::instrument::{FilterBreach, InstrumentDef, InstrumentRegistry};
+use quant_core::report::{Cited, EndedBy, Landing, Provenance, RejectedWhy};
 
 /// A machine and a clock that moves ten nanoseconds per input.
 struct Bench {
@@ -913,6 +914,69 @@ fn what_the_shell_did_not_send_is_never_landed_or_a_refused_cancel() {
     });
     assert_eq!(lines(&refused), ["cancel_refused 1 unknown"]);
     assert_eq!(b.ready(), Ok(()), "an unknown cancel puts nothing in doubt");
+}
+
+/// The reason and the `why` of the one rejection in `out`.
+fn rejection(out: &[VenueReport]) -> (RejectReason, Option<RejectedWhy>) {
+    match out {
+        [VenueReport::Order(OrderReport::Rejected { reason, why, .. })] => (*reason, why.clone()),
+        other => panic!("not one rejection: {other:?}"),
+    }
+}
+
+#[test]
+fn a_rejection_keeps_the_venues_words_the_filter_it_named_and_why_nothing_left() {
+    // Criterion B reads `cited` and `breach` off the `rejected` line, and
+    // `lines` above flattens both away. Written out here by hand rather than
+    // through `orders.rs`'s own mapping, which would make the test agree with
+    // whatever the mapping says. Break: hand the engine `why: None`, or a
+    // `Cited` of zeros, or `RejectReason::Venue` for the refusal.
+    let mut b = Bench::heard();
+    b.submit(1, "0.001");
+    assert_eq!(
+        rejection(&b.refused(1)),
+        (
+            RejectReason::Malformed,
+            Some(RejectedWhy::Declined {
+                cited: Cited {
+                    http_status: Some(400),
+                    code: -1013,
+                    msg: VenueText::new("Filter failure: NOTIONAL"),
+                },
+                breach: Some(FilterBreach::MinNotional),
+            })
+        )
+    );
+    b.submit(2, "0.001");
+    let out = b.step(Input::Placement {
+        id: ClientOrderId(2),
+        placement: Placement::NotSent {
+            why: "connection refused".to_owned(),
+        },
+    });
+    assert_eq!(
+        rejection(&out),
+        (
+            RejectReason::Venue,
+            Some(RejectedWhy::NeverLanded(Landing::NotSent {
+                why: VenueText::new("connection refused"),
+            }))
+        )
+    );
+    b.submit(3, "0.001");
+    let out = b.step(Input::Unsent(Unsent::Order {
+        id: ClientOrderId(3),
+        why: "would not encode".to_owned(),
+    }));
+    assert_eq!(
+        rejection(&out),
+        (
+            RejectReason::Venue,
+            Some(RejectedWhy::NeverLanded(Landing::NotSent {
+                why: VenueText::new("would not encode"),
+            }))
+        )
+    );
 }
 
 #[test]

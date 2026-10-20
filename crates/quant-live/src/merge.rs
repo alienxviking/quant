@@ -52,12 +52,12 @@ use quant_binance::account::{self, AccountFrame, Request};
 use quant_binance::orders::{CancelReply, Placement};
 use quant_binance::user_data::{Concerns, Inbound, Translator, Unreadable};
 use quant_core::event::GapCause;
-use quant_core::execution::{ClientOrderId, RejectReason, VenueOrderId, VenueTradeId};
+use quant_core::execution::{ClientOrderId, VenueOrderId, VenueTradeId};
 use quant_core::fixed::Qty;
 use quant_core::instrument::InstrumentId;
 use quant_core::report::{
     AccountCause, AccountChange, AnomalyKind, CancelRefusal, Clearance, DoubtCause, DoubtChange,
-    FillIds, ForeignOutcome, Landing, Notice, OrderReport, RejectedWhy, VenueReport, VenueText,
+    FillIds, ForeignOutcome, Notice, OrderReport, VenueReport, VenueText,
 };
 use quant_core::time::Ts;
 use quant_engine::Unready;
@@ -356,13 +356,11 @@ impl Merge {
     pub fn step(&mut self, at: Ts, input: Input, out: &mut Vec<VenueReport>) {
         match input {
             Input::Submitted { id, qty } => self.submitted(at, id, qty, out),
-            Input::Placement { id, placement } => self.placement(at, id, placement, out),
+            Input::Placement { id, placement } => self.placement(at, id, &placement, out),
             Input::CancelReply { id, reply } => self.cancel_reply(at, id, &reply, out),
             Input::Unsent(Unsent::Order { id, why }) => {
-                let why = RejectedWhy::NeverLanded(Landing::NotSent {
-                    why: VenueText::new(&why),
-                });
-                self.refused_by_rest(at, id, Rest::NotSent, RejectReason::Venue, why, out);
+                let placement = Placement::NotSent { why };
+                self.refused_by_rest(at, id, Rest::NotSent, &placement, out);
             }
             Input::Unsent(Unsent::Cancel { id, why }) => out.push(notice(Notice::CancelRefused {
                 client_order_id: id,
@@ -464,7 +462,7 @@ impl Merge {
         &mut self,
         at: Ts,
         id: ClientOrderId,
-        placement: Placement,
+        placement: &Placement,
         out: &mut Vec<VenueReport>,
     ) {
         let Some(order) = self.orders.get(&id) else {
@@ -488,7 +486,7 @@ impl Merge {
                 client_order_id: _,
                 transact_time_ms,
             } => {
-                if let Some(named) = self.other_venue_id(id, &order_id) {
+                if let Some(named) = self.other_venue_id(id, order_id) {
                     self.contradiction(Some(id), &named, at, out);
                     return;
                 }
@@ -499,8 +497,8 @@ impl Merge {
                 order.venue_id.get_or_insert_with(|| order_id.clone());
                 out.push(notice(Notice::Placed {
                     client_order_id: id,
-                    venue_order_id: order_id,
-                    transact_ms: transact_time_ms,
+                    venue_order_id: order_id.clone(),
+                    transact_ms: *transact_time_ms,
                     ts: at,
                 }));
                 // The order may have been live in the dark.
@@ -508,19 +506,11 @@ impl Merge {
                     order.raise_deferred(id, at, out);
                 }
             }
-            Placement::Refused(refusal) => {
-                let reason = refusal.cause.reject_reason();
-                let why = RejectedWhy::Declined {
-                    cited: refusal.cited(),
-                    breach: refusal.cause.breach(),
-                };
-                self.refused_by_rest(at, id, Rest::Refused, reason, why, out);
+            Placement::Refused(_) => {
+                self.refused_by_rest(at, id, Rest::Refused, placement, out);
             }
-            Placement::NotSent { why } => {
-                let why = RejectedWhy::NeverLanded(Landing::NotSent {
-                    why: VenueText::new(&why),
-                });
-                self.refused_by_rest(at, id, Rest::NotSent, RejectReason::Venue, why, out);
+            Placement::NotSent { .. } => {
+                self.refused_by_rest(at, id, Rest::NotSent, placement, out);
             }
             Placement::Unknown { why } => {
                 let cause = why.cause();
@@ -561,15 +551,31 @@ impl Merge {
     /// A refusal by REST, or a request never sent: certain, so terminal,
     /// unless the stream has already mentioned the order, in which case the
     /// classifier was wrong about the venue and the order stays working.
+    ///
+    /// What the rejection says comes from `orders.rs`'s own mapping,
+    /// [`Placement::reject_reason`] and [`Placement::rejected_why`], so that
+    /// the venue's words and the filter it named are written down by one
+    /// piece of code wherever a rejection is made.
     fn refused_by_rest(
         &mut self,
         at: Ts,
         id: ClientOrderId,
         rest: Rest,
-        reason: RejectReason,
-        why: RejectedWhy,
+        placement: &Placement,
         out: &mut Vec<VenueReport>,
     ) {
+        // Both are `Some` for exactly the two answers that come here, a
+        // refusal and a request never sent; anything else is our plumbing.
+        let (Some(reason), Some(why)) = (placement.reject_reason(), placement.rejected_why())
+        else {
+            self.contradiction(
+                Some(id),
+                "an answer that is no rejection, handled as one",
+                at,
+                out,
+            );
+            return;
+        };
         let Some(order) = self.orders.get_mut(&id) else {
             self.contradiction(
                 Some(id),
