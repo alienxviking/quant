@@ -1582,6 +1582,7 @@ mod tests {
         assert_eq!(report.totals.account_sessions, 1);
         assert_eq!(report.totals.account_frames, 2);
         assert_eq!(report.totals.market_frames(), 3);
+        assert!(!report.verified_nothing(), "the market tree was read");
         assert_eq!(
             report.verdict(),
             "every discontinuity is explained by a record in the capture"
@@ -1604,11 +1605,15 @@ mod tests {
         assert_eq!(report.totals.frames, 3);
         assert_eq!(report.totals.market_frames(), 0);
         assert!(
-            report
-                .verdict()
-                .starts_with("NOTHING VERIFIED: no market frames"),
-            "{}",
-            report.verdict()
+            report.verified_nothing(),
+            "clean, and still nothing verified"
+        );
+        // The whole sentence, not its first words: a prefix check is how a lost
+        // line continuation put a run of spaces into the middle of it unseen.
+        assert_eq!(
+            report.verdict(),
+            "NOTHING VERIFIED: no market frames found under this root, only 3 of the \
+             account stream"
         );
     }
 

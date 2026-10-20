@@ -346,12 +346,29 @@ impl Report {
             "NOTHING VERIFIED: no capture frames found under this root".to_owned()
         } else if t.market_frames() == 0 {
             format!(
-                "NOTHING VERIFIED: no market frames found under this root, only {} of                  the account stream",
+                "NOTHING VERIFIED: no market frames found under this root, only {} of \
+                 the account stream",
                 t.account_frames
             )
         } else {
             "every discontinuity is explained by a record in the capture".to_owned()
         }
+    }
+}
+
+impl Report {
+    /// Whether the run verified nothing it is judged on: no market frame was
+    /// read, whatever the account tree held.
+    ///
+    /// Clean and empty are different answers, and the exit code has to say so
+    /// as the verdict does. A cron job or a run harness reads the code, not the
+    /// sentence, and exit 0 over a root with nothing in it is the false clean
+    /// bill of health the "nothing verified" verdict was written to prevent.
+    /// Errors still come first: a capture corrupt in its first block reads no
+    /// frames, and its findings are the reason to give.
+    #[must_use]
+    pub const fn verified_nothing(&self) -> bool {
+        self.totals.market_frames() == 0
     }
 }
 

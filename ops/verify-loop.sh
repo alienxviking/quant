@@ -16,6 +16,7 @@
 #   0  every discontinuity is explained
 #   1  something is not
 #   2  --reconcile could not run (a database problem, not a capture problem)
+#   3  nothing verified: no market frame under the root (logged as FAIL)
 #
 # Usage: verify-loop.sh ROOT END_EPOCH LOGDIR [INTERVAL] [FIRST_CHECK_SECONDS]
 #
