@@ -1047,9 +1047,22 @@ from hanging.
 
 **Per order** the machine keeps the request's side and quantity; what REST said
 (`Pending`, `Placed`, `Unknown`, `Refused`, `NotSent`); the venue's order id, from
-whichever names it first; whether the stream has reported on it (*heard*); the
-quantity booked and the trade ids booked; whether it has ended; its open doubt
-causes, a set; and any reports held behind a hole.
+whichever input names it first; whether the stream has **mentioned** the order
+and whether it has been **heard**; the quantity booked and the trade ids booked;
+whether it has ended, and whether REST or the stream ended it; its open doubt
+causes and its deferred ones, two sets; and any reports held behind a hole.
+
+*Mentioned* means any stream report about the order has arrived, held or
+released: the venue has the order. *Heard* means one has been **released**
+(rule 2): the stream's account of the order is continuous from its start. A
+report held behind a hole mentions an order without hearing it. The two are
+kept apart because they answer different questions. Whether REST can still
+refuse the order is a question of existence, so it reads *mentioned*; whether
+an `Unknown` is already answered is a question of whether we know what happened,
+so it reads *heard*. With one word for both, a held report followed by `Unknown`
+and `Unknown` followed by a held report would write different lines, and a held
+report followed by `Refused` would leave an order the stream proved exists
+recorded as rejected, in doubt for ever and with nothing latched.
 
 **The rules.**
 
@@ -1068,30 +1081,42 @@ causes, a set; and any reports held behind a hole.
    past a hole, and keep what came after it.
 3. **Fills deduplicated by trade id**, `t` (user-data-stream.md:105), which the
    translator reads in place of the execution id `I` (`user_data.rs:622-630`). A
-   trade id already booked is `anomaly { duplicate_trade }` and books nothing.
-   Nothing produces one today, since the listener never overlaps two
+   trade id already booked is `anomaly { duplicate_trade }` and books nothing,
+   **in every phase and before every other rule but 6** (*Precedence*, below), so
+   a resent copy of an order's last trade is a duplicate and not a fill after the
+   order's end. Nothing produces one today, since the listener never overlaps two
    subscriptions (item 6, *not done*); if a later listener does, this is what makes
-   it safe, and the anomaly is what moves to counted.
+   its resent trades safe, and the anomaly is what moves to counted. A resent
+   `NEW` or end is not covered: such a listener must first say how it tells a
+   resent frame from a contradiction, because rule 4 and *Precedence* treat
+   both as the venue being wrong.
 4. **One terminal per order.** A second end is `anomaly { second_end }`. A fill
-   after an end is `anomaly { after_end }`, `Diverged`, and the fill itself
-   handed over as an order report, which the engine, no longer working the
-   order, writes down as `orphaned` with its ids and books nowhere
-   (`lib.rs:1053-1082`). That is the only report handed over after an end. The
-   trait asks for none before an order's last fill (`venue.rs:159-161`) so that
-   the engine never books a fill for an order it has forgotten, and here it does
-   not; a contract written for a venue that is right must not make the record
-   drop money when the venue is wrong. The trait's docs say so in item 7's pull
-   request.
+   after an end is `anomaly { after_end }`, and the fill itself is handed over as
+   an order report, which the engine, no longer working the order, writes down
+   as `orphaned` with its ids and books nowhere (`lib.rs:1053-1082`); every
+   orphaned fill latches `Diverged`. That is the only report handed over after an
+   end. The trait asks for none before an order's last fill (`venue.rs:159-161`)
+   so that the engine never books a fill for an order it has forgotten, and here
+   it does not; a contract written for a venue that is right must not make the
+   record drop money when the venue is wrong. The trait's docs say so in item 7's
+   pull request.
 5. **An acceptance comes first.** If the first released report about an order is
    not `NEW`, which happens only when `NEW` fell in a hole, an `Accepted` naming
    the report's venue order id is emitted before it, at its stamp. A trade proves
-   the venue had the order, and every lifecycle the engine tells, from either
-   venue, then begins with an acceptance (`quant-sim/src/lib.rs:650-660`).
+   the venue had the order. So every lifecycle `LiveVenue` tells begins with an
+   acceptance or is a rejection alone, which is the simulator's shape too once
+   §6's simulator change lands (`quant-sim/src/lib.rs:650-690` announces first
+   today).
 6. **The venue's id for an order is checked, not trusted.** The first `orderId`
-   heard, from `Placed` or the stream's `i` (user-data-stream.md:98), is the
-   order's. A later one that differs is `anomaly { contradiction }` and
-   `Diverged`: two orders answering to one name of ours, which `RunTag` exists to
-   prevent (`user_data.rs:115-121`).
+   any input names is the order's: `Placed`'s (`orders.rs:592-598`), a stream
+   report's `i` (user-data-stream.md:98), held reports included, or a cancel's
+   `Acknowledged { order_id }` (`orders.rs:644`). Every later one, from any of the
+   three and in every phase, is compared with it. One that differs is
+   `anomaly { contradiction }` and `Diverged`, and the input that carried it
+   changes nothing else: two orders answering to one name of ours, which
+   `RunTag` exists to prevent (`user_data.rs:115-121`). Comparing only the
+   stream against itself would miss a `Placed` and a `NEW` that disagree, in
+   either order.
 7. **A cancel names the order in `C`, not `c`.** On a `CANCELED` report `c` is the
    cancel request's id, which the venue generates because we send none
    (`orders.rs:331-344`), and which replaces the order's own (web-socket-api.md:4181).
@@ -1101,6 +1126,33 @@ causes, a set; and any reports held behind a hole.
    holds. And `Placed`'s order id is the one name that still finds a cancelled
    order, which is why `placed` is journalled (`report.rs:396-401`) and what slice
    (d)'s lookup will use.
+
+**Precedence.** Several rules can match one stream report: a resent copy of an
+older trade has a booked trade id *and* a `z` behind what is booked. So a report
+about one of our orders is judged in this order, and the first that applies
+decides it alone:
+
+1. its `orderId` differs from the order's (rule 6): `contradiction`, `Diverged`;
+2. a trade whose trade id is booked (rule 3): `duplicate_trade`;
+3. the order has ended. Ended by REST, any report is `contradiction` and
+   `Diverged`, a trade among them also handed over as an orphan (*REST against
+   the stream*). Ended by the stream, a trade is `after_end` and an orphan, an end
+   is `second_end`, and a `NEW` is `after_end`;
+4. a `NEW` about an order already heard: `contradiction` and `Diverged`, whatever
+   its `z`, since a `NEW` always carries `z` of zero and the order may have
+   filled since;
+5. `z` behind what is booked: `contradiction` and `Diverged`;
+6. `z` ahead of what is booked, or reports already held for the order: held, and
+   `fills_missed` (rule 2);
+7. otherwise it is released.
+
+**Every `contradiction` latches `Diverged`.** The first draft let a second `NEW`
+through as a contradiction without the latch, so the kind on a line did not say
+whether the process had stopped trading. A contradiction is the venue saying two
+things about one order of ours, and nothing this system runs can make the venue
+repeat itself (rule 3); it needs a person whichever it is. One rule also gives
+item 8 a predicate over the journal (§6, duty 8) that does not have to know
+which contradiction it was.
 
 **Doubt**, which is where interleavings could disagree, so its rules are written
 to make them agree.
@@ -1115,33 +1167,49 @@ to make them agree.
 - **Only the stream clears it.** The first released report about the order
   clears every open cause, one `cleared { reported }` line per cause, before the
   report itself: one per cause, so every raised doubt has its clearing in
-  whatever order they came. REST never clears one: what REST did not know, the
-  stream may already have answered, and not the reverse. `cleared { looked_up }`
-  is slice (d)'s.
-- **`Unknown` about an order the stream has already reported on is raised and
-  cleared at once.** The stream has said the order exists and what happened to
-  it, and whatever a later blind stretch may hide has its own `account_blind`.
-  This is what makes "REST answered first" and "the stream answered first" write
-  the same lines.
-- **A doubt about an order REST has not answered for and the stream has never
-  mentioned is deferred.** Losing the stream, or an unreadable report, marks it,
-  and the REST answer decides: `Placed` or `Unknown` raises the marked causes,
-  because the order may have been live in the dark; `Refused` or `NotSent` drops
-  them, because an order that never existed missed nothing. Otherwise an order
-  the venue refused would be in doubt or not according to whether the stream
-  dropped before or after the refusal came back.
+  whatever order they came. A held report clears nothing, because nothing about
+  the order is known past its hole. REST never clears one: what REST did not
+  know, the stream may already have answered, and not the reverse.
+  `cleared { looked_up }` is slice (d)'s.
+- **`Unknown` about an order already heard is raised and cleared at once.** The
+  stream has said the order exists and what happened to it, and whatever a later
+  blind stretch may hide has its own `account_blind`. This is what makes "REST
+  answered first" and "the stream answered first" write the same lines. About an
+  order only mentioned, `Unknown` is raised and stays open, as it would had it
+  come first: the held report's own `fills_missed` is open beside it either way.
+- **`IdInUse` latches `Diverged` in every phase**, not only when REST answers
+  first. It says some order is open under a name of ours that should mean one
+  order (`orders.rs:855-870`), which is as true after the stream has spoken as
+  before; latching it in one phase only made `ready` end differently by which
+  source answered first.
+- **A cause about an order REST has not answered for and the stream has never
+  mentioned is deferred**, not raised. Losing the stream, or an unreadable report
+  that cannot be attributed, marks it. The first of three things resolves it.
+  `Placed` or `Unknown` raises it, because the order may have been live in the
+  dark. `Refused` or `NotSent` drops it, because an order that never existed
+  missed nothing. A stream report about the order raises it, because the venue
+  has the order; and when that report is released, its release then clears it
+  with every other open cause, so the deferred cause is raised and cleared in one
+  step. Without the third, an order the stream reported before REST answered
+  kept a deferred cause nothing would ever raise or drop, and stayed `InDoubt`
+  for the rest of the process, while the same order with REST first wrote a
+  raise and a clearing and ended ready.
 - An order in doubt is never rejected on that account (§5, *an unknown outcome is
   not a rejection*).
 
 **REST against the stream.** A refusal is certain only because the classifier
 calls nothing refused that may have been placed (`orders.rs:80-89`). If the
-stream reports on an order REST refused or never sent, before that answer or
-after it, the classifier was wrong about the venue: an order exists that our
-record says does not, and it may trade with nobody watching. That is
-`anomaly { contradiction }` and `Diverged`, never a second terminal, and a fill
-on it is an orphan (rule 4).
+stream mentions an order REST refused or never sent, before that answer or after
+it, held or released, the classifier was wrong about the venue: an order exists
+that our record says does not, and it may trade with nobody watching. That is
+`anomaly { contradiction }` and `Diverged`, never a second terminal. When REST
+answered first, the order has already ended and a fill on it is an orphan (rule
+4). When the stream came first, no `Rejected` is emitted and the order stays
+working, so its fills are booked; both orders latch, and contradictions are
+tested on their own (5).
 
-**Cancels.** `Acknowledged` emits nothing; the stream says how the order ended.
+**Cancels.** `Acknowledged` emits nothing unless it names another order (rule 6);
+the stream says how the order ended.
 `NotOpen`, `Refused`, `Unknown` and `NotSent` each emit `cancel_refused` with the
 venue's words. None changes the order, and an `Unknown` cancel puts nothing in
 doubt, because the stream decides whether the order ended and is still
@@ -1180,37 +1248,37 @@ an order report and is withheld there as a stray or an orphan
 account events the machine does not read (`outboundAccountPosition`,
 `balanceUpdate`), are counted and not journalled.
 
-**The state table.** Phases: **Sent** (the stream has not reported on it, not
-ended), **Live** (the stream has, not ended), **Ended**. Doubts and held reports
-lie across them.
+**The state table.** Phases: **Sent** (not heard, not ended), **Live** (heard,
+not ended), **Ended**, by REST or by the stream. Doubts, deferred causes and held
+reports lie across them. Stream reports are judged by *Precedence* first; the
+rows below are what is left once its steps 1 to 5 have not applied.
 
-| Phase | Heard | Emits | Next |
+| Phase | Input | Emits | Next |
 |---|---|---|---|
-| Sent | `Placed` | `placed`; deferred doubts raised | Sent |
-| Sent | `Refused(r)` | `Rejected { reason, declined { cited, breach } }`; deferred doubts dropped | Ended |
-| Sent | `Unknown(w)` | `doubt raised { cause, said }`; deferred doubts raised; `IdInUse` latches `Diverged` too (`orders.rs:855-870`: "that needs a person") | Sent |
-| Sent | `NotSent`, or an `Unsent` order | `Rejected { Venue, never_landed { not_sent } }`; deferred doubts dropped | Ended |
-| Sent | released `NEW` | open causes cleared; `Accepted` | Live |
-| Sent | released trade or end | cleared; `Accepted` (rule 5); the fill or the end | Live or Ended |
-| Sent, Live | a report past a hole | `doubt raised { fills_missed }`, once; held | unchanged |
-| Sent, Live | the stream lost | `account_blind` raised, or deferred | unchanged |
+| Sent | `Placed` | `placed`; deferred causes raised | Sent |
+| Sent, not mentioned | `Refused(r)` | `Rejected { reason, declined { cited, breach } }`; deferred causes dropped | Ended by REST |
+| Sent, not mentioned | `NotSent`, or an `Unsent` order | `Rejected { Venue, never_landed { not_sent } }`; deferred causes dropped | Ended by REST |
+| Sent, mentioned | `Refused`, `NotSent` | `anomaly { contradiction }`; `Diverged` | Sent |
+| Sent | `Unknown(w)` | `doubt raised { cause, said }`; deferred causes raised | Sent |
+| Sent | released `NEW` | deferred causes raised; every open cause cleared; `Accepted` | Live |
+| Sent | released trade or end | deferred causes raised; every open cause cleared; `Accepted` (rule 5); the fill or the end | Live, or Ended by the stream |
+| Sent, Live | a report held (*Precedence* 6) | deferred causes raised; `doubt raised { fills_missed }`, once | unchanged |
+| Sent, Live | the stream lost | `account_blind` raised where REST answered or the stream mentioned, deferred elsewhere | unchanged |
 | Live | `Placed` | `placed` | Live |
-| Live | `Unknown` | raised and cleared at once | Live |
+| Live | `Unknown(w)` | raised and cleared at once | Live |
 | Live | `Refused`, `NotSent` | `anomaly { contradiction }`; `Diverged` | Live |
-| Live | released trade, `remaining` above zero | cleared; `Filled` with its ids | Live |
-| Live | released trade, `remaining` zero | cleared; `Filled` with its ids | Ended |
-| Live | released end | cleared; `Cancelled` with how it ended | Ended |
-| Live | a trade id already booked | `anomaly { duplicate_trade }` | Live |
-| Live | `z` behind, or another `orderId` | `anomaly { contradiction }`; `Diverged` | Live |
-| Live | a second `NEW` | `anomaly { contradiction }` | Live |
+| Live | released trade, `remaining` above zero | every open cause cleared; `Filled` with its ids | Live |
+| Live | released trade, `remaining` zero | every open cause cleared; `Filled` with its ids | Ended by the stream |
+| Live | released end | every open cause cleared; `Cancelled` with how it ended | Ended by the stream |
 | Ended | `Placed` | `placed` | Ended |
-| Ended | `Unknown` | raised and cleared at once | Ended |
-| Ended, by the stream | `Refused`, `NotSent` | `anomaly { contradiction }`; `Diverged` | Ended |
-| Ended | a trade | `anomaly { after_end }`; the fill, as an orphan; `Diverged` | Ended |
-| Ended | an end | `anomaly { second_end }` | Ended |
-| Ended, by the stream | `NEW` | `anomaly { after_end }` | Ended |
-| Ended, by REST | `NEW` | `anomaly { after_end }`; `Diverged` | Ended |
+| Ended by the stream | `Unknown(w)` | raised and cleared at once | Ended |
+| Ended by the stream | `Refused`, `NotSent` | `anomaly { contradiction }`; `Diverged` | Ended |
+| any | `Unknown(IdInUse)` | the row for its phase, and `Diverged` | as that row |
+| any | `Placed`, or `Acknowledged`, naming another `orderId` | `anomaly { contradiction }`; `Diverged`; nothing else | unchanged |
 | any | a `CancelReply` but `Acknowledged`, or an `Unsent` cancel | `cancel_refused` | unchanged |
+
+REST answers once per order, so an order ended by REST never meets a second REST
+answer, and only *Precedence* step 3 reaches it.
 
 `reason` is `RefusalCause::reject_reason` (`orders.rs:727-736`); item 7 adds
 `RefusalCause::breach`, `Refusal::cited` and `WhyUnknown`'s cause and words, so
@@ -1223,7 +1291,7 @@ nothing (`&self`, `venue.rs:99-100`).
 
 | `Unready` | When `LiveVenue` answers it |
 |---|---|
-| `Diverged` | Latched by a foreign trade on our symbol, a fill after an order's end, REST and the stream disagreeing about whether an order exists, two venue ids for one of ours, or `IdInUse`. Never cleared in the process (`venue.rs:65-75`). |
+| `Diverged` | Latched by every `contradiction` (two venue ids for one of ours, REST and the stream disagreeing about whether an order exists, a second `NEW`, a `z` behind what is booked), every orphaned fill (a fill after an order's end, a fill about an id of this run this machine never sent), a foreign trade on our symbol, and `IdInUse` in any phase. Never cleared in the process (`venue.rs:65-75`), and not cleared by a restart either: item 8 reads it back off the journal (§6, duty 8). |
 | `Unchecked` | False at construction, which takes a `Checked`: minted only by the checks `venue-check` runs (`trade.rs:986`, `:1070`, `:1104`), and carrying the measured offset every order and logon is stamped with. True after a failing `Check`, false after a passing one. **Not** set by an order refused `-1021` or for its key: that is a rejection with the venue's code on its line, every later order would be refused the same way and harmlessly, and a latch on `-1021` would also fire on an order that only waited too long in the queue. |
 | `StreamDown` | From construction until the subscription is accepted, and from each loss until the next. Never across a `LocalOverflow`. |
 | `InDoubt` | While any order has an open doubt cause, a deferred one, or a held report. |
@@ -1282,15 +1350,19 @@ Scenarios: a market buy filled in one trade, and in three (a walk); filled in
 part, then `EXPIRED`; a resting limit cancelled, answered `Acknowledged` and
 answered `NotOpen`; a cancel that lost the race; each `WhyUnknown`, with the
 stream reporting and with it silent; `Refused` and `NotSent` with the stream
-silent; and each with a `Blind` and `Subscribed` placed before, among and after
-the order's records. A contradiction is not a consistent truth and is tested on
-its own. It lives in `quant-backtest`'s tests, which already link the engine, the
+silent; a report held behind a hole, against each REST answer but a refusal; and
+each with a `Blind` and `Subscribed` placed before, among and after the order's
+records, which is where a deferred cause meets a stream report before its REST
+answer. A contradiction is not a consistent truth and is tested on its own, and
+so is `IdInUse`, as a latch in each of the three phases. It lives in `quant-backtest`'s tests, which already link the engine, the
 writer and `quant-binance` (`crates/quant-backtest/Cargo.toml:14-25`).
 
 Breaks that must redden it: `Placed` emitted as an acceptance; deduplicating by
 `I`; `Unknown` raised without the immediate clearing when the stream came first;
 one `cleared` line for several causes; `account_blind` raised on an order REST
-has not answered for; a REST refusal emitted after the stream reported.
+has not answered for; a REST refusal emitted after the stream reported; a
+released report that leaves a deferred cause unresolved; a held report counted
+as heard.
 
 **`account_blind`**, item 7's second acceptance: two working orders and the stream
 lost give `account { lost }` and one `doubt raised { account_blind }` each;
@@ -1307,6 +1379,9 @@ comes to depend on it.
 | Asserts | Break |
 |---|---|
 | a duplicate trade id books once, beside an anomaly | deduplicate by `I`, or not at all |
+| a resent copy of an order's last trade is `duplicate_trade`, not `after_end`, and latches nothing | judge the end before the trade id |
+| a second `NEW` before any fill, whose `z` of zero continues what is booked, is a `contradiction` and `Diverged` | judge it by `z` alone, which releases it |
+| `Placed`, then `Acknowledged` naming another order id: `Diverged` | compare the stream's ids only |
 | a hole holds every later report and raises `fills_missed` once | release past the hole |
 | a fill after an end is an orphan, an anomaly and `Diverged`; a second end only an anomaly | emit the second end |
 | `Refused` after `NEW`, and `NEW` after `Refused`: `Diverged`, no second terminal | emit the refusal |
@@ -1384,9 +1459,27 @@ Item 8 must enforce:
    reproduce only the entries the stream produced. The REST answers come back off
    their own journal lines, and the machine being pure is what makes the two
    together replayable at all.
+8. **A latch survives a restart.** `Diverged` lives in the process, and duty 6
+   catches a restart only while orders were working: a stranger's trade with
+   nothing working, then a clean stop and a restart on the same journal, would
+   trade again against a position nobody knows. That is M6's *a kill switch that
+   forgets is not a kill switch* (`RiskEngine::recover`, `risk.rs:305`), so the
+   journal answers it. `journal::diverged(entries)`, in `quant-engine` beside
+   `recover_risk` (`journal.rs:1493`), is true when the journal holds a line that
+   latches: an `anomaly { contradiction }`, an `orphaned` fill, a `foreign` line
+   with a trade, or a `doubt raised { id_in_use }`. When it is true, item 8 records
+   and does not trade, as for any failed gate, until a person starts a new journal
+   under a new run tag (`venue.rs:65-75`). No new line is written for the latch:
+   the lines that caused it are already there, and a `diverged` line beside them
+   would be a second record of one fact that must agree with the first for ever.
+   Instead the two are made to agree under test: in the machine's and the
+   permutation tests, `ready` ends `Diverged` exactly when `journal::diverged`
+   holds over that run's journal. The machine latches from what it heard, the
+   predicate from what was written, and neither is derived from the other.
 
 **As commits**, each green: the helpers in `orders.rs` and `user_data.rs`
-(`Inbound::Foreign`, attributed errors, `Checked`); the machine and its tests;
+(`Inbound::Foreign`, attributed errors, `Checked`); `journal::diverged`, with
+its own tests; the machine and its tests;
 the shell and the worker with theirs; the permutation and `account_blind` tests;
 the end-to-end test; the docs, then a grep for what they replace.
 
