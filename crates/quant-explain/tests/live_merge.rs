@@ -295,6 +295,14 @@ fn run(orders: &[(OrderRequest, bool)], script: &[Item]) -> Ran {
     let mut engine =
         Engine::new(source, venue, AllowAll, probe, cash).observing_fills(Box::new(writer));
     engine.run().expect("the script ends cleanly");
+    // What the engine believes, for `journal::agrees` to set against a fold
+    // of the lines: the check `reconcile` and `explain --check-journal` make.
+    let end = i64::try_from(script.len()).expect("a short script") + 2;
+    write(
+        &journal,
+        &JournalEntry::checkpoint(Ts::from_nanos(end * 1_000), engine.portfolio()),
+    )
+    .expect("checkpoint");
 
     let entries = journal::read(&path).expect("journal reads").entries;
     std::fs::remove_file(&path).expect("journal removed");
@@ -371,6 +379,11 @@ fn finding(finding: &Finding) -> String {
 fn invariants(name: &str, ran: &Ran) {
     let outcome = &ran.outcome;
     assert_eq!(
+        journal::agrees(&ran.entries),
+        journal::Agreement::Agrees,
+        "{name}: the engine's checkpoint and a fold of the journal disagree"
+    );
+    assert_eq!(
         outcome.ready == Err(Unready::Diverged),
         journal::diverged(&ran.entries),
         "{name}: the machine's latch and the journal's disagree: {outcome:#?}"
@@ -423,6 +436,31 @@ fn invariants(name: &str, ran: &Ran) {
     trades.sort();
     trades.dedup();
     assert_eq!(trades.len(), booked, "{name}: a trade id booked twice");
+}
+
+/// What the check may say about a consistent truth, set against what the
+/// machine says: an order in doubt exactly when `ready` says so, unless it
+/// latched first, and a duplicate trade only where one was resent. The
+/// equality across interleavings cannot see a finding every interleaving
+/// shares.
+fn findings_fit(name: &str, outcome: &Outcome) {
+    let in_doubt = outcome.findings.iter().any(|f| f.starts_with("in doubt "));
+    let duplicate = outcome
+        .findings
+        .iter()
+        .any(|f| f.ends_with(" DuplicateTrade"));
+    for finding in &outcome.findings {
+        assert!(
+            finding.starts_with("in doubt ") || finding.ends_with(" DuplicateTrade"),
+            "{name}: {finding}"
+        );
+    }
+    if outcome.ready == Ok(()) {
+        assert!(!in_doubt, "{name}: {:?}", outcome.findings);
+    } else if outcome.ready == Err(Unready::InDoubt) {
+        assert!(in_doubt, "{name}: {:?}", outcome.findings);
+    }
+    assert_eq!(duplicate, name.contains("resent"), "{name}");
 }
 
 /// Every way to merge `rest` into `stream`, each kept in its own order.
@@ -868,6 +906,7 @@ fn every_interleaving_of_rest_and_the_stream_tells_and_records_the_same() {
                 };
                 assert_eq!(&ran.outcome.ready, ready, "{name}: {script:#?}");
                 assert_eq!(ran.outcome.portfolio.fills(), *fills, "{name}");
+                findings_fit(&name, &ran.outcome);
                 if let Some((before, outcome)) = &first {
                     assert_eq!(
                         &ran.outcome, outcome,
