@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 835 tests green in debug
-and release, clippy and fmt clean, ~69,500 lines across 13 crates.
+same window exactly, on both symbols, to the satoshi. 840 tests green in debug
+and release, clippy and fmt clean, ~69,900 lines across 13 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -2408,7 +2408,19 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   test seen red under its break. Its first run found `runlog check`'s doubt
   fold reading a clearing as the end of every cause, so the check's verdict
   depended on which socket spoke first; a clearing now answers the latest
-  open cause, and each open cause is a finding.
+  open cause, and each open cause is a finding. Two reviews of the branch then
+  found four things the machine got wrong and one it had not been asked: the
+  shell's `Unsent` skipped the guard that a request is answered once (two
+  terminals, a placed order rejected, a doubt stuck on an ended order) and
+  latched when no `Submitted` came first; a stranger's trade that could not be
+  read latched nothing, and now writes `anomaly { unreadable_foreign_trade }`;
+  `Placement::rejected_why`, "the one mapping", was built and not called, with
+  the machine's own copy untested; and a cancel acknowledged for an order REST
+  refused is now the contradiction a stream report would be. The permutation
+  test now also checks the journal against a checkpoint, and the findings
+  against `ready`, since equality across interleavings cannot see a mistake
+  they all share. Held reports are not deduplicated by trade id, which slice
+  (d)'s release owes (`docs/live-run.md` §6).
 
   **What remains in (c) is item 7's shell and item 8 of `docs/live-run.md`
   §4**: `LiveVenue` itself, with its request worker, channels, `wire`,

@@ -957,6 +957,9 @@ impl Merge {
             order.mentioned = true;
             order.raise_deferred(id, at, out);
             order.raise(id, DoubtCause::FillsMissed, None, at, out);
+            // Not deduplicated by trade id: step 2 reads the ids booked, so a
+            // resent copy of a held trade is held again. Slice (d)'s release
+            // must deduplicate (`docs/live-run.md` §6).
             order.held.push(report);
             return;
         }

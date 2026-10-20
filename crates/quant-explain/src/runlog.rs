@@ -32,8 +32,9 @@
 //! # What a venue said that the record cannot account for
 //!
 //! From schema 3 a live run writes down what its venue says beside its own
-//! decisions, and five kinds of line are things the run's record does not
-//! account for, each a finding:
+//! decisions, and six things in it are what the run's record does not account
+//! for, each a finding: five kinds of line, and an order the `lost` lines
+//! show was not watched:
 //!
 //! - an `orphaned` fill, which no order of this run explains: money moved,
 //!   and neither the portfolio nor its checkpoints saw it;
@@ -43,8 +44,8 @@
 //! - a `doubt` raised and never cleared, about an order never seen to end,
 //!   before the doubt or after it;
 //! - an `anomaly`, a report the run could not take at its word: unreadable,
-//!   a trade id already booked, a report after an order's end, a second end,
-//!   or a contradiction. Each is a place where our model of the venue failed,
+//!   a stranger's trade unreadable, a trade id already booked, a report after
+//!   an order's end, a second end, or a contradiction. Each is a place where our model of the venue failed,
 //!   which invariant 5 says is loud, and the record holds the venue's text
 //!   but cannot fold it into its account. No doubt has to stand beside one
 //!   for the check to see it: most kinds have no doubt cause that fits, and
