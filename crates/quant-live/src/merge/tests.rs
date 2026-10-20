@@ -916,6 +916,72 @@ fn what_the_shell_did_not_send_is_never_landed_or_a_refused_cancel() {
     assert_eq!(b.ready(), Ok(()), "an unknown cancel puts nothing in doubt");
 }
 
+fn unsent(id: u64) -> Input {
+    Input::Unsent(Unsent::Order {
+        id: ClientOrderId(id),
+        why: "would not encode".to_owned(),
+    })
+}
+
+#[test]
+fn an_orders_request_is_answered_once_whether_rest_or_the_shell_answers_it() {
+    // Break: hand `Unsent::Order` straight to the rejection, past the guard
+    // REST's answers go through, which gave two terminals for one order, a
+    // placed order rejected, and a doubt on an ended order for ever.
+    let mut b = Bench::heard();
+    b.submit(1, "0.001");
+    assert_eq!(lines(&b.step(unsent(1))), ["never_landed 1"]);
+    assert_eq!(lines(&b.step(unsent(1))), ["anomaly 1 Contradiction"]);
+    assert_eq!(b.ready(), Err(Unready::Diverged));
+
+    let mut b = Bench::heard();
+    b.submit(1, "0.001");
+    b.placed(1, 100);
+    assert_eq!(lines(&b.step(unsent(1))), ["anomaly 1 Contradiction"]);
+    assert_eq!(b.ready(), Err(Unready::Diverged));
+    // Still working: the stream says how it ends.
+    assert_eq!(
+        lines(&b.frame(&fixtures::trade(
+            &ours(1),
+            100,
+            "0.001",
+            "0.001",
+            "0.001",
+            7
+        ))),
+        ["accepted 1 100", "filled 1 0.001 left 0 t=7"]
+    );
+
+    let mut b = Bench::heard();
+    b.submit(1, "0.001");
+    b.unknown(1, WhyUnknown::TimedOut);
+    assert_eq!(lines(&b.step(unsent(1))), ["anomaly 1 Contradiction"]);
+    assert_eq!(b.ready(), Err(Unready::Diverged));
+
+    // And REST after the shell.
+    let mut b = Bench::heard();
+    b.submit(1, "0.001");
+    b.step(unsent(1));
+    assert_eq!(lines(&b.refused(1)), ["anomaly 1 Contradiction"]);
+}
+
+#[test]
+fn an_order_the_shell_refused_before_submitting_it_never_landed_and_latches_nothing() {
+    // Break: require a `Submitted` first, which latched `Diverged` for a
+    // harmless local failure and left the engine's order working for ever.
+    let mut b = Bench::heard();
+    assert_eq!(lines(&b.step(unsent(1))), ["never_landed 1"]);
+    assert_eq!(b.ready(), Ok(()));
+    // The other side: a submission under that id afterwards is still two
+    // stories about one request.
+    let after = b.step(Input::Submitted {
+        id: ClientOrderId(1),
+        qty: "0.001".parse().expect("qty"),
+    });
+    assert_eq!(lines(&after), ["anomaly 1 Contradiction"]);
+    assert_eq!(b.ready(), Err(Unready::Diverged));
+}
+
 /// The reason and the `why` of the one rejection in `out`.
 fn rejection(out: &[VenueReport]) -> (RejectReason, Option<RejectedWhy>) {
     match out {

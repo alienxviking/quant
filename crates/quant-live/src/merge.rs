@@ -105,6 +105,12 @@ pub enum Input {
 pub enum Unsent {
     /// An order that would not encode, or reached `submit` when it should not
     /// have: certain never to have reached the venue, so a `never_landed`.
+    ///
+    /// With or without an [`Input::Submitted`] before it, since the shell may
+    /// refuse an order before it says one is about to go; a `Submitted` after
+    /// it is a second submission under one id. After a `Submitted` it is the
+    /// request's one answer, as REST's would be: a second answer, from either,
+    /// is a contradiction.
     Order { id: ClientOrderId, why: String },
     /// A cancel for an order ended or never sent, a second cancel for an order
     /// whose cancel is held, or one after the shell stopped sending.
@@ -359,8 +365,13 @@ impl Merge {
             Input::Placement { id, placement } => self.placement(at, id, &placement, out),
             Input::CancelReply { id, reply } => self.cancel_reply(at, id, &reply, out),
             Input::Unsent(Unsent::Order { id, why }) => {
-                let placement = Placement::NotSent { why };
-                self.refused_by_rest(at, id, Rest::NotSent, &placement, out);
+                // The shell may refuse an order before it says one is about
+                // to go, so this needs no `Submitted`. After one, it is the
+                // request's one answer, through the same guard as REST's.
+                self.orders
+                    .entry(id)
+                    .or_insert_with(|| Order::new(Qty::ZERO));
+                self.placement(at, id, &Placement::NotSent { why }, out);
             }
             Input::Unsent(Unsent::Cancel { id, why }) => out.push(notice(Notice::CancelRefused {
                 client_order_id: id,
@@ -438,22 +449,7 @@ impl Merge {
             );
             return;
         }
-        self.orders.insert(
-            id,
-            Order {
-                qty,
-                rest: Rest::Pending,
-                venue_id: None,
-                mentioned: false,
-                heard: false,
-                booked: Qty::ZERO,
-                trades: BTreeSet::new(),
-                ended: None,
-                open: Vec::new(),
-                deferred: Vec::new(),
-                held: Vec::new(),
-            },
-        );
+        self.orders.insert(id, Order::new(qty));
     }
 
     /// The REST answer to placing an order: the design's rows for `Placed`,
@@ -474,10 +470,11 @@ impl Merge {
             );
             return;
         };
-        // REST answers once per order: a second answer is our own plumbing
-        // telling two stories about one request.
+        // A request is answered once, by REST or by the shell's `Unsent`: a
+        // second answer is our own plumbing telling two stories about one
+        // request.
         if order.rest != Rest::Pending {
-            self.contradiction(Some(id), "a second REST answer about one order", at, out);
+            self.contradiction(Some(id), "a second answer to one order's request", at, out);
             return;
         }
         match placement {
@@ -1044,6 +1041,23 @@ enum Kind {
 }
 
 impl Order {
+    /// An order of `qty` that nothing has been heard about.
+    const fn new(qty: Qty) -> Self {
+        Self {
+            qty,
+            rest: Rest::Pending,
+            venue_id: None,
+            mentioned: false,
+            heard: false,
+            booked: Qty::ZERO,
+            trades: BTreeSet::new(),
+            ended: None,
+            open: Vec::new(),
+            deferred: Vec::new(),
+            held: Vec::new(),
+        }
+    }
+
     const fn phase(&self) -> Phase {
         match (self.ended, self.heard) {
             (Some(ender), _) => Phase::Ended(ender),
