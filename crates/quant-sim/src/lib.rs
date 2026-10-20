@@ -646,19 +646,6 @@ impl ExecutionVenue for SimulatedVenue {
             if now < order.arrives_at {
                 continue;
             }
-            if !order.announced {
-                order.announced = true;
-                self.stats.accepted += 1;
-                let id = order.id;
-                self.report(
-                    now,
-                    ExecutionEvent::Accepted {
-                        client_order_id: id,
-                        ts: now,
-                    },
-                );
-            }
-
             // The venue's own rules, checked once when it first sees the order
             // -- which is where a real venue checks them, on receipt against its
             // own book. A market order has no price of its own, so the price
@@ -681,16 +668,37 @@ impl ExecutionVenue for SimulatedVenue {
             order.seen = true;
 
             let is_market = order.request.limit().is_none();
+            if is_market && !book.is_live() {
+                // No prices to trade against: the expected outcome after a
+                // disconnect, and its own reject reason so it does not bury
+                // the unexpected ones.
+                let id = order.id;
+                self.reject(id, RejectReason::NoMarket, now);
+                order.remaining = Qty::from_raw(0);
+                continue;
+            }
+
+            // Acknowledged only once the venue has judged the order and kept
+            // it. A live venue refuses a breach or a request it will not take
+            // in its REST answer, and the account stream never reports a NEW
+            // for it, so the strategy hears a rejection alone. Announcing on
+            // arrival and rejecting a line later told a backtest's strategy
+            // "accepted, then rejected" for the same order: a lifecycle no
+            // live run produces, and a way to tell which venue it is wired to.
+            if !order.announced {
+                order.announced = true;
+                self.stats.accepted += 1;
+                let id = order.id;
+                self.report(
+                    now,
+                    ExecutionEvent::Accepted {
+                        client_order_id: id,
+                        ts: now,
+                    },
+                );
+            }
+
             if is_market {
-                if !book.is_live() {
-                    // No prices to trade against: the expected outcome after a
-                    // disconnect, and its own reject reason so it does not bury
-                    // the unexpected ones.
-                    let id = order.id;
-                    self.reject(id, RejectReason::NoMarket, now);
-                    order.remaining = Qty::from_raw(0);
-                    continue;
-                }
                 self.take(order, book, now, Liquidity::Taken);
                 if order.remaining.raw() > 0 {
                     // A market order is immediate by nature: whatever the book
