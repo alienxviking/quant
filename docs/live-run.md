@@ -969,7 +969,7 @@ inputs in and requests out without ever waiting. It is the split `orders.rs`
 and `user_data.rs` already make, pure logic with the transport elsewhere
 (`orders.rs:1-11`, `user_data.rs:5-8`), one level up.
 
-Both go in a crate of their own, **`quant-live`** (question 5), depending on
+Both go in a crate of their own, **`quant-live`** (the owner's decision 5, §7), depending on
 `quant-binance` for the machine's inputs (`Placement`, `CancelReply`, the
 translator's `Inbound`), `TradeClient` and `AccountFeed`, and on `quant-engine`
 for `ExecutionVenue` and `Unready`, as `quant-sim` does
@@ -1041,7 +1041,7 @@ record of what the venue said about the run's last orders.
 `Engine::settle` (`lib.rs:708-714`) is how a run ends, in item 8's order:
 
 1. `run()` returns when the market source ends.
-2. If the owner takes question 3's recommendation, `Engine::cancel_working()`:
+2. The owner chose to cancel at a stop (§7, decision 3), so `Engine::cancel_working()`:
    for each working order, `on_cancel_requested` and then the venue's `cancel`,
    at the engine's `now`, with no strategy call. Nothing can issue those cancels
    today. The engine has no cancel of its own (`lib.rs:599-1113`), only
@@ -1611,41 +1611,38 @@ finding, with its fixtures; the permutation and `account_blind` tests in
 `quant-explain`; the end-to-end test; the docs, then a grep for what they
 replace.
 
-#### 7. For the owner
+#### 7. Decided by the owner, 2026-10-20
 
-1. **Refuse to trade without a start balances snapshot (`NoBaseline`)?** Open
-   since the seam's design. *Recommended: yes.* Criterion A's baseline cannot be
-   taken afterwards, and refusing costs one REST call at startup.
-2. **When a gate fails at startup, record only, or run the strategy against a
-   venue that refuses everything**, so its decisions are journalled as
-   `refused { venue: .. }`? *Recommended: record only.* No order could go, and a
-   run of refusals is noise criterion B would have to exclude. The other way
-   needs a `LiveVenue` that starts without its instrument and holds account
-   frames it cannot yet translate.
-3. **At a stop, cancel resting orders before settling, or leave them** in
-   `stopped.working`? Open since the seam's design. *Recommended: cancel them,*
-   through `Engine::cancel_working` (§1, step 2), a seam addition so that each
-   cancel is journalled as asked for, then settle until their ends arrive.
-   Cancelling is not flattening (§5), and an order left resting can fill after
-   the record has stopped.
-4. **A stranger's trade on another symbol** spends the quote asset criterion A
-   marks. Latch `Diverged` for it too? *Recommended: no.* The rule names our
-   symbol, and §2's one account is the defence; revisit if the account is shared.
-5. **The machine and the shell in a new crate, `quant-live`**, rather than in
-   `quant-binance`? *Recommended: yes.* In `quant-binance` they would make the
-   data tier (`quant-verify`, `quant-normalize`) compile against the trading
-   engine, against the precedent that put `EventSource` in `quant-core`; a new
-   crate costs one manifest (§5's preamble).
-6. **An order `Placed` that a healthy stream never mentions.** As designed it
-   gets no doubt: `ready` stays Ok and the position goes wrong without a sound,
-   which is also what an overflow hiding a reconnect leaves behind (§2, *The
-   account*). Put it in doubt? *Recommended: yes.* The worker sends an
-   `Unheard` input `ORDER_TIMEOUT` after each `Placed`, and the machine raises
-   `fills_missed` on that order if the stream has not mentioned it, cleared by
-   the stream like any doubt. Twenty seconds is above the worst transport delay
-   seen so far (p99 14 s at M7). It is a timeout, so where it lands among the
-   stream's records depends on timing: tested on its own, and kept out of the
-   permutation test's equality.
+Six questions were the owner's. Each was asked with a recommendation, and each
+recommendation was taken. They are decisions now, not options, and changing one
+needs a new argument.
+
+1. **No baseline, no trading (`NoBaseline`).** A live run journals a start
+   balances snapshot before it may trade, and records without trading if it
+   cannot. Criterion A's baseline cannot be taken afterwards, and refusing costs
+   one REST call at startup.
+2. **A failed gate at startup means record only.** No strategy runs against a
+   venue that refuses everything: no order could go, and a run of refusals is
+   noise criterion B would have to exclude. `NoFilters` is still returned for
+   any instrument other than the one wired (§3).
+3. **A stop cancels resting orders, then settles.** `Engine::cancel_working`
+   (§1, step 2) journals each cancel as asked for, then `settle` runs until
+   their ends arrive. Cancelling is not flattening (§5), and an order left
+   resting can fill after the record has stopped.
+4. **A stranger's trade on another symbol does not latch `Diverged`.** The rule
+   names our symbol, the one a position is being traded on, and §2's one
+   account is the defence. Revisit if the account is ever shared.
+5. **The machine and the shell live in a new crate, `quant-live`.** In
+   `quant-binance` they would make the data tier (`quant-verify`,
+   `quant-normalize`) compile against the trading engine, against the
+   precedent that put `EventSource` in `quant-core`.
+6. **An order `Placed` that a healthy stream never mentions goes into doubt.**
+   The worker sends an `Unheard` input `ORDER_TIMEOUT` (20 s) after each
+   `Placed`, and the machine raises `fills_missed` on that order if the stream
+   has not mentioned it, cleared by the stream like any doubt. Twenty seconds
+   is above the worst transport delay seen so far (p99 14 s at M7). It is a
+   timeout, so where it lands among the stream's records depends on timing:
+   tested on its own, and kept out of the permutation test's equality.
 
 ---
 
