@@ -593,6 +593,17 @@ impl Merge {
             );
             return;
         }
+        // Named by the venue while REST had not answered and the stream had
+        // not mentioned it: only an acknowledged cancel can have named it.
+        if order.venue_id.is_some() {
+            self.contradiction(
+                Some(id),
+                "REST says the order does not exist, and the venue acknowledged a cancel of it",
+                at,
+                out,
+            );
+            return;
+        }
         // An order that never existed missed nothing.
         order.deferred.clear();
         order.ended = Some(Ender::Rest);
@@ -613,11 +624,22 @@ impl Merge {
         out: &mut Vec<VenueReport>,
     ) {
         let Some(why) = reply.refusal() else {
-            // Acknowledged: nothing, unless it names another order (rule 6).
+            // Acknowledged: nothing, unless it names another order (rule 6),
+            // or the order is one REST said does not exist. The venue
+            // cancelling an order says it had it, as a stream report does.
             if let CancelReply::Acknowledged { order_id } = reply {
                 if let Some(named) = self.other_venue_id(id, order_id) {
                     self.contradiction(Some(id), &named, at, out);
                 } else if let Some(order) = self.orders.get_mut(&id) {
+                    if order.ended == Some(Ender::Rest) {
+                        self.contradiction(
+                            Some(id),
+                            "the venue acknowledged a cancel of an order REST says does not exist",
+                            at,
+                            out,
+                        );
+                        return;
+                    }
                     order.venue_id.get_or_insert_with(|| order_id.clone());
                 }
             }

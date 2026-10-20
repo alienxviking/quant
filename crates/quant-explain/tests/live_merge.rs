@@ -1072,6 +1072,16 @@ fn the_machine_latches_exactly_when_the_journal_says_it_diverged() {
             false,
         ),
         (
+            "a cancel acknowledged for an order REST refused",
+            vec![
+                Item::Rest(refused()),
+                Item::Rest(cancel_reply(CancelReply::Acknowledged {
+                    order_id: VenueOrderId(VENUE_ID.to_string()),
+                })),
+            ],
+            true,
+        ),
+        (
             "a stranger's trade on our symbol that cannot be read",
             vec![Item::Frame(spoiled(
                 &fixtures::trade("web_1", 900, "1", "1", "1", 77),

@@ -300,6 +300,50 @@ fn placed_then_a_cancel_acknowledged_for_another_order_id_diverges() {
 }
 
 #[test]
+fn a_cancel_acknowledged_for_an_order_rest_refused_diverges_in_either_order() {
+    // An acknowledged cancel is the venue saying it had the order, the same
+    // fact as the stream mentioning it. Break: record the venue id and
+    // nothing else, in either order, which left `ready` Ok.
+    let ack = || Input::CancelReply {
+        id: ClientOrderId(1),
+        reply: CancelReply::Acknowledged {
+            order_id: VenueOrderId("100".to_owned()),
+        },
+    };
+    let mut b = Bench::heard();
+    b.submit(1, "0.001");
+    assert_eq!(lines(&b.refused(1)), ["rejected 1 Malformed"]);
+    assert_eq!(lines(&b.step(ack())), ["anomaly 1 Contradiction"]);
+    assert_eq!(b.ready(), Err(Unready::Diverged));
+
+    let mut b = Bench::heard();
+    b.submit(1, "0.001");
+    assert_eq!(lines(&b.step(ack())), NOTHING);
+    assert_eq!(b.ready(), Ok(()));
+    assert_eq!(
+        lines(&b.refused(1)),
+        ["anomaly 1 Contradiction"],
+        "and no second story: the order stays working"
+    );
+    assert_eq!(b.ready(), Err(Unready::Diverged));
+
+    // The near miss: a cancel answered not open says nothing of the kind.
+    let mut b = Bench::heard();
+    b.submit(1, "0.001");
+    b.refused(1);
+    let not_open = b.step(Input::CancelReply {
+        id: ClientOrderId(1),
+        reply: CancelReply::NotOpen {
+            http_status: 400,
+            code: -2011,
+            msg: "Unknown order sent.".to_owned(),
+        },
+    });
+    assert_eq!(lines(&not_open), ["cancel_refused 1 not_open"]);
+    assert_eq!(b.ready(), Ok(()));
+}
+
+#[test]
 fn a_hole_holds_every_later_report_and_raises_fills_missed_once() {
     // Break: release past the hole.
     let mut b = Bench::heard();
