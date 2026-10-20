@@ -795,6 +795,14 @@ nothing has moved, so a report still in flight stays undelivered.
       a wake of its own moves the clock with no strategy call at all. That is
       by design, and it is how a stream lost during a silent market is dated
       when it was heard.
+
+      *Not yet between the simulator and `LiveVenue`.* The test drove two
+      venues of one shape. `SimulatedVenue` announces an order before judging
+      its filters and its market, so a declined order reaches a strategy as an
+      acceptance and a rejection, where a live refusal is a rejection alone.
+      The simulator change that closes it is owed before M8's item 8 runs a
+      strategy against `LiveVenue` (`docs/live-run.md` §5, *LiveVenue, decided
+      before the code*, §6).
 - [x] Readiness refuses before anything is written and spends nothing of risk's
       count; a record that withholds once withholds for good; strays and orphans
       never reach the strategy; `settle` books a late fill and tells nobody.
