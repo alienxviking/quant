@@ -250,7 +250,8 @@ pub struct Merge {
     orders: BTreeMap<ClientOrderId, Order>,
     account: Account,
     /// The latch: set by every contradiction, every orphaned fill, a foreign
-    /// trade on our symbol and `IdInUse`, and never cleared in the process.
+    /// trade on our symbol, read or not, and `IdInUse`, and never cleared in
+    /// the process.
     diverged: bool,
     /// False after a failing recheck, true after a passing one.
     checked: bool,
@@ -696,8 +697,9 @@ impl Merge {
         }
     }
 
-    /// A report that could not be read: an anomaly always, and `fills_missed`
-    /// on whichever working orders it could have been about.
+    /// A report that could not be read: an anomaly always, `fills_missed` on
+    /// whichever working orders it could have been about, and the latch for a
+    /// stranger's trade.
     fn unreadable(
         &mut self,
         at: Ts,
@@ -705,13 +707,14 @@ impl Merge {
         detail: VenueText,
         out: &mut Vec<VenueReport>,
     ) {
-        let client_order_id = match concerns {
-            Concerns::Ours(id) => Some(id),
-            Concerns::Foreign | Concerns::Unknown => None,
+        let (client_order_id, what) = match concerns {
+            Concerns::Ours(id) => (Some(id), AnomalyKind::Unreadable),
+            Concerns::Foreign | Concerns::Unknown => (None, AnomalyKind::Unreadable),
+            Concerns::ForeignTrade => (None, AnomalyKind::UnreadableForeignTrade),
         };
         out.push(notice(Notice::Anomaly {
             client_order_id,
-            what: AnomalyKind::Unreadable,
+            what,
             detail,
             ts: at,
         }));
@@ -743,6 +746,9 @@ impl Merge {
             }
             // Read far enough to know it was not ours.
             Concerns::Foreign => {}
+            // Not ours, and it moved the balances: the latch, as for a
+            // stranger's trade that could be read.
+            Concerns::ForeignTrade => self.diverged = true,
             // It could have been any of ours.
             Concerns::Unknown => self.doubt_every_working_order(DoubtCause::FillsMissed, at, out),
         }

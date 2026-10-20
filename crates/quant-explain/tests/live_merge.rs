@@ -983,7 +983,16 @@ fn losing_the_stream_puts_every_working_order_in_doubt_until_its_next_report() {
     assert_eq!(ran.outcome.findings, ["in doubt 2 AccountBlind"]);
 }
 
+/// `frame` with its event's `field` made unreadable.
+fn spoiled(frame: &[u8], field: &str) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(frame).expect("json");
+    value["event"][field] = serde_json::json!("oops");
+    serde_json::to_vec(&value).expect("json")
+}
+
 #[test]
+// One list of cases, read top to bottom.
+#[allow(clippy::too_many_lines)]
 fn the_machine_latches_exactly_when_the_journal_says_it_diverged() {
     // `journal::diverged` reads what was written; the machine latches from
     // what it heard; neither is derived from the other. Over the latches the
@@ -1060,6 +1069,22 @@ fn the_machine_latches_exactly_when_the_journal_says_it_diverged() {
         (
             "an unreadable report",
             vec![Item::Rest(placed()), Item::Frame(b"not json".to_vec())],
+            false,
+        ),
+        (
+            "a stranger's trade on our symbol that cannot be read",
+            vec![Item::Frame(spoiled(
+                &fixtures::trade("web_1", 900, "1", "1", "1", 77),
+                "L",
+            ))],
+            true,
+        ),
+        (
+            "a stranger's acceptance that cannot be read",
+            vec![Item::Frame(spoiled(
+                &fixtures::new_order("web_1", 900, "1"),
+                "S",
+            ))],
             false,
         ),
         (

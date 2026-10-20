@@ -61,7 +61,9 @@
 //! has read the client id ([`Concerns`]). One of this run's orders is then in
 //! doubt, and not every working order; another's, read far enough to know it is
 //! not ours, puts none of ours in doubt. Only a report unreadable before its
-//! client id could be any of ours.
+//! client id could be any of ours. Another's trade is named apart
+//! ([`Concerns::ForeignTrade`]): whatever in it could not be read, it moved
+//! the account's balances.
 //!
 //! # A cancel names the order in `C`, not `c`
 //!
@@ -367,6 +369,10 @@ pub enum Concerns {
     /// An order this run did not send: read far enough to know that, and no
     /// further. None of this run's orders can have been what it said.
     Foreign,
+    /// A trade on an order this run did not send, read as far as its type.
+    /// Kept apart from [`Self::Foreign`] because it moved the account's
+    /// balances, which a stranger's readable trade latches on.
+    ForeignTrade,
     /// Unknown: the report could not be read as far as its client id, so it
     /// could have been about any order of this run's.
     Unknown,
@@ -519,7 +525,11 @@ impl Translator {
             Whose::Orphan(OrphanReason::Unparseable) => Provenance::Unparseable,
         };
         Self::foreign(r, exec_type, client_id, provenance, recv).map_err(|error| Unreadable {
-            concerns: Concerns::Foreign,
+            concerns: if exec_type == "TRADE" {
+                Concerns::ForeignTrade
+            } else {
+                Concerns::Foreign
+            },
             error,
         })
     }
@@ -1372,6 +1382,17 @@ mod tests {
         assert_eq!(
             t.read(&theirs, RECV).map_err(|u| u.concerns),
             Err(Concerns::Foreign)
+        );
+        // Somebody else's trade: none of ours, and it moved the balances.
+        // Break: attribute every stranger's report alike, or every one as a
+        // trade (the acceptance above then fails).
+        let their_trade = report(&with(
+            partial_fill(),
+            &[("c", json!("web_4a1b2c3d")), ("L", json!("oops"))],
+        ));
+        assert_eq!(
+            t.read(&their_trade, RECV).map_err(|u| u.concerns),
+            Err(Concerns::ForeignTrade)
         );
         // Before the id: it could have been any of ours.
         let no_id = report(&[("c", Value::Null)]);

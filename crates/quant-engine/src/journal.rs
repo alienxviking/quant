@@ -1605,7 +1605,8 @@ pub fn recover_risk(
 
 /// Whether the journal holds a line that latches `Unready::Diverged`: an
 /// `anomaly { contradiction }`, an `orphaned` fill, a `foreign` line with a
-/// trade, or a `doubt raised { id_in_use }`.
+/// trade or an `anomaly { unreadable_foreign_trade }`, or a
+/// `doubt raised { id_in_use }`.
 ///
 /// The latch lives in a live venue's process, and a latch that forgets is
 /// not one: a stranger's trade with nothing working, a clean stop and a
@@ -1635,11 +1636,14 @@ pub fn diverged(entries: &[JournalEntry]) -> bool {
 #[allow(clippy::match_same_arms)]
 fn latches(entry: &JournalEntry) -> bool {
     match entry {
-        // The venue said two things about one order of ours. The other kinds
-        // are a report we could not read, one we already had, and one after
-        // an end: loud, and none says the account holds what we do not know.
+        // The venue said two things about one order of ours, or a stranger
+        // traded on our symbol in a report we could not read, which moved the
+        // balances as a `foreign` trade line does. The other kinds are a
+        // report we could not read otherwise, one we already had, and one
+        // after an end: loud, and none says the account holds what we do not
+        // know.
         JournalEntry::Anomaly { what, .. } => match what {
-            AnomalyKind::Contradiction => true,
+            AnomalyKind::Contradiction | AnomalyKind::UnreadableForeignTrade => true,
             AnomalyKind::Unreadable
             | AnomalyKind::DuplicateTrade
             | AnomalyKind::AfterEnd
@@ -3687,6 +3691,7 @@ mod venue_entry_tests {
         };
         let latching = [
             anomaly(AnomalyKind::Contradiction),
+            anomaly(AnomalyKind::UnreadableForeignTrade),
             JournalEntry::Orphaned {
                 at: Ts::from_nanos(4),
                 client_order_id: ClientOrderId(1),

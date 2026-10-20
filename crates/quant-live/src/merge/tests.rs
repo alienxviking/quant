@@ -673,6 +673,32 @@ fn a_foreign_trade_paid_in_bnb_is_a_foreign_line_and_diverged_and_an_acceptance_
 }
 
 #[test]
+fn a_strangers_trade_that_cannot_be_read_latches_and_their_acceptance_does_not() {
+    // The owner's rule is that a stranger's trade on our symbol latches,
+    // because it moved the balances; that it could not be read does not
+    // undo the move. Break: treat every stranger's unreadable report alike,
+    // either way.
+    let spoil = |frame: Vec<u8>, field: &str| {
+        let mut value: serde_json::Value = serde_json::from_slice(&frame).expect("json");
+        value["event"][field] = serde_json::json!("oops");
+        serde_json::to_vec(&value).expect("json")
+    };
+    let mut b = Bench::heard();
+    b.submit(1, "0.001");
+    b.placed(1, 100);
+    let theirs = spoil(fixtures::new_order("web_1", 900, "1"), "S");
+    assert_eq!(lines(&b.frame(&theirs)), ["anomaly - Unreadable"]);
+    assert_eq!(b.ready(), Ok(()), "none of ours in doubt, nothing latched");
+    let traded = spoil(fixtures::trade("web_1", 900, "1", "1", "1", 77), "L");
+    assert_eq!(
+        lines(&b.frame(&traded)),
+        ["anomaly - UnreadableForeignTrade"],
+        "and none of ours in doubt"
+    );
+    assert_eq!(b.ready(), Err(Unready::Diverged));
+}
+
+#[test]
 fn after_an_overflow_while_down_any_account_event_is_heard_and_without_one_none_is() {
     // Break: take only the subscription's answer as heard, or take any event.
     let mut b = Bench::down();
