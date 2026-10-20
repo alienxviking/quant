@@ -821,9 +821,12 @@ counter.
 Half of this shipped with slice (a). The clock advanced from venue reports on
 idle wakes only, so on a market wake a later report was journalled at its own
 time while the strategy's clock stayed earlier, and the journal's timestamps
-could run backwards. `runlog`'s `decisions_at` stops at the first entry stamped
-after the instant it is asked about, so one entry out of order hides every entry
-behind it. The market-wake half landed in `m8a-live-source-idles` (#52).
+could run backwards. `runlog`'s `decisions_at` then stopped at the first entry
+stamped after the instant it was asked about, so one entry out of order hid every
+entry behind it. The market-wake half landed in `m8a-live-source-idles` (#52),
+and `decisions_at` has since been changed to skip a later entry and read on
+(`runlog.rs:825-855`, `docs/run-log.md` §9), for a backtest journal's
+wall-clock `started` line.
 
 **The kill switch must stop a live run, and stopping is not flattening.** M6
 decided that a tripped switch refuses everything including the order that would
@@ -966,12 +969,24 @@ inputs in and requests out without ever waiting. It is the split `orders.rs`
 and `user_data.rs` already make, pure logic with the transport elsewhere
 (`orders.rs:1-11`, `user_data.rs:5-8`), one level up.
 
-Both go in `quant-binance`, as `live_venue`, which then depends on
-`quant-engine` for `ExecutionVenue` and `Unready`, as `quant-sim` already does
-(`crates/quant-sim/Cargo.toml:18`). There is no cycle: `quant-engine` depends on
-`quant-core` and `quant-book` alone (`crates/quant-engine/Cargo.toml:17-18`). The
-machine's inputs are `Placement`, `CancelReply` and the translator's `Inbound`,
-all `quant-binance`'s; a crate of its own would hold one module.
+Both go in a crate of their own, **`quant-live`** (question 5), depending on
+`quant-binance` for the machine's inputs (`Placement`, `CancelReply`, the
+translator's `Inbound`), `TradeClient` and `AccountFeed`, and on `quant-engine`
+for `ExecutionVenue` and `Unready`, as `quant-sim` does
+(`crates/quant-sim/Cargo.toml:18`). The first draft put them in `quant-binance`,
+which would then have depended on `quant-engine`. There would have been no
+cycle, since `quant-engine` depends on `quant-core` and `quant-book` alone
+(`crates/quant-engine/Cargo.toml:17-18`), but the cost was not only a crate of
+one module. `quant-verify` and `quant-normalize` both depend on `quant-binance`
+(`crates/quant-verify/Cargo.toml:20`, `crates/quant-normalize/Cargo.toml:27`),
+so the data tier would have compiled against the trading engine, and
+`quant-binance` against `quant-book`, which its manifest keeps to its tests
+(`crates/quant-binance/Cargo.toml:101-105`). The project already chose against
+that shape once: `EventSource` lives in `quant-core` so that crates providing
+events need not depend on the engine (CLAUDE.md, M3.b). Moving
+`ExecutionVenue` and `Unready` down a layer instead is harder, because
+`observe` takes a `&Book` (`venue.rs:133`). Nothing depends on `quant-live` but
+the binary's crate, `quant-backtest`, where `paper` already lives.
 
 #### 1. Tasks and channels
 
@@ -994,7 +1009,7 @@ all `quant-binance`'s; a crate of its own would hold one module.
 | Held cancels | A cancel that finds `orders` full waits in the shell, first in first out, at most one per order, and goes out at the start of the next `poll` that finds room, before anything else that wake can send. While one is held, `ready` answers `QueueFull`, so no new order takes the slot ahead of it. A second cancel for an order whose cancel is held is `cancel_refused { not_sent }`. After `stop_sending`, held cancels come back `NotSent { why: "stopping" }`. | `orders` is full exactly when a request is stuck behind a timeout for up to 20 s. Refused then, the cancel was a `cancel_refused` notice the strategy is never told (§11 of `docs/engine-contract.md`: nothing of a notice reaches it), the strategy went on believing it had asked, and the resting order stayed on the venue, free to fill hours later. Held, it costs a short wait. At most one per working order keeps the hold bounded by the engine's own ledger. |
 | `inbox` | `tokio::sync::mpsc`, bounded at 8; the worker awaits `send` and never drops. | A dropped answer is an order whose outcome nobody holds, and a dropped `Unknown` is an order nobody doubts. The worker can wait only while the engine is not polling, and the engine polls on every wake (`lib.rs:837-838`), an idle one at least every `IDLE_TICK` (`lib.rs:522`). Between two polls the answers are usually no more than the four queued and the one in flight, but not always: a strategy submitting in a loop refills `orders` while the worker drains it within one wake, and item 8's `Control` sends too. When the bound is reached the worker waits for the next poll, so the cost is a delay and never a loss. |
 | Account | `AccountFeed`, as #70 built it, read with `poll`, which never blocks (`account.rs:1155-1157`). | Its channel is the tee's secondary with the capture primary, so a consumer that falls behind loses its own copy, as a `Blind { LocalOverflow }`, and never the file's. |
-| `poll` | Drain `inbox` with `try_recv` and the feed until `Empty` or `Closed`; merge the two by stamp as a **two-way merge**, each source kept in its own order; step the machine; append what it says. | A sort would reorder one source's own frames whenever the host clock steps back, since `local_recv_ts` is wall-clock time (CLAUDE.md, M2.e). Order within a source is evidence. Order across the two decides only the order of lines, and the permutation test (5) shows it changes nothing else. |
+| `poll` | Drain `inbox` with `try_recv` and the feed until `Empty` or `Closed`; merge the two by stamp as a **two-way merge**, each source kept in its own order; step the machine; append what it says. | A sort would reorder one source's own frames whenever the host clock steps back, since `local_recv_ts` is wall-clock time (CLAUDE.md, M2.e). Order within a source is evidence. This is the arrival order the trait asks for (`venue.rs:155`): within a source it is arrival itself, and across the two, both stamped by one clock when they were received (4), ordering by stamp is arrival order unless that clock stepped. Order across the two decides only the order of lines, and the permutation test (5) shows it changes nothing else. |
 
 **Shutdown, and every holder of a sender.** M1.c2's recorder hung at shutdown
 because a forgotten clone kept a channel open. Here:
@@ -1388,8 +1403,12 @@ market events carried the clock past its stamp is written down at its own stamp
 and moves nothing. What the merge can do is put a line after one stamped later,
 when a stream frame overtakes a stamped answer into the next poll: a window of
 the worker's stamp-to-send gap, which the readers tolerate because they filter by
-stamp (`docs/run-log.md` §9). The machine orders nothing by stamp. It decides on
-arrival order alone, so a host clock that steps cannot change what it decides.
+stamp: `decisions_at` skips an entry stamped after the instant and reads on
+(`runlog.rs:825-855`; `docs/run-log.md` §9, *`explain --at` reads backtest
+journals again*). The machine compares no stamps. It decides on the order the
+shell feeds it, which is each source's own order, merged across the two by stamp
+in `poll` (1); so a host clock that steps can change which source's input it
+sees first, which the permutation test covers, and never the order within one.
 
 #### 5. Tests, and the acceptance
 
@@ -1423,8 +1442,8 @@ answer. A contradiction is not a consistent truth and is tested on its own, and
 so is `IdInUse`, as a latch in each of the three phases. It lives in
 `quant-explain`'s tests, the one crate that may link the machine, the engine,
 the writer and `runlog::check` together: it sits at the top of the graph and
-nothing depends on it (`crates/quant-explain/Cargo.toml:10-15`), so taking the
-machine's crate as a dev-dependency costs nothing.
+nothing depends on it (`crates/quant-explain/Cargo.toml:10-15`), so taking
+`quant-live` as a dev-dependency costs nothing.
 
 Breaks that must redden it: `Placed` emitted as an acceptance; deduplicating by
 `I`; `Unknown` raised without the immediate clearing when the stream came first;
@@ -1585,11 +1604,12 @@ Item 8 must enforce:
    predicate from what was written, and neither is derived from the other.
 
 **As commits**, each green: the helpers in `orders.rs` and `user_data.rs`
-(`Inbound::Foreign`, attributed errors, `Checked`); `journal::diverged`, with
-its own tests; the machine and its tests;
-the shell and the worker with theirs; `runlog check`'s `unwatched` finding,
-with its fixtures; the permutation and `account_blind` tests;
-the end-to-end test; the docs, then a grep for what they replace.
+(`Inbound::Foreign`, attributed errors, `Checked`, `cancel_order`'s stamp);
+`journal::diverged`, with its own tests; `quant-live` with the machine and its
+tests; the shell and the worker with theirs; `runlog check`'s `unwatched`
+finding, with its fixtures; the permutation and `account_blind` tests in
+`quant-explain`; the end-to-end test; the docs, then a grep for what they
+replace.
 
 #### 7. For the owner
 
@@ -1611,8 +1631,21 @@ the end-to-end test; the docs, then a grep for what they replace.
 4. **A stranger's trade on another symbol** spends the quote asset criterion A
    marks. Latch `Diverged` for it too? *Recommended: no.* The rule names our
    symbol, and §2's one account is the defence; revisit if the account is shared.
-5. **`quant-binance` depends on `quant-engine`.** *Recommended: yes*, as
-   `quant-sim` does, rather than a crate of one module.
+5. **The machine and the shell in a new crate, `quant-live`**, rather than in
+   `quant-binance`? *Recommended: yes.* In `quant-binance` they would make the
+   data tier (`quant-verify`, `quant-normalize`) compile against the trading
+   engine, against the precedent that put `EventSource` in `quant-core`; a new
+   crate costs one manifest (§5's preamble).
+6. **An order `Placed` that a healthy stream never mentions.** As designed it
+   gets no doubt: `ready` stays Ok and the position goes wrong without a sound,
+   which is also what an overflow hiding a reconnect leaves behind (§2, *The
+   account*). Put it in doubt? *Recommended: yes.* The worker sends an
+   `Unheard` input `ORDER_TIMEOUT` after each `Placed`, and the machine raises
+   `fills_missed` on that order if the stream has not mentioned it, cleared by
+   the stream like any doubt. Twenty seconds is above the worst transport delay
+   seen so far (p99 14 s at M7). It is a timeout, so where it lands among the
+   stream's records depends on timing: tested on its own, and kept out of the
+   permutation test's equality.
 
 ---
 
