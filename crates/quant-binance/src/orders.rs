@@ -159,7 +159,8 @@ use quant_core::execution::{
     ClientOrderId, OrderKind, OrderRequest, RejectReason, TimeInForce, VenueOrderId,
 };
 use quant_core::fixed::{Px, Qty};
-use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind};
+use quant_core::instrument::{Exchange, FilterBreach, InstrumentDef, InstrumentKind};
+use quant_core::report::{CancelRefusal, Cited, DoubtCause, Landing, RejectedWhy, VenueText};
 
 use crate::user_data::RunTag;
 
@@ -630,6 +631,27 @@ impl Placement {
             Self::Placed { .. } | Self::Unknown { .. } => None,
         }
     }
+
+    /// What the record keeps beside a rejection, for the outcomes
+    /// [`Self::reject_reason`] gives a reason for: the venue's words and the
+    /// filter it named for a refusal, and why the request never left for one
+    /// that did not.
+    ///
+    /// The one mapping from this module's answers onto the record's types, so
+    /// that it is written once.
+    #[must_use]
+    pub fn rejected_why(&self) -> Option<RejectedWhy> {
+        match self {
+            Self::Refused(refusal) => Some(RejectedWhy::Declined {
+                cited: refusal.cited(),
+                breach: refusal.cause.breach(),
+            }),
+            Self::NotSent { why } => Some(RejectedWhy::NeverLanded(Landing::NotSent {
+                why: VenueText::new(why),
+            })),
+            Self::Placed { .. } | Self::Unknown { .. } => None,
+        }
+    }
 }
 
 /// What the venue's answer to a cancel means.
@@ -660,6 +682,35 @@ pub enum CancelReply {
     NotSent { why: String },
 }
 
+impl CancelReply {
+    /// What the record says of a cancel that did not take effect, or `None`
+    /// for one the venue took, which says nothing until the stream reports
+    /// how the order ended.
+    #[must_use]
+    pub fn refusal(&self) -> Option<CancelRefusal> {
+        match self {
+            Self::Acknowledged { order_id: _ } => None,
+            Self::NotOpen {
+                http_status,
+                code,
+                msg,
+            } => Some(CancelRefusal::NotOpen(Cited {
+                http_status: Some(*http_status),
+                code: *code,
+                msg: VenueText::new(msg),
+            })),
+            Self::Refused(refusal) => Some(CancelRefusal::Refused(refusal.cited())),
+            Self::Unknown { why } => Some(CancelRefusal::Unknown {
+                cause: why.cause(),
+                said: why.said(),
+            }),
+            Self::NotSent { why } => Some(CancelRefusal::NotSent {
+                why: VenueText::new(why),
+            }),
+        }
+    }
+}
+
 /// A request the venue refused, as it said so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
@@ -680,6 +731,16 @@ impl Refusal {
             code: error.code,
             msg: error.msg,
             cause,
+        }
+    }
+
+    /// What the venue said, as the record keeps it.
+    #[must_use]
+    pub fn cited(&self) -> Cited {
+        Cited {
+            http_status: Some(self.http_status),
+            code: self.code,
+            msg: VenueText::new(&self.msg),
         }
     }
 }
@@ -731,6 +792,45 @@ impl RefusalCause {
             Self::Declined | Self::Timestamp | Self::Credentials | Self::RateLimited => {
                 RejectReason::Venue
             }
+        }
+    }
+
+    /// The rule the model calls the filter the venue named, when the model
+    /// has that rule, for criterion B to set beside the one
+    /// `Filters::rejects` would have named.
+    ///
+    /// `PRICE_FILTER` is the tick, the one part of it the model holds; its
+    /// minimum and maximum price are not modelled, so a `PRICE_FILTER` refusal
+    /// the model did not predict is still a disagreement criterion B shows.
+    /// `NOTIONAL` and `MIN_NOTIONAL` are both the model's minimum notional.
+    /// Every other filter, `MARKET_LOT_SIZE` among them, is a rule the model
+    /// does not have, and gets none.
+    #[must_use]
+    pub const fn breach(self) -> Option<FilterBreach> {
+        let Self::Filter(filter) = self else {
+            return None;
+        };
+        match filter {
+            FilterName::PriceFilter => Some(FilterBreach::TickSize),
+            FilterName::LotSize => Some(FilterBreach::LotSize),
+            FilterName::MinNotional | FilterName::Notional => Some(FilterBreach::MinNotional),
+            FilterName::PercentPrice
+            | FilterName::PercentPriceBySide
+            | FilterName::IcebergParts
+            | FilterName::MarketLotSize
+            | FilterName::MaxNumOrders
+            | FilterName::MaxNumAlgoOrders
+            | FilterName::MaxNumIcebergOrders
+            | FilterName::MaxPosition
+            | FilterName::TrailingDelta
+            | FilterName::MaxNumOrderAmends
+            | FilterName::MaxNumOrderLists
+            | FilterName::ExchangeMaxNumOrders
+            | FilterName::ExchangeMaxNumAlgoOrders
+            | FilterName::ExchangeMaxNumIcebergOrders
+            | FilterName::ExchangeMaxNumOrderLists
+            | FilterName::MaxAsset
+            | FilterName::Unrecognised => None,
         }
     }
 }
@@ -892,6 +992,56 @@ impl WhyUnknown {
             http_status,
             code: error.code,
             msg: error.msg,
+        }
+    }
+
+    /// The doubt this raises, one cause for each variant: `DoubtCause`'s
+    /// first eight mirror this type one for one.
+    #[must_use]
+    pub const fn cause(&self) -> DoubtCause {
+        match self {
+            Self::ServerError { .. } => DoubtCause::ServerError,
+            Self::Unsettled { .. } => DoubtCause::Unsettled,
+            Self::IdInUse { .. } => DoubtCause::IdInUse,
+            Self::UnreadableBody { .. } => DoubtCause::Unreadable,
+            Self::OtherOrder { .. } => DoubtCause::OtherOrder,
+            Self::UnexpectedStatus { .. } => DoubtCause::UnexpectedStatus,
+            Self::TimedOut => DoubtCause::NoAnswer,
+            Self::Interrupted(_) => DoubtCause::Interrupted,
+        }
+    }
+
+    /// What the venue said, when it said it with a code, which the record's
+    /// [`Cited`] needs. A body that was not a Binance error, an answer naming
+    /// another order, an unexpected status, no answer and a broken request
+    /// carry none, and the cause says which it was.
+    #[must_use]
+    pub fn said(&self) -> Option<Cited> {
+        let cited = |http_status: u16, code: i64, msg: &str| Cited {
+            http_status: Some(http_status),
+            code,
+            msg: VenueText::new(msg),
+        };
+        match self {
+            Self::ServerError { http_status, said } => said
+                .as_ref()
+                .map(|said| cited(*http_status, said.code, &said.msg)),
+            Self::Unsettled {
+                http_status,
+                code,
+                msg,
+            }
+            | Self::IdInUse {
+                id: _,
+                http_status,
+                code,
+                msg,
+            } => Some(cited(*http_status, *code, msg)),
+            Self::UnreadableBody { .. }
+            | Self::OtherOrder { .. }
+            | Self::UnexpectedStatus { .. }
+            | Self::TimedOut
+            | Self::Interrupted(_) => None,
         }
     }
 }
@@ -2841,5 +2991,200 @@ mod tests {
             said.contains("an open order already holds q-r1-7"),
             "{said}"
         );
+    }
+
+    /// One of every [`WhyUnknown`], every field distinct.
+    fn every_why_unknown() -> [WhyUnknown; 8] {
+        [
+            WhyUnknown::ServerError {
+                http_status: 503,
+                said: Some(VenueError {
+                    code: -1001,
+                    msg: "Internal error".to_owned(),
+                }),
+            },
+            WhyUnknown::Unsettled {
+                http_status: 400,
+                code: -1007,
+                msg: "Timeout waiting for response".to_owned(),
+            },
+            WhyUnknown::IdInUse {
+                id: "q-r1-7".to_owned(),
+                http_status: 401,
+                code: -2010,
+                msg: "Duplicate order sent.".to_owned(),
+            },
+            WhyUnknown::UnreadableBody {
+                http_status: 200,
+                detail: "EOF".to_owned(),
+            },
+            WhyUnknown::OtherOrder {
+                sent: "q-r1-7".to_owned(),
+                echoed: "q-r1-8".to_owned(),
+            },
+            WhyUnknown::UnexpectedStatus { http_status: 409 },
+            WhyUnknown::TimedOut,
+            WhyUnknown::Interrupted("reset".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn each_unknown_outcome_raises_its_own_cause_with_what_the_venue_said() {
+        let causes: Vec<DoubtCause> = every_why_unknown().iter().map(WhyUnknown::cause).collect();
+        assert_eq!(
+            causes,
+            [
+                DoubtCause::ServerError,
+                DoubtCause::Unsettled,
+                DoubtCause::IdInUse,
+                DoubtCause::Unreadable,
+                DoubtCause::OtherOrder,
+                DoubtCause::UnexpectedStatus,
+                DoubtCause::NoAnswer,
+                DoubtCause::Interrupted,
+            ]
+        );
+        let cited = |http_status, code, msg: &str| {
+            Some(Cited {
+                http_status: Some(http_status),
+                code,
+                msg: VenueText::new(msg),
+            })
+        };
+        let said: Vec<Option<Cited>> = every_why_unknown().iter().map(WhyUnknown::said).collect();
+        assert_eq!(
+            said,
+            [
+                cited(503, -1001, "Internal error"),
+                cited(400, -1007, "Timeout waiting for response"),
+                cited(401, -2010, "Duplicate order sent."),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ]
+        );
+        assert_eq!(
+            WhyUnknown::ServerError {
+                http_status: 502,
+                said: None
+            }
+            .said(),
+            None,
+            "a 5xx without a Binance error said nothing with a code"
+        );
+    }
+
+    #[test]
+    fn a_refusal_and_a_request_never_sent_are_kept_as_the_record_keeps_them() {
+        let refusal = Refusal {
+            http_status: 400,
+            code: -1013,
+            msg: "Filter failure: NOTIONAL".to_owned(),
+            cause: RefusalCause::Filter(FilterName::Notional),
+        };
+        let cited = Cited {
+            http_status: Some(400),
+            code: -1013,
+            msg: VenueText::new("Filter failure: NOTIONAL"),
+        };
+        assert_eq!(refusal.cited(), cited);
+        assert_eq!(
+            Placement::Refused(refusal.clone()).rejected_why(),
+            Some(RejectedWhy::Declined {
+                cited: cited.clone(),
+                breach: Some(FilterBreach::MinNotional),
+            })
+        );
+        assert_eq!(
+            Placement::NotSent {
+                why: "connection refused".to_owned()
+            }
+            .rejected_why(),
+            Some(RejectedWhy::NeverLanded(Landing::NotSent {
+                why: VenueText::new("connection refused"),
+            }))
+        );
+        assert_eq!(
+            Placement::Unknown {
+                why: WhyUnknown::TimedOut
+            }
+            .rejected_why(),
+            None
+        );
+
+        assert_eq!(
+            CancelReply::Acknowledged {
+                order_id: VenueOrderId("1".to_owned())
+            }
+            .refusal(),
+            None
+        );
+        assert_eq!(
+            CancelReply::NotOpen {
+                http_status: 400,
+                code: -2011,
+                msg: "Unknown order sent.".to_owned(),
+            }
+            .refusal(),
+            Some(CancelRefusal::NotOpen(Cited {
+                http_status: Some(400),
+                code: -2011,
+                msg: VenueText::new("Unknown order sent."),
+            }))
+        );
+        assert_eq!(
+            CancelReply::Refused(refusal).refusal(),
+            Some(CancelRefusal::Refused(cited))
+        );
+        assert_eq!(
+            CancelReply::Unknown {
+                why: WhyUnknown::TimedOut
+            }
+            .refusal(),
+            Some(CancelRefusal::Unknown {
+                cause: DoubtCause::NoAnswer,
+                said: None,
+            })
+        );
+        assert_eq!(
+            CancelReply::NotSent {
+                why: "stopping".to_owned()
+            }
+            .refusal(),
+            Some(CancelRefusal::NotSent {
+                why: VenueText::new("stopping"),
+            })
+        );
+    }
+
+    #[test]
+    fn a_filter_the_model_has_is_named_by_the_model_s_rule_and_any_other_by_none() {
+        let named: Vec<(&str, Option<FilterBreach>)> = FILTER_NAMES
+            .iter()
+            .map(|&(name, filter)| (name, RefusalCause::Filter(filter).breach()))
+            .filter(|(_, breach)| breach.is_some())
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("PRICE_FILTER", Some(FilterBreach::TickSize)),
+                ("LOT_SIZE", Some(FilterBreach::LotSize)),
+                ("MIN_NOTIONAL", Some(FilterBreach::MinNotional)),
+                ("NOTIONAL", Some(FilterBreach::MinNotional)),
+            ]
+        );
+        for cause in [
+            RefusalCause::Filter(FilterName::Unrecognised),
+            RefusalCause::InsufficientBalance,
+            RefusalCause::Declined,
+            RefusalCause::Timestamp,
+            RefusalCause::Credentials,
+            RefusalCause::Malformed,
+            RefusalCause::RateLimited,
+        ] {
+            assert_eq!(cause.breach(), None, "{cause:?}");
+        }
     }
 }

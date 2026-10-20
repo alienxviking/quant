@@ -45,6 +45,24 @@
 //! costs an investigation. Wrong in the second leaves a live order of ours that
 //! nothing is watching.
 //!
+//! Both come out as one [`Inbound::Foreign`], with the [`Provenance`] that says
+//! which, because the record keeps both the same way: a `foreign` line, the
+//! trade whole, the commission asset verbatim. **Read leniently where the
+//! reading is ours to impose**: a stranger who pays fees in BNB is recorded
+//! rather than refused, since their fee asset is their business, and a
+//! cancel-replace or an amend, which the stream reports as `REJECTED` or
+//! `REPLACED` and which this system never causes for its own orders, is
+//! counted as [`Inbound::Ignored`] rather than refused, since it moves no
+//! balance. The fields every report is read for stay strict (invariant 5).
+//!
+//! # A report that cannot be read says whose it was, when that much was read
+//!
+//! [`Translator::read`] says which order an unreadable report concerns once it
+//! has read the client id ([`Concerns`]). One of this run's orders is then in
+//! doubt, and not every working order; another's, read far enough to know it is
+//! not ours, puts none of ours in doubt. Only a report unreadable before its
+//! client id could be any of ours.
+//!
 //! # A cancel names the order in `C`, not `c`
 //!
 //! The documentation for `C`: *"Original client order ID; This is the ID of the
@@ -83,7 +101,9 @@ use quant_core::event::Side;
 use quant_core::execution::{ClientOrderId, FeeAsset, Fill, VenueOrderId, VenueTradeId};
 use quant_core::fixed::{Notional, ParseFixedError, Px, Qty};
 use quant_core::instrument::InstrumentDef;
-use quant_core::report::{Ended, EndedBy, FillIds, OrderReport};
+use quant_core::report::{
+    Ended, EndedBy, FillIds, ForeignOutcome, ForeignReport, OrderReport, Provenance, VenueText,
+};
 use quant_core::time::Ts;
 
 /// What every client order id this system sends begins with.
@@ -226,13 +246,15 @@ pub enum OrphanReason {
 }
 
 /// What a report says happened to an order, before it is known whose it is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
+/// The fee is read afterwards, strictly for our own orders and leniently for
+/// anybody else's.
+enum Outcome {
     /// The venue has the order.
     Accepted,
     /// Some or all of it traded, in the venue's trade `trade_id`.
-    Filled {
-        fill: Fill,
+    Traded {
+        px: Px,
+        qty: Qty,
         remaining: Qty,
         trade_id: VenueTradeId,
     },
@@ -243,35 +265,19 @@ pub enum Outcome {
     Ended { remaining: Qty, how: EndedBy },
 }
 
-/// A report about an order with our prefix that this run did not send.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrphanReport {
-    /// The id exactly as the venue sent it. Text on purpose: making it a
-    /// [`ClientOrderId`] is the collision this type exists to prevent.
-    pub client_id: String,
-    pub why: OrphanReason,
-    pub venue_order_id: VenueOrderId,
-    pub side: Side,
-    pub outcome: Outcome,
-}
-
 /// What one message on the user-data stream means to this run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {
     /// About one of this run's orders: the event, with the venue's order id
     /// and, for a fill, its trade id beside it.
     Ours(OrderReport),
-    /// About an order with our prefix that this run did not send. Needs a
-    /// person.
-    Orphan(OrphanReport),
-    /// About this symbol, but an order this system did not place. A `TRADE`
-    /// here means the account's balances moved under the engine's feet, so
-    /// reconciliation will disagree; the caller should say so when it happens
-    /// rather than leave it to be found.
-    NotOurs {
-        client_id: String,
-        exec_type: String,
-    },
+    /// About an order on this symbol that this run did not send: another
+    /// run's, or one under our prefix that parses as nothing we send, which
+    /// need a person, or one this system did not place at all. `provenance`
+    /// says which. A `TRADE` here means the account's balances moved under the
+    /// engine's feet, so reconciliation will disagree; the caller says so when
+    /// it happens rather than leave it to be found.
+    Foreign(ForeignReport),
     /// About another symbol, named here.
     OtherSymbol(String),
     /// The subscription ended. Until it is re-established we cannot hear what
@@ -345,6 +351,27 @@ impl fmt::Display for ReportError {
 
 impl std::error::Error for ReportError {}
 
+/// A message that could not be translated, and whose order it was about, as
+/// far as the translator read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    pub concerns: Concerns,
+    pub error: ReportError,
+}
+
+/// Whose order an unreadable report was about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Concerns {
+    /// One of this run's: its client id was read, and the rest was not.
+    Ours(ClientOrderId),
+    /// An order this run did not send: read far enough to know that, and no
+    /// further. None of this run's orders can have been what it said.
+    Foreign,
+    /// Unknown: the report could not be read as far as its client id, so it
+    /// could have been about any order of this run's.
+    Unknown,
+}
+
 /// Why a [`Translator`] cannot be built for an instrument: it names no base or
 /// no quote asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,239 +433,190 @@ impl Translator {
     ///
     /// [`ReportError`] for a message this module does not understand. Reports
     /// about other symbols and other people's orders are not errors; they are
-    /// classified and returned.
+    /// classified and returned. [`Self::read`] says, beside the error, whose
+    /// order it was about.
     pub fn translate(&self, message: &[u8], recv: Ts) -> Result<Inbound, ReportError> {
-        let mut envelope: serde_json::Value =
-            serde_json::from_slice(message).map_err(|e| ReportError::NotAnEvent(e.to_string()))?;
+        self.read(message, recv)
+            .map_err(|unreadable| unreadable.error)
+    }
+
+    /// [`Self::translate`], with an error saying whose order it concerned.
+    ///
+    /// # Errors
+    ///
+    /// [`Unreadable`]: the [`ReportError`], and [`Concerns`] naming one of
+    /// this run's orders when the client id was read and it was ours.
+    pub fn read(&self, message: &[u8], recv: Ts) -> Result<Inbound, Unreadable> {
+        let unknown = |error| Unreadable {
+            concerns: Concerns::Unknown,
+            error,
+        };
+        let mut envelope: serde_json::Value = serde_json::from_slice(message)
+            .map_err(|e| unknown(ReportError::NotAnEvent(e.to_string())))?;
         let event = envelope
             .get_mut("event")
             .map(serde_json::Value::take)
-            .ok_or_else(|| ReportError::NotAnEvent("no `event` field".to_owned()))?;
+            .ok_or_else(|| unknown(ReportError::NotAnEvent("no `event` field".to_owned())))?;
         match event.get("e").and_then(serde_json::Value::as_str) {
             Some("executionReport") => {}
             Some("eventStreamTerminated") => return Ok(Inbound::StreamTerminated),
             Some(other) => return Ok(Inbound::Ignored(other.to_owned())),
             None => {
-                return Err(ReportError::NotAnEvent(
+                return Err(unknown(ReportError::NotAnEvent(
                     "an event with no type `e`".to_owned(),
-                ))
+                )))
             }
         }
         // Typed only once the type is known. Other events reuse these letters
         // for other things (`listStatus` has its own `c`, `C`, `l` and `L`),
         // and an event we were going to ignore must not be able to fail as a
         // malformed report.
-        let report: RawReport =
-            serde_json::from_value(event).map_err(|e| ReportError::Malformed(e.to_string()))?;
+        let report: RawReport = serde_json::from_value(event)
+            .map_err(|e| unknown(ReportError::Malformed(e.to_string())))?;
         self.execution(&report, recv)
     }
 
-    fn execution(&self, r: &RawReport, recv: Ts) -> Result<Inbound, ReportError> {
-        let symbol = r.symbol.as_deref().ok_or(ReportError::MissingField("s"))?;
+    fn execution(&self, r: &RawReport, recv: Ts) -> Result<Inbound, Unreadable> {
+        let unknown = |error| Unreadable {
+            concerns: Concerns::Unknown,
+            error,
+        };
+        let symbol = r
+            .symbol
+            .as_deref()
+            .ok_or(ReportError::MissingField("s"))
+            .map_err(unknown)?;
         if symbol != self.symbol {
             return Ok(Inbound::OtherSymbol(symbol.to_owned()));
         }
         let exec_type = r
             .exec_type
             .as_deref()
-            .ok_or(ReportError::MissingField("x"))?;
+            .ok_or(ReportError::MissingField("x"))
+            .map_err(unknown)?;
         let client_id = if exec_type == "CANCELED" {
             r.original_client_id
                 .as_deref()
                 .filter(|id| !id.is_empty())
-                .ok_or(ReportError::MissingField("C"))?
+                .ok_or(ReportError::MissingField("C"))
         } else {
-            r.client_id
-                .as_deref()
-                .ok_or(ReportError::MissingField("c"))?
-        };
-        match self.run.whose(client_id) {
-            Whose::NotOurs => Ok(Inbound::NotOurs {
-                client_id: client_id.to_owned(),
-                exec_type: exec_type.to_owned(),
-            }),
-            Whose::Ours(client_order_id) => {
-                let (venue_order_id, outcome) = self.detail(r, exec_type)?;
-                Ok(Inbound::Ours(match outcome {
-                    Outcome::Accepted => OrderReport::Accepted {
-                        client_order_id,
-                        venue_order_id: Some(venue_order_id),
-                        ts: recv,
-                    },
-                    Outcome::Filled {
-                        fill,
-                        remaining,
-                        trade_id,
-                    } => OrderReport::Filled {
-                        client_order_id,
-                        fill,
-                        remaining,
-                        ids: Some(FillIds {
-                            venue_order_id,
-                            trade_id,
-                        }),
-                        ts: recv,
-                    },
-                    Outcome::Ended { remaining, how } => OrderReport::Cancelled {
-                        client_order_id,
-                        remaining,
-                        ended: Some(Ended {
-                            venue_order_id,
-                            how,
-                        }),
-                        ts: recv,
-                    },
-                }))
-            }
-            Whose::Orphan(why) => {
-                let (venue_order_id, outcome) = self.detail(r, exec_type)?;
-                Ok(Inbound::Orphan(OrphanReport {
-                    client_id: client_id.to_owned(),
-                    why,
-                    venue_order_id,
-                    side: side(r)?,
-                    outcome,
-                }))
-            }
+            r.client_id.as_deref().ok_or(ReportError::MissingField("c"))
         }
+        .map_err(unknown)?;
+        let provenance = match self.run.whose(client_id) {
+            Whose::Ours(client_order_id) => {
+                return self
+                    .ours(r, exec_type, client_order_id, recv)
+                    .map_err(|error| Unreadable {
+                        concerns: Concerns::Ours(client_order_id),
+                        error,
+                    })
+            }
+            Whose::NotOurs => Provenance::NotOurs,
+            Whose::Orphan(OrphanReason::OtherRun(run)) => {
+                Provenance::OtherRun(VenueText::new(&run))
+            }
+            Whose::Orphan(OrphanReason::Unparseable) => Provenance::Unparseable,
+        };
+        Self::foreign(r, exec_type, client_id, provenance, recv).map_err(|error| Unreadable {
+            concerns: Concerns::Foreign,
+            error,
+        })
     }
 
-    /// What happened to an order of ours, this run's or another's.
-    fn detail(
+    /// A report about one of this run's orders, read strictly throughout.
+    fn ours(
         &self,
         r: &RawReport,
         exec_type: &str,
-    ) -> Result<(VenueOrderId, Outcome), ReportError> {
-        let venue_order_id = VenueOrderId(
-            r.order_id
-                .ok_or(ReportError::MissingField("i"))?
-                .to_string(),
-        );
-        let status = r.status.as_deref().ok_or(ReportError::MissingField("X"))?;
-        let ordered: Qty = fixed(r.quantity.as_deref(), "q")?;
-        let filled: Qty = fixed(r.cumulative.as_deref(), "z")?;
-        if filled.is_negative() || filled > ordered {
-            return Err(ReportError::Inconsistent(format!(
-                "{filled} filled of an order for {ordered}"
-            )));
-        }
-        let remaining = ordered - filled;
-        let status_is = |expected: &str| {
-            if status == expected {
-                Ok(())
-            } else {
-                Err(ReportError::Inconsistent(format!(
-                    "execution type {exec_type} with order status {status}"
-                )))
-            }
-        };
-        let outcome = match exec_type {
-            "NEW" => {
-                status_is("NEW")?;
-                Outcome::Accepted
-            }
-            "TRADE" => self.trade(r, status, filled, remaining)?,
-            "CANCELED" => {
-                status_is("CANCELED")?;
-                Outcome::Ended {
-                    remaining,
-                    how: EndedBy::Cancelled,
-                }
-            }
-            // How a market order ends when the book runs out before it does.
-            "EXPIRED" => {
-                status_is("EXPIRED")?;
-                Outcome::Ended {
-                    remaining,
-                    how: EndedBy::Expired,
-                }
-            }
-            "TRADE_PREVENTION" => {
-                status_is("EXPIRED_IN_MATCH")?;
-                Outcome::Ended {
-                    remaining,
-                    how: EndedBy::SelfTradePrevention,
-                }
-            }
-            "REJECTED" => {
-                return Err(ReportError::Unsupported(
-                    "a `REJECTED` report, which the stream sends for cancel-replace",
-                ))
-            }
-            "REPLACED" => {
-                return Err(ReportError::Unsupported(
-                    "a `REPLACED` report, which the stream sends for an amended order",
-                ))
-            }
-            other => {
-                return Err(ReportError::Unknown {
-                    field: "x",
-                    value: other.to_owned(),
-                })
-            }
-        };
-        Ok((venue_order_id, outcome))
-    }
-
-    /// A `TRADE` report as a fill: the last execution, `l` at `L`, which is
-    /// neither the order's price `p` nor the running total `z`.
-    fn trade(
-        &self,
-        r: &RawReport,
-        status: &str,
-        filled: Qty,
-        remaining: Qty,
-    ) -> Result<Outcome, ReportError> {
-        let qty: Qty = fixed(r.last_qty.as_deref(), "l")?;
-        let px: Px = fixed(r.last_px.as_deref(), "L")?;
-        if !qty.is_positive() || !px.is_positive() {
-            return Err(ReportError::Inconsistent(format!(
-                "a trade of {qty} at {px}"
-            )));
-        }
-        if qty > filled {
-            return Err(ReportError::Inconsistent(format!(
-                "a trade of {qty} when {filled} has filled in total"
-            )));
-        }
-        // The status is the venue's word on whether the order is done, and the
-        // engine reads that from `remaining`, so the two must agree.
-        let done = match status {
-            "FILLED" => true,
-            "PARTIALLY_FILLED" => false,
-            other => {
-                return Err(ReportError::Inconsistent(format!(
-                    "execution type TRADE with order status {other}"
-                )))
-            }
-        };
-        if done != remaining.is_zero() {
-            return Err(ReportError::Inconsistent(format!(
-                "order status {status} with {remaining} still to fill"
-            )));
-        }
-        let (fee, fee_asset) = self.commission(r)?;
-        let is_maker = r.is_maker.ok_or(ReportError::MissingField("m"))?;
-        // `t`, the trade, and not `I`, the execution: `I` numbers every report
-        // about the order, and `myTrades` names a row by `t`. The documentation
-        // gives `-1` for a report that is not a trade, so on a trade a missing
-        // or negative `t` is a report that cannot be matched to the venue's
-        // own record of the fill, and criterion A could not be judged on it.
-        let trade_id = match r.trade_id {
-            Some(t) if t >= 0 => VenueTradeId(t.to_string()),
-            _ => return Err(ReportError::MissingField("t")),
-        };
-        Ok(Outcome::Filled {
-            fill: Fill {
+        client_order_id: ClientOrderId,
+        recv: Ts,
+    ) -> Result<Inbound, ReportError> {
+        let (venue_order_id, outcome) = detail(r, exec_type)?;
+        Ok(Inbound::Ours(match outcome {
+            Outcome::Accepted => OrderReport::Accepted {
+                client_order_id,
+                venue_order_id: Some(venue_order_id),
+                ts: recv,
+            },
+            Outcome::Traded {
                 px,
                 qty,
-                fee,
-                is_maker,
-                fee_asset,
+                remaining,
+                trade_id,
+            } => {
+                let (fee, fee_asset) = self.commission(r)?;
+                let is_maker = r.is_maker.ok_or(ReportError::MissingField("m"))?;
+                OrderReport::Filled {
+                    client_order_id,
+                    fill: Fill {
+                        px,
+                        qty,
+                        fee,
+                        is_maker,
+                        fee_asset,
+                    },
+                    remaining,
+                    ids: Some(FillIds {
+                        venue_order_id,
+                        trade_id,
+                    }),
+                    ts: recv,
+                }
+            }
+            Outcome::Ended { remaining, how } => OrderReport::Cancelled {
+                client_order_id,
+                remaining,
+                ended: Some(Ended {
+                    venue_order_id,
+                    how,
+                }),
+                ts: recv,
             },
-            remaining,
-            trade_id,
-        })
+        }))
+    }
+
+    /// A report about an order on this symbol that this run did not send.
+    ///
+    /// Lenient where the module docs say: the commission asset is kept as the
+    /// venue wrote it, and a report this system never causes for its own
+    /// orders is counted, not refused.
+    fn foreign(
+        r: &RawReport,
+        exec_type: &str,
+        client_id: &str,
+        provenance: Provenance,
+        recv: Ts,
+    ) -> Result<Inbound, ReportError> {
+        if matches!(exec_type, "REJECTED" | "REPLACED") {
+            return Ok(Inbound::Ignored(format!("executionReport {exec_type}")));
+        }
+        let (venue_order_id, outcome) = detail(r, exec_type)?;
+        let what = match outcome {
+            Outcome::Accepted => ForeignOutcome::Accepted,
+            Outcome::Traded {
+                px,
+                qty,
+                remaining,
+                trade_id,
+            } => ForeignOutcome::Traded {
+                trade_id,
+                px,
+                qty,
+                commission: fixed(r.commission.as_deref(), "n")?,
+                commission_asset: VenueText::new(r.commission_asset.as_deref().unwrap_or("")),
+                remaining,
+            },
+            Outcome::Ended { remaining, how } => ForeignOutcome::Ended { remaining, how },
+        };
+        Ok(Inbound::Foreign(ForeignReport {
+            client_id: VenueText::new(client_id),
+            provenance,
+            venue_order_id,
+            side: side(r)?,
+            what,
+            ts: recv,
+        }))
     }
 
     /// The commission on a trade, and which side of the pair paid it.
@@ -676,7 +654,129 @@ impl Translator {
     }
 }
 
-/// The side of an order, read only for orphans: for this run's orders the
+/// What happened to an order, ours or not: everything but the fee, which is
+/// read strictly for ours and leniently for anybody else's.
+fn detail(r: &RawReport, exec_type: &str) -> Result<(VenueOrderId, Outcome), ReportError> {
+    let venue_order_id = VenueOrderId(
+        r.order_id
+            .ok_or(ReportError::MissingField("i"))?
+            .to_string(),
+    );
+    let status = r.status.as_deref().ok_or(ReportError::MissingField("X"))?;
+    let ordered: Qty = fixed(r.quantity.as_deref(), "q")?;
+    let filled: Qty = fixed(r.cumulative.as_deref(), "z")?;
+    if filled.is_negative() || filled > ordered {
+        return Err(ReportError::Inconsistent(format!(
+            "{filled} filled of an order for {ordered}"
+        )));
+    }
+    let remaining = ordered - filled;
+    let status_is = |expected: &str| {
+        if status == expected {
+            Ok(())
+        } else {
+            Err(ReportError::Inconsistent(format!(
+                "execution type {exec_type} with order status {status}"
+            )))
+        }
+    };
+    let outcome = match exec_type {
+        "NEW" => {
+            status_is("NEW")?;
+            Outcome::Accepted
+        }
+        "TRADE" => trade(r, status, filled, remaining)?,
+        "CANCELED" => {
+            status_is("CANCELED")?;
+            Outcome::Ended {
+                remaining,
+                how: EndedBy::Cancelled,
+            }
+        }
+        // How a market order ends when the book runs out before it does.
+        "EXPIRED" => {
+            status_is("EXPIRED")?;
+            Outcome::Ended {
+                remaining,
+                how: EndedBy::Expired,
+            }
+        }
+        "TRADE_PREVENTION" => {
+            status_is("EXPIRED_IN_MATCH")?;
+            Outcome::Ended {
+                remaining,
+                how: EndedBy::SelfTradePrevention,
+            }
+        }
+        "REJECTED" => {
+            return Err(ReportError::Unsupported(
+                "a `REJECTED` report, which the stream sends for cancel-replace",
+            ))
+        }
+        "REPLACED" => {
+            return Err(ReportError::Unsupported(
+                "a `REPLACED` report, which the stream sends for an amended order",
+            ))
+        }
+        other => {
+            return Err(ReportError::Unknown {
+                field: "x",
+                value: other.to_owned(),
+            })
+        }
+    };
+    Ok((venue_order_id, outcome))
+}
+
+/// A `TRADE` report: the last execution, `l` at `L`, which is neither the
+/// order's price `p` nor the running total `z`.
+fn trade(r: &RawReport, status: &str, filled: Qty, remaining: Qty) -> Result<Outcome, ReportError> {
+    let qty: Qty = fixed(r.last_qty.as_deref(), "l")?;
+    let px: Px = fixed(r.last_px.as_deref(), "L")?;
+    if !qty.is_positive() || !px.is_positive() {
+        return Err(ReportError::Inconsistent(format!(
+            "a trade of {qty} at {px}"
+        )));
+    }
+    if qty > filled {
+        return Err(ReportError::Inconsistent(format!(
+            "a trade of {qty} when {filled} has filled in total"
+        )));
+    }
+    // The status is the venue's word on whether the order is done, and the
+    // engine reads that from `remaining`, so the two must agree.
+    let done = match status {
+        "FILLED" => true,
+        "PARTIALLY_FILLED" => false,
+        other => {
+            return Err(ReportError::Inconsistent(format!(
+                "execution type TRADE with order status {other}"
+            )))
+        }
+    };
+    if done != remaining.is_zero() {
+        return Err(ReportError::Inconsistent(format!(
+            "order status {status} with {remaining} still to fill"
+        )));
+    }
+    // `t`, the trade, and not `I`, the execution: `I` numbers every report
+    // about the order, and `myTrades` names a row by `t`. The documentation
+    // gives `-1` for a report that is not a trade, so on a trade a missing or
+    // negative `t` is a report that cannot be matched to the venue's own
+    // record of the fill, and criterion A could not be judged on it.
+    let trade_id = match r.trade_id {
+        Some(t) if t >= 0 => VenueTradeId(t.to_string()),
+        _ => return Err(ReportError::MissingField("t")),
+    };
+    Ok(Outcome::Traded {
+        px,
+        qty,
+        remaining,
+        trade_id,
+    })
+}
+
+/// The side of an order, read only for foreign orders: for this run's orders the
 /// engine already knows it.
 fn side(r: &RawReport) -> Result<Side, ReportError> {
     match r.side.as_deref().ok_or(ReportError::MissingField("S"))? {
@@ -922,10 +1022,14 @@ mod tests {
     fn the_documented_example_is_somebody_elses_order() {
         assert_eq!(
             translator().translate(DOCUMENTED.as_bytes(), RECV),
-            Ok(Inbound::NotOurs {
-                client_id: "mUvoqJxFIILMdfAW5iGSOW".to_owned(),
-                exec_type: "NEW".to_owned(),
-            })
+            Ok(Inbound::Foreign(ForeignReport {
+                client_id: VenueText::new("mUvoqJxFIILMdfAW5iGSOW"),
+                provenance: Provenance::NotOurs,
+                venue_order_id: documented_order(),
+                side: Side::Buy,
+                what: ForeignOutcome::Accepted,
+                ts: RECV,
+            }))
         );
     }
 
@@ -1156,20 +1260,47 @@ mod tests {
         );
     }
 
+    /// The trade in [`partial_fill`] as a foreign line records it: the
+    /// commission and its asset as the venue wrote them.
+    fn foreign_trade(asset: &str) -> ForeignOutcome {
+        ForeignOutcome::Traded {
+            trade_id: VenueTradeId("12345".to_owned()),
+            px: px("0.1026"),
+            qty: qty("0.2"),
+            commission: notional("0.0002"),
+            commission_asset: VenueText::new(asset),
+            remaining: qty("0.4"),
+        }
+    }
+
     #[test]
-    fn somebody_elses_trade_on_our_symbol_says_that_it_traded() {
-        // Their fee asset is their business, so it is not read.
+    fn somebody_elses_trade_on_our_symbol_is_recorded_whole_whatever_asset_paid_the_fee() {
+        // Their fee asset is their business: a stranger paying in BNB is
+        // recorded, commission and asset verbatim, where one of our own
+        // trades paid in BNB is refused.
         let theirs = with(
             partial_fill(),
             &[("c", json!("web_4a1b2c3d")), ("N", json!("BNB"))],
         );
         assert_eq!(
             translate(&theirs),
-            Ok(Inbound::NotOurs {
-                client_id: "web_4a1b2c3d".to_owned(),
-                exec_type: "TRADE".to_owned(),
-            })
+            Ok(Inbound::Foreign(ForeignReport {
+                client_id: VenueText::new("web_4a1b2c3d"),
+                provenance: Provenance::NotOurs,
+                venue_order_id: documented_order(),
+                side: Side::Buy,
+                what: foreign_trade("BNB"),
+                ts: RECV,
+            }))
         );
+        let no_asset = with(
+            partial_fill(),
+            &[("c", json!("web_4a1b2c3d")), ("N", Value::Null)],
+        );
+        match translate(&no_asset) {
+            Ok(Inbound::Foreign(report)) => assert_eq!(report.what, foreign_trade("")),
+            other => panic!("expected a foreign trade, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1180,17 +1311,82 @@ mod tests {
         );
         assert_eq!(
             translate(&fields),
-            Ok(Inbound::Orphan(OrphanReport {
-                client_id: "q-r0-7".to_owned(),
-                why: OrphanReason::OtherRun("r0".to_owned()),
+            Ok(Inbound::Foreign(ForeignReport {
+                client_id: VenueText::new("q-r0-7"),
+                provenance: Provenance::OtherRun(VenueText::new("r0")),
                 venue_order_id: VenueOrderId("4293153".to_owned()),
                 side: Side::Sell,
-                outcome: Outcome::Filled {
-                    fill: the_partial_fill(),
-                    remaining: qty("0.4"),
-                    trade_id: VenueTradeId("12345".to_owned()),
-                },
+                what: foreign_trade("ETH"),
+                ts: RECV,
             }))
+        );
+        let unparseable = with(partial_fill(), &[("c", json!("q-r1-007"))]);
+        match translate(&unparseable) {
+            Ok(Inbound::Foreign(report)) => {
+                assert_eq!(report.provenance, Provenance::Unparseable);
+            }
+            other => panic!("expected an orphan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cancel_replace_or_an_amend_of_somebody_elses_order_is_counted_not_refused() {
+        // Documented reports this system never causes for its own orders, so
+        // ours are refused; a stranger's move no balance of the run's.
+        for exec_type in ["REJECTED", "REPLACED"] {
+            let fields = [
+                ("c", json!("web_4a1b2c3d")),
+                ("x", json!(exec_type)),
+                ("X", json!("REJECTED")),
+            ];
+            assert_eq!(
+                translate(&fields),
+                Ok(Inbound::Ignored(format!("executionReport {exec_type}"))),
+                "{exec_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_report_names_the_order_it_concerns_once_its_id_was_read() {
+        let t = translator();
+        // Ours, unreadable after the id: that order, and only it.
+        let bnb = report(&with(partial_fill(), &[("N", json!("BNB"))]));
+        assert_eq!(
+            t.read(&bnb, RECV).map_err(|u| u.concerns),
+            Err(Concerns::Ours(ClientOrderId(7)))
+        );
+        let cancel = report(&[
+            ("x", json!("CANCELED")),
+            ("X", json!("NEW")),
+            ("c", json!("6gCrw2kRUAF9CvJDGP16IP")),
+            ("C", json!("q-r1-9")),
+        ]);
+        assert_eq!(
+            t.read(&cancel, RECV).map_err(|u| u.concerns),
+            Err(Concerns::Ours(ClientOrderId(9))),
+            "a cancel is attributed by `C`, as it is read"
+        );
+        // Somebody else's: none of ours.
+        let theirs = report(&[("c", json!("web_4a1b2c3d")), ("S", json!("HOLD"))]);
+        assert_eq!(
+            t.read(&theirs, RECV).map_err(|u| u.concerns),
+            Err(Concerns::Foreign)
+        );
+        // Before the id: it could have been any of ours.
+        let no_id = report(&[("c", Value::Null)]);
+        assert_eq!(
+            t.read(&no_id, RECV).map_err(|u| u.concerns),
+            Err(Concerns::Unknown)
+        );
+        assert_eq!(
+            t.read(b"not json", RECV).map_err(|u| u.concerns),
+            Err(Concerns::Unknown)
+        );
+        // `translate` is `read` without the attribution.
+        assert_eq!(
+            t.translate(&bnb, RECV),
+            t.read(&bnb, RECV).map_err(|u| u.error)
         );
     }
 
