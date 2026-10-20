@@ -807,7 +807,9 @@ nothing optional may stop a recording. So: **refuse to submit** without
 venue-sourced filters, and record regardless. The same shape as a money limit
 refusing when there is no mark. Item 7's design keeps the rule and moves where it
 is enforced: without venue-sourced filters no `LiveVenue` is built, and the run
-records without trading (*LiveVenue, decided before the code*, question 2).
+records without trading (*LiveVenue, decided before the code*, question 2); and a
+`LiveVenue` refuses `NoFilters` for any instrument but the one whose filters it
+was built with.
 
 **The engine clock becomes forward-only.** `now = max(now, ts)`, with the clamps
 counted. Two asynchronous inputs can deliver out of order; `HistoricalSource` is
@@ -1286,8 +1288,8 @@ that the mapping onto `quant-core`'s types is written once, in `orders.rs`.
 
 #### 3. Readiness
 
-`ready` reads the machine and the queue's capacity and nothing else, and changes
-nothing (`&self`, `venue.rs:99-100`).
+`ready` reads the request's instrument, the machine and the queue's capacity and
+nothing else, and changes nothing (`&self`, `venue.rs:99-100`).
 
 | `Unready` | When `LiveVenue` answers it |
 |---|---|
@@ -1296,12 +1298,14 @@ nothing (`&self`, `venue.rs:99-100`).
 | `StreamDown` | From construction until the subscription is accepted, and from each loss until the next. Never across a `LocalOverflow`. |
 | `InDoubt` | While any order has an open doubt cause, a deferred one, or a held report. |
 | `QueueFull` | `orders` has no room, or is closed. Closed cannot happen in a release build, where `panic = "abort"` (`Cargo.toml:86`) takes the process with a worker that panics; a closed queue takes nothing, which is what the variant says. |
-| `NoFilters`, `Untagged`, `NoBaseline` | **Never.** They are preconditions of building one. `wire` takes a `VenueInstrument` (`exchange_info.rs:229-239`), whose definition both the encoder and the translator need (`orders.rs:198-203`, `user_data.rs:384`), and a `RunTag`. A run whose `exchangeInfo` fetch failed, whose journal is non-empty and untagged, or (question 1 below) whose start balances were not written down, builds no `LiveVenue`: item 8 records and does not trade. They stay in the set because the set is serialized (`venue.rs:38-40`). |
+| `NoFilters` | For any instrument but the one the venue was wired for, which is that variant's own meaning (`venue.rs:47-49`): this venue holds venue-sourced filters for one instrument and none for another. `wire` takes the `InstrumentId` beside the `VenueInstrument` (`exchange_info.rs:229-239`), because an `InstrumentDef` carries no id to check `request.instrument` against (`orders.rs:184-186`) and `NewOrder::encode` writes `symbol` from whatever definition it is handed (`orders.rs:206`). Without the check, an order for instrument B passes `ready` and risk and goes out as the wired symbol, with real money. For the wired instrument, never: `wire` cannot be called without its filters. A `submit` for another instrument, which only a `ready` that lied could let through, is `never_landed { not_sent }` and is sent nowhere. |
+| `Untagged`, `NoBaseline` | **Never.** They are preconditions of building one. `wire` takes a `RunTag`, and the definition both the encoder and the translator need (`orders.rs:198-203`, `user_data.rs:384`). A run whose `exchangeInfo` fetch failed, whose journal is non-empty and untagged, or (question 1 below) whose start balances were not written down, builds no `LiveVenue`: item 8 records and does not trade. They stay in the set because the set is serialized (`venue.rs:38-40`). |
 
-When more than one holds, a refusal names one, in this order: `Diverged`,
-`Unchecked`, `StreamDown`, `InDoubt`, `QueueFull`. What needs a person, then what
-needs a check, then what clears by itself, so that a `refused` line points its
-reader at the cause that will last longest.
+When more than one holds, a refusal names one, in this order: `NoFilters`,
+`Diverged`, `Unchecked`, `StreamDown`, `InDoubt`, `QueueFull`. What this venue can
+never send, then what needs a person, then what needs a check, then what clears
+by itself, so that a `refused` line points its reader at the cause that will
+last longest.
 
 #### 4. Time
 
@@ -1397,7 +1401,9 @@ use one (`trade.rs:1467`), and a `ManualClock`: a cancel goes after the answer t
 the order it names; an answer is stamped when it arrived; the `timestamp` sent is
 the engine's `now` less the offset, read back off the request the server
 received, which is the sign `venue-check` once had wrong
-(`m8b-venue-check-offset`); with the worker stalled, `submit` returns, `ready`
+(`m8b-venue-check-offset`); an order for an instrument other than the one wired
+is refused `NoFilters` by `ready`, and if `submit` is called for it regardless,
+nothing reaches the server; with the worker stalled, `submit` returns, `ready`
 answers `QueueFull` and a cancel is `cancel_refused { not_sent }`; after
 `stop_sending` nothing reaches the server, every queued order comes back
 `never_landed`, and `outstanding` reaches zero.
