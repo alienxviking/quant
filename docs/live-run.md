@@ -989,9 +989,10 @@ all `quant-binance`'s; a crate of its own would hold one module.
 | Runtime | The binary's, as paper's is (`paper.rs:257-266`). `LiveVenue` lives on the engine's own thread (`paper.rs:248-254`), owns no runtime, spawns nothing and awaits nothing. `wire(..)` returns the venue and the request worker's future, and the binary spawns the future. | A runtime inside the venue is a second set of threads the binary's shutdown cannot see. A runtime handle in the venue spawning a task per request sends requests in no particular order, and a cancel can then reach the venue before the order it names. |
 | Requests | One **request worker**: one REST request in flight, first in first out, through `TradeClient::place_order` and `cancel_order` (`trade.rs:913`, `:925`). | A cancel sent beside its order can arrive first, come back `-2011` *"Unknown order sent."* (`orders.rs:141-153`), and leave the order resting with nobody cancelling it. One at a time also keeps the venue's `ORDERS` limits out of reach. The cost is head-of-line blocking behind a request that times out, at most `ORDER_TIMEOUT`, 20 s (`trade.rs:108`): nothing at one order a minute, and it shows as `QueueFull` rather than as silence. |
 | `orders` | `tokio::sync::mpsc`, bounded at **4**. The engine thread is its only producer, with `try_send`, which needs no runtime. | Full is `Unready::QueueFull`, refused before anything is written (`venue.rs:62-64`). It cannot race: `ready` (`strategy.rs:179`) and `submit` (`:243`) run on one thread with no poll between them. Four, because depth buys nothing: an order queued behind a request that times out leaves more than 20 s after the `timestamp` it carries, past the 5 s `recvWindow` (`trade.rs:82`), and the venue refuses it on arrival (rest-api.md:225-241). Unbounded would hide a stalled worker behind a growing queue, every order in it journalled `submitted`. |
-| `submit`, `cancel` | Encode, tell the machine, `try_send`, return. | The engine thread is the market's only reader. Blocked for one 20 s timeout it books nothing and tallies nothing, and once the tee's channel fills it loses market records as `LocalOverflow`, after which the book waits for the next snapshot, up to an hour. §5's *does not await* is the rule; that is what breaking it costs. |
-| An order's `timestamp` | The engine's `now`, less the offset measured at startup. No clock is read in `submit`. | The stamp is when the strategy decided, so that the venue refuses an order that waited too long (`trade.rs:58-61`, `:901-906`). `now` is the stamp of the input the strategy was acting on, the invariant-4 reading of that instant; a wall-clock read here would be the only one on the engine's path. |
-| `inbox` | `tokio::sync::mpsc`, bounded at 8; the worker awaits `send` and never drops. | A dropped answer is an order whose outcome nobody holds, and a dropped `Unknown` is an order nobody doubts. The worker can wait only while the engine is not polling, and the engine polls on every wake (`lib.rs:837-838`), an idle one at least every `IDLE_TICK` (`lib.rs:522`). Answers number at most the four queued and the one in flight, so the bound is not reached, and if it were, the cost would be a delay and never a loss. |
+| `submit`, `cancel` | Encode, tell the machine, `try_send`, return. A cancel that finds `orders` full is held (below), never refused for it. | The engine thread is the market's only reader. Blocked for one 20 s timeout it books nothing and tallies nothing, and once the tee's channel fills it loses market records as `LocalOverflow`, after which the book waits for the next snapshot, up to an hour. §5's *does not await* is the rule; that is what breaking it costs. |
+| A request's `timestamp` | An order's is the engine's `now`, less the offset measured at startup; no clock is read in `submit`. A cancel's is taken by the worker when it sends it, from its injected clock, less the same offset. | An order's stamp is when the strategy decided, so that the venue refuses an order that waited too long (`trade.rs:58-61`, `:901-906`). `now` is the stamp of the input the strategy was acting on, the invariant-4 reading of that instant; a wall-clock read here would be the only one on the engine's path. A cancel has no such reason: wanting an order gone does not go stale. Stamped at the engine's `now`, a cancel queued behind a request that timed out would be refused for its age and leave the order resting, which is the outcome holding cancels exists to prevent. The worker's clock is injected (4) and off the engine's path. `cancel_order`'s doc, which says its stamp is as `place_order`'s (`trade.rs:920-923`), changes in item 7. |
+| Held cancels | A cancel that finds `orders` full waits in the shell, first in first out, at most one per order, and goes out at the start of the next `poll` that finds room, before anything else that wake can send. While one is held, `ready` answers `QueueFull`, so no new order takes the slot ahead of it. A second cancel for an order whose cancel is held is `cancel_refused { not_sent }`. After `stop_sending`, held cancels come back `NotSent { why: "stopping" }`. | `orders` is full exactly when a request is stuck behind a timeout for up to 20 s. Refused then, the cancel was a `cancel_refused` notice the strategy is never told (§11 of `docs/engine-contract.md`: nothing of a notice reaches it), the strategy went on believing it had asked, and the resting order stayed on the venue, free to fill hours later. Held, it costs a short wait. At most one per working order keeps the hold bounded by the engine's own ledger. |
+| `inbox` | `tokio::sync::mpsc`, bounded at 8; the worker awaits `send` and never drops. | A dropped answer is an order whose outcome nobody holds, and a dropped `Unknown` is an order nobody doubts. The worker can wait only while the engine is not polling, and the engine polls on every wake (`lib.rs:837-838`), an idle one at least every `IDLE_TICK` (`lib.rs:522`). Between two polls the answers are usually no more than the four queued and the one in flight, but not always: a strategy submitting in a loop refills `orders` while the worker drains it within one wake, and item 8's `Control` sends too. When the bound is reached the worker waits for the next poll, so the cost is a delay and never a loss. |
 | Account | `AccountFeed`, as #70 built it, read with `poll`, which never blocks (`account.rs:1155-1157`). | Its channel is the tee's secondary with the capture primary, so a consumer that falls behind loses its own copy, as a `Blind { LocalOverflow }`, and never the file's. |
 | `poll` | Drain `inbox` with `try_recv` and the feed until `Empty` or `Closed`; merge the two by stamp as a **two-way merge**, each source kept in its own order; step the machine; append what it says. | A sort would reorder one source's own frames whenever the host clock steps back, since `local_recv_ts` is wall-clock time (CLAUDE.md, M2.e). Order within a source is evidence. Order across the two decides only the order of lines, and the permutation test (5) shows it changes nothing else. |
 
@@ -1001,7 +1002,7 @@ because a forgotten clone kept a channel open. Here:
 | | Senders | Receiver | Closed by |
 |---|---|---|---|
 | `orders` | `LiveVenue`, alone | the worker | dropping the engine, which owns the venue |
-| `inbox` | the worker; item 8's `Control`, if it keeps one for rechecks (3) | `LiveVenue` | nothing waits for it to close |
+| `inbox` | the worker; item 8's `Control`, if it keeps one for rechecks (3) | `LiveVenue` | nothing waits for it to close; a worker whose `send` fails stops |
 | account feed | the listener's `TeeSink` | `LiveVenue`'s `AccountFeed` | dropping the listener's future (`account.rs:718-722`), last |
 | stop | an `Arc<AtomicBool>`, set by `LiveVenue`, read by the worker | | not a channel |
 
@@ -1016,20 +1017,44 @@ machine records each as `never_landed`. `LiveVenue::stop_sending(&self)` sets it
 answered. Both take `&self`, because the binary reaches the venue only through
 `Engine::venue` (`lib.rs:1090`).
 
+**The worker never panics on a channel.** A failed `inbox.send` means the venue
+is gone: the worker stops, sending nothing more, and never `expect`s on it.
+Under `panic = "abort"` (`Cargo.toml:86`) an `expect` there would take the
+process down before step 6 below sealed the account capture, losing the one
+record of what the venue said about the run's last orders.
+
 `Engine::settle` (`lib.rs:708-714`) is how a run ends, in item 8's order:
 
 1. `run()` returns when the market source ends.
-2. `settle()` until nothing is working or a deadline longer than `ORDER_TIMEOUT`
+2. If the owner takes question 3's recommendation, `Engine::cancel_working()`:
+   for each working order, `on_cancel_requested` and then the venue's `cancel`,
+   at the engine's `now`, with no strategy call. Nothing can issue those cancels
+   today. The engine has no cancel of its own (`lib.rs:599-1113`), only
+   `Context::cancel` reaches the venue (`strategy.rs:278-284`), and only from a
+   strategy callback, which `settle` never makes. A cancel sent around the engine
+   would skip `on_cancel_requested`, and the journal would hold a `cancelled`
+   with no request behind it. So it is a seam addition, in item 8's pull request,
+   beside `settle` in `docs/engine-contract.md` §11, and its test asserts one
+   `cancel_requested` line per working order before any cancel reaches the venue.
+3. `settle()` until nothing is working or a deadline longer than `ORDER_TIMEOUT`
    passes (`lib.rs:700-704`), pausing `IDLE_TICK` when nothing came.
-3. `stop_sending()`, then `settle()` until `outstanding()` is zero, which the one
-   request in flight bounds at `ORDER_TIMEOUT`.
-4. The closing checkpoint, `stopped { working }`, `balances`.
-5. Drop the engine: `orders` closes, the worker returns, and its `inbox` sender
+4. `stop_sending()`, then `settle()` until `outstanding()` is zero **or a second
+   deadline passes**, `ORDER_TIMEOUT` and a margin, measured by the binary.
+   `outstanding()` reaches zero only if the worker is running, and a worker
+   never spawned, or one that panicked in a debug build, would hold it above
+   zero for ever. Passing the deadline is logged as an error, and every order
+   still unanswered is in `stopped.working`, which duty 6 then refuses to trade
+   past.
+5. The closing checkpoint, `stopped { working }`, `balances`.
+6. Drop the engine: `orders` closes, the worker returns, and its `inbox` sender
    goes with it.
-6. Stop the listener, which seals the account capture.
+7. Stop the listener, which seals the account capture.
+8. Only then shut the runtime down. It drives the worker in steps 3 and 4 and
+   the listener until step 7; dropped earlier, the worker never answers, and
+   the capture is left trailerless, which reads as a crash.
 
-Nothing in that sequence waits for a channel to close, which is what keeps it
-from hanging.
+Nothing in that sequence waits for a channel to close, and each wait has a
+deadline, which is what keeps it from hanging.
 
 #### 2. The merge machine
 
@@ -1040,7 +1065,7 @@ from hanging.
 | `Submitted` | the shell's `submit` | id, side, quantity |
 | `Placement` | the worker | `Placed`, `Refused`, `Unknown`, `NotSent` (`orders.rs:585-614`) |
 | `CancelReply` | the worker | `Acknowledged`, `NotOpen`, `Refused`, `Unknown`, `NotSent` (`orders.rs:641-661`) |
-| `Unsent` | the shell | an order that would not encode, or reached `submit` unready (a bug); a cancel for an order ended or never sent, or with the queue full, or after `stop_sending` |
+| `Unsent` | the shell | an order that would not encode, or reached `submit` unready (a bug); a cancel for an order ended or never sent, a second cancel for an order whose cancel is held, or one after `stop_sending` |
 | `Report` | the translator | `Ours`: an acceptance, a trade, or an end (`CANCELED`, `EXPIRED`, `TRADE_PREVENTION`); `Foreign`; `StreamTerminated` |
 | `Unreadable` | the translator's error | with the order it concerns, when the translator got that far |
 | `Subscribed`, `ServerShutdown` | `account::classify` on a recorded frame | the subscription's accepting answer; the venue's `serverShutdown` |
@@ -1328,7 +1353,7 @@ nothing else, and changes nothing (`&self`, `venue.rs:99-100`).
 | `Unchecked` | False at construction, which takes a `Checked`: minted only by the checks `venue-check` runs (`trade.rs:986`, `:1070`, `:1104`), and carrying the measured offset every order and logon is stamped with. True after a failing `Check`, false after a passing one. **Not** set by an order refused `-1021` or for its key: that is a rejection with the venue's code on its line, every later order would be refused the same way and harmlessly, and a latch on `-1021` would also fire on an order that only waited too long in the queue. |
 | `StreamDown` | From construction until the account is heard, and from each loss until it is heard again (§2, *The account*). Never across a `LocalOverflow` while heard. |
 | `InDoubt` | While any order has an open doubt cause, a deferred one, or a held report. |
-| `QueueFull` | `orders` has no room, or is closed. Closed cannot happen in a release build, where `panic = "abort"` (`Cargo.toml:86`) takes the process with a worker that panics; a closed queue takes nothing, which is what the variant says. |
+| `QueueFull` | `orders` has no room, a cancel is held (§1), or `orders` is closed. Closed cannot happen in a release build, where `panic = "abort"` (`Cargo.toml:86`) takes the process with a worker that panics; a closed queue takes nothing, which is what the variant says. |
 | `NoFilters` | For any instrument but the one the venue was wired for, which is that variant's own meaning (`venue.rs:47-49`): this venue holds venue-sourced filters for one instrument and none for another. `wire` takes the `InstrumentId` beside the `VenueInstrument` (`exchange_info.rs:229-239`), because an `InstrumentDef` carries no id to check `request.instrument` against (`orders.rs:184-186`) and `NewOrder::encode` writes `symbol` from whatever definition it is handed (`orders.rs:206`). Without the check, an order for instrument B passes `ready` and risk and goes out as the wired symbol, with real money. For the wired instrument, never: `wire` cannot be called without its filters. A `submit` for another instrument, which only a `ready` that lied could let through, is `never_landed { not_sent }` and is sent nowhere. |
 | `Untagged`, `NoBaseline` | **Never.** They are preconditions of building one. `wire` takes a `RunTag`, and the definition both the encoder and the translator need (`orders.rs:198-203`, `user_data.rs:384`). A run whose `exchangeInfo` fetch failed, whose journal is non-empty and untagged, or (question 1 below) whose start balances were not written down, builds no `LiveVenue`: item 8 records and does not trade. They stay in the set because the set is serialized (`venue.rs:38-40`). |
 
@@ -1464,9 +1489,13 @@ received, which is the sign `venue-check` once had wrong
 (`m8b-venue-check-offset`); an order for an instrument other than the one wired
 is refused `NoFilters` by `ready`, and if `submit` is called for it regardless,
 nothing reaches the server; with the worker stalled, `submit` returns, `ready`
-answers `QueueFull` and a cancel is `cancel_refused { not_sent }`; after
+answers `QueueFull`, and a cancel is held and reaches the server once room
+appears, before any order submitted after it; a cancel reaches the server
+stamped by the worker's clock at sending, not by the engine's `now`; after
 `stop_sending` nothing reaches the server, every queued order comes back
-`never_landed`, and `outstanding` reaches zero.
+`never_landed`, every held cancel `cancel_refused`, and `outstanding` reaches
+zero; and with the worker never spawned, the shutdown deadline (1) still ends
+the wait.
 
 **And one end to end**, through the real listener: `fake_venue` (#70) as the
 account side and a scripted REST server for orders; a market buy acknowledged,
@@ -1529,7 +1558,7 @@ Item 8 must enforce:
    requires (`account.rs:1174-1186`).
 4. **`JournalWriter::strict`.**
 5. **The shutdown order of (1)**, and the engine never dropped while
-   `outstanding()` is above zero.
+   `outstanding()` is above zero before step 4's deadline.
 6. **Until slice (d), no trading** when the last session has no `stopped` line or
    its `stopped.working` is not empty.
 7. **Its acceptance's replay, read precisely.** REST answers are not in the raw
@@ -1575,8 +1604,10 @@ the end-to-end test; the docs, then a grep for what they replace.
    frames it cannot yet translate.
 3. **At a stop, cancel resting orders before settling, or leave them** in
    `stopped.working`? Open since the seam's design. *Recommended: cancel them,*
-   then settle until their ends arrive. Cancelling is not flattening (§5), and an
-   order left resting can fill after the record has stopped.
+   through `Engine::cancel_working` (§1, step 2), a seam addition so that each
+   cancel is journalled as asked for, then settle until their ends arrive.
+   Cancelling is not flattening (§5), and an order left resting can fill after
+   the record has stopped.
 4. **A stranger's trade on another symbol** spends the quote asset criterion A
    marks. Latch `Diverged` for it too? *Recommended: no.* The rule names our
    symbol, and §2's one account is the defence; revisit if the account is shared.
