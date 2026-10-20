@@ -1129,6 +1129,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "quant-live"
+version = "0.1.0"
+dependencies = [
+ "quant-binance",
+ "quant-core",
+ "quant-engine",
+ "serde_json",
+]
+
+[[package]]
 name = "quant-meta"
 version = "0.1.0"
 dependencies = [

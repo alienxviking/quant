@@ -1077,15 +1077,15 @@ deadline, which is what keeps it from hanging.
 
 | Input | From | Values |
 |---|---|---|
-| `Submitted` | the shell's `submit` | id, side, quantity |
+| `Submitted` | the shell's `submit` | id, quantity (the side is not kept, §8) |
 | `Placement` | the worker | `Placed`, `Refused`, `Unknown`, `NotSent` (`orders.rs:585-614`) |
 | `CancelReply` | the worker | `Acknowledged`, `NotOpen`, `Refused`, `Unknown`, `NotSent` (`orders.rs:641-661`) |
 | `Unsent` | the shell | an order that would not encode, or reached `submit` unready (a bug); a cancel for an order ended or never sent, a second cancel for an order whose cancel is held, or one after `stop_sending` |
 | `Report` | the translator | `Ours`: an acceptance, a trade, or an end (`CANCELED`, `EXPIRED`, `TRADE_PREVENTION`); `Foreign`; `StreamTerminated` |
-| `Unreadable` | the translator's error | with the order it concerns, when the translator got that far |
+| `Unreadable` | the translator's error | with whose order it concerns: one of ours, a foreign one, or unknown (§8) |
 | `Subscribed`, `ServerShutdown` | `account::classify` on a recorded frame | the subscription's accepting answer; the venue's `serverShutdown` |
 | `Blind` | the feed | its `GapCause` |
-| `Check` | item 8, if it rechecks | a passing check, with its offset, or a failing one |
+| `Check` | item 8, if it rechecks | a passing check or a failing one; the offset is the shell's (§8) |
 
 **Per order** the machine keeps the request's side and quantity; what REST said
 (`Pending`, `Placed`, `Unknown`, `Refused`, `NotSent`); the venue's order id, from
@@ -1642,6 +1642,53 @@ needs a new argument.
    is above the worst transport delay seen so far (p99 14 s at M7). It is a
    timeout, so where it lands among the stream's records depends on timing:
    tested on its own, and kept out of the permutation test's equality.
+
+#### 8. What building the machine corrected
+
+The machine is `quant-live::Merge`, built from §2 and §3 and tested by §5's
+tables. Where the code showed the design wrong or silent, it followed the
+design's stated intent, and the difference is written here rather than left
+for a reader to find.
+
+- **`Submitted` carries no side.** No rule reads it; the quantity is kept
+  because a report's `z` is the request's quantity less its `remaining`.
+- **The machine routes frames itself**, `Merge::route`, so the routing the
+  design puts before the translator is pure and tested with the machine: an
+  answer and an unrecognised frame never reach the translator, and
+  `serverShutdown` is read before it.
+- **An unreadable report says whose it was in three ways, not two.** The
+  translator's `read` names one of ours, a foreign order, or nobody
+  (`user_data::Concerns`). A stranger's report read far enough to know it is
+  not ours puts none of ours in doubt; with two ways it could only have been
+  "unattributed", and doubted every working order for a report known not to
+  be about any of them. It is still an `anomaly { unreadable }`, and latches
+  nothing.
+- **A report attributed to one of our orders is a mention**, readable or not:
+  the venue has the order. So an unreadable one raises the order's deferred
+  causes with its `fills_missed`, a REST refusal after it is a contradiction,
+  one about an order REST ended is a contradiction, and one about an order
+  the stream ended is the anomaly alone, since nothing is working to doubt.
+- **A stranger's cancel-replace or amend is counted, not refused.** The
+  translator refuses `REJECTED` and `REPLACED` for our orders, which never
+  cause them; refused for a stranger's, an ordinary report of theirs would
+  have come back unreadable. Read leniently, as the BNB fee is.
+- **A trade handed over as an orphan is recorded as accounted for**, after an
+  end or on an order REST ended, so that a resent copy of it is
+  `duplicate_trade` rather than a second orphan of one trade.
+- **What our own plumbing cannot produce is a contradiction:** a REST answer
+  about an order the machine never sent, a second REST answer for one order,
+  a second submission under one id, a rejection from the stream (rule 1).
+  Each latches, so `journal::diverged` agrees with the machine on them too.
+- **The account, where the table is silent.** A `Blind` while down sets the
+  overflow mark for `LocalOverflow` and clears it for any other cause, since
+  a new connection brings its own answer. The feed closing while heard is
+  `lost { socket_closed }` (the listener records a `Disconnect` before it
+  stops, so this is a fallback), and nothing after it moves the account.
+- **`Check` carries no offset in the machine**, which never stamps a request.
+  The offset is the shell's. A machine is built checked, because the shell's
+  `wire` will take a `Checked`.
+- **`ready` takes the queue's state from the shell** (`Queue`), so the whole
+  order of §3 is in one function and tested pair by pair.
 
 ---
 
