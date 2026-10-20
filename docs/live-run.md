@@ -1495,13 +1495,25 @@ Not in item 7:
   `retryAfter`; refetching `exchangeInfo` or rechecking the clock during a run
   (the `Check` input is there for item 8 to use); anything read from
   `outboundAccountPosition`.
-- **A gap in the simulator this design found**, for slice (e). `SimulatedVenue`
-  announces every order `Accepted` before it judges its filters or its market
-  (`quant-sim/src/lib.rs:650-690`), so a filter breach or `NoMarket` reaches a
-  strategy as an acceptance and then a rejection, where live a refused request
-  is a rejection alone (rule 1). The seam's guarantee covers fields and types
-  (`docs/engine-contract.md` §11), not the shape of a lifecycle, and criterion B,
-  which pairs accepted-or-rejected, will see it.
+
+**Owed before item 8: the simulator announces only what it will not refuse.**
+`SimulatedVenue` announces every order `Accepted` before it judges its filters or
+its market (`quant-sim/src/lib.rs:647-690`), so a filter breach or `NoMarket`
+reaches a strategy as an acceptance and then a rejection, where live a refused
+request is a rejection alone (rule 1). The first draft filed this for slice (e)
+on the ground that the seam's guarantee covers fields and types and not the
+shape of a lifecycle. That was wrong twice over. `docs/engine-contract.md` §11
+ticks "a strategy's view of a lifecycle is identical whichever venue produced
+it", naming the declined order; and CLAUDE.md calls a strategy that can tell
+which pair it is wired to a bug, whatever a checkbox says. So the simulator
+judges filters and market first and announces only an order it will fill or
+rest, in its own pull request, before item 8's rehearsal runs a strategy
+against `LiveVenue`. Its acceptance is M5's money check, 824 fills and cash
+31.64743842, byte-identical in its report; a backtest journal that held
+rejections loses exactly their `accepted` lines, and nothing else moves:
+`MaCrossover` reads only an order's terminal event (`ma.rs:472-475`). §11's box
+stays ticked for what its test drove, two venues of the same shape, and gains a
+line saying it does not yet hold between the simulator and `LiveVenue`.
 
 Item 8 must enforce:
 
