@@ -43,10 +43,9 @@
 //!    `ORDER_TIMEOUT` passes, pausing `IDLE_TICK` when nothing came.
 //! 4. [`LiveVenue::stop_sending`], then `settle()` until
 //!    [`LiveVenue::outstanding`] is zero or a second deadline passes. A worker
-//!    never spawned, or one that panicked in a debug build, holds it above zero
-//!    for ever, which is why the wait has a deadline of its own. Every order
-//!    still unanswered is then still working in the engine, and goes into
-//!    `stopped.working`.
+//!    never spawned holds it above zero for ever, which is why the wait has a
+//!    deadline of its own. Every order still unanswered is then still working
+//!    in the engine, and goes into `stopped.working`.
 //! 5. The closing checkpoint, `stopped { working }`, `balances`.
 //! 6. Drop the engine: this venue goes with it, its `Drop` sets the stop flag,
 //!    `orders` closes, and the worker returns, its `inbox` sender with it.
@@ -54,6 +53,20 @@
 //! 8. Only then shut the runtime down. It drives the worker through steps 3
 //!    and 4 and the listener until step 7: dropped earlier, the worker never
 //!    answers and the capture is left trailerless, which reads as a crash.
+//!
+//! # A worker gone
+//!
+//! A worker whose task is dropped while the venue lives, by a runtime shut
+//! down too early or by a panic in a debug build, can never answer what it
+//! owes, and an order it had sent may be on the venue. The shell sees it go
+//! when the worker's end of `orders` closes, takes every answer it left on
+//! the inbox, logs the loss once as an error, and answers each request still
+//! owed itself: `Unknown { Interrupted }`, an order in doubt and a cancel of
+//! unknown effect. It cannot tell a request the worker took from one still
+//! queued when it went, so none is called certain. That writes the doubt the
+//! journal owes, without which an order the account then went dark on reads
+//! as `unwatched`, and brings `outstanding` to zero, so that step 4 does not
+//! wait out its deadline for answers nobody can send.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +75,7 @@ use std::sync::Arc;
 use quant_binance::account::{AccountFeed, AccountRecord, Polled};
 use quant_binance::exchange_info::VenueInstrument;
 use quant_binance::orders::{CancelOrder, EncodeError, NewOrder};
+use quant_binance::orders::{CancelReply, Placement, WhyUnknown};
 use quant_binance::trade::{Checked, TradeClient};
 use quant_binance::user_data::{MissingAsset, RunTag, Translator};
 use quant_core::execution::{ClientOrderId, OrderRequest};
@@ -70,6 +84,7 @@ use quant_core::report::VenueReport;
 use quant_core::time::{Clock, Ts};
 use quant_engine::{ExecutionVenue, Unready};
 use tokio::sync::mpsc::{self, error::TryRecvError, error::TrySendError};
+use tracing::error;
 
 use crate::merge::{Input, Merge, MergeStats, Queue, Unsent};
 use crate::worker::{Answer, Request, Worker, WorkerStats, STOPPING, UNHEARD_AFTER};
@@ -162,7 +177,8 @@ pub fn wire(
         feed_closed: false,
         held: VecDeque::new(),
         stop: Arc::clone(&stop),
-        outstanding: 0,
+        owed: VecDeque::new(),
+        latest: None,
         pending: Vec::new(),
         stats: LiveStats::default(),
         worker: Arc::clone(&stats),
@@ -198,8 +214,29 @@ pub struct LiveStats {
     /// Account frames and `Blind`s taken off the feed.
     pub frames: u64,
     pub blinds: u64,
-    /// Whether the worker's inbox is gone: its task returned or was dropped.
+    /// Whether the worker went while this venue lived: its task returned or
+    /// was dropped.
     pub worker_gone: bool,
+    /// Requests a gone worker never answered, answered unknown by the shell.
+    pub abandoned: u64,
+}
+
+/// Which answer a request handed to the worker is owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    /// A placement, for an order.
+    Order,
+    /// A cancel's reply.
+    Cancel,
+}
+
+impl Owed {
+    const fn of(request: &Request) -> Self {
+        match request {
+            Request::Order { .. } => Self::Order,
+            Request::Cancel { .. } => Self::Cancel,
+        }
+    }
 }
 
 /// The live venue. See the module docs.
@@ -219,8 +256,12 @@ pub struct LiveVenue {
     /// order. Only ever `Request::Cancel`.
     held: VecDeque<Request>,
     stop: Arc<AtomicBool>,
-    /// Requests handed to the worker and not yet answered.
-    outstanding: usize,
+    /// Requests handed to the worker and not yet answered, in the order they
+    /// were handed over, which is the order the worker answers them in.
+    owed: VecDeque<(ClientOrderId, Owed)>,
+    /// The latest stamp anything was stepped with: the earliest an input
+    /// with no stamp of its own can have been heard.
+    latest: Option<Ts>,
     /// What `submit` and `cancel` made the machine say, for the next poll.
     pending: Vec<VenueReport>,
     stats: LiveStats,
@@ -241,10 +282,12 @@ impl Drop for LiveVenue {
 }
 
 impl LiveVenue {
-    /// Send nothing more: every request the worker has not yet sent is
+    /// Send nothing more: every request the worker reads after this is
     /// answered `NotSent { "stopping" }`, every held cancel and every later
     /// cancel `cancel_refused { not_sent }`, and the queue takes nothing, so
-    /// `ready` answers `QueueFull` (§1, shutdown step 4).
+    /// `ready` answers `QueueFull` (§1, shutdown step 4). A request the worker
+    /// took just before this call may go out just after it; its answer counts
+    /// against [`Self::outstanding`] like any other.
     ///
     /// `&self`, because the binary reaches the venue only through
     /// `Engine::venue`.
@@ -253,10 +296,12 @@ impl LiveVenue {
     }
 
     /// Requests handed to the worker and not yet answered. It reaches zero
-    /// only while the worker runs, so a wait on it needs a deadline.
+    /// only while the worker runs or once the shell has seen it gone, so a
+    /// wait on it needs a deadline: a worker never spawned holds it up for
+    /// ever.
     #[must_use]
-    pub const fn outstanding(&self) -> usize {
-        self.outstanding
+    pub fn outstanding(&self) -> usize {
+        self.owed.len()
     }
 
     /// Whether [`Self::stop_sending`] has been called.
@@ -315,7 +360,21 @@ impl LiveVenue {
     }
 
     fn step(&mut self, at: Ts, input: Input, out: &mut Vec<VenueReport>) {
+        self.heard_at(at);
         self.merge.step(at, input, out);
+    }
+
+    fn heard_at(&mut self, at: Ts) {
+        self.latest = Some(self.latest.map_or(at, |latest| latest.max(at)));
+    }
+
+    /// The stamp for an input with none of its own: the engine's `now`, or
+    /// the latest stamp stepped if that is later. The engine's clock does not
+    /// move on an idle wake, and records drained in this poll can be stamped
+    /// after it, so `now` alone could date a loss before what was heard ahead
+    /// of it.
+    fn unstamped(&self, now: Ts) -> Ts {
+        self.latest.map_or(now, |latest| latest.max(now))
     }
 
     /// An order the shell did not send.
@@ -341,8 +400,9 @@ impl LiveVenue {
     /// Hand `request` to the worker, counting it outstanding; or hand it
     /// back, saying why not.
     fn enqueue(&mut self, request: Request) -> Result<(), TrySendError<Request>> {
+        let owed = (request.id(), Owed::of(&request));
         self.orders.try_send(request)?;
-        self.outstanding += 1;
+        self.owed.push_back(owed);
         self.stats.queued += 1;
         Ok(())
     }
@@ -372,11 +432,11 @@ impl LiveVenue {
     fn answer(&mut self, answer: Answer, out: &mut Vec<VenueReport>) {
         match answer {
             Answer::Placement { id, placement, at } => {
-                self.answered();
+                self.answered(id, Owed::Order);
                 self.step(at, Input::Placement { id, placement }, out);
             }
             Answer::CancelReply { id, reply, at } => {
-                self.answered();
+                self.answered(id, Owed::Cancel);
                 self.step(at, Input::CancelReply { id, reply }, out);
             }
             Answer::Unheard { id, at } => {
@@ -386,9 +446,31 @@ impl LiveVenue {
         }
     }
 
-    fn answered(&mut self) {
+    fn answered(&mut self, id: ClientOrderId, owed: Owed) {
         self.stats.answers += 1;
-        self.outstanding = self.outstanding.saturating_sub(1);
+        if let Some(at) = self.owed.iter().position(|&o| o == (id, owed)) {
+            self.owed.remove(at);
+        }
+    }
+
+    /// The worker is gone: answer everything it still owed, as unknown (the
+    /// module docs, *A worker gone*).
+    fn abandon_owed(&mut self, at: Ts, out: &mut Vec<VenueReport>) {
+        while let Some((id, owed)) = self.owed.pop_front() {
+            self.stats.abandoned += 1;
+            let why = WhyUnknown::Interrupted(WORKER_GONE.to_owned());
+            let input = match owed {
+                Owed::Order => Input::Placement {
+                    id,
+                    placement: Placement::Unknown { why },
+                },
+                Owed::Cancel => Input::CancelReply {
+                    id,
+                    reply: CancelReply::Unknown { why },
+                },
+            };
+            self.step(at, input, out);
+        }
     }
 
     /// One record off the account feed, into the machine.
@@ -400,6 +482,7 @@ impl LiveVenue {
                 payload,
             } => {
                 self.stats.frames += 1;
+                self.heard_at(local_recv_ts);
                 self.merge.frame(local_recv_ts, &payload, out);
             }
             AccountRecord::Blind {
@@ -532,7 +615,8 @@ impl ExecutionVenue for LiveVenue {
     /// What the shell said since the last poll; held cancels sent while there
     /// is room; then everything waiting on the inbox and the account feed,
     /// drained without blocking and merged by stamp as a two-way merge, each
-    /// source kept in its own order (§1, `poll`; §4).
+    /// source kept in its own order (§1, `poll`; §4); then, if the worker is
+    /// gone, what it owed, and if the feed has ended, its end.
     ///
     /// A sort would reorder one source's own records whenever the host clock
     /// steps back, and order within a source is evidence. Across the two, both
@@ -543,12 +627,17 @@ impl ExecutionVenue for LiveVenue {
         out.append(&mut self.pending);
         self.release_held(now, out);
 
+        // Asked before the inbox is drained: once the worker's end of
+        // `orders` is closed the worker is gone, and every answer it sent is
+        // already on the inbox. Not only the inbox's own close, which another
+        // sender on it, such as item 8's rechecks, would hold off.
+        let mut gone = self.orders.is_closed();
         loop {
             match self.inbox.try_recv() {
                 Ok(answer) => self.answers.push_back(answer),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.stats.worker_gone = true;
+                    gone = true;
                     break;
                 }
             }
@@ -582,10 +671,23 @@ impl ExecutionVenue for LiveVenue {
             }
         }
 
-        // The feed's end carries no stamp of its own. The engine's `now`
-        // moves nothing, and every record before it has been handed over.
+        if gone && !self.stats.worker_gone {
+            self.stats.worker_gone = true;
+            error!(
+                owed = self.owed.len(),
+                "the request worker is gone; what it owed is answered unknown"
+            );
+        }
+        if self.stats.worker_gone {
+            let at = self.unstamped(now);
+            self.abandon_owed(at, out);
+        }
+
+        // The feed's end carries no stamp of its own, and every record before
+        // it has been handed over.
         if closed {
-            self.step(now, Input::Closed, out);
+            let at = self.unstamped(now);
+            self.step(at, Input::Closed, out);
         }
     }
 }

@@ -898,7 +898,12 @@ fn a_shutdown_with_a_worker_that_never_answers_ends_at_its_deadline() {
 #[test]
 fn a_shutdown_after_the_runtime_has_gone_does_not_hang() {
     // The runtime goes before the drain: the worker and the listener with it.
-    // Nothing answers and nothing can, and the drain still ends.
+    // Nothing answers and nothing can, and the drain still ends. The order
+    // the worker had sent may be on the venue, so the shell answers it
+    // unknown, which puts it in doubt for `interrupted`, and the account
+    // lost with it then puts it in doubt for `account_blind`: the journal
+    // says what is not known, rather than leaving `runlog check` to find an
+    // order the dark was never written against.
     let mut rig = Rig::new(Setup {
         script: Script {
             orders: [Reply::Silence].into(),
@@ -925,10 +930,53 @@ fn a_shutdown_after_the_runtime_has_gone_does_not_hang() {
     assert!(started.elapsed() < Duration::from_secs(15));
     assert!(runtime.lock().expect("runtime").is_none(), "it went");
 
+    rig.finish();
+
     assert!(ran.stats.worker_gone, "{:?}", ran.stats);
-    assert!(!ran.drained.answered);
+    assert_eq!(ran.stats.abandoned, 1);
+    assert!(!ran.drained.settled);
+    assert!(ran.drained.answered, "answered unknown by the shell");
+    assert_eq!(ran.drained.outstanding, 0);
     assert_eq!(ran.drained.working, [ClientOrderId(1)]);
     assert_eq!(ran.ready, Err(Unready::StreamDown), "the listener went too");
+
+    // The two doubts land in either order, as the worker's end and the
+    // feed's are seen in one poll or in two.
+    let lines = kinds(&ran.entries);
+    let mut doubts = lines[1..lines.len() - 1].to_vec();
+    doubts.sort();
+    assert_eq!(
+        (lines.first(), doubts, lines.last()),
+        (
+            Some(&"submitted 1".to_owned()),
+            vec![
+                "doubt 1 raised AccountBlind".to_owned(),
+                "doubt 1 raised Interrupted".to_owned()
+            ],
+            Some(&"stopped [1]".to_owned())
+        ),
+        "{lines:?}"
+    );
+    let report = runlog::check(&ran.entries);
+    let mut findings: Vec<String> = report
+        .findings
+        .iter()
+        .map(|finding| match finding {
+            runlog::Finding::LeftInDoubt {
+                client_order_id,
+                cause,
+                ..
+            } => format!("in doubt {client_order_id} {cause:?}"),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    findings.sort();
+    assert_eq!(
+        findings,
+        ["in doubt 1 AccountBlind", "in doubt 1 Interrupted"],
+        "nothing unwatched"
+    );
+    assert_eq!(journal::agrees(&ran.entries), journal::Agreement::Agrees);
 }
 
 #[test]

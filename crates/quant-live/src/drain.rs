@@ -53,7 +53,8 @@ pub struct Drained {
     /// Nothing was working before step 3's deadline.
     pub settled: bool,
     /// Every request handed to the worker was answered before step 4's
-    /// deadline.
+    /// deadline: by the worker, or, when it is gone, by the shell as
+    /// unknown (`LiveStats::abandoned` counts those).
     pub answered: bool,
     /// Requests still unanswered when the drain ended.
     pub outstanding: usize,
@@ -64,9 +65,10 @@ pub struct Drained {
 /// [`LiveVenue::outstanding`] is zero or `deadlines.answers` passes.
 ///
 /// The second wait ends at its deadline whether or not the worker runs: one
-/// never spawned, or gone with its runtime, would hold `outstanding` above
-/// zero for ever. Passing either deadline is logged as an error, and every
-/// order still unanswered is in [`Drained::working`].
+/// never spawned would hold `outstanding` above zero for ever. One gone with
+/// its runtime does not, since the shell answers what it owed as soon as it
+/// sees it go. Passing either deadline is logged as an error, and every order
+/// still unanswered is in [`Drained::working`].
 ///
 /// The deadlines are measured on the host's monotonic clock. This paces a
 /// shutdown and decides nothing a replay must reproduce, so it is not the

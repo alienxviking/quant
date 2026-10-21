@@ -12,7 +12,10 @@ use quant_binance::account::AccountFeed;
 use quant_binance::trade::TradeClient;
 use quant_core::execution::{ClientOrderId, OrderRequest};
 use quant_core::instrument::{InstrumentId, InstrumentRegistry};
-use quant_core::report::{CancelRefusal, Landing, Notice, OrderReport, RejectedWhy, VenueReport};
+use quant_core::report::{
+    AccountChange, CancelRefusal, DoubtCause, DoubtChange, Landing, Notice, OrderReport,
+    RejectedWhy, VenueReport,
+};
 use quant_core::time::{ManualClock, Ts};
 use quant_engine::{ExecutionVenue, Unready};
 use quant_recorder::CaptureRecord;
@@ -39,18 +42,23 @@ struct Rig {
     worker: Option<Worker>,
     stats: Arc<WorkerStats>,
     clock: Arc<ManualClock>,
-    _account: SyncSender<CaptureRecord>,
+    /// The account side's channel; taken to end the feed.
+    account: Option<SyncSender<CaptureRecord>>,
     instrument: InstrumentId,
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime")
 }
 
 impl Rig {
     /// A venue whose account is heard, wired to a server answering `script`.
     fn new(script: Script) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("a runtime");
+        let runtime = runtime();
         let rest = RestVenue::start(script);
         let client = TradeClient::new(rest.base(), Duration::from_secs(5), fixtures::credentials())
             .expect("a client");
@@ -92,7 +100,7 @@ impl Rig {
             worker: Some(worker),
             stats,
             clock,
-            _account: account,
+            account: Some(account),
             instrument,
         }
     }
@@ -101,6 +109,14 @@ impl Rig {
     fn spawn(&mut self) {
         let worker = self.worker.take().expect("spawned once");
         self.runtime.spawn(worker.run());
+    }
+
+    /// Shut the rig's runtime down, the worker's task with it, as a binary
+    /// that shut its runtime down too early would; a fresh one takes its
+    /// place for whatever the test does next.
+    fn shut_the_runtime_down(&mut self) {
+        let gone = std::mem::replace(&mut self.runtime, runtime());
+        gone.shutdown_timeout(WITHIN);
     }
 
     fn order(&self) -> OrderRequest {
@@ -384,4 +400,106 @@ fn a_cancel_for_an_order_never_sent_or_already_held_goes_nowhere() {
     assert_eq!(rig.venue.stats().held, 1, "one held per order");
     assert!(cancel_not_sent(&out, 3).is_some(), "{out:#?}");
     rig.rest.release();
+}
+
+/// The doubts raised about order `id`, with their stamps.
+fn doubt_raised(out: &[VenueReport], id: u64) -> Vec<(DoubtCause, Ts)> {
+    out.iter()
+        .filter_map(|report| match report {
+            VenueReport::Notice(Notice::Doubt {
+                client_order_id,
+                change: DoubtChange::Raised { cause, .. },
+                ts,
+            }) if client_order_id.0 == id => Some((*cause, *ts)),
+            VenueReport::Notice(_) | VenueReport::Order(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_worker_gone_mid_run_leaves_what_it_owed_in_doubt_and_nothing_outstanding() {
+    // Order 1 is in flight, held at the server; order 2 and a cancel of 1
+    // are queued behind it. The runtime then goes, and the worker with it:
+    // nobody can answer the three, and order 1 may be on the venue. The
+    // shell answers each itself, unknown: both orders in doubt for
+    // `interrupted`, never `never_landed`, the cancel's effect unknown, and
+    // nothing left outstanding for step 4 to wait on.
+    //
+    // A second sender on the inbox outlives the worker, as item 8's rechecks
+    // would, so the inbox never closes: the shell must see the worker go by
+    // its end of `orders`.
+    let mut rig = Rig::new(Script {
+        orders: [Reply::Hold].into(),
+        ..Script::default()
+    });
+    let _rechecks = rig.worker.as_ref().expect("not spawned").inbox.clone();
+    rig.spawn();
+    rig.submit(1);
+    rig.rest.until("order 1", WITHIN, |seen| !seen.is_empty());
+    rig.submit(2);
+    rig.venue.cancel(ClientOrderId(1), NOW);
+    assert_eq!(rig.venue.outstanding(), 3);
+    rig.shut_the_runtime_down();
+
+    // Polled at an engine `now` later than anything heard: the answers the
+    // shell makes carry no stamp of their own, and take that one.
+    let later = Ts::from_millis(NOW.as_millis() + 9_000);
+    let mut out = Vec::new();
+    rig.venue.poll(later, &mut out);
+    assert!(rig.venue.stats().worker_gone);
+    assert_eq!(rig.venue.stats().abandoned, 3);
+    assert_eq!(rig.venue.outstanding(), 0, "{out:#?}");
+    for id in [1, 2] {
+        assert_eq!(
+            doubt_raised(&out, id),
+            [(DoubtCause::Interrupted, later)],
+            "{out:#?}"
+        );
+        assert_eq!(never_landed(&out, id), None, "{id}");
+    }
+    assert!(
+        out.iter().any(|report| matches!(
+            report,
+            VenueReport::Notice(Notice::CancelRefused {
+                client_order_id: ClientOrderId(1),
+                why: CancelRefusal::Unknown { .. },
+                ..
+            })
+        )),
+        "{out:#?}"
+    );
+    assert_eq!(rig.venue.ready(&rig.order()), Err(Unready::InDoubt));
+}
+
+#[test]
+fn the_feeds_end_is_stamped_no_earlier_than_what_was_heard_before_it() {
+    // A record stamped five seconds after the engine's `now`, then the feed
+    // ends, both taken in one poll at `now`. The loss carries no stamp of
+    // its own, and is dated at the record's, not at `now`, so that it never
+    // reads as heard before something heard ahead of it.
+    let mut rig = Rig::new(Script::default());
+    let later = Ts::from_millis(NOW.as_millis() + 5_000);
+    let account = rig.account.take().expect("the channel");
+    account
+        .send(CaptureRecord::Account {
+            local_recv_ts: later,
+            ingest_seq: 2,
+            payload: fixtures::balances(),
+        })
+        .expect("open");
+    drop(account);
+    let mut out = Vec::new();
+    rig.venue.poll(NOW, &mut out);
+    let lost: Vec<Ts> = out
+        .iter()
+        .filter_map(|report| match report {
+            VenueReport::Notice(Notice::Account {
+                change: AccountChange::Lost { .. },
+                ts,
+            }) => Some(*ts),
+            VenueReport::Notice(_) | VenueReport::Order(_) => None,
+        })
+        .collect();
+    assert_eq!(lost, [later], "{out:#?}");
+    assert_eq!(rig.venue.ready(&rig.order()), Err(Unready::StreamDown));
 }
