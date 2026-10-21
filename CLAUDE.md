@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 860 tests green in debug
-and release, clippy and fmt clean, ~73,300 lines across 13 crates.
+same window exactly, on both symbols, to the satoshi. 864 tests green in debug
+and release, clippy and fmt clean, ~73,700 lines across 13 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -2434,7 +2434,11 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   never overtakes its order, awaiting room rather than dropping an answer,
   stopping without a panic when the venue is gone, and firing decision 6's
   `Unheard` `ORDER_TIMEOUT` after each `Placed`. A cancel that finds the
-  queue (four) full is held and goes first when room appears. `drain` is
+  queue (four) full is held and goes first when room appears. A worker gone
+  while the venue lives, by a runtime shut down too early, is seen by its
+  end of the queue closing, and the shell answers everything it owed
+  `Unknown { Interrupted }`, so the order it had sent is in doubt rather
+  than silently `unwatched` (found by review, before merge). `drain` is
   shutdown steps 3 and 4, each wait with its own deadline, and the shell's
   module docs give the binary the whole order. Accepted by the shell's own
   tests against a scripted local REST server and a `ManualClock`, and by ten
@@ -2442,7 +2446,8 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   writer, listener, tee and feed: a lifecycle `runlog check` calls complete
   and `reconcile` agrees with, a refusal told as a rejection alone, a
   timeout cleared by the stream, a full queue and a held cancel, the timer
-  both ways, both shutdown deadlines, the account lost through the real
+  both ways, both shutdown deadlines, a runtime gone mid-run leaving its
+  order in doubt, the account lost through the real
   feed, and the same events through this venue and the simulator. Every
   test seen red under its break, and every socket test run 20 times in 6
   copies at once. What building it corrected is in `docs/live-run.md` §5,

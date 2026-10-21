@@ -680,7 +680,9 @@ feature.
    `fills_missed` on an order never mentioned and not on one the stream
    reported; a shutdown with a worker that never answers ending at its
    deadlines with the order in `stopped`, and one after the runtime has gone
-   not hanging; the account lost through the real feed; and the same
+   not hanging and leaving the order the worker had sent in doubt, which
+   `runlog check` reads as in doubt rather than unwatched; the account lost
+   through the real feed; and the same
    lifecycle telling a strategy the same events through this venue and the
    simulator. Every test was seen red under its break, and every socket test
    passed 20 runs in each of 6 copies at once. What it corrected is in §5,
@@ -1824,15 +1826,41 @@ The shell's:
   outstanding from the `try_send` that handed it over until its answer is
   taken off the inbox, not until the worker sends the answer. So it reaches
   zero only once the engine holds every answer, which is what step 4 waits
-  for. `Unheard` answers no request and does not count.
-- **A worker dropped is not a worker never spawned.** Dropping the worker's
-  future closes `orders`, so `ready` answers `QueueFull` and nothing is
-  sent at all. The case step 4's deadline exists for is a future held and
-  never polled, which leaves the queue open and the answer never coming;
-  that is what its test holds.
-- **The feed's end carries no stamp.** `Polled::Closed` has none, so the
-  shell steps `Closed` at the engine's `now`, after every record before it,
-  which moves the clock nothing.
+  for. `Unheard` answers no request and does not count. The shell keeps
+  what each request is owed, in order, rather than a count, for the next
+  correction.
+- **A worker gone is answered for, not waited for.** §3 said a closed
+  queue "cannot happen in a release build", where `panic = "abort"` takes
+  the process with a worker that panics. It can, when the binary shuts its
+  runtime down before step 8, and then every answer the worker owed is
+  lost. The first build
+  only set a flag. The order it had sent stayed `Sent` with REST pending, so
+  an account lost after it deferred its `account_blind` for ever and
+  `runlog check` found the order `unwatched`, and step 4 waited out its
+  whole deadline for answers nobody could send. The shell now sees the
+  worker go when the worker's end of `orders` closes (not the inbox's own
+  close, which item 8's rechecks would hold off), takes what the worker
+  left on the inbox, logs the loss once as an error, and answers each
+  request still owed `Unknown { Interrupted }`: an order in doubt, a cancel
+  of unknown effect. It cannot tell a request the worker took from one
+  still queued, so none is called certain. A worker never spawned leaves
+  the queue open and is not seen gone, which is still what step 4's
+  deadline is for.
+- **The worker counts the answers that waited** (`WorkerStats::waited`),
+  each one an answer or `Unheard` that found the inbox full and waited for
+  the next poll. It is what lets a test see an answer wait rather than be
+  dropped, and what shows an engine slow to poll.
+- **An input with no stamp of its own takes the latest stamp heard.**
+  `Polled::Closed` has none, nor does an answer the shell makes for a gone
+  worker. The first build stepped both at the engine's `now`, which does not
+  move on an idle wake, so an `account lost` could be dated before records
+  drained ahead of it in the same poll. Both now take the later of `now`
+  and the latest stamp the shell has stepped.
+- **`Check` has no way in yet.** §1's sender table gives item 8's `Control`
+  a sender on the inbox for rechecks, and the shell has none: `Answer` is
+  the crate's own, and nothing on `LiveVenue` steps a `Check`. Item 8 adds
+  the way in when it adds rechecks (§6), and the worker's end of `orders`,
+  not the inbox, is already what says the worker has gone.
 - **Equal stamps put the REST answer first.** The two-way merge needs a rule
   for a tie, and the permutation test shows the order across the two
   sources changes only the order of lines.

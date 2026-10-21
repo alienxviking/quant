@@ -20,8 +20,10 @@ ends up describing a system that was never run.
 Backtest is `HistoricalSource + SimulatedVenue`. Paper is
 `LiveSource + SimulatedVenue` — see §9, there is no separate paper venue. Live
 is `LiveSource + LiveVenue` **[M8]** — and the mark is not decoration:
-`LiveVenue` does not exist in the workspace yet, so the third wiring names what
-this seam is built for rather than something that runs today. One strategy
+`LiveVenue` exists (`quant-live`, M8's slice (c)) and runs end to end in tests
+against local servers, but no binary wires it yet and no order has gone
+through it to the venue, so the third wiring names what this seam is built
+for rather than something that has traded. One strategy
 binary, three worlds, no code changes between them.
 
 If a strategy *can* tell, the backtest is measuring a system that will never
@@ -712,9 +714,9 @@ inherits without a word (M7.5.e's `take_notes` in `Recorded`), and the
 inherited answer here would be "ready" around a venue that is not. The simulator
 answers always ready; its filters stay judged on receipt, with a `Rejected`, as
 a real venue judges them. `Unready` is closed now because it is serialized
-inside `refused` lines, and includes `Diverged`, which nothing produces yet:
-`LiveVenue` will latch it on an unattributable fill or a stranger's trade on our
-symbol, and only a person clears it.
+inside `refused` lines, and includes `Diverged`, which only `LiveVenue`
+produces: its merge machine latches it on an unattributable fill or a
+stranger's trade on our symbol, and only a person clears it.
 
 ### A submission the record could not hold is never sent
 
@@ -823,8 +825,9 @@ exhaustive `match` in the writer, a request that never landed is
 `on_notice`'s reason. The engine calls it in step 2 when `Book::apply` takes a
 book from not live to live, and the journal writes it as `sighted`: the
 market's return, written down, which `explain` reads in place of inferring it
-from any later line once a session is schema 3. Nothing produces the venue's
-lines until `LiveVenue` exists; `sighted` is in every new backtest and paper
+from any later line once a session is schema 3. Only `LiveVenue`
+(`quant-live`) produces the venue's lines, so for now they are written only by
+its end-to-end tests; `sighted` is in every new backtest and paper
 journal, one each time a book goes from not live to live: after every gap,
 and also when a book re-anchors after its own update chain broke, which writes
 no `blind` line. The readers' pull request, `m8c-journal-readers`, recounts
