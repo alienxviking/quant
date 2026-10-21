@@ -210,11 +210,20 @@ struct Ran {
 
 static RUNS: AtomicUsize = AtomicUsize::new(0);
 
-/// A journal file of its own, under a directory named for this process.
+/// A journal file of its own, under a directory named for this process, and
+/// empty: a run that panicked before removing its journal leaves it behind,
+/// Windows reuses process ids, and `Journal::open` appends, so a later process
+/// given the same id would read a stranger's lines ahead of its own.
 fn journal_path() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("quant-explain-live-merge-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
-    dir.join(format!("{}.jsonl", RUNS.fetch_add(1, Ordering::Relaxed)))
+    let path = dir.join(format!("{}.jsonl", RUNS.fetch_add(1, Ordering::Relaxed)));
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("cannot clear {}: {e}", path.display()),
+    }
+    path
 }
 
 fn instrument() -> InstrumentId {
