@@ -713,7 +713,14 @@ fn a_full_queue_answers_queue_full_and_a_held_cancel_goes_before_later_orders() 
     // refused `QueueFull` before anything is written but the refusal; a
     // cancel of order 1 then waits in the shell, and a seventh order is
     // refused while it does. Released, the cancel goes out ahead of the
-    // eighth order, submitted after it.
+    // eighth order, submitted after it, and the journal accounts for all of
+    // it.
+    //
+    // Order 7 falls while order 1 is still held at the server, so the queue
+    // is full as well as holding the cancel: this cannot tell a held cancel
+    // refusing an order from a full queue refusing it. The shell's own test,
+    // `with_the_worker_stalled_the_queue_fills_and_a_held_cancel_goes_before_later_orders`,
+    // pins that the held cancel alone does.
     let mut rig = Rig::new(Setup {
         script: Script {
             orders: [Reply::Hold].into(),
@@ -783,6 +790,30 @@ fn a_full_queue_answers_queue_full_and_a_held_cancel_goes_before_later_orders() 
         ["rejected 6 Venue", "rejected 7 Venue"],
         "refused, and told only that the venue would not take them"
     );
+    assert_eq!(
+        kinds(&ran.entries),
+        [
+            "submitted 1",
+            "submitted 2",
+            "submitted 3",
+            "submitted 4",
+            "submitted 5",
+            "refused 6",
+            "cancel_requested 1",
+            "refused 7",
+            "placed 1",
+            "placed 2",
+            "placed 3",
+            "placed 4",
+            "placed 5",
+            "submitted 8",
+            "placed 8",
+            "stopped [1, 2, 3, 4, 5, 8]"
+        ]
+    );
+    let report = runlog::check(&ran.entries);
+    assert!(report.is_complete(), "{:#?}", report.findings);
+    assert_eq!(journal::agrees(&ran.entries), journal::Agreement::Agrees);
 }
 
 #[test]
