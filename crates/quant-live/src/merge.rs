@@ -262,9 +262,9 @@ impl Merge {
     /// A machine for `instrument`, whose reports `translator` reads.
     ///
     /// Down until the account is heard. Checked, because the shell that owns
-    /// it is built only from a passing `venue-check` (the next pull request's
-    /// `wire`, taking a `Checked`); a recheck that fails during the run
-    /// is what makes it unchecked.
+    /// it is built only from a passing `venue-check` ([`crate::wire`], taking
+    /// a `Checked`); a recheck that fails during the run is what makes it
+    /// unchecked.
     #[must_use]
     pub const fn new(instrument: InstrumentId, translator: Translator) -> Self {
         Self {
@@ -319,6 +319,17 @@ impl Merge {
     #[must_use]
     pub const fn diverged(&self) -> bool {
         self.diverged
+    }
+
+    /// Whether `id` is an order this machine was told was sent and has not
+    /// heard end: what a cancel may name. The shell asks before it sends one,
+    /// so that a cancel for an order ended or never sent is `cancel_refused
+    /// { not_sent }` and goes nowhere.
+    #[must_use]
+    pub fn working(&self, id: ClientOrderId) -> bool {
+        self.orders
+            .get(&id)
+            .is_some_and(|order| order.ended.is_none())
     }
 
     #[must_use]

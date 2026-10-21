@@ -11,9 +11,11 @@
 //! `quant-binance::user_data` already make, pure logic with the transport
 //! elsewhere, one level up.
 //!
-//! This crate holds the machine. The shell, the request worker that sends
-//! orders one at a time, and the timer behind [`Input::Unheard`] are the next
-//! pull request; the binary that runs them is item 8.
+//! Both are here: the machine in [`merge`], the shell in [`shell`], with
+//! [`wire`] building it and the request worker ([`worker`]) that sends orders
+//! one at a time and keeps the timer behind [`Input::Unheard`], and [`drain`],
+//! the two waits of a live run's shutdown. The binary that runs them is
+//! item 8, and [`shell`]'s module docs say what it must do in which order.
 //!
 //! # Why a merge at all
 //!
@@ -28,8 +30,14 @@
 //! that subsection) and pinned by a test that runs every interleaving of
 //! them (`quant-explain`'s `live_merge` tests).
 
+pub mod drain;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod merge;
+pub mod shell;
+pub mod worker;
 
+pub use drain::{drain, Deadlines, Drained};
 pub use merge::{Check, Heard, Input, Merge, MergeStats, Queue, Unsent};
+pub use shell::{wire, LiveStats, LiveVenue, WireError, INBOX_BOUND, ORDERS_BOUND};
+pub use worker::{Worker, WorkerEnd, WorkerStats};

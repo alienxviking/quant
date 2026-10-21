@@ -1,9 +1,13 @@
-//! The venue's account frames, written as the venue writes them, for tests.
+//! The venue's account frames, written as the venue writes them, and the
+//! pieces a live venue is wired from, for tests.
 //!
 //! On only with the `fixtures` feature, which this crate's tests and
 //! `quant-explain`'s use. One set of builders for both, so that the machine's
 //! own tests and the permutation test feed it the same bytes: two copies would
 //! be two models of the venue's frames that must agree for ever.
+//!
+//! [`rest`] is the REST side's stand-in, and the wiring pieces below it
+//! ([`venue_instrument`], [`credentials`], [`checked`]) are what `wire` takes.
 //!
 //! Each frame is Binance's documented `executionReport`
 //! (`user-data-stream.md` at commit `0556f1a`, the translator's own fixture)
@@ -11,10 +15,24 @@
 //! API sends it in. Constructed, not captured: nothing in this system has
 //! placed a real order yet.
 
+use std::fmt::Write as _;
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+use quant_binance::credentials::Credentials;
+use quant_binance::exchange_info::VenueInstrument;
+use quant_binance::orders::NewOrder;
+use quant_binance::trade::{Checked, NotReady, TradeClient};
 use quant_binance::user_data::RunTag;
-use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind};
+use quant_core::event::Side;
+use quant_core::execution::{ClientOrderId, OrderKind, OrderRequest, TimeInForce};
+use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
 use quant_core::report::EndedBy;
+use ring::rand::{SecureRandom as _, SystemRandom};
+use ring::signature::Ed25519KeyPair;
 use serde_json::{json, Value};
+
+pub mod rest;
 
 /// The run tag every fixture's ids are sent under.
 pub const RUN: &str = "r1";
@@ -47,6 +65,76 @@ pub fn btcusdt() -> InstrumentDef {
         lot_size: "0.00001".parse().expect("lot"),
         min_notional: "5".parse().expect("notional"),
     }
+}
+
+/// [`btcusdt`] as the venue's `exchangeInfo` would give it, with no rule it
+/// does not model: what `wire` takes.
+#[must_use]
+pub fn venue_instrument() -> VenueInstrument {
+    VenueInstrument {
+        definition: btcusdt(),
+        unmodelled: Vec::new(),
+    }
+}
+
+/// Credentials made in this process for this test, and nowhere else: an
+/// Ed25519 key pair generated here and a random API key. No key material is
+/// read from anywhere or written anywhere, and none outlives the test. The
+/// local REST server checks no signature; `quant-binance`'s own tests do.
+///
+/// # Panics
+///
+/// If `ring` cannot make a key pair.
+#[must_use]
+pub fn credentials() -> Credentials {
+    let rng = SystemRandom::new();
+    let document = Ed25519KeyPair::generate_pkcs8(&rng).expect("ring makes a key pair");
+    let mut bytes = [0_u8; 16];
+    rng.fill(&mut bytes).expect("random bytes");
+    let key = bytes.iter().fold(String::new(), |mut text, b| {
+        let _ = write!(text, "{b:02x}");
+        text
+    });
+    Credentials::new(key, &STANDARD.encode(document.as_ref())).expect("a key ring made")
+}
+
+/// A market buy of 0.001 [`btcusdt`], the shape `MaCrossover` sends, for
+/// `instrument`.
+///
+/// # Panics
+///
+/// Never: the literals parse.
+#[must_use]
+pub fn market_buy(instrument: quant_core::instrument::InstrumentId) -> OrderRequest {
+    OrderRequest {
+        instrument,
+        side: Side::Buy,
+        qty: "0.001".parse().expect("qty"),
+        kind: OrderKind::Market,
+        time_in_force: TimeInForce::Gtc,
+    }
+}
+
+/// A `Checked` minted the only way there is, by running the checks against
+/// `client`'s venue, with the host clock measured `offset_ms` ahead.
+///
+/// # Errors
+///
+/// The first check's refusal.
+///
+/// # Panics
+///
+/// Never: the probe encodes.
+pub async fn checked(client: &TradeClient, offset_ms: i64) -> Result<Checked, NotReady> {
+    let instrument = InstrumentRegistry::new().register(btcusdt());
+    let probe = NewOrder::encode(
+        &market_buy(instrument),
+        ClientOrderId(0),
+        &run(),
+        &btcusdt(),
+    )
+    .expect("the probe encodes");
+    client.checked(&probe, "BTCUSDT", offset_ms).await
 }
 
 /// The client id this run sends order `id` under.
