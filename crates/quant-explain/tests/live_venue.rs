@@ -931,6 +931,91 @@ fn a_shutdown_after_the_runtime_has_gone_does_not_hang() {
     assert_eq!(ran.ready, Err(Unready::StreamDown), "the listener went too");
 }
 
+#[test]
+fn losing_the_account_through_the_real_feed_puts_a_working_order_in_doubt() {
+    // The venue drops the account connection while an order is working:
+    // the listener records the gap, the feed hands it over as `Blind`, and
+    // the order is in doubt for `account_blind` until the reconnected
+    // stream's next report about it clears it.
+    let mut rig = Rig::new(Setup::default());
+    let order = venue_order_id(1);
+    let [push_new, read_new] = rig.push(vec![fixtures::new_order(&ours(1), order, "0.001")]);
+    let [push_trade, read_trade] = rig.push(vec![fixtures::trade(
+        &ours(1),
+        order,
+        "0.001",
+        "0.001",
+        "0.001",
+        7,
+    )]);
+    let (dropping, resubscribed) = (Arc::clone(&rig.account), Arc::clone(&rig.account));
+    let steps = vec![
+        rig.heard(),
+        Step::Market,
+        rig.answered(1),
+        push_new,
+        read_new,
+        rig.told("accepted 1"),
+        Step::Do(Box::new(move || dropping.drop_connection())),
+        Step::Until(
+            "the second subscription",
+            Box::new(move || {
+                let log = resubscribed.log();
+                log.subscribed >= 2
+                    && log
+                        .sent
+                        .iter()
+                        .rev()
+                        .find(|sent| sent.said == Said::SubscribeAnswer)
+                        .is_some_and(|sent| {
+                            sent.connection >= 2 && log.read_by_listener(&sent.text)
+                        })
+            }),
+        ),
+        push_trade,
+        read_trade,
+        rig.told("filled 1 0.001 at 76650.12 left 0"),
+    ];
+    let ran = rig.run(steps, vec![vec![Act::Buy]], &QUICK);
+    rig.finish();
+
+    assert_eq!(
+        kinds(&ran.entries),
+        [
+            "submitted 1",
+            "placed 1",
+            "accepted 1",
+            "doubt 1 raised AccountBlind",
+            "doubt 1 cleared",
+            "filled 1",
+            "stopped []"
+        ]
+    );
+    let account: Vec<&quant_core::report::AccountChange> = ran
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            if let JournalEntry::Account { change, .. } = entry {
+                Some(change)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        account,
+        [
+            &quant_core::report::AccountChange::Regained,
+            &quant_core::report::AccountChange::Lost {
+                cause: quant_core::report::AccountCause::SocketClosed
+            },
+            &quant_core::report::AccountChange::Regained,
+        ]
+    );
+    let report = runlog::check(&ran.entries);
+    assert!(report.is_complete(), "{:#?}", report.findings);
+}
+
 /// One market buy, through `venue`, the strategy told what it was told.
 fn told_through<V: quant_engine::ExecutionVenue>(
     venue: V,
