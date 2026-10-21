@@ -22,16 +22,20 @@
 //!
 //! - **Drop an answer.** The inbox is bounded and the worker awaits room in
 //!   it: a full inbox makes it wait for the engine's next poll, never lose an
-//!   answer. A lost `Unknown` would be an order nobody doubts.
+//!   answer. A lost `Unknown` would be an order nobody doubts. Each wait is
+//!   counted ([`WorkerStats::waited`]), so a slow engine shows.
 //! - **Panic on a channel.** A failed send means the venue is gone, and the
 //!   worker stops sending anything more and returns. Under `panic = "abort"`
 //!   an `expect` there would take the process down before the account capture
 //!   was sealed, losing the one record of what the venue said about the run's
 //!   last orders.
-//! - **Send after `stop_sending`.** A tokio receiver still yields what is
-//!   buffered after every sender is gone, so the venue sets a stop flag first,
-//!   and every request read after it is answered `NotSent { "stopping" }`
-//!   without leaving this process.
+//! - **Send a request it reads after `stop_sending`.** A tokio receiver
+//!   still yields what is buffered after every sender is gone, so the venue
+//!   sets a stop flag first, and every request read after it is answered
+//!   `NotSent { "stopping" }` without leaving this process. The flag is read
+//!   between taking a request and sending it, so one taken just before
+//!   `stop_sending` goes out just after it returns. Its answer still counts
+//!   against `outstanding`, and step 4 of the shutdown waits for it.
 //!
 //! # Stamps
 //!
@@ -51,7 +55,7 @@ use quant_binance::orders::{CancelOrder, CancelReply, NewOrder, Placement};
 use quant_binance::trade::{TradeClient, ORDER_TIMEOUT};
 use quant_core::execution::ClientOrderId;
 use quant_core::time::{Clock, Ts};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::time::Instant;
 
 /// Why a request that was queued never left: the venue had stopped sending.
@@ -143,6 +147,7 @@ pub struct WorkerStats {
     answered: AtomicU64,
     stopped: AtomicU64,
     unheard: AtomicU64,
+    waited: AtomicU64,
 }
 
 impl WorkerStats {
@@ -168,6 +173,13 @@ impl WorkerStats {
     #[must_use]
     pub fn unheard(&self) -> u64 {
         self.unheard.load(Ordering::Relaxed)
+    }
+
+    /// Answers and `Unheard`s that found the inbox full and waited for the
+    /// engine's next poll: each one a delay, and none a loss.
+    #[must_use]
+    pub fn waited(&self) -> u64 {
+        self.waited.load(Ordering::Relaxed)
     }
 }
 
@@ -271,9 +283,7 @@ impl Worker {
                     None
                 }
             };
-            // Awaited, never dropped: a full inbox waits for the engine's next
-            // poll. A closed one means nobody is left to hear it.
-            if self.inbox.send(answer).await.is_err() {
+            if !self.deliver(answer).await {
                 return WorkerEnd::VenueGone;
             }
             self.stats.answered.fetch_add(1, Ordering::Relaxed);
@@ -293,11 +303,25 @@ impl Worker {
             id,
             at: self.clock.now(),
         };
-        if self.inbox.send(answer).await.is_err() {
+        if !self.deliver(answer).await {
             return false;
         }
         self.stats.unheard.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    /// Put `answer` on the inbox: at once when there is room, and otherwise
+    /// awaited, never dropped, so that a full inbox waits for the engine's
+    /// next poll. False when the inbox is closed, which means nobody is left
+    /// to hear it.
+    async fn deliver(&self, answer: Answer) -> bool {
+        let answer = match self.inbox.try_send(answer) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(answer)) => answer,
+            Err(TrySendError::Closed(_)) => return false,
+        };
+        self.stats.waited.fetch_add(1, Ordering::Relaxed);
+        self.inbox.send(answer).await.is_ok()
     }
 }
 

@@ -22,7 +22,7 @@ use quant_recorder::CaptureRecord;
 
 use crate::fixtures::rest::{Reply, RestVenue, Script, Seen};
 use crate::fixtures::{self, market_buy};
-use crate::shell::{wire, LiveVenue, ORDERS_BOUND};
+use crate::shell::{wire, LiveVenue, INBOX_BOUND, ORDERS_BOUND};
 use crate::worker::{Worker, WorkerStats};
 
 /// The host clock, measured this far ahead of the venue's.
@@ -414,6 +414,38 @@ fn doubt_raised(out: &[VenueReport], id: u64) -> Vec<(DoubtCause, Ts)> {
             VenueReport::Notice(_) | VenueReport::Order(_) => None,
         })
         .collect()
+}
+
+#[test]
+fn an_answer_that_finds_the_inbox_full_waits_for_the_next_poll_and_is_not_lost() {
+    // Nine orders and no poll. The worker puts eight answers on the inbox,
+    // which holds eight, and the ninth finds it full: it waits there rather
+    // than being dropped, and the polls after take all nine.
+    assert_eq!(INBOX_BOUND, 8);
+    let mut rig = Rig::new(Script::default());
+    rig.spawn();
+    for id in 1..=9 {
+        let deadline = Instant::now() + WITHIN;
+        while rig.venue.readiness().is_err() {
+            assert!(Instant::now() < deadline, "no room for order {id}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        rig.submit(id);
+    }
+    let deadline = Instant::now() + WITHIN;
+    while rig.stats.waited() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no answer waited: answered {}",
+            rig.stats.answered()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let out = rig.poll_until("all nine answers", |out| {
+        (1..=9).all(|id| placed(out, id).is_some())
+    });
+    assert_eq!(rig.venue.outstanding(), 0, "{out:#?}");
+    assert_eq!((rig.stats.answered(), rig.stats.waited()), (9, 1));
 }
 
 #[test]
