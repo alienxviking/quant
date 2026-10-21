@@ -126,6 +126,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -140,7 +141,7 @@ mod tests {
     use quant_recorder::CaptureRecord;
 
     use super::{drain, Deadlines};
-    use crate::fixtures::rest::{RestVenue, Script};
+    use crate::fixtures::rest::{Reply, RestVenue, Script};
     use crate::fixtures::{self, market_buy};
     use crate::shell::wire;
 
@@ -170,13 +171,22 @@ mod tests {
         fn on_execution(&mut self, _: &ExecutionEvent, _: &mut Context<'_>) {}
     }
 
+    /// Step 3's deadline, short enough that an order still working runs it
+    /// out in a test.
+    const SETTLE: Duration = Duration::from_millis(300);
+
     /// An engine that has run, with one order sent to a venue whose account
-    /// is heard and whose worker runs only if `spawn` says so.
+    /// is heard, answering as `script` says, and whose worker runs only if
+    /// `spawn` says so; the venue's stop flag; and the drain, within
+    /// `deadlines`.
     fn ran(
         spawn: bool,
+        script: Script,
+        deadlines: Deadlines,
     ) -> (
         tokio::runtime::Runtime,
         RestVenue,
+        Arc<AtomicBool>,
         impl FnOnce() -> super::Drained,
     ) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -184,7 +194,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("a runtime");
-        let rest = RestVenue::start(Script::default());
+        let rest = RestVenue::start(script);
         let client = TradeClient::new(rest.base(), Duration::from_secs(5), fixtures::credentials())
             .expect("a client");
         let checked = runtime
@@ -210,6 +220,7 @@ mod tests {
             Arc::new(SystemClock),
         )
         .expect("wired");
+        let stop = venue.stop_flag();
         // Never spawned and never dropped: what a binary that forgot to spawn
         // it would hold. Dropped, its queue would close and the venue would
         // take no order at all.
@@ -240,18 +251,11 @@ mod tests {
         );
         let finish = move || {
             engine.run().expect("ran");
-            let drained = {
-                let deadlines = Deadlines {
-                    settle: Duration::from_millis(300),
-                    answers: Duration::from_millis(300),
-                    pause: Duration::from_millis(5),
-                };
-                drain(&mut engine, &deadlines)
-            };
+            let drained = drain(&mut engine, &deadlines);
             drop((account, unspawned));
             drained
         };
-        (runtime, rest, finish)
+        (runtime, rest, stop, finish)
     }
 
     #[test]
@@ -259,7 +263,12 @@ mod tests {
         // The order was handed to a worker that never ran, so nothing can
         // answer it: both waits end at their deadlines, and the order is
         // still working, for `stopped.working`.
-        let (_runtime, rest, finish) = ran(false);
+        let deadlines = Deadlines {
+            settle: SETTLE,
+            answers: Duration::from_millis(300),
+            pause: Duration::from_millis(5),
+        };
+        let (_runtime, rest, _stop, finish) = ran(false, Script::default(), deadlines);
         let started = Instant::now();
         let drained = finish();
         assert!(started.elapsed() < Duration::from_secs(5), "it ended");
@@ -271,12 +280,42 @@ mod tests {
 
     #[test]
     fn a_worker_that_answers_ends_the_second_wait_before_its_deadline() {
-        // The other side of the boundary: placed and never heard from on the
-        // stream, the order is still working at the first deadline, and the
-        // answer has come, so the second wait ends on it.
-        let (_runtime, rest, finish) = ran(true);
-        let drained = finish();
+        // The other side of the boundary. The order is held at the server
+        // through step 3, which runs out its deadline with the order working,
+        // and is let answer only once the venue stops sending: so the answer
+        // is still in flight when step 4 begins, and step 4 ends on it,
+        // long before its own deadline.
+        let deadlines = Deadlines {
+            settle: SETTLE,
+            answers: Duration::from_secs(10),
+            pause: Duration::from_millis(5),
+        };
+        let script = Script {
+            orders: [Reply::Hold].into(),
+            ..Script::default()
+        };
+        let (_runtime, rest, stop, finish) = ran(true, script, deadlines);
+        let started = Instant::now();
+        let drained = std::thread::scope(|scope| {
+            let releaser = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !stop.load(Ordering::SeqCst) {
+                    assert!(Instant::now() < deadline, "the venue never stopped sending");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                rest.release();
+            });
+            let drained = finish();
+            releaser.join().expect("released");
+            drained
+        });
+        let took = started.elapsed();
         assert!(!drained.settled && drained.answered, "{drained:?}");
+        assert!(took >= SETTLE, "step 3 waited: {took:?}");
+        assert!(
+            took < deadlines.settle + deadlines.answers,
+            "step 4 ended on the answer, not at its deadline: {took:?}"
+        );
         assert_eq!(drained.outstanding, 0);
         assert_eq!(drained.working, [ClientOrderId(1)]);
         assert_eq!(rest.order_requests().len(), 1);

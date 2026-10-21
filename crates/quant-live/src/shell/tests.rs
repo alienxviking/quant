@@ -23,7 +23,7 @@ use quant_recorder::CaptureRecord;
 use crate::fixtures::rest::{Reply, RestVenue, Script, Seen};
 use crate::fixtures::{self, market_buy};
 use crate::shell::{wire, LiveVenue, INBOX_BOUND, ORDERS_BOUND};
-use crate::worker::{Worker, WorkerStats};
+use crate::worker::{Worker, WorkerEnd, WorkerStats};
 
 /// The host clock, measured this far ahead of the venue's.
 const OFFSET_MS: i64 = 700;
@@ -414,6 +414,35 @@ fn doubt_raised(out: &[VenueReport], id: u64) -> Vec<(DoubtCause, Ts)> {
             VenueReport::Notice(_) | VenueReport::Order(_) => None,
         })
         .collect()
+}
+
+#[test]
+fn a_venue_dropped_with_requests_queued_lets_none_of_them_out() {
+    // Two orders queued and the worker not yet run when the venue is dropped
+    // without `stop_sending`, as a careless drop of the engine would drop
+    // it. A tokio receiver still yields what was buffered, so only the stop
+    // flag the venue's `Drop` sets keeps the worker from sending order 1.
+    // Its `stopping` answer then finds nobody to hear it, and the worker
+    // returns.
+    let mut rig = Rig::new(Script::default());
+    rig.submit(1);
+    rig.submit(2);
+    let Rig {
+        runtime,
+        rest,
+        venue,
+        worker,
+        stats,
+        ..
+    } = rig;
+    drop(venue);
+    let worker = worker.expect("not spawned");
+    let end = runtime
+        .block_on(async { tokio::time::timeout(WITHIN, worker.run()).await })
+        .expect("the worker returned");
+    assert_eq!(end, WorkerEnd::VenueGone);
+    assert_eq!(requests(&rest.order_requests()), Vec::<String>::new());
+    assert_eq!((stats.sent(), stats.stopped()), (0, 1));
 }
 
 #[test]

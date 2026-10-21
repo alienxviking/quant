@@ -304,6 +304,12 @@ impl LiveVenue {
         self.owed.len()
     }
 
+    /// The stop flag, for a test that must act once the venue stops sending.
+    #[cfg(test)]
+    pub(crate) fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
     /// Whether [`Self::stop_sending`] has been called.
     #[must_use]
     pub fn stopping(&self) -> bool {
