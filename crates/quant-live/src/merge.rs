@@ -321,6 +321,17 @@ impl Merge {
         self.diverged
     }
 
+    /// Whether `id` is an order this machine was told was sent and has not
+    /// heard end: what a cancel may name. The shell asks before it sends one,
+    /// so that a cancel for an order ended or never sent is `cancel_refused
+    /// { not_sent }` and goes nowhere.
+    #[must_use]
+    pub fn working(&self, id: ClientOrderId) -> bool {
+        self.orders
+            .get(&id)
+            .is_some_and(|order| order.ended.is_none())
+    }
+
     #[must_use]
     pub const fn stats(&self) -> MergeStats {
         self.stats

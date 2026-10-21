@@ -16,25 +16,43 @@ license.workspace = true
 # provide events need not depend on the engine.
 #
 # So this crate depends on the venue's dialect for its inputs (`orders`,
-# `user_data`, `account`) and on the engine for its outputs (`Unready`, and
-# from the next pull request `ExecutionVenue`), as `quant-sim` does. Nothing
-# depends on it but its tests, and in item 8 the binary's crate.
+# `user_data`, `account`) and on the engine for its outputs (`Unready`,
+# `ExecutionVenue`), as `quant-sim` does. Nothing depends on it but its tests,
+# and in item 8 the binary's crate.
 [dependencies]
 quant-core = { workspace = true }
 quant-engine = { workspace = true }
 quant-binance = { workspace = true }
-# `fixtures` only: the venue's frames written as the venue writes them.
+# The request worker's channels and its timer. The shell owns no runtime and
+# spawns nothing: the worker is a future the binary spawns on its own runtime,
+# and the engine thread reaches the channels only with `try_send` and
+# `try_recv`, which need none. Already in the graph through quant-binance.
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+# A shutdown deadline passed is logged as an error.
+tracing = "0.1"
+# `fixtures` only: the venue's frames written as the venue writes them, and
+# credentials made in process for a test's own key pair. `ring` and `base64`
+# at the versions quant-binance already links, so they add no crate.
 serde_json = { version = "1", optional = true }
+ring = { version = "0.17", optional = true }
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 # The machine's tests write the venue's frames as the venue writes them, so
 # that every stream input goes through the real classifier and translator.
 serde_json = "1"
+ring = "0.17"
+base64 = "0.22"
+# The shell's tests drive the worker on a runtime of their own, and feed the
+# account side through the real `AccountFeed` from a channel they hold.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+quant-recorder = { workspace = true }
 
-# `fixtures`: those frames, for `quant-explain`'s permutation test too, so that
-# both feed the machine the same bytes. Never on in a build that ships.
+# `fixtures`: those frames, the wiring pieces and a local REST server, for
+# `quant-explain`'s tests too, so that both feed the venue the same bytes.
+# Never on in a build that ships.
 [features]
-fixtures = ["dep:serde_json"]
+fixtures = ["dep:serde_json", "dep:ring", "dep:base64"]
 
 [lints]
 workspace = true
