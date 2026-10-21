@@ -1,0 +1,40 @@
+[package]
+name = "quant-live"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The live venue: what a run trades through when its orders are real.
+#
+# A crate of its own (`docs/live-run.md` §5, *LiveVenue, decided before the
+# code*, and the owner's decision 5 in §7). In `quant-binance` it would have
+# made that crate depend on `quant-engine`, and with it the data tier, which
+# depends on `quant-binance` (`quant-verify`, `quant-normalize`), would compile
+# against the trading engine: the shape this project chose against once
+# already, when `EventSource` went into `quant-core` so that the crates that
+# provide events need not depend on the engine.
+#
+# So this crate depends on the venue's dialect for its inputs (`orders`,
+# `user_data`, `account`) and on the engine for its outputs (`Unready`, and
+# from the next pull request `ExecutionVenue`), as `quant-sim` does. Nothing
+# depends on it but its tests, and in item 8 the binary's crate.
+[dependencies]
+quant-core = { workspace = true }
+quant-engine = { workspace = true }
+quant-binance = { workspace = true }
+# `fixtures` only: the venue's frames written as the venue writes them.
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+# The machine's tests write the venue's frames as the venue writes them, so
+# that every stream input goes through the real classifier and translator.
+serde_json = "1"
+
+# `fixtures`: those frames, for `quant-explain`'s permutation test too, so that
+# both feed the machine the same bytes. Never on in a build that ships.
+[features]
+fixtures = ["dep:serde_json"]
+
+[lints]
+workspace = true

@@ -599,6 +599,12 @@ pub enum AccountChange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountCause {
+    /// The connection ended, for a reason the record does not carry.
+    ///
+    /// The listener knows why it ended a connection and logs it, but the
+    /// capture holds only a `Gap { Disconnect }`, and the live venue reads
+    /// what is recorded so that a replay of the capture reproduces it. Not
+    /// necessarily the venue closing the socket.
     SocketClosed,
     /// The socket stayed open and stopped delivering.
     IdleTimeout,
@@ -633,6 +639,11 @@ pub struct Holding<T> {
 pub enum AnomalyKind {
     /// It could not be read at all.
     Unreadable,
+    /// A stranger's trade on our symbol that could not be read past its
+    /// type. It moved the account's balances by an amount the record does
+    /// not have, as a readable one would have, so it latches as a `foreign`
+    /// trade line does; a kind of its own so that the line says so.
+    UnreadableForeignTrade,
     /// A trade id already booked.
     DuplicateTrade,
     /// A report about an order that had already ended.
@@ -1033,6 +1044,10 @@ mod tests {
         }
         for (kind, name) in [
             (AnomalyKind::Unreadable, "unreadable"),
+            (
+                AnomalyKind::UnreadableForeignTrade,
+                "unreadable_foreign_trade",
+            ),
             (AnomalyKind::DuplicateTrade, "duplicate_trade"),
             (AnomalyKind::AfterEnd, "after_end"),
             (AnomalyKind::SecondEnd, "second_end"),

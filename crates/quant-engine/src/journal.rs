@@ -84,8 +84,8 @@ use quant_core::instrument::{
     Exchange, FilterBreach, Instrument, InstrumentDef, InstrumentId, InstrumentRegistry,
 };
 use quant_core::report::{
-    AccountChange, AnomalyKind, CancelRefusal, Cited, DoubtChange, EndedBy, ForeignOutcome,
-    Holding, Landing, Provenance, VenueText,
+    AccountChange, AnomalyKind, CancelRefusal, Cited, DoubtCause, DoubtChange, EndedBy,
+    ForeignOutcome, Holding, Landing, Provenance, VenueText,
 };
 use quant_core::time::Ts;
 
@@ -1601,6 +1601,106 @@ pub fn recover_risk(
         }
     }
     risk
+}
+
+/// Whether the journal holds a line that latches `Unready::Diverged`: an
+/// `anomaly { contradiction }`, an `orphaned` fill, a `foreign` line with a
+/// trade or an `anomaly { unreadable_foreign_trade }`, or a
+/// `doubt raised { id_in_use }`.
+///
+/// The latch lives in a live venue's process, and a latch that forgets is
+/// not one: a stranger's trade with nothing working, a clean stop and a
+/// restart on the same journal would otherwise trade again against a
+/// position nobody knows. So the live binary asks this of the journal before
+/// it trades, as [`recover_risk`] restores the kill switch, and records
+/// without trading while it holds, until a person starts a new journal under
+/// a new run tag (`docs/live-run.md` §5, *`LiveVenue`, decided before the
+/// code*, §6 duty 8).
+///
+/// No line is written for the latch itself. The lines that caused it are
+/// already here, and a `diverged` line beside them would be a second record
+/// of one fact that must agree with the first for ever. Instead the venue's
+/// latch and this predicate are made to agree under test: the venue latches
+/// from what it heard, this from what was written, and neither is derived
+/// from the other.
+#[must_use]
+pub fn diverged(entries: &[JournalEntry]) -> bool {
+    entries.iter().any(latches)
+}
+
+/// Whether one line latches `Unready::Diverged`.
+///
+/// Exhaustive, with no `_` arm, at every level it reads: a line, a kind of
+/// anomaly, a foreign outcome or a doubt cause added later does not build
+/// here until somebody has decided whether it latches.
+#[allow(clippy::match_same_arms)]
+fn latches(entry: &JournalEntry) -> bool {
+    match entry {
+        // The venue said two things about one order of ours, or a stranger
+        // traded on our symbol in a report we could not read, which moved the
+        // balances as a `foreign` trade line does. The other kinds are a
+        // report we could not read otherwise, one we already had, and one
+        // after an end: loud, and none says the account holds what we do not
+        // know.
+        JournalEntry::Anomaly { what, .. } => match what {
+            AnomalyKind::Contradiction | AnomalyKind::UnreadableForeignTrade => true,
+            AnomalyKind::Unreadable
+            | AnomalyKind::DuplicateTrade
+            | AnomalyKind::AfterEnd
+            | AnomalyKind::SecondEnd => false,
+        },
+        // A fill nobody can attribute: money moved that no order explains.
+        JournalEntry::Orphaned { .. } => true,
+        // A stranger's trade on our symbol moved the account's balances. An
+        // acceptance or an end moved nothing.
+        JournalEntry::Foreign { what, .. } => match what {
+            ForeignOutcome::Traded { .. } => true,
+            ForeignOutcome::Accepted | ForeignOutcome::Ended { .. } => false,
+        },
+        // Some order is open under a name of ours that should mean one order.
+        // Every other cause is a doubt, which the stream or a lookup settles.
+        JournalEntry::Doubt { change, .. } => match change {
+            DoubtChange::Raised { cause, .. } => match cause {
+                DoubtCause::IdInUse => true,
+                DoubtCause::ServerError
+                | DoubtCause::Unsettled
+                | DoubtCause::Unreadable
+                | DoubtCause::OtherOrder
+                | DoubtCause::UnexpectedStatus
+                | DoubtCause::NoAnswer
+                | DoubtCause::Interrupted
+                | DoubtCause::AccountBlind
+                | DoubtCause::FillsMissed
+                | DoubtCause::Restart => false,
+            },
+            DoubtChange::Cleared { .. } => false,
+        },
+        // A report about an order the engine was not working that moved no
+        // money: written down, and a finding, but nothing the account holds.
+        JournalEntry::Stray { .. } => false,
+        // The run's own decisions and lifecycle, the market, the strategy,
+        // and the rest of what a venue says on its own: none of them says
+        // the account and the record have parted.
+        JournalEntry::Started { .. }
+        | JournalEntry::Filled { .. }
+        | JournalEntry::Checkpoint { .. }
+        | JournalEntry::Submitted { .. }
+        | JournalEntry::Refused { .. }
+        | JournalEntry::Accepted { .. }
+        | JournalEntry::Rejected { .. }
+        | JournalEntry::CancelRequested { .. }
+        | JournalEntry::Cancelled { .. }
+        | JournalEntry::Tripped { .. }
+        | JournalEntry::Blind { .. }
+        | JournalEntry::Note { .. }
+        | JournalEntry::Stopped { .. }
+        | JournalEntry::Placed { .. }
+        | JournalEntry::NeverLanded { .. }
+        | JournalEntry::CancelRefused { .. }
+        | JournalEntry::Account { .. }
+        | JournalEntry::Sighted { .. }
+        | JournalEntry::Balances { .. } => false,
+    }
 }
 
 /// Find or register an instrument by its persisted identity.
@@ -3564,5 +3664,92 @@ mod venue_entry_tests {
 
         noisy.push(JournalEntry::checkpoint(Ts::from_nanos(1_000), &expected));
         assert_eq!(agrees(&noisy), Agreement::Agrees);
+    }
+
+    #[test]
+    fn exactly_the_lines_that_latch_make_a_journal_diverged() {
+        use super::diverged;
+
+        let anomaly = |what| JournalEntry::Anomaly {
+            at: Ts::from_nanos(1),
+            client_order_id: Some(ClientOrderId(1)),
+            what,
+            detail: VenueText::new("detail"),
+        };
+        let raised = |cause| JournalEntry::Doubt {
+            at: Ts::from_nanos(2),
+            client_order_id: ClientOrderId(1),
+            change: DoubtChange::Raised { cause, said: None },
+        };
+        let foreign = |what| JournalEntry::Foreign {
+            at: Ts::from_nanos(3),
+            client_id: VenueText::new("web_1"),
+            provenance: Provenance::NotOurs,
+            venue_order_id: venue_order("9"),
+            side: Side::Sell,
+            what,
+        };
+        let latching = [
+            anomaly(AnomalyKind::Contradiction),
+            anomaly(AnomalyKind::UnreadableForeignTrade),
+            JournalEntry::Orphaned {
+                at: Ts::from_nanos(4),
+                client_order_id: ClientOrderId(1),
+                px: "100".parse().expect("px"),
+                qty: "1".parse().expect("qty"),
+                fee: "0.1".parse().expect("fee"),
+                fee_asset: FeeAsset::Quote,
+                venue_order_id: None,
+                trade_id: None,
+            },
+            foreign(ForeignOutcome::Traded {
+                trade_id: VenueTradeId("77".to_owned()),
+                px: "100".parse().expect("px"),
+                qty: "1".parse().expect("qty"),
+                commission: "0.1".parse().expect("commission"),
+                commission_asset: VenueText::new("BNB"),
+                remaining: "0".parse().expect("remaining"),
+            }),
+            raised(DoubtCause::IdInUse),
+        ];
+        // Every line schema 3 added for a venue but its one foreign trade,
+        // which latches, and the near misses of the four lines that do.
+        let mut quiet: Vec<JournalEntry> = every_venue_entry()
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .filter(|entry| {
+                !matches!(
+                    entry,
+                    JournalEntry::Foreign {
+                        what: ForeignOutcome::Traded { .. },
+                        ..
+                    }
+                )
+            })
+            .collect();
+        quiet.extend([
+            anomaly(AnomalyKind::Unreadable),
+            anomaly(AnomalyKind::DuplicateTrade),
+            anomaly(AnomalyKind::AfterEnd),
+            anomaly(AnomalyKind::SecondEnd),
+            foreign(ForeignOutcome::Accepted),
+            foreign(ForeignOutcome::Ended {
+                remaining: "1".parse().expect("remaining"),
+                how: quant_core::report::EndedBy::Cancelled,
+            }),
+            raised(DoubtCause::AccountBlind),
+            raised(DoubtCause::FillsMissed),
+            raised(DoubtCause::NoAnswer),
+            filled(1, Side::Buy, "100"),
+        ]);
+        assert!(!diverged(&quiet), "no line here latches");
+        assert!(!diverged(&[]), "an empty journal has not diverged");
+        for line in latching {
+            // Anywhere in the file: a latch is never cleared by what follows.
+            let mut journal = quiet.clone();
+            journal.insert(quiet.len() / 2, line.clone());
+            assert!(diverged(&journal), "{line:?}");
+            assert!(diverged(std::slice::from_ref(&line)), "{line:?} alone");
+        }
     }
 }

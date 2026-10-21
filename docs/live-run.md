@@ -376,7 +376,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`); items 7 and 8 below remain |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`) and item 7's merge machine (`m8c-live-machine`); item 7's shell and item 8 below remain |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -643,6 +643,27 @@ feature.
    (`account_blind`), which `runlog check` learns to verify: an order working
    when the stream was lost and never put in doubt for it is a finding.
    Designed before the code in §5, *LiveVenue, decided before the code*.
+
+   **The machine is built; the shell is next.** `m8c-live-machine` is the pure
+   half: the crate `quant-live` and its `Merge`, which takes what was heard and
+   appends what the engine is told, with the readiness answer; the
+   translator's and the order classifier's mappings onto the record's types;
+   `journal::diverged`, which reads the latch back off the journal; and
+   `runlog check`'s seventh finding, `unwatched`. Accepted by the permutation
+   test, 1,547 interleavings of 47 truths: each of the 43 consistent truths
+   tells the strategy the same events and writes the same lines in every
+   interleaving, `runlog check` names an order in doubt when `ready` says
+   `InDoubt` and never when it is Ok, and the four contradictions latch in
+   every one; in all
+   of them the journal agrees with a checkpoint of the engine's portfolio.
+   Also by `account_blind`; by a test that the machine's latch and
+   `journal::diverged` agree; and by the machine's own table, every row seen
+   red under its break. What building it corrected is in
+   §5, *LiveVenue, decided before the code*, §8: among it, the permutation
+   test's first run found `runlog check`'s doubt fold disagreeing with itself.
+   The shell, `LiveVenue` with its request worker, channels, `wire` and
+   shutdown, and the timer behind decision 6's `Unheard`, is the next pull
+   request; the machine already takes `Unheard` as an input.
 8. **The `live` binary and a rehearsal.** Paper's session extracted so any venue
    can run it; a startup that records first and trades last; a refusal of any
    size whose floored exit would fall below the minimum notional at the current
@@ -1077,15 +1098,15 @@ deadline, which is what keeps it from hanging.
 
 | Input | From | Values |
 |---|---|---|
-| `Submitted` | the shell's `submit` | id, side, quantity |
+| `Submitted` | the shell's `submit` | id, quantity (the side is not kept, §8) |
 | `Placement` | the worker | `Placed`, `Refused`, `Unknown`, `NotSent` (`orders.rs:585-614`) |
 | `CancelReply` | the worker | `Acknowledged`, `NotOpen`, `Refused`, `Unknown`, `NotSent` (`orders.rs:641-661`) |
-| `Unsent` | the shell | an order that would not encode, or reached `submit` unready (a bug); a cancel for an order ended or never sent, a second cancel for an order whose cancel is held, or one after `stop_sending` |
+| `Unsent` | the shell | an order that would not encode, or reached `submit` unready (a bug), with or without a `Submitted` before it; a cancel for an order ended or never sent, a second cancel for an order whose cancel is held, or one after `stop_sending` |
 | `Report` | the translator | `Ours`: an acceptance, a trade, or an end (`CANCELED`, `EXPIRED`, `TRADE_PREVENTION`); `Foreign`; `StreamTerminated` |
-| `Unreadable` | the translator's error | with the order it concerns, when the translator got that far |
+| `Unreadable` | the translator's error | with whose order it concerns: one of ours, a foreign one, a foreign trade, or unknown (§8) |
 | `Subscribed`, `ServerShutdown` | `account::classify` on a recorded frame | the subscription's accepting answer; the venue's `serverShutdown` |
 | `Blind` | the feed | its `GapCause` |
-| `Check` | item 8, if it rechecks | a passing check, with its offset, or a failing one |
+| `Check` | item 8, if it rechecks | a passing check or a failing one; the offset is the shell's (§8) |
 
 **Per order** the machine keeps the request's side and quantity; what REST said
 (`Pending`, `Placed`, `Unknown`, `Refused`, `NotSent`); the venue's order id, from
@@ -1249,8 +1270,10 @@ answered first, the order has already ended and a fill on it is an orphan (rule
 working, so its fills are booked; both orders latch, and contradictions are
 tested on their own (5).
 
-**Cancels.** `Acknowledged` emits nothing unless it names another order (rule 6);
-the stream says how the order ended.
+**Cancels.** `Acknowledged` emits nothing unless it names another order (rule 6),
+or the order is one REST refused or never sent: the venue cancelling an order
+says it had it, as a stream report would, so that is a contradiction in either
+order (§8). The stream says how the order ended.
 `NotOpen`, `Refused`, `Unknown` and `NotSent` each emit `cancel_refused` with the
 venue's words. None changes the order, and an `Unknown` cancel puts nothing in
 doubt, because the stream decides whether the order ended and is still
@@ -1363,7 +1386,7 @@ nothing else, and changes nothing (`&self`, `venue.rs:99-100`).
 
 | `Unready` | When `LiveVenue` answers it |
 |---|---|
-| `Diverged` | Latched by every `contradiction` (two venue ids for one of ours, REST and the stream disagreeing about whether an order exists, a second `NEW`, a `z` behind what is booked), every orphaned fill (a fill after an order's end, a fill about an id of this run this machine never sent), a foreign trade on our symbol, and `IdInUse` in any phase. Never cleared in the process (`venue.rs:65-75`), and not cleared by a restart either: item 8 reads it back off the journal (§6, duty 8). |
+| `Diverged` | Latched by every `contradiction` (two venue ids for one of ours, REST and the stream or an acknowledged cancel disagreeing about whether an order exists, a second `NEW`, a `z` behind what is booked, a second answer to one order's request), every orphaned fill (a fill after an order's end, a fill about an id of this run this machine never sent), a foreign trade on our symbol, read or not, and `IdInUse` in any phase. Never cleared in the process (`venue.rs:65-75`), and not cleared by a restart either: item 8 reads it back off the journal (§6, duty 8). |
 | `Unchecked` | False at construction, which takes a `Checked`: minted only by the checks `venue-check` runs (`trade.rs:986`, `:1070`, `:1104`), and carrying the measured offset every order and logon is stamped with. True after a failing `Check`, false after a passing one. **Not** set by an order refused `-1021` or for its key: that is a rejection with the venue's code on its line, every later order would be refused the same way and harmlessly, and a latch on `-1021` would also fire on an order that only waited too long in the queue. |
 | `StreamDown` | From construction until the account is heard, and from each loss until it is heard again (§2, *The account*). Never across a `LocalOverflow` while heard. |
 | `InDoubt` | While any order has an open doubt cause, a deferred one, or a held report. |
@@ -1496,6 +1519,11 @@ The coverage half and the permutation test share `quant-explain`'s tests.
 | an overflow while down, then an account event: `regained` and ready; no overflow, then an event: still down | take only the subscription answer as heard, or take any event |
 | a `Subscribed` while heard: `lost`, `account_blind` on each working order, `regained` | ignore it as a repeat |
 | a refused subscription answer and an `Unrecognised` frame never reach the translator | route by `e` alone |
+| a rejection keeps the venue's words, the filter it named and why nothing left, written out by hand | hand the engine `why: None`, or a `Cited` of zeros |
+| an order's request is answered once, whether REST or the shell's `Unsent` answers it | send `Unsent` past the guard |
+| an `Unsent` with no `Submitted` is `never_landed` and latches nothing; a `Submitted` after it is a contradiction | require a `Submitted` first |
+| `Acknowledged` and a refusal for one order, in either order: `Diverged` | record the venue id alone |
+| a stranger's unreadable trade is `unreadable_foreign_trade` and `Diverged`; their unreadable acceptance only an anomaly | treat every stranger's unreadable report alike |
 | the readiness order, one test per pair | swap two |
 | every output's stamp is its input's | stamp from a clock |
 
@@ -1534,7 +1562,10 @@ Not in item 7:
 - **Lookup and adoption**, slice (d): `GET /api/v3/order` by `origClientOrderId`
   or by `Placed`'s order id, `cleared { looked_up }`, `never_landed { not_found }`,
   `DoubtCause::Restart`, releasing held reports once the fills they wait for are
-  found, and taking over a previous process's working orders. Until then every
+  found, and taking over a previous process's working orders. The release must
+  deduplicate by trade id among the held reports too: *Precedence* 2 reads the
+  trade ids booked, so a resent copy of a held trade is held a second time,
+  and released as it stands would book one trade twice. Until then every
   doubt and every held report is loud and stuck, as §5 decided.
 - **The binary**, item 8: the gates, the settle loop, the strict writer,
   `balances`, the live mode in `ops/`.
@@ -1592,7 +1623,8 @@ Item 8 must enforce:
    journal answers it. `journal::diverged(entries)`, in `quant-engine` beside
    `recover_risk` (`journal.rs:1493`), is true when the journal holds a line that
    latches: an `anomaly { contradiction }`, an `orphaned` fill, a `foreign` line
-   with a trade, or a `doubt raised { id_in_use }`. When it is true, item 8 records
+   with a trade or an `anomaly { unreadable_foreign_trade }`, or a
+   `doubt raised { id_in_use }`. When it is true, item 8 records
    and does not trade, as for any failed gate, until a person starts a new journal
    under a new run tag (`venue.rs:65-75`). No new line is written for the latch:
    the lines that caused it are already there, and a `diverged` line beside them
@@ -1642,6 +1674,96 @@ needs a new argument.
    is above the worst transport delay seen so far (p99 14 s at M7). It is a
    timeout, so where it lands among the stream's records depends on timing:
    tested on its own, and kept out of the permutation test's equality.
+
+#### 8. What building the machine corrected
+
+The machine is `quant-live::Merge`, built from §2 and §3 and tested by §5's
+tables. Where the code showed the design wrong or silent, it followed the
+design's stated intent, and the difference is written here rather than left
+for a reader to find.
+
+- **`Submitted` carries no side.** No rule reads it; the quantity is kept
+  because a report's `z` is the request's quantity less its `remaining`.
+- **The machine routes frames itself**, `Merge::route`, so the routing the
+  design puts before the translator is pure and tested with the machine: an
+  answer and an unrecognised frame never reach the translator, and
+  `serverShutdown` is read before it.
+- **An unreadable report says whose it was in three ways, not two.** The
+  translator's `read` names one of ours, a foreign order, or nobody
+  (`user_data::Concerns`). A stranger's report read far enough to know it is
+  not ours puts none of ours in doubt; with two ways it could only have been
+  "unattributed", and doubted every working order for a report known not to
+  be about any of them. It is still an `anomaly { unreadable }`, and latches
+  nothing, unless it was a trade: a stranger's trade on our symbol moved the
+  balances whether or not it could be read, so the translator names it
+  (`Concerns::ForeignTrade`) and the machine writes
+  `anomaly { unreadable_foreign_trade }` and latches, as for a readable one.
+  A kind of its own, because the latch survives a restart only through
+  `journal::diverged`, which reads the kind on a line.
+- **A report attributed to one of our orders is a mention**, readable or not:
+  the venue has the order. So an unreadable one raises the order's deferred
+  causes with its `fills_missed`, a REST refusal after it is a contradiction,
+  one about an order REST ended is a contradiction, and one about an order
+  the stream ended is the anomaly alone, since nothing is working to doubt.
+- **A stranger's cancel-replace or amend is counted, not refused.** The
+  translator refuses `REJECTED` and `REPLACED` for our orders, which never
+  cause them; refused for a stranger's, an ordinary report of theirs would
+  have come back unreadable. Read leniently, as the BNB fee is.
+- **A trade handed over as an orphan is recorded as accounted for**, after an
+  end or on an order REST ended, so that a resent copy of it is
+  `duplicate_trade` rather than a second orphan of one trade.
+- **What our own plumbing cannot produce is a contradiction:** a REST answer
+  about an order the machine never sent, a second answer to one order's
+  request, whether REST's or the shell's `Unsent`, a second submission under
+  one id, a rejection from the stream (rule 1). Each latches, so
+  `journal::diverged` agrees with the machine on them too. The first build
+  sent `Unsent` past the guard REST's answers go through, so a second one was
+  a second terminal and one after `Placed` rejected a placed order.
+- **`Unsent` needs no `Submitted`.** A shell may refuse an order before it says
+  one is about to go, and treating that as a REST answer about an order never
+  sent latched `Diverged` for a harmless local failure and told the engine
+  nothing, leaving its order working. So an `Unsent` makes the order and ends
+  it; a `Submitted` under that id afterwards is a second submission.
+- **An acknowledged cancel is the venue saying it had the order.** The table
+  was silent on one for an order REST refused or never sent. It is the same
+  fact as the stream mentioning that order, so it is the same contradiction,
+  in either order: after the refusal it latches; before it, the refusal that
+  follows latches and the order stays working.
+- **The account, where the table is silent.** A `Blind` while down sets the
+  overflow mark for `LocalOverflow` and clears it for any other cause, since
+  a new connection brings its own answer. The feed closing while heard is
+  `lost { socket_closed }` (the listener records a `Disconnect` before it
+  stops, so this is a fallback), and nothing after it moves the account.
+- **`Check` carries no offset in the machine**, which never stamps a request.
+  The offset is the shell's. A machine is built checked, because the shell's
+  `wire` will take a `Checked`.
+- **`ready` takes the queue's state from the shell** (`Queue`), so the whole
+  order of §3 is in one function and tested pair by pair.
+- **`runlog check`'s doubt fold read a clearing as the end of every cause**,
+  and named only an order's first; the permutation test found the check
+  reporting different findings for two interleavings of one truth. The venue
+  writes one `cleared` line per cause and a raise-and-clear as an adjacent
+  pair, so a clearing now answers the latest open cause, and each cause still
+  open is a finding (`docs/run-log.md` §9). The design had foreseen the fold
+  seeing order through a `cleared` before its `raised`, which the machine
+  never writes, and not through this.
+- **A report held behind a hole is tested in two shapes, not one:** the hole
+  after the order's `NEW`, so the order is heard and then held, and the hole
+  swallowing the `NEW`, so the order is mentioned and never heard. Only the
+  second can tell the two words apart, and "a held report counted as heard"
+  reddened the test only once it was there.
+- **The permutation test**, `crates/quant-explain/tests/live_merge.rs`, runs
+  1,547 interleavings over 313 scenario variants: 47 truths (including
+  every `WhyUnknown` reporting, silent and held, and four contradictions held
+  to the invariants alone), each as it is and with a disconnect and its
+  resubscribe, and an overflow, at every position among the order's records.
+  Equality across interleavings cannot see a mistake every interleaving
+  shares, so every run also ends with a checkpoint that `journal::agrees`
+  must accept, and a consistent truth's findings must fit its readiness.
+- **Held reports are not deduplicated by trade id.** *Precedence* 2 reads the
+  ids booked, as the design says, so a resent copy of a held trade is held a
+  second time. Nothing releases a held report before slice (d), whose release
+  must deduplicate them (§6).
 
 ---
 
