@@ -262,9 +262,9 @@ impl Merge {
     /// A machine for `instrument`, whose reports `translator` reads.
     ///
     /// Down until the account is heard. Checked, because the shell that owns
-    /// it is built only from a passing `venue-check` (the next pull request's
-    /// `wire`, taking a `Checked`); a recheck that fails during the run
-    /// is what makes it unchecked.
+    /// it is built only from a passing `venue-check` ([`crate::wire`], taking
+    /// a `Checked`); a recheck that fails during the run is what makes it
+    /// unchecked.
     #[must_use]
     pub const fn new(instrument: InstrumentId, translator: Translator) -> Self {
         Self {

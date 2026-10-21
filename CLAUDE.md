@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 840 tests green in debug
-and release, clippy and fmt clean, ~69,900 lines across 13 crates.
+same window exactly, on both symbols, to the satoshi. 860 tests green in debug
+and release, clippy and fmt clean, ~73,300 lines across 13 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -2422,10 +2422,35 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   they all share. Held reports are not deduplicated by trade id, which slice
   (d)'s release owes (`docs/live-run.md` §6).
 
-  **What remains in (c) is item 7's shell and item 8 of `docs/live-run.md`
-  §4**: `LiveVenue` itself, with its request worker, channels, `wire`,
-  shutdown and the `Unheard` timer, and then the `live` binary with its
-  testnet rehearsal.
+  **Item 7's shell is built** (`m8c-live-shell`), so item 7 is done.
+  `quant-live::wire` builds a `LiveVenue` and its request worker from the
+  instrument's id and venue-given definition, the run tag, a `Checked`
+  (`TradeClient::checked`, the only way to mint one: venue-check's three
+  checks, carrying the offset they passed with), the trade client, the
+  `AccountFeed` and the one clock. The venue owns no runtime and never
+  blocks: `submit` and `cancel` encode, tell the machine and `try_send`;
+  `poll` drains the inbox and the feed and merges them by stamp. The worker
+  is one future the binary spawns, one REST request at a time so a cancel
+  never overtakes its order, awaiting room rather than dropping an answer,
+  stopping without a panic when the venue is gone, and firing decision 6's
+  `Unheard` `ORDER_TIMEOUT` after each `Placed`. A cancel that finds the
+  queue (four) full is held and goes first when room appears. `drain` is
+  shutdown steps 3 and 4, each wait with its own deadline, and the shell's
+  module docs give the binary the whole order. Accepted by the shell's own
+  tests against a scripted local REST server and a `ManualClock`, and by ten
+  end-to-end tests in `quant-explain` through the real engine, journal
+  writer, listener, tee and feed: a lifecycle `runlog check` calls complete
+  and `reconcile` agrees with, a refusal told as a rejection alone, a
+  timeout cleared by the stream, a full queue and a held cancel, the timer
+  both ways, both shutdown deadlines, the account lost through the real
+  feed, and the same events through this venue and the simulator. Every
+  test seen red under its break, and every socket test run 20 times in 6
+  copies at once. What building it corrected is in `docs/live-run.md` §5,
+  *LiveVenue, decided before the code*, §8.
+
+  **What remains in (c) is item 8 of `docs/live-run.md` §4**: the `live`
+  binary, which runs the gates, spawns the worker and the listener, and
+  shuts down in the order the shell documents, and its testnet rehearsal.
   Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
   shipped code, which went first, each on its own branch (#52 to #56, and see
   *Still open*), and eighteen design questions. The ones that block code are

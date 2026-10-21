@@ -66,7 +66,8 @@ enum Item {
 }
 
 /// The scripted account feed and request worker, and the machine behind
-/// them: what the next pull request's shell will be, without the transport.
+/// them: what `quant-live::LiveVenue` is, without the transport, so that the
+/// interleavings are the script's and not the sockets'.
 #[derive(Debug)]
 struct Scripted {
     merge: Merge,

@@ -6,6 +6,9 @@
 //! own tests and the permutation test feed it the same bytes: two copies would
 //! be two models of the venue's frames that must agree for ever.
 //!
+//! [`rest`] is the REST side's stand-in, and the wiring pieces below it
+//! ([`venue_instrument`], [`credentials`], [`checked`]) are what `wire` takes.
+//!
 //! Each frame is Binance's documented `executionReport`
 //! (`user-data-stream.md` at commit `0556f1a`, the translator's own fixture)
 //! with the fields a test names changed, wrapped in the envelope the WebSocket

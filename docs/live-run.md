@@ -376,7 +376,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`) and item 7's merge machine (`m8c-live-machine`); item 7's shell and item 8 below remain |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`) and item 7, its merge machine (`m8c-live-machine`) and its shell (`m8c-live-shell`); item 8 below remains |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -644,7 +644,7 @@ feature.
    when the stream was lost and never put in doubt for it is a finding.
    Designed before the code in §5, *LiveVenue, decided before the code*.
 
-   **The machine is built; the shell is next.** `m8c-live-machine` is the pure
+   **The machine and the shell are built; item 8 is next.** `m8c-live-machine` is the pure
    half: the crate `quant-live` and its `Merge`, which takes what was heard and
    appends what the engine is told, with the readiness answer; the
    translator's and the order classifier's mappings onto the record's types;
@@ -661,9 +661,30 @@ feature.
    red under its break. What building it corrected is in
    §5, *LiveVenue, decided before the code*, §8: among it, the permutation
    test's first run found `runlog check`'s doubt fold disagreeing with itself.
-   The shell, `LiveVenue` with its request worker, channels, `wire` and
-   shutdown, and the timer behind decision 6's `Unheard`, is the next pull
-   request; the machine already takes `Unheard` as an input.
+   `m8c-live-shell` is the rest of it: `LiveVenue` behind `ExecutionVenue`,
+   built by `quant-live::wire` from the instrument's id and venue-given
+   definition, the run tag, a `Checked` (`TradeClient::checked`, the one way
+   to mint it), the trade client, the `AccountFeed` and the one clock; the
+   request worker, one REST request at a time behind a queue of four, with
+   decision 6's `Unheard` timer; held cancels; and `quant-live::drain`, the
+   two waits of the shutdown, each with its own deadline. The engine thread
+   never waits on any of it. Accepted by the shell's own tests against a
+   scripted local REST server and a `ManualClock`, and by ten end-to-end
+   tests in `quant-explain` (`tests/live_venue.rs`) through the real
+   engine, journal writer, listener, tee and feed: a market buy placed,
+   accepted and filled with the venue's ids on every line, `runlog check`
+   complete and the closing checkpoint agreeing; a REST refusal told as a
+   rejection alone with the venue's code; a timed-out order in doubt until
+   the stream clears it; a full queue answering `QueueFull` and a held
+   cancel going before a later order; the `Unheard` timer raising
+   `fills_missed` on an order never mentioned and not on one the stream
+   reported; a shutdown with a worker that never answers ending at its
+   deadlines with the order in `stopped`, and one after the runtime has gone
+   not hanging; the account lost through the real feed; and the same
+   lifecycle telling a strategy the same events through this venue and the
+   simulator. Every test was seen red under its break, and every socket test
+   passed 20 runs in each of 6 copies at once. What it corrected is in §5,
+   *LiveVenue, decided before the code*, §8. Item 8, the binary, is next.
 8. **The `live` binary and a rehearsal.** Paper's session extracted so any venue
    can run it; a startup that records first and trades last; a refusal of any
    size whose floored exit would fall below the minimum notional at the current
@@ -1675,12 +1696,14 @@ needs a new argument.
    timeout, so where it lands among the stream's records depends on timing:
    tested on its own, and kept out of the permutation test's equality.
 
-#### 8. What building the machine corrected
+#### 8. What building the machine and the shell corrected
 
 The machine is `quant-live::Merge`, built from §2 and §3 and tested by §5's
-tables. Where the code showed the design wrong or silent, it followed the
-design's stated intent, and the difference is written here rather than left
-for a reader to find.
+tables; the shell is `quant-live::LiveVenue`, with `wire`, the request worker
+and `drain`, built from §1, §3 and §4. Where the code showed the design wrong
+or silent, it followed the design's stated intent, and the difference is
+written here rather than left for a reader to find. The machine's come first,
+then the shell's.
 
 - **`Submitted` carries no side.** No rule reads it; the quantity is kept
   because a report's `z` is the request's quantity less its `remaining`.
@@ -1764,6 +1787,70 @@ for a reader to find.
   ids booked, as the design says, so a resent copy of a held trade is held a
   second time. Nothing releases a held report before slice (d), whose release
   must deduplicate them (§6).
+
+The shell's:
+
+- **`Checked` did not exist.** The list of commits in §6 put it among the
+  helpers, and nothing had built it. It is `quant-binance::trade::Checked`,
+  minted only by `TradeClient::checked`, which runs `venue-check`'s three
+  checks in its order and stops at the first refusal, and carries the
+  offset the clock check passed with. It is not `Clone`: one check, one
+  venue. `venue-check` itself still runs the three one by one, to print a
+  line for each, and item 8's binary calls `checked`.
+- **`wire` takes the clock too.** §1's list of what it takes left out the
+  injected clock §4 says the worker stamps answers with; without it the
+  worker would read a clock of its own. It takes the `VenueInstrument` by
+  reference, as §3 says, and refuses a definition the translator could book
+  no fee for or the encoder could write no order for (`WireError`), so a
+  venue that could send nothing is never built.
+- **After `stop_sending`, `ready` answers `QueueFull`.** §1 had the worker
+  answer what was queued and the shell refuse held cancels, and was silent
+  on what `ready` says then. A queue that takes nothing is what the variant
+  says, as for a closed one, so the engine refuses rather than journalling a
+  submission only the shell's `Unsent` would answer. A cancel asked for
+  after it, and every held cancel, is the machine's `Unsent::Cancel`, its
+  own input for "one after the shell stopped sending", which writes the same
+  `cancel_refused { not_sent }` that a worker's `NotSent { "stopping" }`
+  writes for a queued one.
+- **`submit` asks `ready` again.** §3 called an order for another instrument
+  reaching `submit` something only a `ready` that lied could let through,
+  and said it is `never_landed` and sent nowhere. The shell makes that true
+  of every reason: an order that reaches `submit` unready is `Unsent` with
+  the reason in its words, with no `Submitted` before it, and goes nowhere.
+- **A cancel names a working order.** "A cancel for an order ended or never
+  sent" is the machine's to know, so `Merge::working(id)` answers it, and
+  the shell asks before it queues a cancel.
+- **`outstanding` is counted on the engine thread**: a request is
+  outstanding from the `try_send` that handed it over until its answer is
+  taken off the inbox, not until the worker sends the answer. So it reaches
+  zero only once the engine holds every answer, which is what step 4 waits
+  for. `Unheard` answers no request and does not count.
+- **A worker dropped is not a worker never spawned.** Dropping the worker's
+  future closes `orders`, so `ready` answers `QueueFull` and nothing is
+  sent at all. The case step 4's deadline exists for is a future held and
+  never polled, which leaves the queue open and the answer never coming;
+  that is what its test holds.
+- **The feed's end carries no stamp.** `Polled::Closed` has none, so the
+  shell steps `Closed` at the engine's `now`, after every record before it,
+  which moves the clock nothing.
+- **Equal stamps put the REST answer first.** The two-way merge needs a rule
+  for a tie, and the permutation test shows the order across the two
+  sources changes only the order of lines.
+- **The timer is the worker's, on tokio's clock.** Every timer is
+  `ORDER_TIMEOUT` long, so they come due in the order they were set and one
+  queue holds them; each is set when its `Placed` goes on the inbox and
+  stamped from the injected clock when it fires. Its length is fixed in
+  production; a test shortens it only behind the `fixtures` feature, as a
+  test shortens the trade client's order timeout only behind `fake-venue`.
+- **The shutdown's two waits are code, `quant-live::drain`**, rather than
+  only prose for item 8, because the shell's tests need them and the binary
+  will call them. Their deadlines are measured on the host's monotonic
+  clock: they pace a shutdown and decide nothing a replay must reproduce.
+- **The account side of the end-to-end tests is the real listener's**:
+  `fake_venue::Listening::feeding` wires the tee with its mark and hands
+  back the `AccountFeed`, as a live run wires it. The REST side is
+  `quant-live::fixtures::rest`, a scripted server shared by both crates'
+  tests, which acknowledges by default and matches nothing, as §5 asks.
 
 ---
 
