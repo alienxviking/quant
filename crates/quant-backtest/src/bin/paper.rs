@@ -3,11 +3,18 @@
 //! ```text
 //! paper --symbol SYM [DATA_ROOT] [--cash N] [--qty N] [--hours N]
 //!       [--journal PATH] [--free] [--max-position N] [--max-order N]
-//!       [--max-daily-loss N] [--max-orders N]
+//!       [--max-daily-loss N] [--max-orders N] [--market-ws URL --rest URL]
 //!
 //! paper --symbol BTCUSDT data --hours 336     # the fortnight
 //! paper --symbol BTCUSDT data --hours 1       # a rehearsal
 //! ```
+//!
+//! `--market-ws` and `--rest` point the capture at another market stream and
+//! REST base, together: a local stand-in, for a rehearsal that must not reach
+//! the venue. Without them it captures the live venue, as it always has.
+//!
+//! The session itself is `quant_backtest::session`, extracted from here so
+//! that the live binary runs the same path with its own venue.
 //!
 //! # There is no `PaperVenue`, and that is the finding
 //!
@@ -53,19 +60,16 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use quant_backtest::record::{write, JournalWriter};
-use quant_backtest::{MaConfig, MaCrossover, Recorded};
-use quant_binance::capture::{self, CaptureConfig};
-use quant_binance::LiveSource;
+use quant_backtest::session::{self, Settings};
+use quant_binance::capture::CaptureConfig;
 use quant_core::fixed::{Notional, Qty};
-use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
-use quant_core::time::Ts;
-use quant_engine::journal::{self, Agreement};
-use quant_engine::{Engine, Journal, JournalEntry, Limits, RiskEngine};
+use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind};
+use quant_engine::journal;
+use quant_engine::{Journal, JournalEntry, Limits, RiskEngine};
 use quant_sim::{Costs, SimulatedVenue};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -90,6 +94,9 @@ struct Args {
     fast: usize,
     slow: usize,
     interval_secs: i64,
+    /// The market stream and REST base to capture from, when not the live
+    /// venue's: a local stand-in for a rehearsal.
+    endpoints: Option<(String, String)>,
 }
 
 fn main() -> ExitCode {
@@ -122,10 +129,6 @@ fn main() -> ExitCode {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the wiring is the point of this binary"
-)]
 fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let costs = if args.free {
         Costs::NONE
@@ -137,47 +140,33 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| args.root.join(format!("paper-{}.jsonl", args.symbol)));
 
-    // Recover before anything else. A restart on day nine has to come back up
-    // holding what it held, or the strategy's first act is to trade against a
-    // position it does not know about. `resume` registers the instrument's own
-    // definition before it replays a line: this used to replay first, so after
-    // a restart with fills the journal's placeholder rules won and the session
-    // traded under none. It fails if the registry already held other rules for
-    // the symbol, which a fresh registry cannot.
+    // Recover before anything else: `session::prepare` says why, and what the
+    // risk layer's tally is recounted from.
     let recovered = journal::read(&journal_path)?;
-    let mut registry = InstrumentRegistry::new();
-    let traded = definition(&args.symbol);
-    // The strategy sizes its exits in the venue's lots, so it is handed the
-    // lot of the definition the session trades under, which `resume` has just
-    // made the registry's own (it refuses a registry that held other rules).
-    let lot = traded.lot_size;
-    let resumed = journal::resume(&recovered.entries, &mut registry, traded, args.cash)?;
-    let instrument = resumed.instrument;
-    let starting = resumed.starting_cash;
-    // The risk layer's tally, recounted from the same journal on the registry
-    // `resume` just made the instrument's own, so the holding lands under the
-    // id the engine trades. Recovering the switch alone would check this
-    // session's first orders as if from flat on a fresh day: an addition to a
-    // real position against nothing, a real exit as the opposite position,
-    // and a loss budget and order count already spent today as unspent.
-    let risk = journal::recover_risk(&recovered.entries, &mut registry, args.limits);
+    let prepared = session::prepare(recovered, definition(&args.symbol), args.cash, args.limits)?;
+    let instrument = prepared.instrument;
+    let starting = prepared.resumed.starting_cash;
 
     // Built before anything is written, so a size the venue would refuse stops
     // the session here rather than after the journal says one started.
-    let strategy = Recorded::new(
-        MaCrossover::new(MaConfig {
-            instrument,
+    let strategy = session::strategy(
+        Settings {
             fast: args.fast,
             slow: args.slow,
             interval: args.interval_secs * 1_000_000_000,
             qty: args.qty,
-            lot,
-        })?,
+        },
         instrument,
-        args.interval_secs * 1_000_000_000,
-    );
+        prepared.lot,
+    )?;
 
-    print_banner(args, &journal_path, &recovered, &resumed, &risk);
+    print_banner(
+        args,
+        &journal_path,
+        &prepared.recovered,
+        &prepared.resumed,
+        &prepared.risk,
+    );
 
     let journal = Arc::new(Mutex::new(Journal::open(&journal_path)?));
     write(
@@ -198,89 +187,48 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
         },
     )?;
 
-    // The engine's channel. Generous on purpose: holding a few thousand records
-    // is cheaper than blinding the strategy, and the capture is never at risk
-    // either way -- the tee drops the engine's copy, never the writer's.
-    let (engine_tx, engine_rx) = sync_channel(8192);
+    let (engine_tx, engine_rx) = session::market_channel();
 
     let observer = Box::new(JournalWriter::new(
         Arc::clone(&journal),
         args.symbol.clone(),
-        recovered_fills(&recovered.entries),
+        session::recovered_fills(&prepared.recovered.entries),
     ));
 
-    let mut engine = Engine::new(
-        LiveSource::new(engine_rx, instrument),
-        // See `backtest`: the venue enforces the venue's rules in every world,
-        // so paper cannot fill what live would refuse.
-        SimulatedVenue::with_costs(costs).enforcing(
-            instrument,
-            registry.get(instrument).expect("just registered").filters(),
-        ),
-        risk,
-        strategy,
-        starting,
-    )
-    .observing_fills(observer);
-    // Only when there is something to resume, which `resume` says with `None`
-    // rather than an empty recompute. `resuming` replaces the portfolio
-    // outright, so calling it with a fresh journal's empty recompute would
-    // silently reset starting capital to zero -- which a rehearsal caught,
-    // reporting "cash 0 from 0" on a session configured with a hundred.
-    if let Some(portfolio) = resumed.portfolio {
-        engine = engine.resuming(portfolio);
-        // And the id counter, which `resuming` does *not* carry: `Ledger::mint`
-        // starts at 1 with the process, so a restart would hand out ids the file
-        // already holds. `runlog check` reads density from 1 and would see no
-        // hole, because there is none -- the ids are not missing, they are
-        // ambiguous, which is worse. Built in M7.5.a as `minting_from` and
-        // called from nowhere until the post-milestone audit found it: the
-        // fourth time this project has built a thing and not wired it.
-        engine = engine.minting_from(resumed.next_order_id);
-    }
+    // See `backtest`: the venue enforces the venue's rules in every world, so
+    // paper cannot fill what live would refuse.
+    let venue = SimulatedVenue::with_costs(costs).enforcing(
+        instrument,
+        prepared
+            .registry
+            .get(instrument)
+            .expect("just registered")
+            .filters(),
+    );
+    let engine = session::engine(engine_rx, venue, prepared, strategy, observer);
 
-    // The engine spends the whole run waiting on its channel. Since M8 the waits
-    // are bounded, so that it can look at the venue while the market is quiet,
-    // but each one still holds the thread it runs on -- so it gets a thread of
-    // its own, the same reasoning that gives the capture writer one. It ends
-    // when the capture drops the sender, which is how a clean shutdown reaches
-    // it.
-    let engine_thread = std::thread::Builder::new()
-        .name(format!("paper-engine-{}", args.symbol))
-        .spawn(move || {
-            let outcome = engine.run();
-            (outcome, engine)
-        })?;
-
-    let config = CaptureConfig::new(args.symbol.clone(), args.root.clone())
+    let mut config = CaptureConfig::new(args.symbol.clone(), args.root.clone())
         .for_at_most(Duration::from_secs(args.minutes * 60));
+    if let Some((ws, rest)) = &args.endpoints {
+        config = config.at(ws.clone(), rest.clone());
+    }
     let runtime = tokio::runtime::Runtime::new()?;
-    // The tee is moved into the closure and gone, so the only way to learn what
-    // it dropped is to hand it somewhere to count. Unreachable for the whole of
-    // M5's fortnight, which is why that run can only *assume* the engine saw
-    // every record.
-    let tee_drops = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter = std::sync::Arc::clone(&tee_drops);
-    let capture = runtime.block_on(capture::run(config, move |tx| {
-        quant_recorder::TeeSink::new(tx, engine_tx).counting_into(std::sync::Arc::clone(&counter))
-    }));
-    let tee_dropped = tee_drops.load(std::sync::atomic::Ordering::Relaxed);
-
-    // The capture is finished, so its sender is gone, so the engine's channel is
-    // closed, so the source returns None and the thread ends on its own.
-    let (outcome, engine) = engine_thread
-        .join()
-        .map_err(|_| "the paper engine thread panicked")?;
-    outcome?;
-
-    // The engine's final claim, and the mark that says this was a clean stop.
-    // Without the checkpoint there is nothing for the recompute to be compared
-    // against, and `reconcile` would exit 2 on a perfectly good session.
-    let stopped_at = engine.stats().last_ts.unwrap_or(Ts::from_nanos(0));
-    write(
-        &journal,
-        &JournalEntry::checkpoint(stopped_at, engine.portfolio()),
+    let ran = session::run_market(
+        engine,
+        engine_tx,
+        config,
+        &runtime,
+        tokio::signal::ctrl_c(),
+        "paper",
+        |_| (),
     )?;
+    let engine = ran.engine;
+    ran.outcome?;
+
+    // The engine's final claim, and the mark that says this was a clean stop
+    // (`session::closing` says why each).
+    let (checkpoint, stopped) = session::closing(&engine);
+    write(&journal, &checkpoint)?;
     // The trip itself is journalled by `on_tripped` at the instant it happens,
     // so there is nothing to write here -- only something to say. Writing it
     // again would put a second `tripped` line in the file stamped with the
@@ -288,18 +236,10 @@ fn run(args: &Args) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Some(cause) = engine.risk().tripped() {
         warn!(%cause, "the kill switch is thrown; the next session will refuse orders");
     }
-    // With the orders still working, which against the simulator is any whose
-    // reports were still in flight when the capture ended.
-    write(
-        &journal,
-        &JournalEntry::Stopped {
-            at: stopped_at,
-            working: engine.working(),
-        },
-    )?;
+    write(&journal, &stopped)?;
 
-    report(&engine, &journal_path, tee_dropped)?;
-    capture.map(|()| ExitCode::SUCCESS)
+    session::report(&engine, &journal_path, ran.tee_dropped)?;
+    ran.capture.map(|()| ExitCode::SUCCESS)
 }
 
 /// Everything the run is about to do, before it does any of it.
@@ -384,79 +324,6 @@ fn print_banner(
     println!();
 }
 
-/// What the session did, and whether its own record agrees.
-fn report<V, R, K>(
-    engine: &Engine<LiveSource, V, R, K>,
-    journal_path: &std::path::Path,
-    tee_dropped: u64,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    V: quant_engine::ExecutionVenue,
-    R: quant_engine::RiskLayer,
-    K: quant_engine::Strategy,
-{
-    let portfolio = engine.portfolio();
-    let stats = engine.stats();
-    println!();
-    println!(
-        "events    {} reached the engine ({} gaps), {} execution events",
-        stats.events, stats.gaps, stats.execution_events
-    );
-    // Two independent counts of one fact. The tee counts what it failed to hand
-    // over; the engine counts the `ingest_seq` holes those drops left, and
-    // journals each as a `blind` line. Neither is derived from the other, so a
-    // disagreement means one of them is wrong -- and for the whole of M5 only
-    // one of them could be read at all.
-    if tee_dropped == 0 {
-        println!("tee       0 records dropped on the way to the engine");
-    } else {
-        println!(
-            "tee       {tee_dropped} records DROPPED on the way to the engine -- \
-             the engine was blind for them, and journalled it"
-        );
-    }
-    println!(
-        "orders    {} sent, {} refused, {} fills",
-        stats.submitted, stats.refused, stats.fills
-    );
-    println!(
-        "cash      {} from {}",
-        portfolio.cash(),
-        portfolio.starting_cash()
-    );
-    println!("realized  {}", portfolio.realized());
-    println!("fees      {}", portfolio.fees());
-    println!("fills     {}", portfolio.fills());
-
-    // The check, run in-process at the end as well as by `reconcile` afterwards.
-    // Two independent computations of one quantity: the engine accumulated its
-    // numbers in memory, this replays them from the file.
-    let recovered = journal::read(journal_path)?;
-    match journal::agrees(&recovered.entries) {
-        Agreement::Agrees => println!("journal   AGREES with the engine"),
-        // Not a disagreement, and not reported as one: nothing was checked. It
-        // means no checkpoint reached the disk, which is itself worth knowing.
-        Agreement::NothingToCheck => {
-            println!("journal   NOTHING TO CHECK: no checkpoint reached the disk");
-        }
-        other => println!("journal   DISAGREES: {other:?} -- run `reconcile` for detail"),
-    }
-    Ok(())
-}
-
-/// Fills already on record, so the writer's checkpoint cadence carries on
-/// across a restart rather than counting from zero again.
-///
-/// It once kept client order ids from colliding, when the journal's id was a
-/// fill ordinal. The engine's own ids replaced that at M7.5.a; what is left is
-/// `JournalWriter` checkpointing every `CHECKPOINT_EVERY` fills of the session.
-fn recovered_fills(entries: &[JournalEntry]) -> u64 {
-    entries
-        .iter()
-        .filter(|e| matches!(e, JournalEntry::Filled { .. }))
-        .count() as u64
-}
-
 /// The instrument this session trades, with the rules its venue enforces.
 ///
 /// The same definition `backtest` registers, which is part of what lets the two
@@ -478,6 +345,10 @@ fn definition(symbol: &str) -> InstrumentDef {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per flag, which reads better as one list than as several"
+)]
 fn parse_args() -> Result<Option<Args>, String> {
     let mut args = Args {
         root: PathBuf::from("data"),
@@ -493,6 +364,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         fast: 10,
         slow: 30,
         interval_secs: 60,
+        endpoints: None,
         limits: Limits {
             max_order_notional: Some("200".parse().expect("a valid amount")),
             max_position_notional: Some("200".parse().expect("a valid amount")),
@@ -500,6 +372,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             max_orders_per_day: Some(200),
         },
     };
+    let (mut market_ws, mut rest) = (None, None);
     let mut remaining = std::env::args().skip(1);
     while let Some(arg) = remaining.next() {
         let mut value = || {
@@ -512,7 +385,8 @@ fn parse_args() -> Result<Option<Args>, String> {
                 println!(
                     "usage: paper --symbol SYM [DATA_ROOT] [--cash N] [--qty N] [--hours N]\n\
                      \x20            [--journal PATH] [--free]\n\
-                     \x20            [--max-order N] [--max-position N] [--max-daily-loss N] [--max-orders N]"
+                     \x20            [--max-order N] [--max-position N] [--max-daily-loss N] [--max-orders N]\n\
+                     \x20            [--market-ws URL --rest URL]"
                 );
                 return Ok(None);
             }
@@ -534,6 +408,8 @@ fn parse_args() -> Result<Option<Args>, String> {
                     .map_err(|e| format!("--interval-secs: {e}"))?;
             }
             "--journal" => args.journal = Some(PathBuf::from(value()?)),
+            "--market-ws" => market_ws = Some(value()?),
+            "--rest" => rest = Some(value()?),
             "--free" => args.free = true,
             "--max-order" => {
                 args.limits.max_order_notional =
@@ -564,6 +440,13 @@ fn parse_args() -> Result<Option<Args>, String> {
     if args.symbol.is_empty() {
         return Err("--symbol is required; a paper session trades one instrument".to_owned());
     }
+    // Both or neither: a market from one place and its snapshots from another
+    // would anchor a book with a stranger's depth.
+    args.endpoints = match (market_ws, rest) {
+        (Some(ws), Some(rest)) => Some((ws, rest)),
+        (None, None) => None,
+        _ => return Err("--market-ws and --rest go together".to_owned()),
+    };
     if args.minutes == 0 {
         return Err("the duration must be positive".to_owned());
     }

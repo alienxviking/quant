@@ -19,6 +19,7 @@
 pub mod equity;
 pub mod ma;
 pub mod record;
+pub mod session;
 
 pub use equity::{EquityCurve, EquityPoint, Recorded};
 pub use ma::{MaConfig, MaConfigError, MaCrossover};

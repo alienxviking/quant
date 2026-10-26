@@ -29,5 +29,14 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# A rehearsal of paper's session against local stand-ins, so that no test
+# reaches the venue (`tests/paper_rehearsal.rs`): the market stream's from
+# quant-binance's `fake-venue`, and the REST side's from quant-live's
+# `fixtures`. Tests only; neither feature reaches a binary.
+[dev-dependencies]
+quant-binance = { workspace = true, features = ["fake-venue"] }
+quant-live = { workspace = true, features = ["fixtures"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+
 [lints]
 workspace = true

@@ -1055,6 +1055,7 @@ dependencies = [
  "quant-book",
  "quant-core",
  "quant-engine",
+ "quant-live",
  "quant-normalize",
  "quant-recorder",
  "quant-sim",
