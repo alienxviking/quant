@@ -1954,6 +1954,18 @@ showed it otherwise:
   One case does leave such a session: `started` written and `balances` not.
   The next run then refuses until a person has looked, which is the
   conservative reading of a journal that failed mid-start.
+- **The venue is wired, and every credential read, before the first line.**
+  Review found two steps that could fail after `started` and `balances`
+  were written: wiring the venue, and reading the account listener's
+  credentials. Either would have left a session with no `stopped` line for
+  a run that sent nothing, and every later run would have refused at the
+  last-session gate, against the code's own comment. The listener's
+  credentials are now read in the baseline gate beside the closing
+  client's, and a venue that cannot be wired is the instrument's refusal;
+  both record only and leave the journal as it was. The wiring failure
+  cannot be reached today, since `exchangeInfo` refuses an empty asset name
+  and its definition is always Binance spot, so only the credentials have a
+  test.
 - **The last-session gate also refuses a journal with lines and no
   `started` line**, whose last session cannot be read at all.
 - **The size check is a gate, once, at the best bid.** §2 asked the binary to

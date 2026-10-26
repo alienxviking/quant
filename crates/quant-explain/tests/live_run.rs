@@ -31,6 +31,7 @@ use quant_backtest::account_replay::{self, Verdict};
 use quant_backtest::live::{self, Gate, Journalled, LiveConfig, LiveRun, Outcome};
 use quant_backtest::record::Lines;
 use quant_backtest::session::Settings;
+use quant_binance::credentials::{CredentialError, Credentials};
 use quant_binance::fake_market::{self, FakeMarket};
 use quant_binance::fake_venue::{self, FakeVenue};
 use quant_core::event::Side;
@@ -177,10 +178,19 @@ impl Rig {
     /// Start a run on its own thread, with the account's credentials, and
     /// stopped by the handle returned.
     fn start(&self, config: LiveConfig, journalled: Journalled) -> Running {
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let account = Arc::clone(&self.account);
+        Self::start_with(config, journalled, move || Ok(account.credentials()))
+    }
+
+    /// [`Self::start`], with the credentials `keys` gives each time the run
+    /// asks for them.
+    fn start_with(
+        config: LiveConfig,
+        journalled: Journalled,
+        keys: impl Fn() -> Result<Credentials, CredentialError> + Send + Sync + 'static,
+    ) -> Running {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
-            let keys = move || Ok(account.credentials());
             live::run(&config, &keys, journalled, async {
                 let _ = stopped.await;
                 Ok(())
@@ -715,6 +725,53 @@ fn no_baseline_is_recorded_and_not_traded() {
             },
         );
     refused_at(Gate::Baseline, script, &[], "0.001");
+}
+
+#[test]
+fn credentials_that_stop_answering_after_the_checks_leave_the_journal_as_it_was() {
+    // The order path and the closing baseline read the credentials and
+    // pass; the account listener's read, the third, fails. It must fail
+    // before the first journal line: a `started` with no `stopped` behind
+    // it would make every later run refuse at the last-session gate, for a
+    // run that sent nothing.
+    let rig = Rig::new(Script::default());
+    rig.earlier(&[started(Some("r1")), stopped()]);
+    let before = rig.entries();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let keys = {
+        let account = Arc::clone(&rig.account);
+        let asked = Arc::clone(&asked);
+        move || {
+            if asked.fetch_add(1, Ordering::SeqCst) < 2 {
+                Ok(account.credentials())
+            } else {
+                Err(CredentialError::Missing("BINANCE_ED25519_PRIVATE_KEY"))
+            }
+        }
+    };
+    let running = Rig::start_with(rig.config("0.001"), rig.journalled(), keys);
+    until("the market connection", || rig.market.connections() == 1);
+    Market::new().moves(&rig.market, 12);
+    until("every move sent", || rig.market.sent().len() == 12);
+    let run = running.stop();
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        3,
+        "asked for each holder once"
+    );
+    assert_eq!(run.capture, Ok(()));
+    match run.outcome {
+        Outcome::RecordOnly(refusal) => assert_eq!(refusal.gate, Gate::Baseline, "{refusal}"),
+        Outcome::Traded(traded) => panic!("traded without the listener's credentials: {traded:?}"),
+    }
+    assert_eq!(rig.entries(), before, "nothing written to the journal");
+    assert_eq!(rig.orders().len(), 0);
+    assert_eq!(rig.account.log().connections, 0, "no account stream opened");
+    assert_eq!(
+        live::last_session_gate(&rig.entries()),
+        Ok(()),
+        "the next run may trade"
+    );
 }
 
 #[test]

@@ -31,7 +31,10 @@
 //!    the exit after a buy's fee in the base, rounded down to the lot, still at
 //!    or above the minimum notional at the best bid (§2).
 //! 7. **The baseline**: the account's two balances, which the run journals
-//!    before it may trade (§7, decision 1, *no baseline, no trading*).
+//!    before it may trade (§7, decision 1, *no baseline, no trading*), and
+//!    the credentials the closing balances and the account listener will
+//!    sign with, read now so that none is found missing after the journal
+//!    says a session started.
 //!
 //! A gate that fails means the run records the market and does not trade
 //! (§7, decision 2), saying which gate and why. No strategy runs, no account
@@ -41,8 +44,11 @@
 //!
 //! # A run that trades
 //!
-//! It writes `started`, with the run tag, and the start `balances`, through
-//! the strict writer's latch; a journal that cannot hold them records only.
+//! The venue is wired and every credential it needs read before the first
+//! line, so that a run which cannot be wired records only and leaves the
+//! journal as it found it. Then it writes `started`, with the run tag, and
+//! the start `balances`, through the strict writer's latch; a journal that
+//! cannot hold them records only.
 //! Then the account stream is captured under its own root and the market
 //! under `raw/`, both stamped by one clock, the account's offset the
 //! `Checked` one (§6 duty 2), the account's tee marking its drops (duty 3).
@@ -269,6 +275,9 @@ struct Passed {
     checked: Checked,
     client: TradeClient,
     closing: TradeClient,
+    /// The account listener's, read with the others so that a source that
+    /// stops answering is found before the journal is written.
+    listener: Credentials,
     offset_ms: i64,
     instrument: VenueInstrument,
     run: RunTag,
@@ -309,13 +318,45 @@ where
         Err(refusal) => return Ok(record_only(runtime, market, stop, refusal)),
     };
 
-    // The journal's first lines for this session, through the latch the
-    // writer will share. A journal that cannot hold them is no baseline.
-    let latch = Latch::default();
     let instrument = prepared.instrument;
     let Some(registered) = prepared.registry.get(instrument).cloned() else {
         return Err("the instrument resume registered is not in its registry".to_owned());
     };
+    // The venue, wired before anything is written: one that cannot be is
+    // the instrument's refusal, and records only with the journal as it was.
+    // Nothing runs yet; a venue dropped unrun sends nothing.
+    let FeedParts {
+        consumer,
+        mark,
+        feed,
+    } = feed_parts;
+    let wired = quant_live::wire(
+        instrument,
+        &passed.instrument,
+        passed.run.clone(),
+        passed.checked,
+        passed.client,
+        feed,
+        Arc::clone(&config.clock),
+    );
+    let (venue, worker) = match wired {
+        Ok(wired) => wired,
+        Err(e) => {
+            return Ok(record_only(
+                runtime,
+                market,
+                stop,
+                Refusal {
+                    gate: Gate::ExchangeInfo,
+                    why: format!("the venue could not be wired: {e}"),
+                },
+            ))
+        }
+    };
+
+    // The journal's first lines for this session, through the latch the
+    // writer will share. A journal that cannot hold them is no baseline.
+    let latch = Latch::default();
     let wrote = latch.write(
         &sink,
         &JournalEntry::Started {
@@ -351,19 +392,7 @@ where
 
     // The account stream, under its own root, stamped by the run's clock and
     // logged on with the measured offset, its tee marking what it drops.
-    let FeedParts {
-        consumer,
-        mark,
-        feed,
-    } = feed_parts;
-    let credentials = match keys() {
-        Ok(credentials) => credentials,
-        Err(e) => {
-            return Err(format!(
-                "the credentials could be read for the checks and not now: {e}"
-            ))
-        }
-    };
+    let credentials = passed.listener;
     let (account_stop, account_stopped) = tokio::sync::oneshot::channel::<()>();
     let account_config = AccountConfig {
         root: config.root.clone(),
@@ -380,16 +409,6 @@ where
         .map_err(|e| e.to_string())
     });
 
-    let (venue, worker) = quant_live::wire(
-        instrument,
-        &passed.instrument,
-        passed.run.clone(),
-        passed.checked,
-        passed.client,
-        feed,
-        Arc::clone(&config.clock),
-    )
-    .map_err(|e| format!("the venue could not be wired: {e}"))?;
     runtime.spawn(worker.run());
 
     let writer = JournalWriter::strict_to(
@@ -532,9 +551,10 @@ where
     }
 }
 
-/// What the account feed is built from, made before anything is written so
-/// that a venue that cannot be wired is found before the journal says a
-/// session started.
+/// What the account feed is built from, made with the session's other pieces
+/// once the gates pass. `run` wires the venue from it before anything is
+/// written, so that a venue that cannot be wired is found before the journal
+/// says a session started.
 struct FeedParts {
     consumer: std::sync::mpsc::SyncSender<quant_recorder::CaptureRecord>,
     mark: Arc<LastDropped>,
@@ -659,10 +679,14 @@ async fn gates(
         .map_err(|e| e.to_string())
         .map_err(refuse(Gate::Baseline))?;
     let closing = trade_client(config, keys).map_err(refuse(Gate::Baseline))?;
+    let listener = keys()
+        .map_err(|e| e.to_string())
+        .map_err(refuse(Gate::Baseline))?;
     Ok(Passed {
         checked,
         client,
         closing,
+        listener,
         offset_ms,
         instrument,
         run,
