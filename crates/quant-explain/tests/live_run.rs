@@ -774,6 +774,111 @@ fn credentials_that_stop_answering_after_the_checks_leave_the_journal_as_it_was(
     );
 }
 
+/// A stop that notes how many lines the journal held when it was first
+/// polled, and completes when its sender says so.
+struct Noted {
+    journal: PathBuf,
+    /// The journal's length at the first poll; `usize::MAX` until then.
+    first: Arc<AtomicUsize>,
+    stopped: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl std::future::Future for Noted {
+    type Output = std::io::Result<()>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.first.load(Ordering::SeqCst) == usize::MAX {
+            let held = journal::read(&self.journal).map_or(usize::MAX - 1, |r| r.entries.len());
+            self.first.store(held, Ordering::SeqCst);
+        }
+        std::pin::Pin::new(&mut self.stopped)
+            .poll(cx)
+            .map(|_| Ok(()))
+    }
+}
+
+#[test]
+fn the_stop_is_listened_for_before_the_journal_is_written() {
+    // The binary's stop is Ctrl-C, whose handler is installed on its first
+    // poll. Polled first by the capture, a Ctrl-C after `started` and before
+    // the capture killed the process and left a session with no `stopped`
+    // line. So the run polls its stop before it writes anything.
+    let rig = Rig::new(Script::default());
+    let first = Arc::new(AtomicUsize::new(usize::MAX));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let noted = Noted {
+        journal: rig.journal.clone(),
+        first: Arc::clone(&first),
+        stopped,
+    };
+    let config = rig.config("0.001");
+    let journalled = rig.journalled();
+    let account = Arc::clone(&rig.account);
+    let thread = std::thread::spawn(move || {
+        let keys = move || Ok(account.credentials());
+        live::run(&config, &keys, journalled, noted)
+    });
+    let running = Running {
+        thread: Some(thread),
+        stop: Some(stop),
+    };
+    rig.trading();
+    let traded = traded(running.stop());
+    assert_eq!(first.load(Ordering::SeqCst), 0, "polled before any line");
+    assert_eq!(traded.drained.working, Vec::new());
+    // And the run it stopped wrote its session whole.
+    let entries = rig.entries();
+    assert!(matches!(
+        entries.first(),
+        Some(JournalEntry::Started { .. })
+    ));
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e, JournalEntry::Stopped { .. })));
+}
+
+#[test]
+fn a_stop_that_comes_before_the_capture_ends_the_run_cleanly() {
+    // A Ctrl-C during the gates is now caught rather than fatal: the gates
+    // finish and the run stops at once, with its session written whole. A
+    // stop complete before the run begins stands for it.
+    let rig = Rig::new(Script::default());
+    let config = rig.config("0.001");
+    let journalled = rig.journalled();
+    let account = Arc::clone(&rig.account);
+    let thread = std::thread::spawn(move || {
+        let keys = move || Ok(account.credentials());
+        live::run(&config, &keys, journalled, std::future::ready(Ok(())))
+    });
+    let running = Running {
+        thread: Some(thread),
+        stop: None,
+    };
+    let traded = traded(running.join());
+    assert_eq!(traded.stats.submitted, 0);
+    assert_eq!(traded.drained.working, Vec::new());
+    let entries = rig.entries();
+    assert!(matches!(
+        entries.first(),
+        Some(JournalEntry::Started { .. })
+    ));
+    assert!(
+        matches!(entries.last(), Some(JournalEntry::Balances { .. })),
+        "{entries:#?}"
+    );
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e, JournalEntry::Stopped { working, .. } if working.is_empty())));
+    assert_eq!(
+        live::last_session_gate(&entries),
+        Ok(()),
+        "the next run may trade"
+    );
+}
+
 #[test]
 fn a_clean_stop_cancels_a_resting_order_and_settles_its_end() {
     let rig = Rig::new(Script::default());

@@ -286,7 +286,9 @@ struct Passed {
 
 /// Run until `stop` completes or the configured limit passes: the gates, then
 /// a run that trades or one that records only, then the shutdown in §1's
-/// order. The run owns its runtime, so that the runtime is shut down last.
+/// order. The run owns its runtime, so that the runtime is shut down last,
+/// and polls `stop` once as soon as the runtime exists (`Primed`), so that a
+/// stop which listens for a signal listens before anything is written.
 ///
 /// # Errors
 ///
@@ -308,6 +310,7 @@ where
     Stop: core::future::Future<Output = std::io::Result<()>>,
 {
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let stop = Primed::new(&runtime, stop);
     let market = market_config(config);
     let Journalled { recovered, sink } = journalled;
     let gated = runtime
@@ -508,6 +511,58 @@ where
     };
     outcome.map_err(|e| format!("the market source failed: {e}"))?;
     Ok(run)
+}
+
+/// The stop, polled once as the run begins, so that whatever it listens for
+/// is listened for from the run's first instant rather than from the
+/// capture's.
+///
+/// The binary's stop is `tokio::signal::ctrl_c()`, which installs its handler
+/// on its first poll. Polled first by the capture, a Ctrl-C during the gates
+/// or between the journal's first lines and the capture took the system's
+/// default and killed the process: harmless during the gates, but after
+/// `started` it left a session with no `stopped` line, and the next run
+/// refused at the last-session gate. Primed, a Ctrl-C at any point after the
+/// runtime exists is a stop: the gates finish, each bounded by its request
+/// timeout, and the run stops at once, cleanly, with its closing lines.
+enum Primed<F> {
+    /// Not yet complete: polled on, wherever the run polls its stop.
+    Waiting(std::pin::Pin<Box<F>>),
+    /// Complete on its first poll; what it completed with, until taken.
+    Done(Option<std::io::Result<()>>),
+}
+
+impl<F> Primed<F>
+where
+    F: core::future::Future<Output = std::io::Result<()>>,
+{
+    fn new(runtime: &tokio::runtime::Runtime, stop: F) -> Self {
+        let mut stop = Box::pin(stop);
+        let first = runtime.block_on(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(stop.as_mut().poll(cx))
+        }));
+        match first {
+            std::task::Poll::Ready(result) => Self::Done(Some(result)),
+            std::task::Poll::Pending => Self::Waiting(stop),
+        }
+    }
+}
+
+impl<F> core::future::Future for Primed<F>
+where
+    F: core::future::Future<Output = std::io::Result<()>>,
+{
+    type Output = std::io::Result<()>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Waiting(stop) => stop.as_mut().poll(cx),
+            Self::Done(result) => std::task::Poll::Ready(result.take().unwrap_or(Ok(()))),
+        }
+    }
 }
 
 /// The market capture a run makes, whether or not it trades.

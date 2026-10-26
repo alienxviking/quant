@@ -1967,6 +1967,15 @@ showed it otherwise:
   cannot be reached today, since `exchangeInfo` refuses an empty asset name
   and its definition is always Binance spot, so only the credentials have a
   test.
+- **The stop is polled once as the run begins.** The binary's stop is
+  `tokio::signal::ctrl_c()`, which installs its handler on its first poll,
+  and the capture was the first to poll it. Review found that a Ctrl-C
+  before then took the system's default and killed the process: harmless
+  during the gates, but after `started` it left a session with no `stopped`
+  line, which the next run refused over. The run now polls its stop as soon
+  as its runtime exists, so a Ctrl-C at any point is a stop: the gates
+  finish, each bounded by its request timeout, and the run stops at once
+  with its session written whole.
 - **The last-session gate also refuses a journal with lines and no
   `started` line**, whose last session cannot be read at all.
 - **The size check is a gate, once, at the best bid.** §2 asked the binary to
