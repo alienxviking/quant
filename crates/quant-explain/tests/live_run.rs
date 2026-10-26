@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use quant_backtest::account_replay::{self, Verdict};
 use quant_backtest::live::{self, Gate, Journalled, LiveConfig, LiveRun, Outcome};
 use quant_backtest::record::Lines;
 use quant_backtest::session::Settings;
@@ -408,21 +409,22 @@ fn verified_clean(root: &Path) -> usize {
     sessions.len()
 }
 
-#[test]
-fn a_rehearsal_passes_its_gates_trades_one_round_trip_and_stops_with_nothing_resting() {
-    let rig = Rig::new(Script::default());
+/// A run that passes its gates and trades one round trip: a buy, its fee
+/// taken in the base, and an exit that sells what is held. Stopped once the
+/// exit's fill is journalled.
+fn round_trip(rig: &Rig) -> LiveRun {
     let running = rig.start(rig.config("0.001"), rig.journalled());
     rig.trading();
     let mut market = Market::new();
 
-    let buy = market.cross(&rig, 1, 1);
+    let buy = market.cross(rig, 1, 1);
     assert_eq!(buy.param("side"), Some("BUY"));
     assert_eq!(buy.param("quantity"), Some("0.001"));
     // A spot venue takes a buy's fee in the asset bought.
     rig.fill(&buy, "76651.00", ("0.00000100", "BTC"), 1);
     rig.journalled_line("the buy's fill", filled(1));
 
-    let sell = market.cross(&rig, -1, 2);
+    let sell = market.cross(rig, -1, 2);
     assert_eq!(sell.param("side"), Some("SELL"));
     assert_eq!(
         sell.param("quantity"),
@@ -431,8 +433,13 @@ fn a_rehearsal_passes_its_gates_trades_one_round_trip_and_stops_with_nothing_res
     );
     rig.fill(&sell, "76649.00", ("0.07588251", "USDT"), 2);
     rig.journalled_line("the sell's fill", filled(2));
+    running.stop()
+}
 
-    let run = running.stop();
+#[test]
+fn a_rehearsal_passes_its_gates_trades_one_round_trip_and_stops_with_nothing_resting() {
+    let rig = Rig::new(Script::default());
+    let run = round_trip(&rig);
     assert_eq!(run.capture, Ok(()));
     let traded = traded(run);
     assert_eq!(
@@ -483,6 +490,79 @@ fn a_rehearsal_passes_its_gates_trades_one_round_trip_and_stops_with_nothing_res
         2,
         "the market's session and the account's"
     );
+
+    // And the account replay check: the recorded account frames and the
+    // journal's REST lines reproduce every line the venue produced.
+    let replay = account_replay::replay(&entries, &rig.root, None).expect("a live journal");
+    assert_eq!(replay.verdict(), Verdict::Agrees, "{replay:#?}");
+    assert_eq!((replay.sessions, replay.matched), (1, 1));
+    assert!(replay.records > 0 && replay.compared > 0, "{replay:#?}");
+}
+
+#[test]
+fn the_account_replay_disagrees_with_a_journal_its_capture_does_not_support() {
+    // Criterion A's sabotages, against the replay: a fill line deleted, a fee
+    // moved by one raw unit, a stamp moved by a nanosecond, and the capture
+    // taken away. Each must be a
+    // disagreement, naming the line; and a journal that is not a live run's
+    // is nothing to compare.
+    let rig = Rig::new(Script::default());
+    let _ = round_trip(&rig);
+    let entries = rig.entries();
+    let replayed = |entries: &[JournalEntry], root: &Path| {
+        account_replay::replay(entries, root, None).expect("a live journal")
+    };
+    assert_eq!(replayed(&entries, &rig.root).verdict(), Verdict::Agrees);
+
+    let fill = entries.iter().position(filled(1)).expect("the buy's fill");
+    let mut deleted = entries.clone();
+    let gone = deleted.remove(fill);
+    let replay = replayed(&deleted, &rig.root);
+    assert_eq!(replay.verdict(), Verdict::Disagrees);
+    assert_eq!(
+        replay.extra,
+        [gone],
+        "the replay made the line the journal lost"
+    );
+
+    let mut moved = entries.clone();
+    if let JournalEntry::Filled { fee, .. } = &mut moved[fill] {
+        *fee = quant_core::fixed::Notional::from_raw(fee.raw() + 1);
+    }
+    let replay = replayed(&moved, &rig.root);
+    assert_eq!(replay.verdict(), Verdict::Disagrees);
+    assert_eq!(replay.missing, [moved[fill].clone()]);
+    assert_eq!(replay.extra, [entries[fill].clone()]);
+
+    let mut late = entries.clone();
+    if let JournalEntry::Filled { at, .. } = &mut late[fill] {
+        *at = Ts::from_nanos(at.as_nanos() + 1);
+    }
+    let replay = replayed(&late, &rig.root);
+    assert_eq!(
+        replay.verdict(),
+        Verdict::Disagrees,
+        "a stamp a nanosecond out"
+    );
+    assert_eq!(replay.missing, [late[fill].clone()]);
+
+    let elsewhere = rig.dir.join("no-capture");
+    std::fs::create_dir_all(&elsewhere).expect("an empty root");
+    let replay = replayed(&entries, &elsewhere);
+    assert_eq!(replay.verdict(), Verdict::Disagrees);
+    assert!(
+        replay
+            .missing
+            .iter()
+            .any(|e| matches!(e, JournalEntry::Filled { .. })),
+        "what the stream said is missing without its capture: {replay:#?}"
+    );
+
+    let paper = [started(None), stopped()];
+    assert!(matches!(
+        account_replay::replay(&paper, &rig.root, Some("BTCUSDT")),
+        Err(account_replay::ReplayError::NotLive(_))
+    ));
 }
 
 /// A run whose gate `gate` refuses: it records the market, trades nothing,

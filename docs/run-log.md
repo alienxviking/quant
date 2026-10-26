@@ -605,3 +605,70 @@ item: `journal::recover_risk` folds a journal through the risk layer as the
 earlier process counted it, so a restart resumes the holding and the day's
 order count and loss rather than starting flat on a fresh day.
 `docs/engine-contract.md` §10 has the rule for each line.
+
+---
+## 10. The account replay check (`replay-account`, M8 item 8)
+
+```text
+replay-account data/testnet/live-BTCUSDT.jsonl            # the root: the journal's directory
+replay-account <JOURNAL> [DATA_ROOT] [--symbol SYM]
+```
+
+Item 8's acceptance asks that replaying a live run's recorded account frames
+through the translator reproduce every venue-produced line of its journal
+(`docs/live-run.md` §4). This is that check, in `quant-backtest`'s
+`account_replay`, exit-coded as the others: **0** the replay agrees, **1** it
+does not, or the capture cannot be read, **2** nothing was compared.
+
+**What it replays.** REST answers are not in the raw tier, so the account
+frames alone reproduce only what the stream said (`docs/live-run.md` §5,
+*LiveVenue, decided before the code*, §6 duty 7). The REST side comes back off
+its own lines: `submitted` as the machine's `Submitted`; `placed`, a
+`rejected` that cites the venue, `never_landed { not_sent }` and a `doubt
+raised` for a REST cause as the placement each records; `cancel_refused` as
+the cancel's reply; and a `fills_missed` raise as the owner's `Unheard` timer,
+which a hole's own raise makes a no-op. The frames come back off the account
+capture under `DATA_ROOT/account`, through the real `AccountFeed`, so a gap or
+a hole reaches the machine as it reached the live one. A fresh merge machine
+per session hears the two merged by stamp, each source in its own order, a
+REST answer first on a tie and a submission after the records it was decided
+on, as the live venue merges them. What it says is routed by the engine's rule
+for an order it is not working (a fill withheld is an orphan, anything else a
+stray) into the journal's own writer, writing into memory: one writer, so the
+lines compared cannot differ for being written by two.
+
+**What it compares.** Every line of the kinds a venue produces (`accepted`,
+`rejected`, `filled`, `cancelled`, `orphaned`, `stray`, `placed`,
+`never_landed`, `doubt`, `cancel_refused`, `foreign`, `account`, `anomaly`),
+one exhaustive match deciding which, as multisets of whole lines, stamps
+included. A line the journal holds and the replay does not make is *missing*,
+a claim the capture does not support; one the replay makes and the journal
+does not hold is *extra*, something the capture holds that the record did not
+take. A session is matched to the account capture whose first record falls
+between its `started` line and the next, and the capture is read up to the
+session's `stopped` stamp, the engine's last instant, after which nothing it
+heard was acted on.
+
+**What makes it fail**, each seen in its tests: a `filled` line deleted (the
+replay makes it: extra), a fee moved by one raw unit or a stamp by one
+nanosecond (missing and extra), the capture taken away (every stream line
+missing), the REST lines not read back, the frames not fed, and a comparison
+that drops the stamp.
+
+**What it cannot see.** An acknowledged cancel writes no line and is not
+replayed, so the one contradiction only it makes (a cancel acknowledged for an
+order REST refused) is beyond it. And across the two sources the order is
+arrival order only while each record reached the engine before what the engine
+did after it; a record still crossing the tee when the engine polled is heard
+a poll later live and in stamp order here, which across a lost stream can
+change whether an order submitted in that instant was in doubt for it. That
+shows as a disagreement, never as agreement by accident.
+
+**Nothing to compare** is a journal with no run tag (not a live run's), one
+without a `balances` line to name its two assets, or one with no account
+record and no venue line: a check that compared nothing must not look like one
+that agreed.
+
+Measured on 8a's rehearsal against local stand-ins (`quant-explain`'s
+`tests/live_run.rs`): a session that traded one round trip replays to the same
+lines, stamps included.

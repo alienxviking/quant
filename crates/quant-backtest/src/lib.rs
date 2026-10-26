@@ -22,6 +22,7 @@
 //! ingress, generic over the venue: `paper`'s, extracted so that [`live`], the
 //! `live` binary's body, runs the same path with `LiveVenue` behind it.
 
+pub mod account_replay;
 pub mod equity;
 pub mod live;
 pub mod ma;

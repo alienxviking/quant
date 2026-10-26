@@ -27,6 +27,9 @@ quant-recorder = { workspace = true }
 # drain. Nothing depends on this crate, so linking the live venue here costs
 # the graph nothing (`docs/live-run.md` §5, the owner's decision 5).
 quant-live = { workspace = true }
+# The account replay check reads the account stream's capture back, frame by
+# frame, as `quant-verify` and `normalize` read theirs.
+quant-storage = { workspace = true }
 # The strategy's notes are opaque JSON by design -- see `Strategy::take_notes`.
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }

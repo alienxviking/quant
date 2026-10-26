@@ -710,11 +710,14 @@ feature.
      only when typed, every endpoint overridable for a local stand-in; seven
      gates before the capture, any of which fails into recording only; the
      capture of both streams under one clock; and §1's shutdown order, the
-     closing lines only while the strict writer stands. Accepted against the
+     closing lines only while the strict writer stands. The account replay
+     check is `replay-account` (`docs/run-log.md` §10). Accepted against the
      stand-ins by `quant-explain`'s `tests/live_run.rs`: a full rehearsal that
      passes the gates, trades one round trip, cancels nothing, and ends with
-     `reconcile` agreeing, `runlog check` complete and `quant-verify` clean on
-     both roots; each gate failing in turn, recording
+     `reconcile` agreeing, `runlog check` complete, `quant-verify` clean on
+     both roots and the replay check agreeing (and disagreeing with a fill
+     deleted, a fee moved by one raw unit, a stamp by a nanosecond, or the
+     capture taken away); each gate failing in turn, recording
      and never trading; a restart onto a journal that latched `Diverged` and
      one after a stop that left an order working, each recording only; a stop
      that cancels a resting order and settles its end; a journal that fails,
@@ -1982,6 +1985,13 @@ showed it otherwise:
 - **A refused gate exits 0.** It is a run that did what it was told, recording,
   and said loudly why it did not trade; a supervisor that restarted it would
   meet the same refusal.
+- **The account replay check reads the REST answers back off the journal**,
+  as duty 7 says it must, and needs a stamp after which the stream was not
+  heard: the session's `stopped` line, stamped at the engine's last instant
+  (above). It replays the `Unheard` timer from each `fills_missed` raise,
+  which no line distinguishes from a hole's, safely: a hole's raise makes the
+  timer's a no-op. An acknowledged cancel writes no line and is not replayed
+  (`docs/run-log.md` §10).
 - **The account capture is a library function**, `capture::record_account`,
   which `fake_venue`'s `Listening` now runs too, so the tests record through
   the code a live run records through. It came with one test, because none of
