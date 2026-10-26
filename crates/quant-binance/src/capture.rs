@@ -915,6 +915,7 @@ mod tests {
         let venue = FakeVenue::start(fake_venue::Script::default()).await;
         let (consumer, records) = std::sync::mpsc::sync_channel(1);
         let mark = Arc::new(LastDropped::default());
+        let dropped = Arc::clone(&mark);
         let mut feed = AccountFeed::new(records, Arc::clone(&mark));
         let config = AccountConfig {
             root: root.clone(),
@@ -934,7 +935,19 @@ mod tests {
                     log.asked("userDataStream.subscribe") >= 1
                 })
                 .await;
+            // Not a poll until the tee has dropped something. The venue being
+            // asked is not the answer being recorded: polled before the answer
+            // reached the tee, the consumer would have room for it again and
+            // nothing would be missed, which is the race this test once lost
+            // under load (one full-suite run in fourteen).
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while dropped.get().is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the tee never dropped the subscription's answer"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
             let mut read = Vec::new();
             while !read.iter().any(|r| {
                 matches!(
