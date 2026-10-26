@@ -19,6 +19,17 @@
 //! metadata tier, the writer thread, the host-clock check, the periodic metrics,
 //! and the shutdown that seals a trailer so a clean stop is distinguishable from
 //! a kill.
+//!
+//! # Where, by which clock, and until when
+//!
+//! M8's live binary added three things to [`CaptureConfig`] and one way in,
+//! each defaulted to what `record` and `paper` always did. The endpoints, so
+//! that a run can capture Spot Testnet or a local stand-in
+//! (`crate::fake_market`) rather than the live venue. The clock, so that one
+//! clock stamps the market, the account stream and the request worker
+//! (`docs/live-run.md` §5, *`LiveVenue`, decided before the code*, §4, and §6
+//! duty 2). And [`run_until`], a stop that is not ctrl-c, which [`run`] now
+//! calls with ctrl-c.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -216,21 +227,54 @@ pub struct CaptureConfig {
     pub root: PathBuf,
     /// Stop after this long. `None` runs until interrupted.
     pub limit: Option<Duration>,
+    /// Where the market stream is subscribed: [`SPOT_WS`] unless a run says
+    /// otherwise.
+    pub ws_base: String,
+    /// Where depth snapshots and the clock are asked for: [`SPOT_REST`]
+    /// unless a run says otherwise.
+    pub rest_base: String,
+    /// The clock every record is stamped by. A live run hands the same one to
+    /// its account stream and its request worker (`docs/live-run.md` §5,
+    /// *`LiveVenue`, decided before the code*, §4): one clock stamps
+    /// `local_recv_ts` everywhere. The wall clock unless a run says otherwise.
+    pub clock: Arc<dyn Clock>,
 }
 
 impl CaptureConfig {
+    /// The live venue's market stream and REST endpoints, stamped by the wall
+    /// clock: what `record` and `paper` have always captured.
     #[must_use]
     pub fn new(symbol: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
             symbol: symbol.into(),
             root: root.into(),
             limit: None,
+            ws_base: SPOT_WS.to_owned(),
+            rest_base: SPOT_REST.to_owned(),
+            clock: Arc::new(SystemClock),
         }
     }
 
     #[must_use]
     pub const fn for_at_most(mut self, limit: Duration) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Subscribe at `ws_base` and ask `rest_base` for snapshots instead: Spot
+    /// Testnet, or a local stand-in for a rehearsal.
+    #[must_use]
+    pub fn at(mut self, ws_base: impl Into<String>, rest_base: impl Into<String>) -> Self {
+        self.ws_base = ws_base.into();
+        self.rest_base = rest_base.into();
+        self
+    }
+
+    /// Stamp every record with `clock`, the one the rest of the run stamps
+    /// with.
+    #[must_use]
+    pub fn stamped_by(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 }
@@ -253,15 +297,40 @@ where
     S: quant_recorder::sink::RecordSink,
     F: FnOnce(quant_recorder::CaptureSender) -> S,
 {
+    run_until(config, wrap, tokio::signal::ctrl_c()).await
+}
+
+/// [`run`], stopped by `stop` rather than by ctrl-c: what a run that has its
+/// own way of being told to stop passes, a test among them.
+///
+/// `stop` completing with `Ok` is a requested shutdown, sealed as one; with
+/// `Err`, the capture stops and the error is returned, as [`run`] returns a
+/// failure to listen for ctrl-c.
+///
+/// # Errors
+///
+/// As [`run`].
+pub async fn run_until<S, F, Stop>(
+    config: CaptureConfig,
+    wrap: F,
+    stop: Stop,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: quant_recorder::sink::RecordSink,
+    F: FnOnce(quant_recorder::CaptureSender) -> S,
+    Stop: core::future::Future<Output = std::io::Result<()>>,
+{
     let CaptureConfig {
         symbol,
         root,
         limit,
+        ws_base,
+        rest_base,
+        clock,
     } = config;
 
     // The one and only clock. Everything that stamps a timestamp takes this, so
     // that the same code can be driven by a replayed event stream later.
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let started = clock.now();
 
     let session_id = *uuid::Uuid::new_v4().as_bytes();
@@ -333,7 +402,7 @@ where
     // deltas are recorded faithfully and can never be turned into a book, so a
     // recorder that quietly ran without one would produce a week of data that
     // looks complete and is not usable.
-    let snapshots = SnapshotClient::new(SPOT_REST, SNAPSHOT_TIMEOUT)?;
+    let snapshots = SnapshotClient::new(rest_base, SNAPSHOT_TIMEOUT)?;
     check_host_clock(&snapshots, clock.as_ref()).await;
     // The session id, not a path: with day rolling a run can produce several
     // files, and the session is what identifies them all. Each is logged as it
@@ -346,11 +415,11 @@ where
     );
 
     let outcome = tokio::select! {
-        result = connection::run(&spec, SPOT_WS, &mut ingress, &policy, Some(&snapshots)) => {
+        result = connection::run(&spec, &ws_base, &mut ingress, &policy, Some(&snapshots)) => {
             // Only returns on a fatal condition -- normal disconnects are gaps.
             result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
         }
-        result = tokio::signal::ctrl_c() => {
+        result = stop => {
             result?;
             info!("shutdown requested");
             Ok(())
@@ -561,5 +630,128 @@ async fn until(limit: Option<Duration>) {
     match limit {
         Some(d) => tokio::time::sleep(d).await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use quant_core::time::{ManualClock, Ts};
+    use quant_recorder::catalog;
+    use quant_storage::{FrameKind, RawReader};
+
+    use super::{run_until, CaptureConfig};
+    use crate::fake_market::{self, FakeMarket};
+
+    /// A data root of this test's own, named for this process and cleared, so
+    /// that a root a reused process id left behind is never read as this one.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "quant-binance-capture-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// A REST base nothing answers: a port bound and let go.
+    fn nowhere() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        format!("http://{}", listener.local_addr().expect("address"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capture_subscribes_where_it_is_told_stamps_by_the_clock_it_is_given_and_stops_when_asked(
+    ) {
+        // The three things a rehearsal needs of the capture that `record` and
+        // `paper` never did: another endpoint, another clock, and a stop that
+        // is not ctrl-c. Every record is stamped by the clock handed in, which
+        // a live run shares with its account stream and its request worker.
+        let root = scratch("endpoints");
+        let market = FakeMarket::start().await;
+        let at = Ts::from_nanos(1_789_000_000_000_000_000);
+        let clock = Arc::new(ManualClock::new(at));
+        let frames = [
+            fake_market::trade("BTCUSDT", 1, "76650.12", "0.01", 1_000),
+            fake_market::trade("BTCUSDT", 2, "76650.13", "0.02", 1_001),
+        ];
+        for frame in &frames {
+            market.send(frame);
+        }
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let config = CaptureConfig::new("BTCUSDT", &root)
+            .at(market.url(), nowhere())
+            .stamped_by(clock);
+        // A second consumer, as paper's engine is, to see the records arrive:
+        // the capture's own file is not readable until it is sealed.
+        let (side_tx, side) = std::sync::mpsc::sync_channel(64);
+        let capture = run_until(
+            config,
+            |tx| quant_recorder::TeeSink::new(tx, side_tx),
+            async {
+                let _ = stopped.await;
+                Ok(())
+            },
+        );
+        let drive = async {
+            market
+                .until("both frames sent", Duration::from_secs(20), |m| {
+                    m.sent().len() == frames.len()
+                })
+                .await;
+            // Sent is not recorded. Wait until ingress has handed both on, the
+            // session's opening gap first: what ingress has taken, the writer
+            // seals on the way out.
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut handed = 0;
+            while handed < 1 + frames.len() {
+                assert!(std::time::Instant::now() < deadline, "not handed on");
+                match side.try_recv() {
+                    Ok(_) => handed += 1,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
+                }
+            }
+            let _ = stop.send(());
+        };
+        let (outcome, ()) = tokio::time::timeout(
+            Duration::from_secs(30),
+            Box::pin(async { tokio::join!(capture, drive) }),
+        )
+        .await
+        .expect("the capture stops when asked");
+        outcome.expect("a clean stop");
+
+        let cat = catalog(&root);
+        assert_eq!(cat.sessions.len(), 1);
+        let mut read = Vec::new();
+        for entry in &cat.sessions[0].segments {
+            let file = std::fs::File::open(&entry.path).expect("open");
+            let mut reader = RawReader::open(std::io::BufReader::new(file)).expect("a capture");
+            let (frames, truncation) = reader.read_all().expect("readable");
+            assert_eq!(truncation, None);
+            assert!(reader.is_finalized(), "sealed, as a clean stop seals");
+            read.extend(frames);
+        }
+        let payloads: Vec<String> = read
+            .iter()
+            .filter(|f| f.kind == FrameKind::VenuePayload)
+            .map(|f| String::from_utf8(f.payload.clone()).expect("text"))
+            .collect();
+        assert_eq!(payloads, frames, "the venue's bytes, verbatim and in order");
+        assert!(
+            read.iter().all(|f| f.local_recv_ts == at),
+            "every record stamped by the clock handed in: {:?}",
+            read.iter().map(|f| f.local_recv_ts).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            market.targets(),
+            ["/stream?streams=btcusdt@trade/btcusdt@depth@100ms"],
+            "subscribed at the base it was given, to the streams M1 records"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
