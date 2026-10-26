@@ -43,7 +43,13 @@ tracing-subscriber = { version = "0.3", features = ["json"] }
 # only: nothing here may depend on a venue or a binary's crate.
 quant-live = { workspace = true, features = ["fixtures"] }
 quant-backtest = { workspace = true }
-quant-binance = { workspace = true }
+# `fake-venue` for item 7's end-to-end tests (`tests/live_venue.rs`): the
+# account side's stand-in, and a trade client whose order timeout a test may
+# shorten. The simulator, for the same lifecycle through both venues, and a
+# runtime for the request worker and the listener.
+quant-binance = { workspace = true, features = ["fake-venue"] }
+quant-sim = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

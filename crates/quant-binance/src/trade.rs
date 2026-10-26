@@ -768,9 +768,12 @@ impl TradeClient {
 
     /// This client, with orders and cancels waiting `timeout` instead of
     /// [`ORDER_TIMEOUT`]: for a test that needs a timeout to happen, and only
-    /// there. Production has no way to change the number.
-    #[cfg(test)]
-    fn with_order_timeout(mut self, timeout: Duration) -> Self {
+    /// there. Production has no way to change the number: outside this
+    /// crate's tests it exists only behind `fake-venue`, which nothing that
+    /// ships turns on, for `quant-live`'s tests through the real engine.
+    #[cfg(any(test, feature = "fake-venue"))]
+    #[must_use]
+    pub fn with_order_timeout(mut self, timeout: Duration) -> Self {
         self.order_timeout = timeout;
         self
     }
@@ -918,9 +921,16 @@ impl TradeClient {
     }
 
     /// Send `cancel` to `DELETE /api/v3/order`, stamped `stamped_at_ms`, and
-    /// say what the answer means. The stamp and the sending are as
-    /// [`Self::place_order`]'s; what an answer means is
-    /// [`CancelOrder::classify`]'s.
+    /// say what the answer means. The sending is as [`Self::place_order`]'s;
+    /// what an answer means is [`CancelOrder::classify`]'s.
+    ///
+    /// The stamp is not. `stamped_at_ms` is when the request is sent, on the
+    /// venue's clock, and not when the strategy asked: wanting an order gone
+    /// does not go stale, and a cancel stamped when it was asked for and then
+    /// queued behind a request that timed out would be refused for its age,
+    /// leaving the order resting (`docs/live-run.md` §5, *`LiveVenue`, decided
+    /// before the code*, §1). `quant-live`'s request worker stamps it as it
+    /// sends it.
     #[must_use = "a cancel is sent once, and this is all that says whether it took effect"]
     pub async fn cancel_order(&self, cancel: &CancelOrder, stamped_at_ms: i64) -> CancelReply {
         let sent = self
@@ -1124,6 +1134,58 @@ impl TradeClient {
             ));
         }
         bnb_discount_off(&reply.body)
+    }
+
+    /// The three checks `venue-check` runs, in its order, and the token that
+    /// says they passed: [`Self::check_ready`], [`Self::check_trade_permission`]
+    /// with `probe`, and [`Self::check_bnb_discount_off`] for `symbol`, each
+    /// stamped with `offset_ms` taken off the host's clock.
+    ///
+    /// The first refusal stops it, and nothing after that refusal is asked.
+    /// The only way to make a [`Checked`], which is what a live venue is built
+    /// from (`quant-live`'s `wire`), so that no venue that can trade exists
+    /// before the host, the key and the account have been shown fit to.
+    ///
+    /// # Errors
+    ///
+    /// The first check's [`NotReady`], as that check reports it.
+    pub async fn checked(
+        &self,
+        probe: &NewOrder,
+        symbol: &str,
+        offset_ms: i64,
+    ) -> Result<Checked, NotReady> {
+        self.check_ready(offset_ms).await?;
+        self.check_trade_permission(probe, offset_ms).await?;
+        self.check_bnb_discount_off(symbol, offset_ms).await?;
+        Ok(Checked { offset_ms })
+    }
+}
+
+/// Proof that the checks `venue-check` runs passed on this host, and the
+/// clock offset they passed with: what a live venue is built from
+/// (`docs/live-run.md` §5, *`LiveVenue`, decided before the code*, §3).
+///
+/// Minted only by [`TradeClient::checked`]; it has no other constructor, so a
+/// venue built from one was built after the checks and never instead of them.
+/// It carries the offset because every order and every logon is stamped with
+/// it: the offset the clock check passed is the offset the run uses, and not a
+/// second reading that could disagree with it.
+///
+/// Not `Clone`: one check, one venue. Item 8 reads [`Checked::offset_ms`] for
+/// the account listener before handing the token to `wire`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Checked {
+    offset_ms: i64,
+}
+
+impl Checked {
+    /// The host clock's offset from the venue's, in milliseconds, positive
+    /// when the host is ahead: what every signed request's stamp has taken
+    /// off it.
+    #[must_use]
+    pub const fn offset_ms(&self) -> i64 {
+        self.offset_ms
     }
 }
 
@@ -3277,5 +3339,63 @@ Content-Length: {}
                 }),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_checked_token_is_minted_only_once_all_three_checks_pass() {
+        // The three answers that pass, in venue-check's order: the account
+        // probe, the trade probe, the commission rates.
+        let pass = || {
+            vec![
+                http("200 OK", "", &account("true")),
+                http("200 OK", "", "{}"),
+                http("200 OK", "", &commission("false", "false")),
+            ]
+        };
+        let venue = TestVenue::start(pass().into_iter().map(Reply::Bytes).collect());
+        let checked = client_at(&venue.base)
+            .checked(&order_on("BTCUSDT"), "BTCUSDT", 412)
+            .await
+            .expect("every check passed");
+        let requests = venue.stop();
+        assert_eq!(
+            checked.offset_ms(),
+            412,
+            "the offset the checks passed with"
+        );
+        let paths: Vec<&str> = requests
+            .iter()
+            .map(|r| r.split(['?', ' ']).nth(1).unwrap_or_default())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/api/v3/account",
+                ORDER_TEST_PATH,
+                "/api/v3/account/commission"
+            ]
+        );
+
+        // Each check refusing in turn: no token, and nothing after it asked.
+        let refusals = [
+            http("200 OK", "", &account("false")),
+            http(
+                "400 Bad Request",
+                "",
+                r#"{"code":-2010,"msg":"Account has insufficient balance for requested action."}"#,
+            ),
+            http("200 OK", "", &commission("true", "true")),
+        ];
+        for (n, refusal) in refusals.into_iter().enumerate() {
+            let mut replies = pass();
+            replies[n] = refusal;
+            let venue = TestVenue::start(replies.into_iter().map(Reply::Bytes).collect());
+            let answer = client_at(&venue.base)
+                .checked(&order_on("BTCUSDT"), "BTCUSDT", 0)
+                .await;
+            let requests = venue.stop();
+            assert!(answer.is_err(), "check {n} refused, and still {answer:?}");
+            assert_eq!(requests.len(), n + 1, "asked past check {n}: {requests:#?}");
+        }
     }
 }

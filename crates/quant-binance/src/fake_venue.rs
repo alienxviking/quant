@@ -59,7 +59,7 @@ use quant_core::instrument::Exchange;
 use quant_core::time::{Clock, SystemClock};
 use quant_recorder::{
     account_catalog, channel, run_writer, BackoffPolicy, CaptureRecord, CaptureSession, FileStore,
-    Ingress, Metrics, TeeSink, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
+    Ingress, LastDropped, Metrics, TeeSink, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
 };
 use quant_storage::{
     RawFrame, RawReader, WriterOptions, BLOCK_HEADER_LEN, BLOCK_SYNC, FILE_HEADER_LEN, TRAILER_LEN,
@@ -74,7 +74,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::account::{listen, AccountPolicy, Stopped};
+use crate::account::{listen, AccountFeed, AccountPolicy, Stopped};
 use crate::credentials::Credentials;
 
 /// The venue's default `recvWindow`, which a logon's timestamp is judged by.
@@ -791,7 +791,9 @@ pub fn quick_policy() -> AccountPolicy {
 pub struct Listening {
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<Heard>,
-    consumer: Receiver<CaptureRecord>,
+    /// The consumer side, unless an [`AccountFeed`] reads it
+    /// ([`Self::feeding`]).
+    consumer: Option<Receiver<CaptureRecord>>,
 }
 
 /// How a [`Listening`] ended.
@@ -830,13 +832,47 @@ impl Listening {
             policy,
             offset_ms,
             stopped,
-            consumer_tx,
+            (consumer_tx, None),
         ));
         Self {
             stop: Some(stop),
             task,
-            consumer,
+            consumer: Some(consumer),
         }
+    }
+
+    /// [`Self::start_with_offset`], with the consumer side read by the
+    /// [`AccountFeed`] handed back, wired as a live run wires it: the tee
+    /// marks what it drops in the handle the feed reads
+    /// ([`TeeSink::marking_into`]), so a hole is told while the account is
+    /// quiet. What `quant-live`'s tests run a live venue's account side on.
+    /// [`Heard::consumed`] is then empty: the feed had it all.
+    #[must_use]
+    pub fn feeding(
+        root: &Path,
+        url: &str,
+        credentials: Credentials,
+        policy: AccountPolicy,
+        offset_ms: i64,
+    ) -> (Self, AccountFeed) {
+        let (stop, stopped) = oneshot::channel();
+        let (consumer_tx, consumer) = sync_channel(DEFAULT_CHANNEL_CAPACITY);
+        let mark = Arc::new(LastDropped::default());
+        let task = tokio::spawn(capture(
+            root.to_path_buf(),
+            url.to_owned(),
+            credentials,
+            policy,
+            offset_ms,
+            stopped,
+            (consumer_tx, Some(Arc::clone(&mark))),
+        ));
+        let listening = Self {
+            stop: Some(stop),
+            task,
+            consumer: None,
+        };
+        (listening, AccountFeed::new(consumer, mark))
     }
 
     /// Stop listening, seal the capture, and say what was heard.
@@ -862,7 +898,10 @@ impl Listening {
             .await
             .unwrap_or_else(|_| panic!("the listener did not finish within {within:?}"))
             .expect("the listening task");
-        heard.consumed = self.consumer.try_iter().collect();
+        heard.consumed = self
+            .consumer
+            .map(|consumer| consumer.try_iter().collect())
+            .unwrap_or_default();
         heard
     }
 }
@@ -874,7 +913,7 @@ async fn capture(
     policy: AccountPolicy,
     offset_ms: i64,
     stop: oneshot::Receiver<()>,
-    consumer: SyncSender<CaptureRecord>,
+    (consumer, mark): (SyncSender<CaptureRecord>, Option<Arc<LastDropped>>),
 ) -> Heard {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut session = CaptureSession::account(
@@ -889,7 +928,12 @@ async fn capture(
         let outcome = run_writer(&rx, &mut session, DEFAULT_FLUSH_INTERVAL);
         (outcome, session)
     });
-    let mut ingress = Ingress::new(TeeSink::new(tx, consumer), clock, metrics);
+    let tee = TeeSink::new(tx, consumer);
+    let tee = match mark {
+        Some(mark) => tee.marking_into(mark),
+        None => tee,
+    };
+    let mut ingress = Ingress::new(tee, clock, metrics);
     ingress
         .record_gap(GapCause::RecorderRestart)
         .expect("the writer is running");

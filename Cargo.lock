@@ -1125,8 +1125,10 @@ dependencies = [
  "quant-live",
  "quant-normalize",
  "quant-recorder",
+ "quant-sim",
  "quant-storage",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1135,10 +1137,15 @@ dependencies = [
 name = "quant-live"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "quant-binance",
  "quant-core",
  "quant-engine",
+ "quant-recorder",
+ "ring",
  "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

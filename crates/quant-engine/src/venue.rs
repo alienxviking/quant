@@ -1,8 +1,8 @@
 //! Where orders go.
 //!
 //! Two implementations: simulated (M3), which paper trading uses as well -- M5
-//! found that a paper venue would be the simulator again -- and live (M8, not
-//! built yet). The trait is what makes them interchangeable, and its shape is
+//! found that a paper venue would be the simulator again -- and live (M8,
+//! `quant-live::LiveVenue`). The trait is what makes them interchangeable, and its shape is
 //! the contract's central claim — **submission returns nothing**.
 //!
 //! # Why `submit` has no return value
