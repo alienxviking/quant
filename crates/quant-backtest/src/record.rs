@@ -11,6 +11,7 @@
 //! against a replayed one, so the two writers *must* agree or the diff measures
 //! the writers rather than the runs. One writer cannot disagree with itself.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use quant_core::execution::{
@@ -61,19 +62,71 @@ use tracing::error;
 /// thing to slip in before a run.
 pub const CHECKPOINT_EVERY: u64 = 5;
 
+/// Where a journal's lines go: the file, always, outside a test.
+///
+/// A trait for two readers of the writer that are not a run. The account
+/// replay check (`crate::account_replay`) writes what a replayed venue said
+/// through this same writer into memory, so that the lines it compares with
+/// the journal's are written by the code that wrote those, rather than by a
+/// second mapping that must agree with it for ever. And a test of the strict
+/// writer needs an append that fails when it says, which a file on a healthy
+/// disk will not do.
+pub trait Lines: Send {
+    /// Append one entry, durably, or say why not.
+    ///
+    /// # Errors
+    ///
+    /// Whatever kept the entry from being held.
+    fn append(&mut self, entry: &JournalEntry) -> std::io::Result<()>;
+}
+
+impl Lines for Journal {
+    fn append(&mut self, entry: &JournalEntry) -> std::io::Result<()> {
+        Journal::append(self, entry)
+    }
+}
+
+/// In memory, for a reader that compares lines rather than keeping them.
+impl Lines for Vec<JournalEntry> {
+    fn append(&mut self, entry: &JournalEntry) -> std::io::Result<()> {
+        self.push(entry.clone());
+        Ok(())
+    }
+}
+
+/// A journal shared between a writer and the path that writes around it.
+pub type Shared = Arc<Mutex<dyn Lines>>;
+
 /// Writes fills down before the strategy is told about them.
-#[derive(Debug)]
 pub struct JournalWriter {
     /// Shared with the shutdown path, which writes the final checkpoint and the
     /// `Stopped` mark. Two owners and a few hundred writes over a fortnight, so
     /// the lock is never contended -- and the alternative, prising the journal
     /// back out of the engine, would mean the engine knowing what a journal is.
-    journal: Arc<Mutex<Journal>>,
+    journal: Shared,
     symbol: String,
     fills: u64,
     failures: u64,
     /// What a failed append means: see [`Policy`].
     policy: Policy,
+    /// Set by a strict writer's first failure and never cleared. Shared, so
+    /// that the shutdown path, which writes around this writer, stops where
+    /// it stops ([`Latch`]).
+    failed: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for JournalWriter {
+    /// By hand: the sink is a trait object, and what is worth printing is the
+    /// policy and how it has fared.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JournalWriter")
+            .field("symbol", &self.symbol)
+            .field("fills", &self.fills)
+            .field("failures", &self.failures)
+            .field("policy", &self.policy)
+            .field("failed", &self.failed.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a writer does once an append has failed.
@@ -81,9 +134,46 @@ pub struct JournalWriter {
 enum Policy {
     /// Count it, log it, carry on writing, and let every order through.
     Lenient,
-    /// Stop: write nothing more, and withhold every submission. `failed`
-    /// is set by the first failure and never cleared.
-    Strict { failed: bool },
+    /// Stop: write nothing more, and withhold every submission, from the
+    /// first failure on.
+    Strict,
+}
+
+/// A strict writer's stop, for the lines written around it.
+///
+/// The live binary writes `started` and the start `balances` before the
+/// engine exists, and the closing checkpoint, `stopped` and the end
+/// `balances` after it has gone, all through the shared journal rather than
+/// through the writer. Each goes through this, so that none lands after a
+/// line a failed append may have torn (`docs/run-log.md` §8, *The strict
+/// writer*), and a failure among them stops the writer too.
+#[derive(Debug, Clone, Default)]
+pub struct Latch(Arc<AtomicBool>);
+
+impl Latch {
+    /// Whether an append has failed.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Append `entry` unless an append has already failed. Returns whether
+    /// it is on the disk; a failure sets the latch.
+    ///
+    /// # Errors
+    ///
+    /// The failure, which has set the latch.
+    pub fn write<J: Lines + ?Sized>(
+        &self,
+        journal: &Arc<Mutex<J>>,
+        entry: &JournalEntry,
+    ) -> std::io::Result<bool> {
+        if self.is_set() {
+            return Ok(false);
+        }
+        write(journal, entry).inspect_err(|_| self.0.store(true, Ordering::SeqCst))?;
+        Ok(true)
+    }
 }
 
 impl JournalWriter {
@@ -91,12 +181,20 @@ impl JournalWriter {
     /// counted and logged, and the run goes on. For paper and backtests.
     #[must_use]
     pub fn new(journal: Arc<Mutex<Journal>>, symbol: String, fills: u64) -> Self {
+        Self::to(journal, symbol, fills)
+    }
+
+    /// [`Self::new`], writing into any [`Lines`]: what the account replay
+    /// check writes a replayed venue's lines into, in memory.
+    #[must_use]
+    pub fn to(journal: Shared, symbol: String, fills: u64) -> Self {
         Self {
             journal,
             symbol,
             fills,
             failures: 0,
             policy: Policy::Lenient,
+            failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -117,13 +215,27 @@ impl JournalWriter {
     ///
     /// The shutdown path writes the closing checkpoint and `stopped` through
     /// the shared journal, outside this writer; a live binary must not write
-    /// them after this writer has failed, for the same reason.
+    /// them after this writer has failed, for the same reason. It writes them
+    /// through [`Self::latch`], which knows.
     #[must_use]
     pub fn strict(journal: Arc<Mutex<Journal>>, symbol: String, fills: u64) -> Self {
+        Self::strict_to(journal, symbol, fills)
+    }
+
+    /// [`Self::strict`], writing into any [`Lines`]: the live binary's
+    /// journal, which a test gives an append that fails when it says.
+    #[must_use]
+    pub fn strict_to(journal: Shared, symbol: String, fills: u64) -> Self {
         Self {
-            policy: Policy::Strict { failed: false },
-            ..Self::new(journal, symbol, fills)
+            policy: Policy::Strict,
+            ..Self::to(journal, symbol, fills)
         }
+    }
+
+    /// This writer's latch, for the lines written around it.
+    #[must_use]
+    pub fn latch(&self) -> Latch {
+        Latch(Arc::clone(&self.failed))
     }
 
     /// Write down what the engine currently believes.
@@ -145,7 +257,7 @@ impl JournalWriter {
     ///
     /// Returns whether the line is on the disk.
     fn record(&mut self, entry: &JournalEntry, what: &str) -> bool {
-        if self.policy == (Policy::Strict { failed: true }) {
+        if self.policy == Policy::Strict && self.failed.load(Ordering::SeqCst) {
             // Not written: after a failed append, a line written now could
             // land after a torn one. Loud, because the fact is lost.
             self.failures += 1;
@@ -167,8 +279,8 @@ impl JournalWriter {
         // too, and writes nothing after this.
         self.failures += 1;
         error!(error = %e, what, "could not journal");
-        if let Policy::Strict { failed } = &mut self.policy {
-            *failed = true;
+        if self.policy == Policy::Strict {
+            self.failed.store(true, Ordering::SeqCst);
         }
         false
     }
@@ -468,8 +580,8 @@ impl RunObserver for JournalWriter {
         );
         match self.policy {
             Policy::Lenient => WriteAhead::Proceed,
-            Policy::Strict { .. } if held => WriteAhead::Proceed,
-            Policy::Strict { .. } => WriteAhead::Withhold,
+            Policy::Strict if held => WriteAhead::Proceed,
+            Policy::Strict => WriteAhead::Withhold,
         }
     }
 
@@ -712,7 +824,10 @@ fn fill_ids(ids: Option<&FillIds>) -> (Option<VenueOrderId>, Option<VenueTradeId
 /// A poisoned lock is treated as a write failure rather than a panic: the
 /// session is more valuable than the entry, and `reconcile` will notice the hole
 /// afterwards because the checkpoint and the fill count will disagree.
-pub fn write(journal: &Arc<Mutex<Journal>>, entry: &JournalEntry) -> std::io::Result<()> {
+pub fn write<J: Lines + ?Sized>(
+    journal: &Arc<Mutex<J>>,
+    entry: &JournalEntry,
+) -> std::io::Result<()> {
     journal
         .lock()
         .map_err(|_| std::io::Error::other("the journal lock is poisoned"))?

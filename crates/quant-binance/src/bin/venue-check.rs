@@ -71,30 +71,8 @@ use quant_binance::credentials::Credentials;
 use quant_binance::orders::{EncodeError, NewOrder};
 use quant_binance::rest::{SnapshotClient, SPOT_REST, SPOT_TESTNET_REST};
 use quant_binance::trade::{
-    ClockSample, NotReady, TradeClient, MAX_CLOCK_SKEW_MS, MIN_CLOCK_READINGS,
+    read_clock, ClockSample, NotReady, TradeClient, CLOCK_READINGS, MAX_CLOCK_SKEW_MS,
 };
-use quant_binance::user_data::RunTag;
-use quant_core::event::Side;
-use quant_core::execution::{ClientOrderId, OrderKind, OrderRequest, TimeInForce};
-use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
-
-/// How many readings of the venue's clock to try before believing one.
-///
-/// Five, as `ops/preflight.sh` takes. The first reading also opens the
-/// connection, so DNS, TCP and TLS all land on its outbound leg -- exactly the
-/// asymmetry a midpoint cannot correct -- and its round trip is the longer for
-/// it, which is what lets [`ClockSample::tightest`] pass it over. The client
-/// pools the connection, so the readings after it normally go out warm.
-///
-/// All five are tried whatever happens to any one of them, each bounded by the
-/// client's timeout, and a verdict needs [`MIN_CLOCK_READINGS`] of them back.
-/// Stopping at the first failure could leave the verdict resting on the one
-/// reading that came back before it -- the cold one.
-const CLOCK_READINGS: usize = 5;
-
-// A run that could never collect enough readings could never be judged, and
-// would say so only at run time, every time.
-const _: () = assert!(MIN_CLOCK_READINGS <= CLOCK_READINGS);
 
 /// The symbol checked when `--symbol` is not given: the one M5 traded and M8
 /// will.
@@ -104,11 +82,6 @@ const DEFAULT_SYMBOL: &str = "BTCUSDT";
 /// (`docs/live-run.md` §2), so that the venue validates the order the run would
 /// send rather than one it never will.
 const PROBE_QTY: &str = "0.001";
-
-/// The run tag the probe's id is written under, `q-venuecheck-0`. The probe is
-/// never an order, but its id is sent all the same, and under this tag no run
-/// of ours would ever have sent it.
-const PROBE_RUN: &str = "venuecheck";
 
 /// The help text. A raw string, so the commands in it read exactly as they are
 /// to be typed, quotes and backslashes included.
@@ -321,21 +294,7 @@ async fn clock_offset(venue: Venue) -> Result<i64, ExitCode> {
             return Err(ExitCode::FAILURE);
         }
     };
-    let mut readings = Vec::with_capacity(CLOCK_READINGS);
-    let mut failures = Vec::new();
-    for attempt in 1..=CLOCK_READINGS {
-        let sent_at = millis();
-        match public.server_time_millis().await {
-            Ok(server_time) => readings.push(ClockSample {
-                sent_at,
-                server_time,
-                received_at: millis(),
-            }),
-            // Noted and carried on from: one failed request says little about
-            // the next, and the client's timeout bounds what waiting costs.
-            Err(e) => failures.push((attempt, e)),
-        }
-    }
+    let (readings, failures) = read_clock(&public, millis).await;
     let best = match ClockSample::best_of(&readings, CLOCK_READINGS) {
         Ok(best) => best,
         Err(why) => {
@@ -368,46 +327,12 @@ async fn clock_offset(venue: Venue) -> Result<i64, ExitCode> {
 
 /// The order `POST /api/v3/order/test` is asked to validate: a market buy of
 /// [`PROBE_QTY`] of `symbol`, the shape `MaCrossover` sends, written by the
-/// encoder the run's orders go through.
-///
-/// The instrument is built from literals, because nothing here reads the
-/// venue's `exchangeInfo` yet; a sibling pull request adds it, and this is where
-/// it plugs in. The encoder reads the instrument's symbol, exchange and kind,
-/// and leaves every venue rule to the venue (`quant_binance::orders`), so the
-/// rules below go nowhere. They are `BTCUSDT`'s as `paper` and `backtest`
-/// register them, there because an instrument must have some, and the asset
-/// names stay empty because nothing reads them.
-///
-/// So nothing of those literals reaches the request, and what does is the run's
-/// own order: its symbol, side, type and size. The venue checks it against its
-/// rules and the account as they stand, as it will check the run's, and some of
-/// its filters judge the account rather than the order: the orders open on the
-/// symbol or on the exchange, and the position in the base asset
-/// (filters.md:217-219, :253-260, :331-333). Any refusal of the probe, a filter
-/// failure included, is one the run's orders would meet, so READY needs the
-/// venue to accept it outright. `TradeClient::check_trade_permission` sorts the
-/// answers, and says what a refusal suggests about the key, and on what
-/// footing.
+/// encoder the run's orders go through. `quant_binance::trade::probe` writes
+/// it, and says why any refusal of it, a filter failure included, is not
+/// ready; the live binary asks the venue the same question with the same
+/// probe at its own size.
 fn probe(symbol: &str) -> Result<NewOrder, EncodeError> {
-    let instrument = InstrumentDef {
-        exchange: Exchange::Binance,
-        symbol: symbol.to_owned(),
-        base: String::new(),
-        quote: String::new(),
-        kind: InstrumentKind::Spot,
-        tick_size: "0.01".parse().expect("a valid literal"),
-        lot_size: "0.00001".parse().expect("a valid literal"),
-        min_notional: "5".parse().expect("a valid literal"),
-    };
-    let request = OrderRequest {
-        instrument: InstrumentRegistry::new().register(instrument.clone()),
-        side: Side::Buy,
-        qty: PROBE_QTY.parse().expect("a valid literal"),
-        kind: OrderKind::Market,
-        time_in_force: TimeInForce::Gtc,
-    };
-    let run = RunTag::new(PROBE_RUN).expect("a valid run tag");
-    NewOrder::encode(&request, ClientOrderId(0), &run, &instrument)
+    quant_binance::trade::probe(symbol, PROBE_QTY.parse().expect("a valid literal"))
 }
 
 /// The three signed requests, a line for each, and the verdict.

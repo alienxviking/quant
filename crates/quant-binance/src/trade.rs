@@ -1251,6 +1251,111 @@ impl TradeClient {
     }
 }
 
+/// How many readings of the venue's clock to try before believing one.
+///
+/// Five, as `ops/preflight.sh` takes. The first reading also opens the
+/// connection, so DNS, TCP and TLS all land on its outbound leg -- exactly the
+/// asymmetry a midpoint cannot correct -- and its round trip is the longer for
+/// it, which is what lets [`ClockSample::tightest`] pass it over. The client
+/// pools the connection, so the readings after it normally go out warm.
+///
+/// All five are tried whatever happens to any one of them, each bounded by the
+/// client's timeout, and a verdict needs [`MIN_CLOCK_READINGS`] of them back.
+/// Stopping at the first failure could leave the verdict resting on the one
+/// reading that came back before it -- the cold one.
+pub const CLOCK_READINGS: usize = 5;
+
+// A run that could never collect enough readings could never be judged, and
+// would say so only at run time, every time.
+const _: () = assert!(MIN_CLOCK_READINGS <= CLOCK_READINGS);
+
+/// [`CLOCK_READINGS`] readings of the venue's clock through `public`, the
+/// host's taken from `host_millis` either side of each `GET /api/v3/time`,
+/// and the attempts that failed, numbered from 1.
+///
+/// The venue's clock read the way NTP reads one: its reading taken to
+/// describe the midpoint, and of several the one with the smallest round trip
+/// believed ([`ClockSample::best_of`]). One reading routine for `venue-check`
+/// and the live binary, so that the offset the check prints is the offset the
+/// run is stamped with. `host_millis` is the run's own clock, as every other
+/// read of time is.
+pub async fn read_clock(
+    public: &crate::rest::SnapshotClient,
+    host_millis: impl Fn() -> i64,
+) -> (Vec<ClockSample>, Vec<(usize, SnapshotError)>) {
+    let mut readings = Vec::with_capacity(CLOCK_READINGS);
+    let mut failures = Vec::new();
+    for attempt in 1..=CLOCK_READINGS {
+        let sent_at = host_millis();
+        match public.server_time_millis().await {
+            Ok(server_time) => readings.push(ClockSample {
+                sent_at,
+                server_time,
+                received_at: host_millis(),
+            }),
+            // Noted and carried on from: one failed request says little about
+            // the next, and the client's timeout bounds what waiting costs.
+            Err(e) => failures.push((attempt, e)),
+        }
+    }
+    (readings, failures)
+}
+
+/// The run tag the trade probe's id is written under, `q-venuecheck-0`. The
+/// probe is never an order, but its id is sent all the same, and under this
+/// tag no run of ours would ever have sent it.
+pub const PROBE_RUN: &str = "venuecheck";
+
+/// The order [`TradeClient::check_trade_permission`] asks the venue to
+/// validate: a market buy of `qty` of `symbol`, the shape `MaCrossover`
+/// sends, written by the encoder every order goes through, under
+/// [`PROBE_RUN`].
+///
+/// `venue-check` sends it at M5's size and the live binary at the size the
+/// run trades, so that the venue validates the order the run would send
+/// rather than one it never will. The instrument is built from literals,
+/// because the encoder reads only its symbol, exchange and kind and leaves
+/// every venue rule to the venue (`crate::orders`): nothing of the rules
+/// below reaches the request, and the asset names stay empty because nothing
+/// reads them. What does reach it is the run's own order, which the venue
+/// checks against its rules and the account as they stand, as it will check
+/// the run's. Some of its filters judge the account rather than the order
+/// (filters.md:217-219, :253-260, :331-333), so any refusal of the probe, a
+/// filter failure included, is one the run's orders would meet.
+///
+/// # Errors
+///
+/// [`EncodeError`], for a symbol or size the encoder cannot write.
+///
+/// # Panics
+///
+/// Never: the literals parse and the tag is valid.
+pub fn probe(symbol: &str, qty: Qty) -> Result<NewOrder, crate::orders::EncodeError> {
+    use quant_core::event::Side;
+    use quant_core::execution::{ClientOrderId, OrderKind, OrderRequest, TimeInForce};
+    use quant_core::instrument::{Exchange, InstrumentDef, InstrumentKind, InstrumentRegistry};
+
+    let instrument = InstrumentDef {
+        exchange: Exchange::Binance,
+        symbol: symbol.to_owned(),
+        base: String::new(),
+        quote: String::new(),
+        kind: InstrumentKind::Spot,
+        tick_size: "0.01".parse().expect("a valid literal"),
+        lot_size: "0.00001".parse().expect("a valid literal"),
+        min_notional: "5".parse().expect("a valid literal"),
+    };
+    let request = OrderRequest {
+        instrument: InstrumentRegistry::new().register(instrument.clone()),
+        side: Side::Buy,
+        qty,
+        kind: OrderKind::Market,
+        time_in_force: TimeInForce::Gtc,
+    };
+    let run = crate::user_data::RunTag::new(PROBE_RUN).expect("a valid run tag");
+    NewOrder::encode(&request, ClientOrderId(0), &run, &instrument)
+}
+
 /// Proof that the checks `venue-check` runs passed on this host, and the
 /// clock offset they passed with: what a live venue is built from
 /// (`docs/live-run.md` §5, *`LiveVenue`, decided before the code*, §3).
