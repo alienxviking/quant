@@ -67,6 +67,8 @@ use crate::orders::{
     Attempt, CancelOrder, CancelReply, FilterName, NewOrder, Placement, ORDER_PATH, ORDER_TEST_PATH,
 };
 use crate::rest::SnapshotError;
+use quant_core::fixed::{Notional, Qty};
+use quant_core::report::Holding;
 
 /// The `recvWindow` sent with every signed request, in milliseconds.
 ///
@@ -346,6 +348,12 @@ pub enum NotReady {
     /// Which way it was not is said; what it held is not, because it lists the
     /// account's balances.
     UnreadableAccount(AccountFault),
+    /// The venue answered 200 to the account request, and its balances do
+    /// not state the two the run needs, each once and readable. From
+    /// [`TradeClient::balances`], whose answer is criterion A's baseline: a
+    /// run without one does not trade (`docs/live-run.md` §5, the owner's
+    /// decision 1). Which asset and which way is said; no amount is.
+    UnreadableBalances(BalanceFault),
     /// The venue refused this API key a `TRADE` request: HTTP 401 whatever
     /// the body says, or `-2015`, *"Invalid API-key, IP, or permissions for
     /// action"* (errors.md:341-342), under any status but those that decide
@@ -499,6 +507,44 @@ impl core::fmt::Display for AccountFault {
             Self::CanTradeNotBool => "canTrade is neither true nor false",
         })
     }
+}
+
+/// How a 200 answer to `GET /api/v3/account` failed to state the balances
+/// [`TradeClient::balances`] reads. Names an asset, never an amount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BalanceFault {
+    /// The body is not JSON, or has no `balances` list of objects.
+    NoBalances,
+    /// The list does not name this asset.
+    Missing(String),
+    /// The list names this asset more than once, so which entry is the
+    /// account's cannot be told.
+    Repeated(String),
+    /// This asset's `free` or `locked` is absent, or not a decimal string the
+    /// fixed-point types take: a malformed amount is never rounded or taken
+    /// for zero (invariant 5).
+    Unreadable { asset: String, field: &'static str },
+}
+
+impl core::fmt::Display for BalanceFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoBalances => f.write_str("the body has no balances list"),
+            Self::Missing(asset) => write!(f, "the balances do not name {asset}"),
+            Self::Repeated(asset) => write!(f, "the balances name {asset} more than once"),
+            Self::Unreadable { asset, field } => {
+                write!(f, "{asset}'s {field} is absent or not a decimal amount")
+            }
+        }
+    }
+}
+
+/// What the account held of an instrument's two assets, as the venue said:
+/// what a `balances` journal line is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Balances {
+    pub base: Holding<Qty>,
+    pub quote: Holding<Notional>,
 }
 
 /// `, code -2015: Invalid API-key, IP, or permissions for action.`, or nothing.
@@ -674,6 +720,11 @@ impl core::fmt::Display for NotReady {
                 f,
                 "the venue answered 200, but {fault}. Nothing of the body is printed: it lists \
                  the account's balances"
+            ),
+            Self::UnreadableBalances(fault) => write!(
+                f,
+                "the venue answered 200 to the account request, but {fault}, so there is no \
+                 baseline to trade from. No amount is printed"
             ),
             Self::KeyCannotTrade { status, venue } => write!(
                 f,
@@ -1136,6 +1187,44 @@ impl TradeClient {
         bnb_discount_off(&reply.body)
     }
 
+    /// What the account holds of `base` and `quote`, from the same signed
+    /// `GET /api/v3/account` [`Self::check_ready`] makes (rest-api.md:4196-4229),
+    /// stamped as it stamps, the host's clock less `offset_ms`.
+    ///
+    /// Criterion A's baseline, which the live binary journals at the start of
+    /// a run and at its stop: a run that cannot take it does not trade (the
+    /// owner's decision 1). It reads the two assets' `free` and `locked` and
+    /// nothing else of the body, straight to fixed-point, and neither prints
+    /// nor logs any of it. An asset the list does not name is an error rather
+    /// than a zero: a baseline taken for nothing would make criterion A
+    /// compare against a number the venue never said.
+    ///
+    /// # Errors
+    ///
+    /// [`NotReady::UnreadableBalances`] for a body that does not state both,
+    /// and otherwise [`NotReady`] with the reason, a refusal sorted as
+    /// `check_ready` sorts one.
+    pub async fn balances(
+        &self,
+        base: &str,
+        quote: &str,
+        offset_ms: i64,
+    ) -> Result<Balances, NotReady> {
+        let now = chrono_millis().saturating_sub(offset_ms);
+        let reply = self
+            .send_signed(reqwest::Method::GET, "/api/v3/account", "", now)
+            .await
+            .map_err(NotReady::from)?;
+        if !reply.status.is_success() {
+            return Err(classify_refusal(
+                reply.status.as_u16(),
+                reply.retry_after,
+                &reply.body,
+            ));
+        }
+        read_balances(&reply.body, base, quote).map_err(NotReady::UnreadableBalances)
+    }
+
     /// The three checks `venue-check` runs, in its order, and the token that
     /// says they passed: [`Self::check_ready`], [`Self::check_trade_permission`]
     /// with `probe`, and [`Self::check_bnb_discount_off`] for `symbol`, each
@@ -1323,6 +1412,54 @@ fn account_can_trade(body: &[u8]) -> Result<(), NotReady> {
     }
 }
 
+/// `base`'s and `quote`'s `free` and `locked`, read out of an account
+/// document's `balances`, each straight to fixed-point.
+fn read_balances(body: &[u8], base: &str, quote: &str) -> Result<Balances, BalanceFault> {
+    fn amount<T: core::str::FromStr>(
+        entry: &serde_json::Value,
+        asset: &str,
+        field: &'static str,
+    ) -> Result<T, BalanceFault> {
+        entry
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| BalanceFault::Unreadable {
+                asset: asset.to_owned(),
+                field,
+            })
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| BalanceFault::NoBalances)?;
+    let listed = document
+        .get("balances")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(BalanceFault::NoBalances)?;
+    let entry = |asset: &str| -> Result<&serde_json::Value, BalanceFault> {
+        let mut named = listed
+            .iter()
+            .filter(|e| e.get("asset").and_then(serde_json::Value::as_str) == Some(asset));
+        let first = named
+            .next()
+            .ok_or_else(|| BalanceFault::Missing(asset.to_owned()))?;
+        if named.next().is_some() {
+            return Err(BalanceFault::Repeated(asset.to_owned()));
+        }
+        Ok(first)
+    };
+    let (b, q) = (entry(base)?, entry(quote)?);
+    Ok(Balances {
+        base: Holding {
+            free: amount(b, base, "free")?,
+            locked: amount(b, base, "locked")?,
+        },
+        quote: Holding {
+            free: amount(q, quote, "free")?,
+            locked: amount(q, quote, "locked")?,
+        },
+    })
+}
+
 /// What an answer to `POST /api/v3/order/test` says, sorted as
 /// [`TradeClient::check_trade_permission`] describes: `Ok` only for the
 /// venue's acceptance of the probe outright.
@@ -1465,9 +1602,10 @@ fn redact_signature(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        account_can_trade, bnb_discount_off, classify_refusal, midpoint_offset_ms, read_order_test,
-        redact_signature, AccountFault, ClockSample, CommissionFault, NotReady, TradeClient,
-        VenueError, A_VERDICT_SUGGESTS_PERMISSION, MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
+        account_can_trade, bnb_discount_off, classify_refusal, midpoint_offset_ms, read_balances,
+        read_order_test, redact_signature, AccountFault, BalanceFault, ClockSample,
+        CommissionFault, NotReady, TradeClient, VenueError, A_VERDICT_SUGGESTS_PERMISSION,
+        MAX_CLOCK_SKEW_MS, RECV_WINDOW_MS,
     };
     use crate::credentials::fixture;
     use crate::orders::{
@@ -2439,6 +2577,117 @@ mod tests {
                             .to_owned(),
                 }),
             }
+        );
+    }
+
+    /// An account document holding `entries`, each `(asset, free, locked)`
+    /// as written.
+    fn holding(entries: &[(&str, &str, &str)]) -> String {
+        let listed: Vec<String> = entries
+            .iter()
+            .map(|(asset, free, locked)| {
+                format!(r#"{{"asset":"{asset}","free":"{free}","locked":"{locked}"}}"#)
+            })
+            .collect();
+        format!(
+            r#"{{"canTrade":true,"accountType":"SPOT","balances":[{}],"permissions":["SPOT"]}}"#,
+            listed.join(",")
+        )
+    }
+
+    #[test]
+    fn balances_are_read_for_the_two_assets_straight_to_fixed_point() {
+        // Distinct amounts in all four places, so a field read from the wrong
+        // asset, or `free` for `locked`, shows.
+        let body = holding(&[
+            ("BNB", "9.00000000", "0.00000000"),
+            ("BTC", "0.01234567", "0.00000011"),
+            ("USDT", "1000.12345678", "2.50000000"),
+        ]);
+        let read = read_balances(body.as_bytes(), "BTC", "USDT").expect("both stated");
+        assert_eq!(
+            (
+                read.base.free.to_string(),
+                read.base.locked.to_string(),
+                read.quote.free.to_string(),
+                read.quote.locked.to_string(),
+            ),
+            (
+                "0.01234567".to_owned(),
+                "0.00000011".to_owned(),
+                "1000.12345678".to_owned(),
+                "2.5".to_owned(),
+            )
+        );
+    }
+
+    #[test]
+    fn a_balance_not_stated_once_and_readably_is_no_baseline_and_says_no_amount() {
+        let cases = [
+            (
+                holding(&[("USDT", BALANCE, "0")]),
+                BalanceFault::Missing("BTC".to_owned()),
+            ),
+            (
+                holding(&[("BTC", BALANCE, "0"), ("BTC", "1", "0"), ("USDT", "1", "0")]),
+                BalanceFault::Repeated("BTC".to_owned()),
+            ),
+            (
+                holding(&[("BTC", BALANCE, "0"), ("USDT", "1e3", "0")]),
+                BalanceFault::Unreadable {
+                    asset: "USDT".to_owned(),
+                    field: "free",
+                },
+            ),
+            (
+                format!(
+                    r#"{{"balances":[{{"asset":"BTC","free":"{BALANCE}"}},{{"asset":"USDT","free":"1","locked":"0"}}]}}"#
+                ),
+                BalanceFault::Unreadable {
+                    asset: "BTC".to_owned(),
+                    field: "locked",
+                },
+            ),
+            (
+                account("true").replace("balances", "holdings"),
+                BalanceFault::NoBalances,
+            ),
+            (format!("<html>{BALANCE}</html>"), BalanceFault::NoBalances),
+        ];
+        for (body, expected) in cases {
+            let fault = read_balances(body.as_bytes(), "BTC", "USDT").expect_err("no baseline");
+            assert_eq!(fault, expected, "{body}");
+            let said = NotReady::UnreadableBalances(fault).to_string();
+            assert!(!said.contains(BALANCE), "{said}");
+            assert!(said.contains("no baseline"), "{said}");
+        }
+    }
+
+    #[tokio::test]
+    async fn balances_are_asked_for_with_the_signed_account_request() {
+        let body = holding(&[("BTC", "0.5", "0"), ("USDT", "1000", "0")]);
+        let (base, server) = serve_once(http("200 OK", "", &body));
+        let read = client_at(&base)
+            .balances("BTC", "USDT", 0)
+            .await
+            .expect("both stated");
+        let request = received(server);
+        assert_eq!(read.base.free.to_string(), "0.5");
+        assert!(
+            request.starts_with("GET /api/v3/account?timestamp="),
+            "{request}"
+        );
+        signed_on_the_wire(&request);
+        // A refusal is sorted as the account probe's is.
+        let (base, server) = serve_once(http("401 Unauthorized", "", ""));
+        let why = client_at(&base)
+            .balances("BTC", "USDT", 0)
+            .await
+            .expect_err("refused");
+        received(server);
+        assert!(
+            matches!(why, NotReady::BadCredentials { status: 401, .. }),
+            "{why:?}"
         );
     }
 
