@@ -17,8 +17,9 @@
 //! # Exit codes, as `runlog`'s
 //!
 //! `0` the replay agrees, `1` it does not, or the capture could not be read,
-//! and **`2` nothing was compared**: a journal that is not a live run's, or
-//! one with no account record and no line a venue produced. A check that
+//! and **`2` nothing was compared**: no journal at the path given, a journal
+//! that is not a live run's, or one with no account record and no line a
+//! venue produced. A check that
 //! compared nothing must not look like one that agreed.
 
 use std::path::PathBuf;
@@ -57,6 +58,17 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // `journal::read` takes a missing file for an empty journal, which is
+    // right for a run about to begin one and wrong here: a mistyped path
+    // would be told it "has no run tag", sending whoever reads it to the
+    // journal's contents rather than its name.
+    if matches!(journal.try_exists(), Ok(false)) {
+        println!(
+            "verdict   NOTHING TO COMPARE: there is no journal at {}",
+            journal.display()
+        );
+        return ExitCode::from(2);
+    }
     let recovered = match quant_engine::journal::read(&journal) {
         Ok(recovered) => recovered,
         Err(e) => {

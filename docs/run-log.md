@@ -618,7 +618,11 @@ Item 8's acceptance asks that replaying a live run's recorded account frames
 through the translator reproduce every venue-produced line of its journal
 (`docs/live-run.md` §4). This is that check, in `quant-backtest`'s
 `account_replay`, exit-coded as the others: **0** the replay agrees, **1** it
-does not, or the capture cannot be read, **2** nothing was compared.
+does not, or the capture cannot be read, **2** nothing was compared. A path
+with no journal at it is the third, and says so by name: the journal reader
+takes a missing file for an empty journal, which is right for a run about to
+begin one, and review found that a mistyped path was told its journal "has no
+run tag".
 
 **What it replays.** REST answers are not in the raw tier, so the account
 frames alone reproduce only what the stream said (`docs/live-run.md` §5,
