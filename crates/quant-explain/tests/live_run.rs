@@ -36,6 +36,7 @@ use quant_binance::fake_market::{self, FakeMarket};
 use quant_binance::fake_venue::{self, FakeVenue};
 use quant_core::event::Side;
 use quant_core::execution::ClientOrderId;
+use quant_core::fixed::Px;
 use quant_core::instrument::Exchange;
 use quant_core::report::EndedBy;
 use quant_core::time::{Clock, SystemClock, Ts};
@@ -388,6 +389,56 @@ impl Market {
         rig.orders()[n - 1].clone()
     }
 
+    /// Wait until the engine has taken every move sent so far, while an
+    /// order is working: before a test answers the order, so that no move
+    /// still queued behind it is taken after the answer.
+    ///
+    /// Without it a round trip was flaky under load (2 in 120 runs, 6 copies
+    /// at once). `cross` turns back when no order has appeared after a run of
+    /// moves, and an engine running behind the market may have sent the order
+    /// already: the turn is then queued behind it. Taken while the order works
+    /// it is suppressed, but the test answers the order as soon as it sees it,
+    /// and a turn taken after the fill crossed while flat and sent a third
+    /// order, which rested and was cancelled at the stop.
+    ///
+    /// The engine's progress shows only in what the strategy notes, and it
+    /// notes crossings. So the touch zigzags out to prices no walk reaches,
+    /// each move further out than the last and the other way, until the
+    /// strategy notes a crossing at the price last sent; with an order
+    /// working every crossing is suppressed, so none sends an order. A move
+    /// stamped too close to the one before is not sampled and crosses
+    /// nothing, so a note that has not come within a short wait is answered
+    /// with the next move rather than waited on for ever.
+    fn drained(&mut self, rig: &Rig) {
+        let from = rig.entries().len();
+        let deadline = Instant::now() + WITHIN;
+        for k in 1_i64.. {
+            assert!(
+                Instant::now() < deadline,
+                "gave up waiting for the engine to take the market after {WITHIN:?}"
+            );
+            self.step_by(&rig.market, if k % 2 == 1 { 200 * k } else { -200 * k });
+            let mid: Px = format!("{}.50", self.bid).parse().expect("a price");
+            let noted = || {
+                journal::read(&rig.journal).is_ok_and(|r| {
+                    r.entries.iter().skip(from).any(|e| {
+                        matches!(e, JournalEntry::Note { kind, detail, .. }
+                            if kind == "suppressed"
+                                && detail["fast"].as_str().and_then(|f| f.parse::<Px>().ok())
+                                    == Some(mid))
+                    })
+                })
+            };
+            let wait = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < wait {
+                if noted() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
     /// Move `n` times.
     fn moves(&mut self, market: &FakeMarket, n: usize) {
         for _ in 0..n {
@@ -430,6 +481,7 @@ fn round_trip(rig: &Rig) -> LiveRun {
     let buy = market.cross(rig, 1, 1);
     assert_eq!(buy.param("side"), Some("BUY"));
     assert_eq!(buy.param("quantity"), Some("0.001"));
+    market.drained(rig);
     // A spot venue takes a buy's fee in the asset bought.
     rig.fill(&buy, "76651.00", ("0.00000100", "BTC"), 1);
     rig.journalled_line("the buy's fill", filled(1));
@@ -441,6 +493,7 @@ fn round_trip(rig: &Rig) -> LiveRun {
         Some("0.00099"),
         "the exit sells what is held, rounded down to the lot"
     );
+    market.drained(rig);
     rig.fill(&sell, "76649.00", ("0.07588251", "USDT"), 2);
     rig.journalled_line("the sell's fill", filled(2));
     running.stop()
