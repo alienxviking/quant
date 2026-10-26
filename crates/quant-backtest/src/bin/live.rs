@@ -36,6 +36,10 @@
 //! It is given with `--root` rather than bare, unlike `paper`'s, so that an
 //! argument this does not take is refused without being printed back: a key
 //! pasted in the wrong place would otherwise appear in the banner as a path.
+//! A value a numeric flag refuses is not printed back either. What
+//! `--root` and `--journal` are given is printed, on purpose: any text is a
+//! legal path, so no rule could tell a key from a directory, and the banner
+//! is where the operator reads where the run writes.
 //!
 //! # Credentials
 //!
@@ -262,8 +266,12 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
                 .and_then(|v| v.into_string().ok())
                 .ok_or_else(|| BadArgument(format!("{flag} needs a value")))
         };
-        let number = |what: &str, text: String| {
-            BadArgument(format!("{what} is not a number this takes: {text:?}"))
+        // The value is not repeated: a key pasted after a flag that takes a
+        // number is as much a key in the wrong place as a bare one.
+        let number = |what: &str| {
+            BadArgument(format!(
+                "{what} is not given a number this takes; not repeated here, in case it was a                  key pasted in the wrong place"
+            ))
         };
         match flag.as_str() {
             "-h" | "--help" => {
@@ -296,52 +304,49 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
             "--root" => root = Some(PathBuf::from(value()?)),
             "--cash" => {
                 let text = value()?;
-                cash = text.parse().map_err(|_| number("--cash", text))?;
+                cash = text.parse().map_err(|_| number("--cash"))?;
             }
             "--qty" => {
                 let text = value()?;
-                qty = text.parse().map_err(|_| number("--qty", text))?;
+                qty = text.parse().map_err(|_| number("--qty"))?;
             }
             "--minutes" => {
                 let text = value()?;
-                minutes = text.parse().map_err(|_| number("--minutes", text))?;
+                minutes = text.parse().map_err(|_| number("--minutes"))?;
             }
             "--hours" => {
                 let text = value()?;
-                let hours: u64 = text.parse().map_err(|_| number("--hours", text))?;
+                let hours: u64 = text.parse().map_err(|_| number("--hours"))?;
                 minutes = hours * 60;
             }
             "--fast" => {
                 let text = value()?;
-                fast = text.parse().map_err(|_| number("--fast", text))?;
+                fast = text.parse().map_err(|_| number("--fast"))?;
             }
             "--slow" => {
                 let text = value()?;
-                slow = text.parse().map_err(|_| number("--slow", text))?;
+                slow = text.parse().map_err(|_| number("--slow"))?;
             }
             "--interval-secs" => {
                 let text = value()?;
-                interval_secs = text.parse().map_err(|_| number("--interval-secs", text))?;
+                interval_secs = text.parse().map_err(|_| number("--interval-secs"))?;
             }
             "--max-order" => {
                 let text = value()?;
-                limits.max_order_notional =
-                    Some(text.parse().map_err(|_| number("--max-order", text))?);
+                limits.max_order_notional = Some(text.parse().map_err(|_| number("--max-order"))?);
             }
             "--max-position" => {
                 let text = value()?;
                 limits.max_position_notional =
-                    Some(text.parse().map_err(|_| number("--max-position", text))?);
+                    Some(text.parse().map_err(|_| number("--max-position"))?);
             }
             "--max-daily-loss" => {
                 let text = value()?;
-                limits.max_daily_loss =
-                    Some(text.parse().map_err(|_| number("--max-daily-loss", text))?);
+                limits.max_daily_loss = Some(text.parse().map_err(|_| number("--max-daily-loss"))?);
             }
             "--max-orders" => {
                 let text = value()?;
-                limits.max_orders_per_day =
-                    Some(text.parse().map_err(|_| number("--max-orders", text))?);
+                limits.max_orders_per_day = Some(text.parse().map_err(|_| number("--max-orders"))?);
             }
             "--rest" => rest = Some(url(&value()?, &["http://", "https://"])?),
             "--ws-api" => ws_api = Some(url(&value()?, &["ws://", "wss://"])?),
@@ -583,5 +588,53 @@ mod tests {
             assert!(!said.contains(&key[..12]), "{said}");
         }
         assert!(parsed(&[]).is_err(), "a symbol is required");
+    }
+
+    /// Every flag that takes a number.
+    const NUMERIC: [&str; 11] = [
+        "--cash",
+        "--qty",
+        "--minutes",
+        "--hours",
+        "--fast",
+        "--slow",
+        "--interval-secs",
+        "--max-order",
+        "--max-position",
+        "--max-daily-loss",
+        "--max-orders",
+    ];
+
+    #[test]
+    fn a_key_given_to_a_flag_that_takes_a_number_is_refused_without_being_repeated() {
+        let key = "MC4CAQAwBQYDK2VwBCIEIIJEYWtGBrhACmb9Dvy+qa8WEf0lQOl1s4CLIAB9m89u";
+        for flag in NUMERIC {
+            let BadArgument(said) = parsed(&["--symbol", "BTCUSDT", flag, key]).expect_err(flag);
+            assert!(said.contains(flag), "{said}");
+            assert!(!said.contains(&key[..12]), "{flag}: {said}");
+        }
+    }
+
+    #[test]
+    fn a_number_each_numeric_flag_takes_is_taken() {
+        // The other side of the refusal above: each flag still parses the
+        // value it is for, so the refusal is about the value and not the flag.
+        for (flag, value) in [
+            ("--cash", "250"),
+            ("--qty", "0.002"),
+            ("--minutes", "30"),
+            ("--hours", "2"),
+            ("--fast", "3"),
+            ("--slow", "40"),
+            ("--interval-secs", "5"),
+            ("--max-order", "150"),
+            ("--max-position", "150"),
+            ("--max-daily-loss", "10"),
+            ("--max-orders", "50"),
+        ] {
+            assert!(NUMERIC.contains(&flag));
+            parsed(&["--symbol", "BTCUSDT", flag, value])
+                .unwrap_or_else(|e| panic!("{flag} {value}: {e:?}"));
+        }
     }
 }
