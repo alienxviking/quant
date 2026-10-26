@@ -86,6 +86,8 @@ struct Args {
     cash: Notional,
     qty: Qty,
     minutes: u64,
+    /// The same duration, which `minutes` is checked to fit.
+    limit: Duration,
     fast: usize,
     slow: usize,
     interval_secs: i64,
@@ -141,7 +143,7 @@ fn main() -> ExitCode {
             qty: args.qty,
         },
         limits: args.limits,
-        limit: Some(Duration::from_secs(args.minutes * 60)),
+        limit: Some(args.limit),
         account_policy: AccountPolicy::default(),
         deadlines: Deadlines::default(),
         clock: Arc::new(SystemClock),
@@ -317,7 +319,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
             "--hours" => {
                 let text = value()?;
                 let hours: u64 = text.parse().map_err(|_| number("--hours"))?;
-                minutes = hours * 60;
+                // Checked: a product that wrapped would be a duration nobody
+                // asked for, shown in the banner as though it were.
+                minutes = hours.checked_mul(60).ok_or_else(|| number("--hours"))?;
             }
             "--fast" => {
                 let text = value()?;
@@ -365,6 +369,11 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
     if minutes == 0 {
         return Err(BadArgument("the duration must be positive".to_owned()));
     }
+    let Some(limit) = minutes.checked_mul(60).map(Duration::from_secs) else {
+        return Err(BadArgument(
+            "the duration is longer than this can count in seconds".to_owned(),
+        ));
+    };
     if fast == 0 || slow <= fast {
         return Err(BadArgument(
             "--slow must exceed --fast, or the averages never cross".to_owned(),
@@ -399,6 +408,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
         cash,
         qty,
         minutes,
+        limit,
         fast,
         slow,
         interval_secs,
@@ -469,6 +479,7 @@ mod tests {
     use quant_backtest::live::Environment;
     use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn parsed(list: &[&str]) -> Result<Args, BadArgument> {
         parse_args(list.iter().map(OsString::from)).map(|args| args.expect("not help"))
@@ -612,6 +623,28 @@ mod tests {
             let BadArgument(said) = parsed(&["--symbol", "BTCUSDT", flag, key]).expect_err(flag);
             assert!(said.contains(flag), "{said}");
             assert!(!said.contains(&key[..12]), "{flag}: {said}");
+        }
+    }
+
+    #[test]
+    fn a_duration_too_long_to_count_is_refused_and_the_longest_that_fits_is_taken() {
+        // The largest number of minutes whose seconds fit, and of hours whose
+        // minutes do: taken, and counted exactly.
+        let most = u64::MAX / 60;
+        let args = parsed(&["--symbol", "BTCUSDT", "--minutes", &most.to_string()]).expect("fits");
+        assert_eq!(args.minutes, most);
+        assert_eq!(args.limit, Duration::from_secs(most * 60));
+        let args = parsed(&["--symbol", "BTCUSDT", "--hours", "2"]).expect("fits");
+        assert_eq!((args.minutes, args.limit), (120, Duration::from_secs(7200)));
+        // One more of either is refused rather than wrapped into a duration
+        // nobody asked for. `--hours 307445734561825861` is review's: its
+        // minutes fit, and its seconds wrap.
+        for (flag, value) in [
+            ("--minutes", (most + 1).to_string()),
+            ("--hours", (u64::MAX / 60 + 1).to_string()),
+            ("--hours", "307445734561825861".to_owned()),
+        ] {
+            parsed(&["--symbol", "BTCUSDT", flag, &value]).expect_err(&value);
         }
     }
 
