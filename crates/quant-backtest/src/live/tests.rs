@@ -1,6 +1,7 @@
-//! The gates that read the journal and the size, by themselves. The gates
-//! that ask the venue, and the run around them, are rehearsed end to end
-//! against local stand-ins in `quant-explain`'s `tests/live_run.rs`.
+//! The gates that read the journal and the size, by themselves, and how the
+//! journal is opened. The gates that ask the venue, and the run around them,
+//! are rehearsed end to end against local stand-ins in `quant-explain`'s
+//! `tests/live_run.rs`.
 
 use quant_core::execution::ClientOrderId;
 use quant_core::fixed::{Notional, Px, Qty};
@@ -10,7 +11,8 @@ use quant_core::time::Ts;
 use quant_engine::JournalEntry;
 
 use super::{
-    diverged_gate, floored_exit, last_session_gate, mint_run_tag, run_tag_gate, size_gate, Gate,
+    diverged_gate, floored_exit, journal_at, last_session_gate, mint_run_tag, run_tag_gate,
+    size_gate, Gate,
 };
 
 fn started(run: Option<&str>) -> JournalEntry {
@@ -193,4 +195,30 @@ fn a_size_whose_exit_falls_under_the_minimum_is_refused_and_one_at_it_is_not() {
             .gate,
         Gate::Size
     );
+}
+
+#[test]
+fn the_journal_s_directory_is_made_when_a_fresh_root_has_none() {
+    // A directory of this process's own, cleared: a process id is reused
+    // once its process has gone.
+    let dir =
+        std::env::temp_dir().join(format!("quant-backtest-journal-at-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("data").join("testnet").join("live-BTCUSDT.jsonl");
+    assert!(!path.parent().expect("a parent").exists());
+
+    let journalled = journal_at(&path).expect("opens on a fresh root");
+    assert_eq!(journalled.recovered.entries, Vec::<JournalEntry>::new());
+    journalled
+        .sink
+        .lock()
+        .expect("sink")
+        .append(&started(Some("r1")))
+        .expect("appends");
+    drop(journalled);
+    // And a journal that is there is read, not replaced.
+    let again = journal_at(&path).expect("opens again");
+    assert_eq!(again.recovered.entries, vec![started(Some("r1"))]);
+    drop(again);
+    let _ = std::fs::remove_dir_all(&dir);
 }

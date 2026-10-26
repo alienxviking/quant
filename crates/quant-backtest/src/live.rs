@@ -939,12 +939,19 @@ fn report(
     }
 }
 
-/// A clean journal's sink, for the binary: the file at `path`.
+/// A clean journal's sink, for the binary: the file at `path`, and the
+/// directory it goes in, made when there is none. The binary's default
+/// journal is under `data/<env>`, which nothing has made before the first
+/// run on a fresh host; without this, the documented `live --symbol BTCUSDT`
+/// could not start there.
 ///
 /// # Errors
 ///
-/// The file could not be read or opened.
+/// The directory could not be made, or the file read or opened.
 pub fn journal_at(path: &std::path::Path) -> std::io::Result<Journalled> {
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
     let recovered = journal::read(path)?;
     let file = quant_engine::Journal::open(path)?;
     Ok(Journalled {
