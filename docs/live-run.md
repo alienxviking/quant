@@ -1977,7 +1977,11 @@ showed it otherwise:
   finish, each bounded by its request timeout, and the run stops at once
   with its session written whole.
 - **The last-session gate also refuses a journal with lines and no
-  `started` line**, whose last session cannot be read at all.
+  `started` line**, whose last session cannot be read at all. No run reaches
+  that branch: the run-tag gate is asked first and refuses any journal with
+  lines and no tagged `started` line, as review pointed out. It is kept so
+  that the gate is right on its own, and only its unit test, which calls it
+  directly, shows it.
 - **The size check is a gate, once, at the best bid.** §2 asked the binary to
   refuse a size whose exit falls under the minimum notional "at the current
   mark". Before the capture there is no book, so the mark is the best bid of

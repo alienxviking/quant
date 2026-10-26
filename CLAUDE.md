@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 901 tests green in debug
-and release, clippy and fmt clean, ~79,400 lines across 13 crates.
+same window exactly, on both symbols, to the satoshi. 911 tests green in debug
+and release, clippy and fmt clean, ~80,000 lines across 13 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -2476,7 +2476,15 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   cancelled at the stop; a failed journal sending nothing more and closing
   nothing. Every test seen red under its break, and every socket test run
   20 times in 6 copies at once. What it corrected is in `docs/live-run.md`
-  §5, *LiveVenue, decided before the code*, §8.
+  §5, *LiveVenue, decided before the code*, §8. Two reviews of the branch
+  then found what the rehearsal could not: an override could name the other
+  environment's host under this one's banner, so overrides take a loopback
+  host only; the venue was wired, and the listener's credentials read, after
+  `started` was written; Ctrl-C was not caught until the capture polled it;
+  the documented command exited 1 on a fresh root, whose journal directory
+  nothing made; and a failed journal exited 0. The exit codes are now 0
+  traded, 1 could not go on, 2 a bad argument and 3 recorded only, which
+  8b's supervisor must not restart.
 
   **What remains in (c) is 8b and 8c of `docs/live-run.md` §4 item 8.** 8b,
   the live mode in `ops/`, waits on the owner's choice of a PowerShell or a

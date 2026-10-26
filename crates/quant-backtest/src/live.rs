@@ -830,6 +830,10 @@ pub fn diverged_gate(entries: &[JournalEntry]) -> Result<(), Refusal> {
 /// Nothing left working by the last session: it wrote `stopped`, and its
 /// `stopped` names no order.
 ///
+/// A journal with lines and no `started` line is refused too, though the
+/// run never asks this about one: the run-tag gate, asked first, has already
+/// refused it. The branch keeps this gate right on its own.
+///
 /// # Errors
 ///
 /// The last-session gate's [`Refusal`].
