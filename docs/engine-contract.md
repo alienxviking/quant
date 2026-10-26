@@ -778,6 +778,24 @@ before the closing checkpoint and `Stopped`. Neither `backtest` nor `paper`
 calls it, and against the simulator it changes nothing: it polls at a clock
 nothing has moved, so a report still in flight stays undelivered.
 
+### Cancel what is working
+
+`Engine::cancel_working()` is how a live stop asks for its resting orders to
+go, before it settles (the owner's decision 3, `docs/live-run.md` §5,
+*LiveVenue, decided before the code*, §7). For each order the engine is
+working, lowest id first, it calls `on_cancel_requested` and then the venue's
+`cancel`, both at the engine's clock, and it calls no strategy method. It is
+the engine's own because nothing else could do it: only `Context::cancel`
+reaches the venue, and only from a strategy callback, which a stop must not
+make, and a cancel sent around the engine would leave a `cancelled` line with
+no request behind it. It asks; it does not end anything. The venue's report
+ends an order, and `settle` hears it. Not a trait method, so no venue had to
+change; `backtest` and `paper` never call it. Its test asserts one
+`cancel_requested` line per working order, each before the venue hears the
+cancel, and no strategy call, and was seen red with the venue told first and
+with the record skipped; a second asserts that a run ending flat asks the
+venue nothing.
+
 ### Acceptance
 
 - [x] The simulator reproduces every existing test, and M5's money check —

@@ -597,6 +597,9 @@ enum Heard {
     Sighted(Ts),
     /// Not a hook: a venue that writes to the same log says it was sent this.
     Sent(ClientOrderId),
+    /// Not a hook: a venue that writes to the same log says it was asked to
+    /// cancel this, with the clock it was asked at.
+    CancelSent(ClientOrderId, Ts),
     /// Not a hook: a strategy that writes to the same log was told this, with
     /// its clock.
     Told(ExecutionEvent, Ts),
@@ -2756,6 +2759,127 @@ fn settle_books_a_late_fill_and_tells_the_strategy_nothing() {
         Some(at),
         "the period covered runs to the fill, so the closing checkpoint cannot land before it"
     );
+}
+
+/// Takes every order and cancel and says nothing, writing each into the same
+/// log: a live venue whose orders rest, at the moment the market ends.
+#[derive(Debug)]
+struct Rests {
+    log: std::sync::Arc<std::sync::Mutex<Witness>>,
+}
+
+impl ExecutionVenue for Rests {
+    fn ready(&self, _request: &OrderRequest) -> Result<(), Unready> {
+        Ok(())
+    }
+
+    fn submit(&mut self, client_order_id: ClientOrderId, _r: &OrderRequest, _now: Ts) {
+        self.log
+            .lock()
+            .expect("log")
+            .heard
+            .push(Heard::Sent(client_order_id));
+    }
+
+    fn cancel(&mut self, client_order_id: ClientOrderId, now: Ts) {
+        self.log
+            .lock()
+            .expect("log")
+            .heard
+            .push(Heard::CancelSent(client_order_id, now));
+    }
+
+    fn poll(&mut self, _now: Ts, _out: &mut Vec<VenueReport>) {}
+}
+
+/// Two orders left resting when the market ended, and the log they were
+/// written into.
+fn two_resting() -> (
+    Engine<Scripted, Rests, AllowAll, Recorder>,
+    std::sync::Arc<std::sync::Mutex<Witness>>,
+) {
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![trade(1, "100.00"), trade(2, "100.00")]),
+        Rests {
+            log: std::sync::Arc::clone(&log),
+        },
+        AllowAll,
+        Recorder {
+            submit_every_event: true,
+            ..Recorder::default()
+        },
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&log)));
+    engine.run().expect("no source failure");
+    (engine, log)
+}
+
+#[test]
+fn a_stop_writes_each_cancel_down_before_the_venue_hears_it_and_tells_no_strategy() {
+    // The owner's decision 3: a stop cancels what rests. Each cancel goes the
+    // way a strategy's does, the record first and then the venue, at the
+    // engine's clock, so the journal holds one `cancel_requested` line for
+    // every order the venue was asked to cancel, and holds it first. And no
+    // strategy method runs: the market it trades on has ended.
+    let (mut engine, log) = two_resting();
+    let (c1, c2) = (ClientOrderId(1), ClientOrderId(2));
+    assert_eq!(engine.working(), vec![c1, c2]);
+    let seen_before = log.lock().expect("log").heard.len();
+    let calls_before = engine.strategy().best_bids.len();
+
+    let asked = engine.cancel_working();
+
+    let t2 = meta(2).local_recv_ts;
+    assert_eq!(asked, vec![c1, c2]);
+    assert_eq!(
+        log.lock().expect("log").heard[seen_before..],
+        [
+            Heard::CancelRequested(c1, t2),
+            Heard::CancelSent(c1, t2),
+            Heard::CancelRequested(c2, t2),
+            Heard::CancelSent(c2, t2),
+        ],
+        "each written down before the venue is asked, at the engine's clock"
+    );
+    assert_eq!(engine.stats().cancels, 2);
+    assert_eq!(
+        (
+            engine.strategy().best_bids.len(),
+            engine.strategy().executions.len()
+        ),
+        (calls_before, 0),
+        "and the strategy was neither shown anything nor told anything"
+    );
+    assert_eq!(
+        engine.working(),
+        vec![c1, c2],
+        "asked, not ended: the venue's report ends an order, and settle hears it"
+    );
+}
+
+#[test]
+fn a_stop_with_nothing_working_asks_the_venue_nothing() {
+    // The other side: an order that ended is not cancelled, and a run that
+    // ends flat writes no cancel at all.
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Witness::default()));
+    let mut engine = Engine::new(
+        Scripted::new(vec![snapshot(1), trade(2, "100.00")]),
+        RecordingVenue::default(),
+        AllowAll,
+        Recorder::default(),
+        CASH,
+    )
+    .observing_fills(Box::new(std::sync::Arc::clone(&log)));
+    engine.run().expect("no source failure");
+    assert_eq!(engine.working(), Vec::new(), "the order filled");
+    let seen_before = log.lock().expect("log").heard.len();
+
+    assert_eq!(engine.cancel_working(), Vec::new());
+    assert_eq!(log.lock().expect("log").heard.len(), seen_before);
+    assert_eq!(engine.venue().cancelled, Vec::new());
+    assert_eq!(engine.stats().cancels, 0);
 }
 
 /// Raises doubt about the first order it is sent, on the poll after, and is
