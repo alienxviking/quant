@@ -376,7 +376,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`) and item 7, its merge machine (`m8c-live-machine`) and its shell (`m8c-live-shell`); item 8 below remains |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`) and item 7, its merge machine (`m8c-live-machine`) and its shell (`m8c-live-shell`); and item 8's binary, 8a (`m8c-live-binary`). Item 8's `ops/` live mode (8b) and its Spot Testnet run (8c) remain |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -694,6 +694,48 @@ feature.
    criterion D's states 1, 2, 4 and 6, `reconcile` agrees, `quant-verify` is clean
    on both data roots, and replaying the recorded account frames through the
    translator reproduces every venue-produced journal entry.
+
+   It is three pieces of work, and the first is done.
+
+   - **8a, the binary, is built** (`m8c-live-binary`), rehearsed against local
+     stand-ins for every endpoint: `quant-live::fixtures::rest` for REST,
+     `quant-binance::fake_venue` for the account side and
+     `quant-binance::fake_market`, new, for the market stream. Paper's session
+     is `quant-backtest::session`, and `paper` runs it unchanged, proven by
+     M5's own criterion: a rehearsal of paper's session against the local
+     market, normalized and backtested, reproduces its fills and cash exactly.
+     `Engine::cancel_working` is the stop's cancel through the record
+     (`docs/engine-contract.md` §11). The binary is `live`, its body
+     `quant-backtest::live::run`: `--env testnet` by default and `--env live`
+     only when typed, every endpoint overridable for a local stand-in; seven
+     gates before the capture, any of which fails into recording only; the
+     capture of both streams under one clock; and §1's shutdown order, the
+     closing lines only while the strict writer stands. Accepted against the
+     stand-ins by `quant-explain`'s `tests/live_run.rs`: a full rehearsal that
+     passes the gates, trades one round trip, cancels nothing, and ends with
+     `reconcile` agreeing, `runlog check` complete and `quant-verify` clean on
+     both roots; each gate failing in turn, recording
+     and never trading; a restart onto a journal that latched `Diverged` and
+     one after a stop that left an order working, each recording only; a stop
+     that cancels a resting order and settles its end; a journal that fails,
+     after which no order goes and no closing line is written; and a size
+     whose floored exit is under the minimum, refused. Every test seen red
+     under its break; what building it corrected is in §5, *LiveVenue,
+     decided before the code*, §8.
+   - **8b, the live mode in `ops/`, remains**, and needs the owner's decision
+     first: a PowerShell port or a WSL port of the bash harness for this
+     Windows host (*Where it runs*, below). Either way it enforces one symbol,
+     one process, one account, and is tested as `ops/test-supervise.sh` tests
+     the supervisor. The binary already exits 0 on a refused gate, so a
+     supervisor that restarts only on a failure does not restart it into the
+     same refusal.
+   - **8c, the Spot Testnet run, remains**, and needs two things from the
+     owner: this host's clock fixed (it read 2.1 s ahead of Binance with
+     `w32time` stopped, and the venue-checks gate refuses past 1 s), and an
+     Ed25519 testnet key pair registered with Spot Testnet, loaded as
+     `venue-check --help` says. It confirms the testnet market stream's
+     address, which 8a took from memory (`SPOT_TESTNET_WS`), and its run is
+     this item's acceptance.
 
 Outside slice (c): resolving an in-doubt order by lookup is slice (d), criteria
 A, B and C as a binary are slice (e), and the run with criteria D and E is slice
@@ -1879,6 +1921,71 @@ The shell's:
   back the `AccountFeed`, as a live run wires it. The REST side is
   `quant-live::fixtures::rest`, a scripted server shared by both crates'
   tests, which acknowledges by default and matches nothing, as §5 asks.
+
+The binary's (item 8, 8a), each where the design was silent or the code
+showed it otherwise:
+
+- **`Check` has no way in, still, and 8a does not need one.** Nothing in 8a
+  rechecks during a run: the `Checked` is minted at startup, a run is an
+  afternoon, and an order refused `-1021` is a rejection with the venue's code
+  on its line and harmless (§3, `Unchecked`). So the input stays as §6 left
+  it, for whichever later item rechecks the clock or refetches
+  `exchangeInfo`, and adds the way in with the recheck.
+- **The baseline gate reads the balances; the lines are written after every
+  gate.** §6 duty 1 lists "the start `balances` line" among the gates. The
+  balances are fetched as the seventh gate, and `started`, with the run tag,
+  and `balances` are written only once all seven pass, through a latch that
+  stops at a failed append. A journal that cannot hold them is the baseline
+  gate's refusal: no baseline, no trading.
+- **A run that records only writes nothing to the journal, and opens no
+  account stream.** The design was silent. A `started` line from a run that
+  trades nothing would leave a session without a `stopped` line, which the
+  last-session gate (duty 6) would then refuse the next run over, for a run
+  that never sent an order. With no venue wired there is nothing to hear on
+  the account stream, and a key the checks refused may be unable to log on.
+  One case does leave such a session: `started` written and `balances` not.
+  The next run then refuses until a person has looked, which is the
+  conservative reading of a journal that failed mid-start.
+- **The last-session gate also refuses a journal with lines and no
+  `started` line**, whose last session cannot be read at all.
+- **The size check is a gate, once, at the best bid.** §2 asked the binary to
+  refuse a size whose exit falls under the minimum notional "at the current
+  mark". Before the capture there is no book, so the mark is the best bid of
+  a REST depth snapshot, the price a market exit sells at; the exit is the
+  entry less the standard tier's taker fee in the base, truncated as the
+  simulator truncates it, rounded down to the lot. A size that is not a whole
+  number of lots fails it too, where `MaCrossover::new` would otherwise
+  refuse it after the journal had been opened. It is not repeated per order:
+  a market that falls during the run can still put an exit under the
+  minimum, and the venue refuses that exit with its code on the line. The
+  margin §2 asks for beyond one lot, the move expected between entry and
+  exit, is the operator's to choose and is not checked.
+- **The trade probe is the run's own size.** `venue-check` probes at M5's
+  0.001; the live binary sends the same probe (`trade::probe`, moved into the
+  library so the two cannot drift) at the size it will trade, so that a
+  filter the run's orders would meet is met at the gate.
+- **The clock is read once, through the run's clock**, by `trade::read_clock`,
+  `venue-check`'s routine moved into the library: the offset the checks pass
+  with is the one every order and logon is stamped with.
+- **The run tag is the wall clock's milliseconds in base 36**, eight or nine
+  letters and digits, so that a journal begun a millisecond after a lost one
+  is under a different tag (§5).
+- **`stopped` and the closing checkpoint are stamped at the engine's last
+  instant**, `EngineStats::last_ts`, which runs to the last report the drain
+  booked, so no line of the session is stamped after them; and they are
+  `session::closing`, which `paper` writes too, as it always did.
+- **The environment defaults to Spot Testnet**, and every endpoint follows
+  it, so the run that spends no money is the one with no flag. The data root
+  defaults to `data/<env>`, so a testnet market never lands beside the real
+  one, and is given with `--root` rather than bare, so that an argument the
+  binary does not take is refused without being printed back.
+- **A refused gate exits 0.** It is a run that did what it was told, recording,
+  and said loudly why it did not trade; a supervisor that restarted it would
+  meet the same refusal.
+- **The account capture is a library function**, `capture::record_account`,
+  which `fake_venue`'s `Listening` now runs too, so the tests record through
+  the code a live run records through. It came with one test, because none of
+  the existing ones saw the tee's mark go missing from the wiring.
 
 ---
 

@@ -252,6 +252,44 @@ pub fn trade_with(
     ])
 }
 
+/// `TRADE` with every field a rehearsal sets: the order's `side` as the venue
+/// spells it (`BUY`, `SELL`), `last` of it traded at `price` as trade
+/// `trade_id`, `filled` in all, and the venue's `fee` in `fee_asset`. For a
+/// rehearsal whose round trip has a buy's fee taken in the base, as a spot
+/// venue takes it, and a sell's in the quote.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn trade_priced(
+    client: &str,
+    order: u64,
+    side: &str,
+    qty: &str,
+    (last, filled, price): (&str, &str, &str),
+    (fee, fee_asset): (&str, &str),
+    trade_id: i64,
+) -> Vec<u8> {
+    let done = qty
+        .parse::<quant_core::fixed::Qty>()
+        .ok()
+        .zip(filled.parse::<quant_core::fixed::Qty>().ok())
+        .is_some_and(|(qty, filled)| qty == filled);
+    report(&[
+        ("c", json!(client)),
+        ("i", json!(order)),
+        ("S", json!(side)),
+        ("q", json!(qty)),
+        ("x", json!("TRADE")),
+        ("X", json!(if done { "FILLED" } else { "PARTIALLY_FILLED" })),
+        ("l", json!(last)),
+        ("z", json!(filled)),
+        ("L", json!(price)),
+        ("n", json!(fee)),
+        ("N", json!(fee_asset)),
+        ("t", json!(trade_id)),
+        ("I", json!(trade_id + 1000)),
+    ])
+}
+
 /// The order ended, `how`, with `filled` filled. A cancel names the order in
 /// `C` and the cancel request, whose id the venue generated, in `c`.
 #[must_use]

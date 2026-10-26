@@ -1128,6 +1128,7 @@ dependencies = [
  "quant-recorder",
  "quant-sim",
  "quant-storage",
+ "quant-verify",
  "serde_json",
  "tokio",
  "tracing",

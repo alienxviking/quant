@@ -9,6 +9,18 @@ use core::fmt;
 /// Binance spot market-data endpoint.
 pub const SPOT_WS: &str = "wss://stream.binance.com:9443";
 
+/// Spot Testnet's market-data endpoint, for the rehearsal `docs/live-run.md`
+/// §5 runs before any real order.
+///
+/// Written from Binance's Spot Testnet page as remembered, not from the
+/// pinned documentation this crate cites elsewhere (commit `0556f1a`), which
+/// names Spot Testnet's REST and WebSocket API addresses
+/// ([`crate::SPOT_TESTNET_REST`], [`crate::account::SPOT_TESTNET_WS_API`]) and
+/// was not to hand when this was added. Item 8's testnet run (8c) confirms or
+/// corrects it before any rehearsal depends on it. Testnet's market is not the
+/// real one in any case: it is captured under a data root of its own.
+pub const SPOT_TESTNET_WS: &str = "wss://stream.testnet.binance.vision";
+
 /// One subscribed stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamKind {

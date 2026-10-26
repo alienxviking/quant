@@ -17,8 +17,8 @@ license.workspace = true
 #
 # So this crate depends on the venue's dialect for its inputs (`orders`,
 # `user_data`, `account`) and on the engine for its outputs (`Unready`,
-# `ExecutionVenue`), as `quant-sim` does. Nothing depends on it but its tests,
-# and in item 8 the binary's crate.
+# `ExecutionVenue`), as `quant-sim` does. Nothing depends on it but its tests
+# and the binary's crate, `quant-backtest`, whose `live` binary runs it.
 [dependencies]
 quant-core = { workspace = true }
 quant-engine = { workspace = true }

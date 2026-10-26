@@ -15,7 +15,8 @@
 //! [`wire`] building it and the request worker ([`worker`]) that sends orders
 //! one at a time and keeps the timer behind [`Input::Unheard`], and [`drain`],
 //! the two waits of a live run's shutdown. The binary that runs them is
-//! item 8, and [`shell`]'s module docs say what it must do in which order.
+//! `quant-backtest`'s `live` (its body is `quant_backtest::live::run`), and
+//! [`shell`]'s module docs say what it must do in which order.
 //!
 //! # Why a merge at all
 //!
