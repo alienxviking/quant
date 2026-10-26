@@ -26,8 +26,10 @@
 //! needs no flag, and real money is spent only by typing `--env live`. A
 //! mistyped command then lands on the testnet, where a live key is refused at
 //! the first check. Each endpoint can be overridden on its own (`--rest`,
-//! `--ws-api`, `--market-ws`) for a local stand-in, and the banner says which
-//! were.
+//! `--ws-api`, `--market-ws`) for a local stand-in, and only for one: an
+//! override must name a loopback host, so that no override can point a run
+//! at the other environment's venue under this one's banner. The banner says
+//! which were overridden.
 //!
 //! The data root defaults to `data/<env>`, so that a testnet market, which is
 //! not the real one, never lands in the raw tier beside the real market's.
@@ -216,7 +218,8 @@ const USAGE: &str = "usage: live --symbol SYM [--root PATH] [--env testnet|live]
             [--rest URL] [--ws-api URL] [--market-ws URL]
 
 --env picks every endpoint at once and defaults to testnet: real money is
-spent only with --env live. Credentials come from BINANCE_API_KEY and
+spent only with --env live. --rest, --ws-api and --market-ws are for a local
+stand-in and take only a loopback host. Credentials come from BINANCE_API_KEY and
 BINANCE_ED25519_PRIVATE_KEY, as venue-check reads them.
 
 Exit 0 for a clean stop, traded or recorded only; 1 when the run could not go
@@ -398,17 +401,61 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
     }))
 }
 
-/// An endpoint, if it begins with one of `schemes`: a key pasted in its place
-/// does not, and is refused without being repeated.
+/// An endpoint override, if it begins with one of `schemes` and names a
+/// loopback host: a key pasted in its place does not, and is refused without
+/// being repeated.
+///
+/// Loopback only, because an override exists for a local stand-in and for
+/// nothing else. Any other host could be the other environment's: a testnet
+/// run with `--rest https://api.binance.com` would place real orders under a
+/// banner that says no money is at risk, and `--env live` with the testnet's
+/// market stream would trade real money on prices that are not the market's.
+/// `--env` is the one way to choose a venue, so the venue a run names is the
+/// venue it reaches.
 fn url(text: &str, schemes: &[&str]) -> Result<String, BadArgument> {
-    if schemes.iter().any(|scheme| text.starts_with(scheme)) {
-        Ok(text.to_owned())
-    } else {
-        Err(BadArgument(format!(
+    let Some(rest) = schemes.iter().find_map(|scheme| text.strip_prefix(scheme)) else {
+        return Err(BadArgument(format!(
             "an endpoint begins with {}, and that one does not; not repeated here",
             schemes.join(" or ")
-        )))
+        )));
+    };
+    if loopback(rest) {
+        Ok(text.to_owned())
+    } else {
+        Err(BadArgument(
+            "an endpoint override names a local stand-in, on 127.0.0.1, ::1 or localhost, and \
+             that one does not; not repeated here. --env chooses the venue"
+                .to_owned(),
+        ))
     }
+}
+
+/// Whether what follows a URL's scheme names a loopback host. Strict: a user
+/// part is refused outright (`127.0.0.1@elsewhere` is elsewhere), and a name
+/// counts only when it is exactly `localhost`, so `localhost.example` and
+/// `127.0.0.1.example` are not loopback.
+fn loopback(after_scheme: &str) -> bool {
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((inside, after)) = bracketed.split_once(']') else {
+            return false;
+        };
+        return (after.is_empty() || after.starts_with(':'))
+            && inside
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok_and(|ip| ip.is_loopback());
+    }
+    let host = authority.split(':').next().unwrap_or_default();
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 #[cfg(test)]
@@ -477,6 +524,46 @@ mod tests {
         assert_eq!(args.endpoints.market_ws, "ws://127.0.0.1:3");
         assert_eq!(args.overridden, ["rest", "ws-api", "market-ws"]);
         assert_eq!(args.root, PathBuf::from("elsewhere"));
+        for local in [
+            "ws://localhost:9",
+            "ws://LOCALHOST/ws",
+            "ws://[::1]:5/ws-api/v3",
+            "ws://127.0.0.2:7?x=1",
+            "wss://127.0.0.1",
+        ] {
+            let args = parsed(&["--symbol", "BTCUSDT", "--env", "live", "--ws-api", local])
+                .unwrap_or_else(|e| panic!("{local}: {e:?}"));
+            assert_eq!(args.endpoints.ws_api, local);
+        }
+    }
+
+    #[test]
+    fn an_override_that_is_not_a_local_stand_in_is_refused_without_being_repeated() {
+        // The other environment's hosts above all: a testnet banner over the
+        // live venue's orders, or real money on the testnet's prices.
+        for (flag, remote) in [
+            ("--rest", "https://api.binance.com"),
+            ("--rest", "https://testnet.binance.vision"),
+            ("--ws-api", "wss://ws-api.binance.com:443/ws-api/v3"),
+            ("--market-ws", "wss://stream.testnet.binance.vision"),
+            ("--market-ws", "wss://stream.binance.com:9443"),
+            // Loopback in name only.
+            ("--rest", "http://127.0.0.1.example"),
+            ("--rest", "http://localhost.example:80"),
+            ("--rest", "http://127.0.0.1@example.org"),
+            ("--rest", "http://localhost:1@example.org"),
+            ("--rest", "http://[::1].example"),
+            ("--rest", "http://[::2]:80"),
+            ("--rest", "http://0.0.0.0:80"),
+            ("--rest", "http://"),
+        ] {
+            for env in ["testnet", "live"] {
+                let BadArgument(said) =
+                    parsed(&["--symbol", "BTCUSDT", "--env", env, flag, remote]).expect_err(remote);
+                assert!(said.contains("local stand-in"), "{remote}: {said}");
+                assert!(!said.contains(remote), "{said}");
+            }
+        }
     }
 
     #[test]

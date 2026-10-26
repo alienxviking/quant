@@ -707,7 +707,8 @@ feature.
      `Engine::cancel_working` is the stop's cancel through the record
      (`docs/engine-contract.md` §11). The binary is `live`, its body
      `quant-backtest::live::run`: `--env testnet` by default and `--env live`
-     only when typed, every endpoint overridable for a local stand-in; seven
+     only when typed, every endpoint overridable for a local stand-in on a
+     loopback host and nothing else; seven
      gates before the capture, any of which fails into recording only; the
      capture of both streams under one clock; and §1's shutdown order, the
      closing lines only while the strict writer stands. The account replay
@@ -1986,6 +1987,13 @@ showed it otherwise:
   defaults to `data/<env>`, so a testnet market never lands beside the real
   one, and is given with `--root` rather than bare, so that an argument the
   binary does not take is refused without being printed back.
+- **An endpoint override takes a loopback host only.** Overrides exist for a
+  local stand-in. A host that is not loopback could be the other
+  environment's, and review found that `--rest https://api.binance.com` on
+  the default testnet would place real orders under a banner saying no money
+  was at risk, as `--env live` with the testnet's market stream would trade
+  real money on prices that are not the market's. So `--env` is the only way
+  to choose a venue.
 - **A refused gate exits 0.** It is a run that did what it was told, recording,
   and said loudly why it did not trade; a supervisor that restarted it would
   meet the same refusal.

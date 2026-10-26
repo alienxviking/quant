@@ -2458,7 +2458,8 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   session is `quant-backtest::session`, and paper runs it unchanged: a
   rehearsal of it against a local market, normalized and backtested,
   reproduces its fills and cash exactly, M5's own criterion. `live` is
-  `--env testnet` unless `--env live` is typed, every endpoint overridable;
+  `--env testnet` unless `--env live` is typed, every endpoint overridable
+  for a loopback stand-in only;
   seven gates run before any capture (the venue's checks, `exchangeInfo`, the
   run tag, no latch on the journal, nothing left working, a size whose
   floored exit clears the minimum at the best bid, the baseline), and any
