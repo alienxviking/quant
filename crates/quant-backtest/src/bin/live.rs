@@ -47,10 +47,18 @@
 //! `BINANCE_API_KEY` and `BINANCE_ED25519_PRIVATE_KEY`. `venue-check --help`
 //! says how to make the key, at an absolute path outside the repository.
 //!
-//! Exit 0 for a clean stop, whether it traded or recorded only (a refused gate
-//! is said loudly and is not a crash, so a supervisor must not restart it into
-//! the same refusal); 1 when the run could not go on; 2 for an argument it
-//! does not take.
+//! # Exit codes
+//!
+//! - **0**: it traded and stopped clean.
+//! - **1**: the run could not go on: it could not start, a capture ended in
+//!   error, or the journal failed, after which every order is withheld and no
+//!   closing line is written.
+//! - **2**: an argument it does not take.
+//! - **3**: a gate refused, and it recorded the market and traded nothing.
+//!   Not a failure: a supervisor that restarted it would meet the same
+//!   refusal, so it must end supervision on 3 as on 0. Distinct from 0, so
+//!   that a harness can tell a run that traded from one that only recorded
+//!   without reading its output.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -58,7 +66,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quant_backtest::live::{self, Endpoints, Environment, LiveConfig, Outcome};
+use quant_backtest::live::{self, Endpoints, Environment, LiveConfig, LiveRun, Outcome};
 use quant_backtest::session::Settings;
 use quant_binance::account::AccountPolicy;
 use quant_binance::credentials::Credentials;
@@ -68,6 +76,9 @@ use quant_engine::Limits;
 use quant_live::Deadlines;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
+
+/// The exit code of a run that recorded only because a gate refused.
+const RECORDED_ONLY: u8 = 3;
 
 /// How long a run captures when not told: an afternoon, which is what M8 plans
 /// (`docs/live-run.md` §2), not a fortnight.
@@ -151,32 +162,58 @@ fn main() -> ExitCode {
     let keys = Credentials::from_env;
     match live::run(&config, &keys, journalled, tokio::signal::ctrl_c()) {
         Ok(run) => {
-            if let Err(e) = &run.capture {
-                error!(error = %e, "the market capture ended in error");
-                return ExitCode::FAILURE;
+            let (code, line) = verdict(&run);
+            if code == 1 {
+                error!(verdict = %line, "the live run could not go on");
             }
-            match run.outcome {
-                Outcome::RecordOnly(refusal) => {
-                    println!("verdict   RECORDED ONLY: {refusal}");
-                }
-                Outcome::Traded(traded) => {
-                    if let Err(e) = &traded.account {
-                        error!(error = %e, "the account capture ended in error");
-                        return ExitCode::FAILURE;
-                    }
-                    println!(
-                        "verdict   STOPPED under run tag {}, {} order(s) working",
-                        traded.run.as_str(),
-                        traded.drained.working.len()
-                    );
-                }
-            }
-            ExitCode::SUCCESS
+            println!("{line}");
+            ExitCode::from(code)
         }
         Err(e) => {
             error!(error = %e, "the live run stopped");
             eprintln!("the live run stopped: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// How a run that returned ended: its verdict line and its exit code.
+fn verdict(run: &LiveRun) -> (u8, String) {
+    if let Err(e) = &run.capture {
+        return (
+            1,
+            format!("verdict   FAILED: the market capture ended in error: {e}"),
+        );
+    }
+    match &run.outcome {
+        Outcome::RecordOnly(refusal) => {
+            (RECORDED_ONLY, format!("verdict   RECORDED ONLY: {refusal}"))
+        }
+        Outcome::Traded(traded) => {
+            let tag = traded.run.as_str();
+            if traded.latched {
+                return (
+                    1,
+                    format!(
+                        "verdict   JOURNAL FAILED under run tag {tag}: every order after its                          first failed append was withheld and no closing line was written, so                          the next run records only until a person has looked"
+                    ),
+                );
+            }
+            if let Err(e) = &traded.account {
+                return (
+                    1,
+                    format!(
+                        "verdict   FAILED under run tag {tag}: the account capture ended in                          error: {e}"
+                    ),
+                );
+            }
+            (
+                0,
+                format!(
+                    "verdict   STOPPED under run tag {tag}, {} order(s) working",
+                    traded.drained.working.len()
+                ),
+            )
         }
     }
 }
@@ -228,8 +265,9 @@ spent only with --env live. --rest, --ws-api and --market-ws are for a local
 stand-in and take only a loopback host. Credentials come from BINANCE_API_KEY and
 BINANCE_ED25519_PRIVATE_KEY, as venue-check reads them.
 
-Exit 0 for a clean stop, traded or recorded only; 1 when the run could not go
-on; 2 for an argument it does not take.";
+Exit 0 when it traded and stopped clean; 1 when the run could not go on,
+the journal's failure included; 2 for an argument it does not take; 3 when a
+gate refused and it recorded only, which a supervisor must not restart.";
 
 #[allow(
     clippy::too_many_lines,
@@ -475,8 +513,11 @@ fn loopback(after_scheme: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, Args, BadArgument};
-    use quant_backtest::live::Environment;
+    use super::{parse_args, verdict, Args, BadArgument, RECORDED_ONLY};
+    use quant_backtest::live::{Environment, Gate, LiveRun, Outcome, Refusal, Traded};
+    use quant_binance::capture::AccountCaptured;
+    use quant_binance::user_data::RunTag;
+    use quant_core::execution::ClientOrderId;
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -668,6 +709,81 @@ mod tests {
             assert!(NUMERIC.contains(&flag));
             parsed(&["--symbol", "BTCUSDT", flag, value])
                 .unwrap_or_else(|e| panic!("{flag} {value}: {e:?}"));
+        }
+    }
+
+    fn traded(latched: bool, account: Result<AccountCaptured, String>) -> LiveRun {
+        LiveRun {
+            outcome: Outcome::Traded(Box::new(Traded {
+                run: RunTag::new("r1").expect("a tag"),
+                cancelled: Vec::new(),
+                drained: quant_live::Drained {
+                    working: vec![ClientOrderId(4)],
+                    settled: false,
+                    answered: true,
+                    outstanding: 0,
+                },
+                stats: quant_engine::EngineStats::default(),
+                venue: quant_live::LiveStats::default(),
+                latched,
+                account,
+            })),
+            capture: Ok(()),
+            tee_dropped: 0,
+        }
+    }
+
+    fn sealed() -> AccountCaptured {
+        AccountCaptured {
+            stopped: None,
+            stats: quant_recorder::IngressStats::default(),
+            segments: Vec::new(),
+        }
+    }
+
+    fn refused() -> LiveRun {
+        LiveRun {
+            outcome: Outcome::RecordOnly(Refusal {
+                gate: Gate::Size,
+                why: "too small".to_owned(),
+            }),
+            capture: Ok(()),
+            tee_dropped: 0,
+        }
+    }
+
+    #[test]
+    fn each_way_a_run_ends_has_its_own_exit_code() {
+        // Traded and stopped clean: 0.
+        let (code, line) = verdict(&traded(false, Ok(sealed())));
+        assert_eq!(code, 0, "{line}");
+        assert!(
+            line.contains("STOPPED under run tag r1, 1 order(s) working"),
+            "{line}"
+        );
+        // A gate refused: 3, which is neither a failure nor a trade.
+        let (code, line) = verdict(&refused());
+        assert_eq!((code, RECORDED_ONLY), (3, 3), "{line}");
+        assert!(
+            line.contains("RECORDED ONLY") && line.contains("size"),
+            "{line}"
+        );
+        // The journal failed: 1, however clean the rest of the stop was.
+        let (code, line) = verdict(&traded(true, Ok(sealed())));
+        assert_eq!(code, 1, "{line}");
+        assert!(line.contains("JOURNAL FAILED"), "{line}");
+        // A capture that ended in error: 1, on either stream.
+        let (code, line) = verdict(&traded(false, Err("disk".to_owned())));
+        assert_eq!(code, 1, "{line}");
+        assert!(line.contains("account capture"), "{line}");
+        for run in [traded(false, Ok(sealed())), refused()] {
+            let run = LiveRun {
+                capture: Err("disk".to_owned()),
+                ..run
+            };
+            let (code, line) = verdict(&run);
+            assert_eq!(code, 1, "{line}");
+            assert!(line.contains("market capture"), "{line}");
         }
     }
 }

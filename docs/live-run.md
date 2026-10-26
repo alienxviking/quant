@@ -730,9 +730,10 @@ feature.
      first: a PowerShell port or a WSL port of the bash harness for this
      Windows host (*Where it runs*, below). Either way it enforces one symbol,
      one process, one account, and is tested as `ops/test-supervise.sh` tests
-     the supervisor. The binary already exits 0 on a refused gate, so a
-     supervisor that restarts only on a failure does not restart it into the
-     same refusal.
+     the supervisor. The binary exits 3 on a refused gate, so 8b's
+     supervisor must end supervision on 3 as on 0, or it restarts the run
+     into the same refusal; `supervise.sh` as it stands restarts on any code
+     but 0, and would.
    - **8c, the Spot Testnet run, remains**, and needs two things from the
      owner: this host's clock fixed (it read 2.1 s ahead of Binance with
      `w32time` stopped, and the venue-checks gate refuses past 1 s), and an
@@ -2006,9 +2007,16 @@ showed it otherwise:
   was at risk, as `--env live` with the testnet's market stream would trade
   real money on prices that are not the market's. So `--env` is the only way
   to choose a venue.
-- **A refused gate exits 0.** It is a run that did what it was told, recording,
-  and said loudly why it did not trade; a supervisor that restarted it would
-  meet the same refusal.
+- **A refused gate exits 3, and a failed journal exits 1.** A refused gate
+  is a run that did what it was told, recording, and said loudly why it did
+  not trade; a supervisor that restarted it would meet the same refusal, so
+  it is not a failure. It first exited 0, and review found two things wrong
+  with that: a harness could not tell a run that traded from one that only
+  recorded without reading its output, and a run whose strict writer had
+  failed, withholding every order and writing no closing line, also exited 0
+  with a verdict line that hid it. So 0 is a run that traded and stopped
+  clean, 1 a run that could not go on (the journal's failure included), 2 an
+  argument it does not take, and 3 a refused gate.
 - **The account replay check reads the REST answers back off the journal**,
   as duty 7 says it must, and needs a stamp after which the stream was not
   heard: the session's `stopped` line, stamped at the engine's last instant
