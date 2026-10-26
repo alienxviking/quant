@@ -54,16 +54,12 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use futures_util::{SinkExt as _, StreamExt as _};
-use quant_core::event::GapCause;
-use quant_core::instrument::Exchange;
 use quant_core::time::{Clock, SystemClock};
 use quant_recorder::{
-    account_catalog, channel, run_writer, BackoffPolicy, CaptureRecord, CaptureSession, FileStore,
-    Ingress, LastDropped, Metrics, TeeSink, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
+    account_catalog, BackoffPolicy, CaptureRecord, LastDropped, DEFAULT_CHANNEL_CAPACITY,
 };
 use quant_storage::{
-    RawFrame, RawReader, WriterOptions, BLOCK_HEADER_LEN, BLOCK_SYNC, FILE_HEADER_LEN, TRAILER_LEN,
-    TRAILER_SYNC,
+    RawFrame, RawReader, BLOCK_HEADER_LEN, BLOCK_SYNC, FILE_HEADER_LEN, TRAILER_LEN, TRAILER_SYNC,
 };
 use ring::rand::{SecureRandom as _, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
@@ -74,7 +70,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::account::{listen, AccountFeed, AccountPolicy, Stopped};
+use crate::account::{AccountFeed, AccountPolicy, Stopped};
 use crate::credentials::Credentials;
 
 /// The venue's default `recvWindow`, which a logon's timestamp is judged by.
@@ -786,7 +782,9 @@ pub fn quick_policy() -> AccountPolicy {
 
 /// A listener recording into an account tree, as a live run would: a
 /// capture session of the account's own, an `Ingress` behind a
-/// [`TeeSink`] with the capture primary, and a consumer on the secondary.
+/// [`TeeSink`](quant_recorder::TeeSink) with the capture primary, and a
+/// consumer on the secondary. The capture is the run's own
+/// ([`crate::capture::record_account`]).
 #[derive(Debug)]
 pub struct Listening {
     stop: Option<oneshot::Sender<()>>,
@@ -844,8 +842,8 @@ impl Listening {
     /// [`Self::start_with_offset`], with the consumer side read by the
     /// [`AccountFeed`] handed back, wired as a live run wires it: the tee
     /// marks what it drops in the handle the feed reads
-    /// ([`TeeSink::marking_into`]), so a hole is told while the account is
-    /// quiet. What `quant-live`'s tests run a live venue's account side on.
+    /// ([`TeeSink::marking_into`](quant_recorder::TeeSink::marking_into)), so
+    /// a hole is told while the account is quiet. What `quant-live`'s tests run a live venue's account side on.
     /// [`Heard::consumed`] is then empty: the feed had it all.
     #[must_use]
     pub fn feeding(
@@ -906,6 +904,10 @@ impl Listening {
     }
 }
 
+/// The listener's task: the run's own account capture
+/// ([`crate::capture::record_account`]), on the host clock, stopped by
+/// `stop`. One way to wire an account capture, so that what these tests
+/// record is what a live run records.
 async fn capture(
     root: PathBuf,
     url: String,
@@ -915,42 +917,20 @@ async fn capture(
     stop: oneshot::Receiver<()>,
     (consumer, mark): (SyncSender<CaptureRecord>, Option<Arc<LastDropped>>),
 ) -> Heard {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let mut session = CaptureSession::account(
-        FileStore::new(root),
-        Exchange::Binance,
-        Arc::clone(&clock),
-        WriterOptions::default(),
-    );
-    let metrics = Metrics::new(DEFAULT_CHANNEL_CAPACITY);
-    let (tx, rx) = channel(DEFAULT_CHANNEL_CAPACITY, Arc::clone(&metrics));
-    let writer = std::thread::spawn(move || {
-        let outcome = run_writer(&rx, &mut session, DEFAULT_FLUSH_INTERVAL);
-        (outcome, session)
-    });
-    let tee = TeeSink::new(tx, consumer);
-    let tee = match mark {
-        Some(mark) => tee.marking_into(mark),
-        None => tee,
+    let config = crate::capture::AccountConfig {
+        root,
+        url,
+        policy,
+        offset_ms,
+        clock: Arc::new(SystemClock),
     };
-    let mut ingress = Ingress::new(tee, clock, metrics);
-    ingress
-        .record_gap(GapCause::RecorderRestart)
-        .expect("the writer is running");
-
-    let stopped = tokio::select! {
-        stopped = listen(&url, &credentials, &mut ingress, &policy, offset_ms) => Some(stopped),
-        _ = stop => None,
-    };
-    drop(ingress);
-    let (outcome, session) = tokio::task::spawn_blocking(move || writer.join())
-        .await
-        .expect("joining the writer")
-        .expect("the writer thread");
-    outcome.expect("the writer");
-    session.finish().expect("sealing the account capture");
+    let captured = crate::capture::record_account(config, &credentials, consumer, mark, async {
+        let _ = stop.await;
+    })
+    .await
+    .expect("the account capture records and seals");
     Heard {
-        stopped,
+        stopped: captured.stopped,
         consumed: Vec::new(),
     }
 }

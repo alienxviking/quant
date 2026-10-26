@@ -36,6 +36,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::account::{listen, AccountPolicy, Stopped};
+use crate::credentials::Credentials;
 use crate::{connection, ConnectionPolicy, SnapshotClient, StreamSpec, SPOT_REST, SPOT_WS};
 use quant_core::event::GapCause;
 use quant_core::instrument::Exchange;
@@ -47,8 +49,8 @@ use quant_meta::{
 };
 use quant_recorder::{
     channel, format_session_id, run_writer, CaptureSession, FileStore, Ingress, IngressStats,
-    Metrics, MetricsLine, MetricsReporter, ObservedStore, SegmentReport, WriterOutcome,
-    DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
+    LastDropped, Metrics, MetricsLine, MetricsReporter, ObservedStore, SegmentReport,
+    WriterOutcome, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
 };
 use quant_storage::WriterOptions;
 use tokio::sync::mpsc::Sender as MetaSender;
@@ -472,6 +474,147 @@ where
     outcome
 }
 
+/// Where an account capture records, whom it listens to, and by which clock.
+#[derive(Debug, Clone)]
+pub struct AccountConfig {
+    /// Data root; the capture lands under `<root>/account/...`, never beside
+    /// the market's (`docs/live-run.md` §5).
+    pub root: PathBuf,
+    /// The WebSocket API: [`crate::account::SPOT_WS_API`], Spot Testnet's, or
+    /// a local stand-in.
+    pub url: String,
+    pub policy: AccountPolicy,
+    /// The host clock's measured offset from the venue's, positive when the
+    /// host is ahead: the same number the order path takes off, which every
+    /// logon is stamped with (`docs/live-run.md` §5, §6 duty 2).
+    pub offset_ms: i64,
+    /// The clock every record is stamped by: the run's one clock.
+    pub clock: Arc<dyn Clock>,
+}
+
+/// How an account capture ended.
+#[derive(Debug)]
+pub struct AccountCaptured {
+    /// Why the listener stopped by itself, or `None` when it was stopped.
+    pub stopped: Option<Stopped>,
+    pub stats: IngressStats,
+    /// The segments sealed, each with its trailer.
+    pub segments: Vec<SegmentReport>,
+}
+
+/// Why an account capture could not record or seal.
+#[derive(Debug)]
+pub enum AccountCaptureError {
+    /// The writer thread was gone before the session's opening gap.
+    WriterGone,
+    /// The writer thread panicked.
+    WriterPanicked,
+    /// The writer, or sealing the last segment, failed.
+    Storage(quant_storage::StorageError),
+}
+
+impl std::fmt::Display for AccountCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriterGone => f.write_str("the account capture's writer was gone at the start"),
+            Self::WriterPanicked => f.write_str("the account capture's writer thread panicked"),
+            Self::Storage(e) => write!(f, "the account capture could not write or seal: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AccountCaptureError {}
+
+/// Record the account stream into its own data root until `stop` completes
+/// or the listener stops for good, handing every record to `consumer` as
+/// well: the run's `AccountFeed`, behind a [`TeeSink`](quant_recorder::TeeSink)
+/// with the capture primary, as the market's engine copy is.
+///
+/// What a live run wires (`docs/live-run.md` §5, *`LiveVenue`, decided before
+/// the code*, §6 duties 2 and 3): one clock, the measured offset, and the tee
+/// marking its drops into `mark` so the feed tells a hole while the account
+/// is quiet ([`AccountFeed::new`](crate::account::AccountFeed::new) requires
+/// it). `mark` is optional only for a test that reads the consumer raw. The
+/// session's opening `Gap{RecorderRestart}` is recorded here, as
+/// [`run_until`] records the market's, and the capture is sealed with its
+/// trailer however listening ended, so a clean stop never reads as a crash.
+///
+/// # Errors
+///
+/// [`AccountCaptureError`], for a capture that could not be written or
+/// sealed. A listener that stopped by itself is not an error: it is
+/// [`AccountCaptured::stopped`], and the gap it recorded is the loss.
+pub async fn record_account<Stop>(
+    config: AccountConfig,
+    credentials: &Credentials,
+    consumer: std::sync::mpsc::SyncSender<quant_recorder::CaptureRecord>,
+    mark: Option<Arc<LastDropped>>,
+    stop: Stop,
+) -> Result<AccountCaptured, AccountCaptureError>
+where
+    Stop: core::future::Future<Output = ()>,
+{
+    let AccountConfig {
+        root,
+        url,
+        policy,
+        offset_ms,
+        clock,
+    } = config;
+    let mut session = CaptureSession::account(
+        FileStore::new(root),
+        Exchange::Binance,
+        Arc::clone(&clock),
+        WriterOptions::default(),
+    );
+    let metrics = Metrics::new(DEFAULT_CHANNEL_CAPACITY);
+    let (tx, rx) = channel(DEFAULT_CHANNEL_CAPACITY, Arc::clone(&metrics));
+    let writer = thread::Builder::new()
+        .name("capture-writer-account".to_owned())
+        .spawn(move || {
+            let outcome = run_writer(&rx, &mut session, DEFAULT_FLUSH_INTERVAL);
+            (outcome, session)
+        })
+        .map_err(|e| AccountCaptureError::Storage(quant_storage::StorageError::Io(e)))?;
+    let tee = quant_recorder::TeeSink::new(tx, consumer);
+    let tee = match mark {
+        Some(mark) => tee.marking_into(mark),
+        None => tee,
+    };
+    let mut ingress = Ingress::new(tee, clock, metrics);
+    // First record in every file, as for the market.
+    let opened = ingress.record_gap(GapCause::RecorderRestart);
+
+    let stopped = if opened.is_ok() {
+        tokio::select! {
+            stopped = listen(&url, credentials, &mut ingress, &policy, offset_ms) => Some(stopped),
+            () = stop => None,
+        }
+    } else {
+        None
+    };
+    let stats = ingress.stats();
+    // Closes the channel, which is how the writer knows to seal the trailer.
+    drop(ingress);
+    let (outcome, session) = tokio::task::spawn_blocking(move || writer.join())
+        .await
+        .map_err(|_| AccountCaptureError::WriterPanicked)?
+        .map_err(|_| AccountCaptureError::WriterPanicked)?;
+    outcome.map_err(AccountCaptureError::Storage)?;
+    let (segments, _store) = session.finish().map_err(AccountCaptureError::Storage)?;
+    if opened.is_err() {
+        return Err(AccountCaptureError::WriterGone);
+    }
+    if let Some(why) = &stopped {
+        error!(%why, "the account listener stopped by itself; the account is not heard");
+    }
+    Ok(AccountCaptured {
+        stopped,
+        stats,
+        segments,
+    })
+}
+
 /// Compare the host clock against the venue's, once, before recording starts.
 ///
 /// Not fatal, because a wrong clock does not make the capture wrong: every
@@ -643,8 +786,12 @@ mod tests {
     use quant_recorder::catalog;
     use quant_storage::{FrameKind, RawReader};
 
-    use super::{run_until, CaptureConfig};
+    use super::{record_account, run_until, AccountConfig, CaptureConfig};
+    use crate::account::{AccountFeed, AccountRecord, Polled};
     use crate::fake_market::{self, FakeMarket};
+    use crate::fake_venue::{self, FakeVenue};
+    use quant_core::event::GapCause;
+    use quant_recorder::{account_catalog, LastDropped};
 
     /// A data root of this test's own, named for this process and cleared, so
     /// that a root a reused process id left behind is never read as this one.
@@ -752,6 +899,87 @@ mod tests {
             ["/stream?streams=btcusdt@trade/btcusdt@depth@100ms"],
             "subscribed at the base it was given, to the streams M1 records"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_account_capture_opens_with_its_gap_and_marks_what_its_consumer_missed() {
+        // The two things a live run's account capture must wire that a
+        // listener alone does not: the session's opening gap, and the tee
+        // marking its drops so the feed tells a hole while the account is
+        // quiet (docs/live-run.md section 5, section 6 duty 3). A consumer
+        // with room for one record and never drained takes the opening gap
+        // and misses the subscription's answer; the account then says
+        // nothing, and the feed must still say it missed something.
+        let root = scratch("account");
+        let venue = FakeVenue::start(fake_venue::Script::default()).await;
+        let (consumer, records) = std::sync::mpsc::sync_channel(1);
+        let mark = Arc::new(LastDropped::default());
+        let mut feed = AccountFeed::new(records, Arc::clone(&mark));
+        let config = AccountConfig {
+            root: root.clone(),
+            url: venue.url().to_owned(),
+            policy: fake_venue::quick_policy(),
+            offset_ms: 0,
+            clock: Arc::new(quant_core::time::SystemClock),
+        };
+        let credentials = venue.credentials();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let capture = record_account(config, &credentials, consumer, Some(mark), async {
+            let _ = stopped.await;
+        });
+        let drive = async {
+            venue
+                .until("the subscription", Duration::from_secs(20), |log| {
+                    log.asked("userDataStream.subscribe") >= 1
+                })
+                .await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut read = Vec::new();
+            while !read.iter().any(|r| {
+                matches!(
+                    r,
+                    AccountRecord::Blind {
+                        cause: GapCause::LocalOverflow,
+                        ..
+                    }
+                )
+            }) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the feed never told the hole: {read:?}"
+                );
+                match feed.poll() {
+                    Polled::Record(record) => read.push(record),
+                    Polled::Empty | Polled::Closed => {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }
+            }
+            let _ = stop.send(());
+            read
+        };
+        let (captured, read) = tokio::time::timeout(
+            Duration::from_secs(30),
+            Box::pin(async { tokio::join!(capture, drive) }),
+        )
+        .await
+        .expect("the capture stops when asked");
+        let captured = captured.expect("recorded and sealed");
+        assert_eq!(captured.stopped, None, "stopped, not refused");
+        assert!(
+            matches!(
+                read.first(),
+                Some(AccountRecord::Blind {
+                    cause: GapCause::RecorderRestart,
+                    ..
+                })
+            ),
+            "the session opens with its gap: {read:?}"
+        );
+        let cat = account_catalog(&root);
+        assert_eq!(cat.sessions.len(), 1, "under the account's own root");
+        assert!(!captured.segments.is_empty(), "sealed");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
