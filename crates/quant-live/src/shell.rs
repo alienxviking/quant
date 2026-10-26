@@ -46,7 +46,9 @@
 //!    never spawned holds it above zero for ever, which is why the wait has a
 //!    deadline of its own. Every order still unanswered is then still working
 //!    in the engine, and goes into `stopped.working`.
-//! 5. The closing checkpoint, `stopped { working }`, `balances`.
+//! 5. The closing checkpoint, `stopped { working }`, `balances`, only while
+//!    the strict writer has not failed: the binary writes them through its
+//!    `Latch`, so none lands after a line a failed append may have torn.
 //! 6. Drop the engine: this venue goes with it, its `Drop` sets the stop flag,
 //!    `orders` closes, and the worker returns, its `inbox` sender with it.
 //! 7. Stop the account listener, which seals the account capture.

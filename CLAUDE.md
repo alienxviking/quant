@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 864 tests green in debug
-and release, clippy and fmt clean, ~73,700 lines across 13 crates.
+same window exactly, on both symbols, to the satoshi. 901 tests green in debug
+and release, clippy and fmt clean, ~79,400 lines across 13 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -2453,10 +2453,36 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   copies at once. What building it corrected is in `docs/live-run.md` §5,
   *LiveVenue, decided before the code*, §8.
 
-  **What remains in (c) is item 8 of `docs/live-run.md` §4**: the `live`
-  binary, which runs the gates, spawns the worker and the listener, and
-  shuts down in the order the shell documents, and its testnet rehearsal.
-  Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
+  **Item 8's binary is built (8a, `m8c-live-binary`)**, rehearsed against
+  local stand-ins for every endpoint and never against Binance. Paper's
+  session is `quant-backtest::session`, and paper runs it unchanged: a
+  rehearsal of it against a local market, normalized and backtested,
+  reproduces its fills and cash exactly, M5's own criterion. `live` is
+  `--env testnet` unless `--env live` is typed, every endpoint overridable;
+  seven gates run before any capture (the venue's checks, `exchangeInfo`, the
+  run tag, no latch on the journal, nothing left working, a size whose
+  floored exit clears the minimum at the best bid, the baseline), and any
+  failure records the market and trades nothing, writing nothing to the
+  journal. A run that trades captures both streams on one clock, runs
+  paper's session with `LiveVenue` and the strict writer, and stops in the
+  shell's order: `Engine::cancel_working` (new), the drain, and the closing
+  lines only while the writer's `Latch` stands. `replay-account` is the
+  account replay check (`docs/run-log.md` §10). `Input::Check` still has no
+  way in, because 8a rechecks nothing. Accepted by `quant-explain`'s
+  `tests/live_run.rs`: a full round trip ending with `reconcile`, `runlog
+  check`, `quant-verify` on both roots and the replay check all agreeing;
+  each gate failing in turn; both restarts recording only; a resting order
+  cancelled at the stop; a failed journal sending nothing more and closing
+  nothing. Every test seen red under its break, and every socket test run
+  20 times in 6 copies at once. What it corrected is in `docs/live-run.md`
+  §5, *LiveVenue, decided before the code*, §8.
+
+  **What remains in (c) is 8b and 8c of `docs/live-run.md` §4 item 8.** 8b,
+  the live mode in `ops/`, waits on the owner's choice of a PowerShell or a
+  WSL port of the harness for this host. 8c, the Spot Testnet run, waits on
+  this host's clock (2.1 s ahead, `w32time` stopped) and an Ed25519 testnet
+  key pair, and confirms the testnet market stream's address, which 8a took
+  from memory. Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
   shipped code, which went first, each on its own branch (#52 to #56, and see
   *Still open*), and eighteen design questions. The ones that block code are
   settled in §5; the rest are settled in the pull request that meets them.

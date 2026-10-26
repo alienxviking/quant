@@ -1132,14 +1132,15 @@ record of what the venue said about the run's last orders.
 1. `run()` returns when the market source ends.
 2. The owner chose to cancel at a stop (§7, decision 3), so `Engine::cancel_working()`:
    for each working order, `on_cancel_requested` and then the venue's `cancel`,
-   at the engine's `now`, with no strategy call. Nothing can issue those cancels
-   today. The engine has no cancel of its own (`lib.rs:599-1113`), only
-   `Context::cancel` reaches the venue (`strategy.rs:278-284`), and only from a
-   strategy callback, which `settle` never makes. A cancel sent around the engine
-   would skip `on_cancel_requested`, and the journal would hold a `cancelled`
-   with no request behind it. So it is a seam addition, in item 8's pull request,
-   beside `settle` in `docs/engine-contract.md` §11, and its test asserts one
-   `cancel_requested` line per working order before any cancel reaches the venue.
+   at the engine's `now`, with no strategy call. Nothing could issue those
+   cancels before item 8. The engine had no cancel of its own, only
+   `Context::cancel` reaches the venue, and only from a strategy callback, which
+   `settle` never makes. A cancel sent around the engine would skip
+   `on_cancel_requested`, and the journal would hold a `cancelled` with no
+   request behind it. So it is a seam addition, built in item 8
+   (`m8c-live-binary`), beside `settle` in `docs/engine-contract.md` §11, and
+   its test asserts one `cancel_requested` line per working order before any
+   cancel reaches the venue.
 3. `settle()` until nothing is working or a deadline longer than `ORDER_TIMEOUT`
    passes (`lib.rs:700-704`), pausing `IDLE_TICK` when nothing came.
 4. `stop_sending()`, then `settle()` until `outstanding()` is zero **or a second
@@ -1149,7 +1150,10 @@ record of what the venue said about the run's last orders.
    zero for ever. Passing the deadline is logged as an error, and every order
    still unanswered is in `stopped.working`, which duty 6 then refuses to trade
    past.
-5. The closing checkpoint, `stopped { working }`, `balances`.
+5. The closing checkpoint, `stopped { working }`, `balances`, only while the
+   strict writer has not failed: a line written after a torn one would sit in
+   the middle of the file, where `read` refuses the whole journal. The writer's
+   `Latch` is what the binary writes them through (8a).
 6. Drop the engine: `orders` closes, the worker returns, and its `inbox` sender
    goes with it.
 7. Stop the listener, which seals the account capture.
