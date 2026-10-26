@@ -2487,11 +2487,12 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   8b's supervisor must not restart.
 
   **What remains in (c) is 8b and 8c of `docs/live-run.md` §4 item 8.** 8b,
-  the live mode in `ops/`, waits on the owner's choice of a PowerShell or a
-  WSL port of the harness for this host. 8c, the Spot Testnet run, waits on
-  this host's clock (2.1 s ahead, `w32time` stopped) and an Ed25519 testnet
-  key pair, and confirms the testnet market stream's address, which 8a took
-  from memory. Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
+  the live mode in `ops/`, is a PowerShell live mode with no automatic
+  restart, the owner's choice on 2026-10-26. 8c, the Spot Testnet run, waits
+  on this host's clock (2.1 s ahead, `w32time` stopped) and an Ed25519
+  testnet key pair. The testnet market stream's address, which 8a first wrote
+  from memory, was checked against Binance's published testnet documentation
+  before 8a merged. Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
   shipped code, which went first, each on its own branch (#52 to #56, and see
   *Still open*), and eighteen design questions. The ones that block code are
   settled in §5; the rest are settled in the pull request that meets them.

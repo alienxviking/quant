@@ -726,21 +726,24 @@ feature.
      whose floored exit is under the minimum, refused. Every test seen red
      under its break; what building it corrected is in §5, *LiveVenue,
      decided before the code*, §8.
-   - **8b, the live mode in `ops/`, remains**, and needs the owner's decision
-     first: a PowerShell port or a WSL port of the bash harness for this
-     Windows host (*Where it runs*, below). Either way it enforces one symbol,
-     one process, one account, and is tested as `ops/test-supervise.sh` tests
-     the supervisor. The binary exits 3 on a refused gate, so 8b's
-     supervisor must end supervision on 3 as on 0, or it restarts the run
-     into the same refusal; `supervise.sh` as it stands restarts on any code
-     but 0, and would.
+   - **8b, the live mode in `ops/`, remains**, and the owner settled its
+     shape on 2026-10-26: a **PowerShell** live mode in the `.ps1` half, not a
+     WSL port, and **no automatic restart** (*Where it runs*, below). It
+     enforces one symbol, one process, one account, and is tested as
+     `ops/test-supervise.sh` tests the supervisor. With no restart, every
+     exit ends the run: 0 traded and stopped cleanly, 3 a refused gate
+     (recorded only), 1 a failure, and the harness says which, since a
+     restart into the same refusal or after a crash is what the owner ruled
+     out.
    - **8c, the Spot Testnet run, remains**, and needs two things from the
      owner: this host's clock fixed (it read 2.1 s ahead of Binance with
      `w32time` stopped, and the venue-checks gate refuses past 1 s), and an
      Ed25519 testnet key pair registered with Spot Testnet, loaded as
-     `venue-check --help` says. It confirms the testnet market stream's
-     address, which 8a took from memory (`SPOT_TESTNET_WS`), and its run is
-     this item's acceptance.
+     `venue-check --help` says. Its run is this item's acceptance. The
+     testnet market stream's address (`SPOT_TESTNET_WS`), which 8a first
+     wrote from memory, was checked against Binance's published testnet
+     documentation before 8a merged (`binance-spot-api-docs`,
+     `testnet/web-socket-streams.md:39-41`, commit `f4a9c0b`).
 
 Outside slice (c): resolving an in-doubt order by lookup is slice (d), criteria
 A, B and C as a binary are slice (e), and the run with criteria D and E is slice
@@ -751,7 +754,17 @@ and M5 still reproduce. The model replay for criteria B and C runs with it on,
 or it predicts some exits a lot bigger than the ones live sends: not every exit,
 because one trip's dust tops up the next buy, but over M5's fortnight 42 of 412.
 
-### Where it runs, which is not yet settled
+### Where it runs
+
+**Settled by the owner on 2026-10-26:** the run happens on this Windows host,
+through a **PowerShell** live mode added to `ops/*.ps1`, with **no automatic
+restart**. PowerShell over WSL, because WSL2 keeps a clock of its own, which
+drifts after the host sleeps, and the clock is the one thing that stops this
+host trading at all; the bash half is macOS-only in any case (below). No
+restart, because a crash mid-order is criterion E's to exercise deliberately,
+and the gates already refuse to trade after an unclean stop with orders
+working. The paragraphs below are the reasoning as it stood before the
+decision.
 
 M5 ran on the MacBook Air, and `ops/`'s bash half is the only harness with a
 paper or live mode — the `.ps1` half is **record-only**, deliberately, because
