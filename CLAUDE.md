@@ -1808,6 +1808,18 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
 
 ### Still open
 
+- **zstd is four advisories behind, and the fix is a parquet bump.** The first
+  `cargo audit` (2026-10-27, `ci-audit-and-onboarding`) found eleven
+  vulnerabilities. Seven fell to `cargo update`, rustls's four among them. The
+  other four are zstd's and need zstd 0.14, which parquet 59 will not take, so
+  they sit in `.cargo/audit.toml` with the reason each does not reach us. Owed:
+  parquet and arrow to 60 (MSRV 1.85 → 1.88), zstd to 0.14 in `quant-storage`
+  and `quant-binance`, and the ignore list emptied. It touches both storage
+  tiers, so it is judged the way M2 was: `verify` over the captures and
+  `normalize --write --check` over the fortnight, event for event. A new
+  compressor writing different bytes is fine; reading the existing raw tier
+  back differently is not.
+
 - **A supervisor could start a doomed final attempt. Fixed (M8.a), and `ops/`
   has tests now.** `supervise.sh` broke its restart loop only on a clean exit
   within **30s** of the deadline; M5's paper binary finished and exited with
