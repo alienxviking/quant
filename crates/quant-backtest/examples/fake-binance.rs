@@ -176,7 +176,11 @@ async fn walk(market: Arc<FakeMarket>, rest: Arc<RestVenue>, bid: Arc<Mutex<i64>
     let mut step = 0_u64;
     loop {
         tokio::time::sleep(STEP).await;
-        let by = if (step / LEG) % 2 == 0 { 1 } else { -1 };
+        let by = if (step / LEG).is_multiple_of(2) {
+            1
+        } else {
+            -1
+        };
         let (old, new) = {
             let mut bid = bid
                 .lock()

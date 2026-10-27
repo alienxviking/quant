@@ -19,13 +19,16 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# The floor our dependencies actually impose, not an aspiration. Cargo's
-# MSRV-aware resolver honours this number when choosing versions, so a stale one
-# is not free: at 1.75 it silently held us to `parquet` 54 (early 2025) while 59
-# was current, for a promise nothing tests -- CI runs `stable` and
-# rust-toolchain.toml pins the channel, not a version. Raise it when a dependency
-# we want requires it; never lower it below what we can build.
-rust-version = "1.85"
+# The floor our dependencies actually impose, not an aspiration. `cargo add`
+# reads this number when it picks a version, so a stale one is not free: at
+# 1.75 it silently held us to `parquet` 54 (early 2025) while 59 was current,
+# for a promise nothing tests -- CI runs `stable` and rust-toolchain.toml pins
+# the channel, not a version. Under `resolver = "2"` a plain `cargo update`
+# does not read it, which is how dependabot took parquet to 60 (MSRV 1.88) and
+# uuid to 1.29 (MSRV 1.89) past a stated 1.85. So the number can fall behind
+# the lock without anything failing: after a dependency bump, check the highest
+# `rust_version` in `cargo metadata`. Never lower it below what we can build.
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/alienxviking/quant"
 

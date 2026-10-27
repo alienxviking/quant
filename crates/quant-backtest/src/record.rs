@@ -542,7 +542,7 @@ impl RunObserver for JournalWriter {
         );
         // Frequent and cheap rather than one at the end: a run killed hard still
         // leaves a recent claim for the recompute to be compared against.
-        if self.fills % CHECKPOINT_EVERY == 0 {
+        if self.fills.is_multiple_of(CHECKPOINT_EVERY) {
             self.checkpoint(at, portfolio);
         }
     }
