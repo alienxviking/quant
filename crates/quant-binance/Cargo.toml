@@ -96,14 +96,14 @@ uuid = { version = "1", features = ["v4"] }
 # because a search of zstd's output for a string proves nothing. Optional, and
 # on only with `fake-venue` and in this crate's tests: the same 0.13 that
 # quant-storage writes with, so it adds no crate to the build.
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 # For the `replay` example only: it feeds a recorded capture through a
 # reconstructed book to check the invariants hold. The library itself knows
 # nothing about books -- that stays venue-agnostic in quant-book.
 [dev-dependencies]
 quant-book = { workspace = true }
-zstd = "0.13"
+zstd = "0.14"
 
 # `fake_venue`: a local stand-in for the WebSocket API's account side, which the
 # account listener's tests run against, here and in quant-verify; and
