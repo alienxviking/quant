@@ -54,7 +54,7 @@ rustls = { version = "0.23", default-features = false, features = [
 # which is base64 too. 0.22, because 0.22.1 is already in Cargo.lock through
 # reqwest's hyper-util, with the same default features: naming it here adds no
 # crate to the build. Do not let this drift to a version nothing else uses.
-base64 = "0.22"
+base64 = "0.23"
 
 # REST, for the one thing the WebSocket cannot give us: an order-book snapshot to
 # anchor the depth deltas against. See `rest.rs`.
