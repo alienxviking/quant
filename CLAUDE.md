@@ -2044,8 +2044,8 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   now. *A fixture of zeros proves far less than it looks like it does*, which is
   the M2.e lesson wearing yet another costume.
 
-- Minor: CI annotates `Node.js 20 is deprecated` for `actions/checkout@v4` on both
-  jobs. Harmless; fixed by bumping to `@v5` whenever CI is next touched.
+- CI's `Node.js 20 is deprecated` annotation on `actions/checkout@v4` is gone:
+  both jobs moved to `@v5` (`ci-audit-and-onboarding`).
 
 ## Conventions
 
