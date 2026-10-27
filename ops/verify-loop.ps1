@@ -31,6 +31,26 @@
 
 .PARAMETER LogDir
     Where the verification log goes.
+
+.PARAMETER Journal
+    A live run's journal (start-live.ps1 passes it). Each pass then also runs
+    reconcile and runlog check on it, which is how a live run's record is
+    watched while it is written: a journal that has stopped agreeing with
+    itself should cost minutes, not the afternoon. Without it, nothing about
+    the loop changes: a recorder run has no journal to read.
+
+      reconcile     0 agrees, 2 no checkpoint yet (WAIT, not an alarm), 1 not
+      runlog check  0 complete, 2 nothing to check yet (WAIT), 1 not
+
+    A torn last line is normal for a journal being written, and both read it
+    as the tail of an open file rather than as damage. The account replay
+    needs the account capture sealed, so it runs once, after the run, in
+    check-live.ps1.
+
+.PARAMETER IntervalSeconds
+    How often to check, in seconds, in place of IntervalHours: a live run is
+    an afternoon, not a week, and its rehearsal is minutes. Zero, the
+    default, leaves IntervalHours in charge.
 #>
 [CmdletBinding()]
 param(
@@ -40,7 +60,9 @@ param(
     [int] $IntervalHours = 6,
     # How long to wait before the first check. A misconfiguration shows up in the
     # first few minutes, and that is the failure most worth catching early.
-    [int] $FirstCheckSeconds = 300
+    [int] $FirstCheckSeconds = 300,
+    [string] $Journal,
+    [int] $IntervalSeconds = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,7 +88,46 @@ function Note {
 # time, which would train whoever reads this log to ignore a non-zero code -- the
 # same reason warnings do not fail a verification run.
 $useReconcile = -not [string]::IsNullOrWhiteSpace($env:QUANT_DATABASE_URL)
-Note "verifying $Root every ${IntervalHours}h until $($EndAt.ToUniversalTime().ToString('u')), reconcile=$useReconcile"
+$intervalSecondsNow = $IntervalHours * 3600
+$cadence = "${IntervalHours}h"
+if ($IntervalSeconds -gt 0) { $intervalSecondsNow = $IntervalSeconds; $cadence = "${IntervalSeconds}s" }
+$watchJournal = -not [string]::IsNullOrWhiteSpace($Journal)
+$journalNote = ''
+if ($watchJournal) { $journalNote = ", journal $Journal" }
+Note "verifying $Root every $cadence until $($EndAt.ToUniversalTime().ToString('u')), reconcile=$useReconcile$journalNote"
+
+# A live run's journal, read the two ways that can be read while it is still
+# being written. Each binary's output kept in a file of its own, as verify's is.
+function Watch-Journal {
+    param([string] $Stamp)
+    if (-not (Test-Path $Journal)) {
+        Note "WAIT $([System.IO.Path]::GetFileName($Journal)): not written yet"
+        return
+    }
+    $checks = @(
+        @{ name = 'reconcile'; exe = (Join-Path $repo 'target\release\reconcile.exe'); arguments = @($Journal) },
+        @{ name = 'runlog'; exe = (Join-Path $repo 'target\release\runlog.exe'); arguments = @('check', $Journal) }
+    )
+    foreach ($check in $checks) {
+        $jout = Join-Path $LogDir "$($check.name)-$Stamp.txt"
+        $jerr = Join-Path $LogDir "$($check.name)-$Stamp.err"
+        if (-not (Test-Path $check.exe)) {
+            Note "FAIL $($check.name): no release binary at $($check.exe)"
+            continue
+        }
+        $quoted = @()
+        foreach ($argument in $check.arguments) { $quoted += "`"$argument`"" }
+        $p = Start-Process -FilePath $check.exe -ArgumentList $quoted `
+            -RedirectStandardOutput $jout -RedirectStandardError $jerr `
+            -NoNewWindow -Wait -PassThru
+        $said = (Get-Content $jout -ErrorAction SilentlyContinue | Select-String '^verdict') -join ''
+        switch ($p.ExitCode) {
+            0 { Note "OK   $($check.name): $said" }
+            2 { Note "WAIT $($check.name): nothing to check yet" }
+            default { Note "FAIL $($check.name) exit $($p.ExitCode): $said" }
+        }
+    }
+}
 
 # A first pass shortly after the start, because the failure worth catching early
 # is a misconfiguration, and that shows up in the first few minutes.
@@ -98,9 +159,13 @@ while ((Get-Date).ToUniversalTime() -lt $EndAt.ToUniversalTime()) {
         }
     }
 
+    if ($watchJournal) {
+        Watch-Journal $stamp
+    }
+
     $remaining = ($EndAt.ToUniversalTime() - (Get-Date).ToUniversalTime()).TotalSeconds
     if ($remaining -le 60) { break }
-    Start-Sleep -Seconds ([math]::Min($IntervalHours * 3600, $remaining))
+    Start-Sleep -Seconds ([math]::Min($intervalSecondsNow, $remaining))
 }
 
 Note "verification loop finished"

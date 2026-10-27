@@ -26,6 +26,17 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ([string]::IsNullOrWhiteSpace($Root)) { $Root = Join-Path (Join-Path $here '..') 'data\acceptance' }
 $Root = (Resolve-Path $Root).Path
 
+# A live run is stopped by stop-live.ps1, and must not reach the code below:
+# it would kill the live supervisor, which records how the run ended and holds
+# the host awake, then look for a recorder, find none, and report success
+# while live.exe went on trading. A recorder run's run.json has no mode.
+$probe = Join-Path $Root 'run.json'
+if ((Test-Path $probe) -and ((Get-Content $probe -Raw | ConvertFrom-Json).mode -eq 'live')) {
+    Write-Host 'a live run: stopping it with ops\stop-live.ps1'
+    & (Join-Path $here 'stop-live.ps1') -Root $Root
+    exit $LASTEXITCODE
+}
+
 # Supervisors first. Stopping a recorder while its supervisor is watching would
 # simply produce another recorder.
 $pidFile = Join-Path $Root 'run.pids'
