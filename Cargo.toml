@@ -53,10 +53,10 @@ serde = { version = "1", features = ["derive"] }
 # and arrow-ipc; we compress with zstd exactly as the raw tier does, so none of
 # that earns its build time. `arrow` is not optional -- the low-level column API
 # would mean hand-rolling the nested LIST<STRUCT> encoding that book levels need.
-parquet = { version = "59", default-features = false, features = ["arrow", "zstd"] }
-arrow-array = "59"
-arrow-buffer = "59"
-arrow-schema = "59"
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
+arrow-array = "60"
+arrow-buffer = "60"
+arrow-schema = "60"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
