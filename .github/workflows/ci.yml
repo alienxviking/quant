@@ -41,7 +41,7 @@ jobs:
       QUANT_DATABASE_URL: postgres://quant:quant_local_dev@localhost:5432/quant
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -81,7 +81,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -114,7 +114,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # A prebuilt binary. `cargo install cargo-audit` would compile it from
       # source on every run, which costs minutes to save nothing.
