@@ -67,6 +67,17 @@
 //!   refusal, so it must end supervision on 3 as on 0. Distinct from 0, so
 //!   that a harness can tell a run that traded from one that only recorded
 //!   without reading its output.
+//!
+//! Every path that returns says so first, as the last line on stdout:
+//! `exit      N`, with `N` the code it is about to exit with. A process ended
+//! from outside never gets to write it, and that is the point. Windows has no
+//! signals, so a kill is an exit code someone else chose: `taskkill /F` and
+//! Task Manager's *End task* end a process with **1**, this binary's own code
+//! for a run that could not go on. Without the line a harness cannot tell
+//! "the journal failed and every order was withheld" from "somebody killed it
+//! mid-order", and those want different things from the person who reads it.
+//! `ops/live-common.ps1` reads the line, and calls an ending the binary did not
+//! announce a kill whatever its code.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -122,13 +133,26 @@ struct Args {
 struct BadArgument(String);
 
 fn main() -> ExitCode {
+    let code = live_main();
+    println!("{}", ended(code));
+    ExitCode::from(code)
+}
+
+/// The last line the binary writes, naming the code it exits with. The
+/// module docs say why; `ops/live-common.ps1` reads it, and a test pins it.
+fn ended(code: u8) -> String {
+    format!("exit      {code}")
+}
+
+/// The run, to the code it ends with.
+fn live_main() -> u8 {
     let args = match parse_args(std::env::args_os().skip(1)) {
         Ok(Some(args)) => args,
-        Ok(None) => return ExitCode::SUCCESS,
+        Ok(None) => return 0,
         Err(BadArgument(why)) => {
             eprintln!("{why}");
             eprintln!("{USAGE}");
-            return ExitCode::from(2);
+            return 2;
         }
     };
     // JSON, so the metrics line is a value rather than prose, as paper's is.
@@ -149,7 +173,7 @@ fn main() -> ExitCode {
                 "the journal {} could not be read or opened: {e}",
                 args.journal.display()
             );
-            return ExitCode::FAILURE;
+            return 1;
         }
     };
     let config = LiveConfig {
@@ -183,12 +207,12 @@ fn main() -> ExitCode {
                 error!(verdict = %line, "the live run could not go on");
             }
             println!("{line}");
-            ExitCode::from(code)
+            code
         }
         Err(e) => {
             error!(error = %e, "the live run stopped");
             eprintln!("the live run stopped: {e}");
-            ExitCode::FAILURE
+            1
         }
     }
 }
@@ -511,7 +535,7 @@ fn url(text: &str, schemes: &[&str]) -> Result<String, BadArgument> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, verdict, Args, BadArgument, RECORDED_ONLY};
+    use super::{ended, parse_args, verdict, Args, BadArgument, RECORDED_ONLY};
     use quant_backtest::live::{Environment, Gate, LiveRun, Outcome, Refusal, Traded};
     use quant_binance::capture::AccountCaptured;
     use quant_binance::user_data::RunTag;
@@ -805,6 +829,23 @@ mod tests {
             let (code, line) = verdict(&run);
             assert_eq!(code, 1, "{line}");
             assert!(line.contains("market capture"), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_last_line_names_the_exit_code_in_the_shape_the_harness_reads() {
+        // ops/live-common.ps1 matches '^exit\s+(-?\d+)$' and compares the
+        // number with the code the process really ended with; a run whose
+        // line it cannot find is reported as killed. So the shape is the
+        // contract, and every code the binary has must produce it.
+        assert_eq!(ended(0), "exit      0");
+        assert_eq!(ended(3), "exit      3");
+        for code in [0_u8, 1, 2, 3] {
+            let line = ended(code);
+            let rest = line.strip_prefix("exit").expect("starts with exit");
+            assert!(rest.starts_with(char::is_whitespace), "{line}");
+            assert_eq!(rest.trim().parse::<u8>(), Ok(code), "{line}");
+            assert!(!line.contains(['\r', '\n']), "one line: {line:?}");
         }
     }
 }
