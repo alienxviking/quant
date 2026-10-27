@@ -61,6 +61,18 @@
 //! the private key: see `credentials.rs` for why that is a property of the type
 //! rather than of this file's care, and for how to make the key.
 //!
+//! Three more flags exist for the PowerShell harness's preflights (item 8b).
+//! `--qty` sets the trade probe's size, so that the probe is the run's own
+//! order at any size the run is given and not only at M5's 0.001 the gate
+//! inside `live` would otherwise be the first to judge. `--rest` points every
+//! request at a local stand-in for a rehearsal, and only at one: the override
+//! is held to `quant_binance::endpoint`'s loopback rule, the live binary's,
+//! so it cannot point a check of one venue at the other. And `--clock` reads
+//! the venue's clock alone, unsigned and with no credentials, round-trip
+//! corrected by the same `read_clock` the live binary's first gate uses, so
+//! that the record harness's preflight can ask it rather than measure
+//! `now - serverTime` itself, which folds the one-way latency into the offset.
+//!
 //! Exit 0 ready, 1 not, 2 for an argument it does not take.
 
 use std::ffi::OsString;
@@ -68,11 +80,13 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use quant_binance::credentials::Credentials;
+use quant_binance::endpoint::local_override;
 use quant_binance::orders::{EncodeError, NewOrder};
 use quant_binance::rest::{SnapshotClient, SPOT_REST, SPOT_TESTNET_REST};
 use quant_binance::trade::{
     read_clock, ClockSample, NotReady, TradeClient, CLOCK_READINGS, MAX_CLOCK_SKEW_MS,
 };
+use quant_core::fixed::Qty;
 
 /// The symbol checked when `--symbol` is not given: the one M5 traded and M8
 /// will.
@@ -85,7 +99,7 @@ const PROBE_QTY: &str = "0.001";
 
 /// The help text. A raw string, so the commands in it read exactly as they are
 /// to be typed, quotes and backslashes included.
-const USAGE: &str = r#"usage: venue-check [--testnet] [--symbol SYMBOL]
+const USAGE: &str = r#"usage: venue-check [--testnet] [--symbol SYMBOL] [--qty QTY] [--rest URL] [--clock]
 
 Makes three signed requests and places nothing: GET /api/v3/account, for the
 key, the signature, the clock and the account's canTrade; POST
@@ -120,6 +134,12 @@ The last command prints the public key, which is what to register with Binance.
               the symbol the trade probe names and the fee check reads, spelled
               as the venue spells it, in capital letters and digits: BTCUSDT
               when not given.
+  --qty QTY   the size of the trade probe's market buy, the run's own size:
+              0.001 when not given.
+  --rest URL  send every request to a local stand-in for a rehearsal instead,
+              on 127.0.0.1, ::1 or localhost and nowhere else.
+  --clock     read the venue's clock only, round-trip corrected, unsigned and
+              with no credentials: ready when it is within a second.
 
 Exit 0 ready, 1 not ready, 2 for an argument it does not take.
 "#;
@@ -153,10 +173,30 @@ impl Venue {
     }
 }
 
+/// What a check is asked to check.
+#[derive(Debug, PartialEq, Eq)]
+struct Check {
+    venue: Venue,
+    symbol: String,
+    /// The trade probe's size.
+    qty: Qty,
+    /// A local stand-in every request goes to instead of the venue's base.
+    rest: Option<String>,
+    /// The clock alone, with no credentials.
+    clock_only: bool,
+}
+
+impl Check {
+    /// Where every request goes.
+    fn base(&self) -> &str {
+        self.rest.as_deref().unwrap_or(self.venue.base())
+    }
+}
+
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Check { venue: Venue, symbol: String },
+    Check(Check),
     Help,
 }
 
@@ -168,7 +208,8 @@ impl core::fmt::Display for UnknownArgument {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(
             "venue-check takes --testnet, --symbol followed by a symbol in capital letters and \
-             digits, and --help, and was given something else. It is not repeated here, in case \
+             digits, --qty followed by a quantity, --rest followed by a local stand-in's URL, \
+             --clock, and --help, and was given something else. It is not repeated here, in case \
              it was a key pasted in the wrong place.",
         )
     }
@@ -185,19 +226,49 @@ impl core::fmt::Display for UnknownArgument {
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, UnknownArgument> {
     let mut venue = Venue::Live;
     let mut symbol = None;
+    let mut qty = None;
+    let mut rest = None;
+    let mut clock_only = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--testnet") => venue = Venue::Testnet,
             Some("--symbol") => symbol = Some(parse_symbol(args.next().as_ref())?),
+            Some("--qty") => qty = Some(parse_qty(args.next().as_ref())?),
+            Some("--rest") => rest = Some(parse_rest(args.next().as_ref())?),
+            Some("--clock") => clock_only = true,
             Some("-h" | "--help") => return Ok(Command::Help),
             _ => return Err(UnknownArgument),
         }
     }
-    Ok(Command::Check {
+    Ok(Command::Check(Check {
         venue,
         symbol: symbol.unwrap_or_else(|| DEFAULT_SYMBOL.to_owned()),
-    })
+        qty: qty.unwrap_or_else(|| PROBE_QTY.parse().expect("a valid literal")),
+        rest,
+        clock_only,
+    }))
+}
+
+/// The value given after `--qty`, if it is a positive quantity. Anything
+/// else is refused without being echoed, as every argument this refuses is:
+/// the alphabets a key comes in do not parse as a quantity.
+fn parse_qty(given: Option<&OsString>) -> Result<Qty, UnknownArgument> {
+    given
+        .and_then(|value| value.to_str())
+        .and_then(|text| text.parse::<Qty>().ok())
+        .filter(|qty| *qty > Qty::ZERO)
+        .ok_or(UnknownArgument)
+}
+
+/// The value given after `--rest`, if it is an `http` or `https` URL on a
+/// loopback host (`quant_binance::endpoint`), so that no override can point a
+/// check of one venue at the other.
+fn parse_rest(given: Option<&OsString>) -> Result<String, UnknownArgument> {
+    given
+        .and_then(|value| value.to_str())
+        .and_then(|text| local_override(text, &["http://", "https://"]).ok())
+        .ok_or(UnknownArgument)
 }
 
 /// The value given after `--symbol`, if it is spelled as the venue spells the
@@ -224,8 +295,8 @@ fn parse_symbol(given: Option<&OsString>) -> Result<String, UnknownArgument> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let (venue, symbol) = match parse_args(std::env::args_os().skip(1)) {
-        Ok(Command::Check { venue, symbol }) => (venue, symbol),
+    let asked = match parse_args(std::env::args_os().skip(1)) {
+        Ok(Command::Check(asked)) => asked,
         Ok(Command::Help) => {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -237,6 +308,7 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let venue = asked.venue;
     match venue {
         Venue::Live => println!("venue        {}", venue.base()),
         Venue::Testnet => {
@@ -244,6 +316,35 @@ async fn main() -> ExitCode {
             println!("             a testnet key pair is separate from the live one");
         }
     }
+    if let Some(rest) = &asked.rest {
+        println!("             every request goes instead to {rest}, a local stand-in (--rest)");
+    }
+    if asked.clock_only {
+        // The clock alone: unsigned, so no credentials are read, and nothing
+        // about the account or the key is claimed.
+        return match clock_offset(asked.base()).await {
+            Ok(offset) if offset.unsigned_abs() <= MAX_CLOCK_SKEW_MS.unsigned_abs() => {
+                println!(
+                    "verdict      CLOCK READY: within {MAX_CLOCK_SKEW_MS} ms of the venue. Only \
+                     the clock was checked (--clock): no key, no signature, no account"
+                );
+                ExitCode::SUCCESS
+            }
+            Ok(offset) => {
+                println!();
+                eprintln!(
+                    "verdict      NOT READY: {}",
+                    NotReady::ClockSkew {
+                        offset_ms: offset,
+                        allowed_ms: MAX_CLOCK_SKEW_MS,
+                    }
+                );
+                ExitCode::FAILURE
+            }
+            Err(code) => code,
+        };
+    }
+    let symbol = asked.symbol.as_str();
     println!("symbol       {symbol}, which the trade probe names and the fee check reads");
 
     let credentials = match Credentials::from_env() {
@@ -263,31 +364,32 @@ async fn main() -> ExitCode {
     );
     print!("{}", credentials.public_key_pem());
 
-    let offset = match clock_offset(venue).await {
+    let offset = match clock_offset(asked.base()).await {
         Ok(offset) => offset,
         Err(code) => return code,
     };
-    check(venue, &symbol, credentials, offset).await
+    check(&asked, credentials, offset).await
 }
 
-/// How far this host's clock is from the venue's, printed, or the exit code
-/// when there is no verdict to be had.
-async fn clock_offset(venue: Venue) -> Result<i64, ExitCode> {
+/// How far this host's clock is from the clock at `base`, printed, or the
+/// exit code when there is no verdict to be had.
+async fn clock_offset(base: &str) -> Result<i64, ExitCode> {
     // The venue's clock, read the way NTP reads one: the host's clock either
     // side of `GET /api/v3/time`, the venue's reading taken to describe the
     // midpoint, and of several readings the one with the smallest round trip
     // believed. `ClockSample` holds the arithmetic and the reasons for it.
     //
     // This is not the recorder's startup check, and the two figures differ by
-    // design. That one -- like `ops/preflight.ps1` and `ops/fix-clock.ps1` --
-    // reads `before - serverTime` once and leaves it uncorrected
-    // (`SnapshotClient::clock_offset_millis` says why), so it comes out short by
-    // the outbound leg: on a slow link, enough to make a clock that is fine look
-    // like one behind the venue. Tolerable in a warning about a metric; not in
-    // the figure that decides whether this host may trade. `ops/preflight.sh`
-    // and `ops/fix-clock.sh` compute the same midpoint as this, with the
-    // opposite sign: positive there means the host is behind.
-    let public = match SnapshotClient::new(venue.base(), Duration::from_secs(10)) {
+    // design. That one reads `before - serverTime` once and leaves it
+    // uncorrected (`SnapshotClient::clock_offset_millis` says why), so it comes
+    // out short by the outbound leg: on a slow link, enough to make a clock
+    // that is fine look like one behind the venue. Tolerable in a warning
+    // about a metric; not in the figure that decides whether this host may
+    // trade. `ops/preflight.ps1` and `ops/fix-clock.ps1` can read this one, with
+    // `--clock`, rather than measure the naive figure themselves.
+    // `ops/preflight.sh` and `ops/fix-clock.sh` compute the same midpoint as
+    // this, with the opposite sign: positive there means the host is behind.
+    let public = match SnapshotClient::new(base, Duration::from_secs(10)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("clock        could not build a client: {e}");
@@ -326,18 +428,19 @@ async fn clock_offset(venue: Venue) -> Result<i64, ExitCode> {
 }
 
 /// The order `POST /api/v3/order/test` is asked to validate: a market buy of
-/// [`PROBE_QTY`] of `symbol`, the shape `MaCrossover` sends, written by the
+/// `qty` of `symbol`, [`PROBE_QTY`] unless `--qty` says otherwise, the shape `MaCrossover` sends, written by the
 /// encoder the run's orders go through. `quant_binance::trade::probe` writes
 /// it, and says why any refusal of it, a filter failure included, is not
 /// ready; the live binary asks the venue the same question with the same
 /// probe at its own size.
-fn probe(symbol: &str) -> Result<NewOrder, EncodeError> {
-    quant_binance::trade::probe(symbol, PROBE_QTY.parse().expect("a valid literal"))
+fn probe(symbol: &str, qty: Qty) -> Result<NewOrder, EncodeError> {
+    quant_binance::trade::probe(symbol, qty)
 }
 
 /// The three signed requests, a line for each, and the verdict.
-async fn check(venue: Venue, symbol: &str, credentials: Credentials, offset: i64) -> ExitCode {
-    let client = match TradeClient::new(venue.base(), Duration::from_secs(10), credentials) {
+async fn check(asked: &Check, credentials: Credentials, offset: i64) -> ExitCode {
+    let (venue, symbol, qty) = (asked.venue, asked.symbol.as_str(), asked.qty);
+    let client = match TradeClient::new(asked.base(), Duration::from_secs(10), credentials) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("venue        could not build a client: {e}");
@@ -349,7 +452,7 @@ async fn check(venue: Venue, symbol: &str, credentials: Credentials, offset: i64
     }
     println!("account      a signed request was accepted, and the account reports canTrade true");
 
-    let probe = match probe(symbol) {
+    let probe = match probe(symbol, qty) {
         Ok(probe) => probe,
         Err(why) => {
             eprintln!("permission   could not write the trade probe: {why}");
@@ -362,7 +465,7 @@ async fn check(venue: Venue, symbol: &str, credentials: Credentials, offset: i64
         return not_ready(venue, &why);
     }
     println!(
-        "permission   POST /api/v3/order/test accepted a market buy of {PROBE_QTY} {symbol}, the \
+        "permission   POST /api/v3/order/test accepted a market buy of {qty} {symbol}, the \
          run's own order, and refused nothing: this API key may trade"
     );
 
@@ -398,7 +501,8 @@ fn millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, probe, Command, UnknownArgument, Venue, READY, USAGE};
+    use super::{parse_args, probe, Check, Command, UnknownArgument, Venue, READY, USAGE};
+    use quant_core::fixed::Qty;
     use std::ffi::OsString;
 
     fn args(list: &[&str]) -> Vec<OsString> {
@@ -406,9 +510,84 @@ mod tests {
     }
 
     fn check(venue: Venue, symbol: &str) -> Command {
-        Command::Check {
+        Command::Check(Check {
             venue,
             symbol: symbol.to_owned(),
+            qty: qty("0.001"),
+            rest: None,
+            clock_only: false,
+        })
+    }
+
+    fn qty(text: &str) -> Qty {
+        text.parse().expect("a quantity")
+    }
+
+    fn asked(given: &[&str]) -> Check {
+        match parse_args(args(given)) {
+            Ok(Command::Check(asked)) => asked,
+            other => panic!("{given:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_harness_flags_set_the_size_a_local_stand_in_and_the_clock_alone() {
+        let plain = asked(&[]);
+        assert_eq!(
+            (plain.qty, &plain.rest, plain.clock_only),
+            (qty("0.001"), &None, false)
+        );
+        assert_eq!(plain.base(), "https://api.binance.com");
+
+        let given = asked(&[
+            "--testnet",
+            "--qty",
+            "0.002",
+            "--rest",
+            "http://127.0.0.1:9",
+        ]);
+        assert_eq!(given.venue, Venue::Testnet);
+        assert_eq!(given.qty, qty("0.002"));
+        // The stand-in is where every request goes, whichever venue is named.
+        assert_eq!(given.base(), "http://127.0.0.1:9");
+        assert!(
+            probe(&given.symbol, given.qty)
+                .expect("encodes")
+                .query()
+                .contains("&quantity=0.002&"),
+            "the probe is the run's size"
+        );
+        for local in [
+            "http://localhost:1",
+            "https://[::1]:2/api",
+            "http://127.0.0.2",
+        ] {
+            assert_eq!(asked(&["--rest", local]).base(), local);
+        }
+        assert!(asked(&["--clock"]).clock_only);
+    }
+
+    #[test]
+    fn a_stand_in_that_is_not_local_or_a_size_that_is_not_one_is_refused_unrepeated() {
+        // Either venue named as a stand-in above all: a check of the testnet
+        // that reached the live venue, or the other way round.
+        let key = "MC4CAQAwBQYDK2VwBCIEIIJEYWtGBrhACmb9Dvy+qa8WEf0lQOl1s4CLIAB9m89u";
+        for given in [
+            args(&["--rest", "https://api.binance.com"]),
+            args(&["--testnet", "--rest", "https://testnet.binance.vision"]),
+            args(&["--rest", "http://127.0.0.1.example"]),
+            args(&["--rest", "http://127.0.0.1@example.org"]),
+            args(&["--rest", "ws://127.0.0.1:9"]),
+            args(&["--rest", key]),
+            args(&["--rest"]),
+            args(&["--qty", key]),
+            args(&["--qty", "0"]),
+            args(&["--qty", "-0.001"]),
+            args(&["--qty"]),
+        ] {
+            let why = parse_args(given.clone()).expect_err("refused");
+            assert_eq!(why, UnknownArgument, "{given:?}");
+            assert!(!why.to_string().contains(&key[..12]));
         }
     }
 
@@ -497,11 +676,11 @@ mod tests {
         // The run's shape and size, under an id no run of ours would send,
         // written by the encoder every order goes through.
         assert_eq!(
-            probe("BTCUSDT").expect("encodes").query(),
+            probe("BTCUSDT", qty("0.001")).expect("encodes").query(),
             "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.001&newClientOrderId=q-venuecheck-0\
              &newOrderRespType=ACK"
         );
-        assert!(probe("ETHUSDT")
+        assert!(probe("ETHUSDT", qty("0.001"))
             .expect("encodes")
             .query()
             .starts_with("symbol=ETHUSDT&"));
@@ -555,7 +734,10 @@ mod tests {
             "--testnet",
             "https://testnet.binance.vision",
             "A testnet key pair is separate from the live one",
-            "usage: venue-check [--testnet] [--symbol SYMBOL]\n",
+            "usage: venue-check [--testnet] [--symbol SYMBOL] [--qty QTY] [--rest URL] [--clock]\n",
+            "\n  --rest URL  send every request to a local stand-in",
+            "on 127.0.0.1, ::1 or localhost and nowhere else",
+            "\n  --clock     read the venue's clock only",
             "\n  --symbol SYMBOL\n",
             "in capital letters and digits: BTCUSDT",
             "places nothing",
