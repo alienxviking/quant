@@ -1,5 +1,5 @@
-//! A local stand-in for Binance, for rehearsing the live harness end to end
-//! (`docs/live-run.md` section 4, item 8b).
+//! A local stand-in for Binance, for rehearsing the live harness end to end:
+//! `ops/rehearse-live.ps1` runs under it (`docs/live-run.md` §7, *Running it*).
 //!
 //! ```text
 //! cargo build --release -p quant-backtest --example fake-binance

@@ -115,8 +115,8 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 911 tests green in debug
-and release, clippy and fmt clean, ~80,000 lines across 13 crates.
+same window exactly, on both symbols, to the satoshi. 916 tests green in debug
+and release, clippy and fmt clean, ~80,800 lines of Rust across 13 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
 > artifacts were proven intact here the same day.** *"Picking up on the Omen"* at
@@ -1847,16 +1847,20 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   fixes one side of the boundary under test proves much less than it looks like
   it does.
 
-- **`ops/*.ps1` is record-only, and the bash half has only ever run on macOS.**
-  The paper mode exists in the bash half alone, which was the right call when it
-  was made — *an untested paper mode there would be exactly the
-  harness-never-run M1 warns about*. There is **no live mode in either half
-  yet**: `supervise.sh` accepts only `record` and `paper`. This entry used to say
-  WSL runs the bash half unmodified; it does not, because it uses BSD
-  `date -u -r EPOCH`, `caffeinate` and BSD `stat -f`. So an M8 run on Windows
-  needs either a WSL port or a PowerShell port, rehearsed either way. M8 plans
-  an afternoon, not 72 hours (`docs/live-run.md` §2), but the host still has to
-  stay awake through it.
+- **`ops/*.ps1` has a live mode now (8b), and a recorder there still cannot
+  be stopped cleanly.** `m8c-live-ops` added `ops/start-live.ps1` and its
+  siblings, one attempt and no restart as the owner chose, tested by
+  `ops/test-live.ps1` and rehearsed end to end against `fake-binance`
+  (`docs/live-run.md` §7, *Running it*). The paper mode is still bash-only, and
+  the bash half has only ever run on macOS: it uses BSD `date -u -r EPOCH`,
+  `caffeinate` and BSD `stat -f`. What 8b found and left alone, because the
+  record harness was to stay as it is: `stop-run.ps1` asks a recorder to finish
+  with `CloseMainWindow`, and a process in the hidden console the harness starts
+  it in has no window. Tried against the live binary started the same way:
+  `MainWindowHandle` 0, the call returned `False`, and the process ran on until
+  killed. So a Windows recorder run ends cleanly only at its duration limit. The
+  live binary got `--stop-file` for exactly this, and the recorder would need
+  the same.
 
 - **Whichever machine runs M8 must pass `venue-check` before anything is
   planned around it.** M8.b made a host more than 1000 ms from the venue unable
@@ -2498,11 +2502,22 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   traded, 1 could not go on, 2 a bad argument and 3 recorded only, which
   8b's supervisor must not restart.
 
-  **What remains in (c) is 8b and 8c of `docs/live-run.md` §4 item 8.** 8b,
-  the live mode in `ops/`, is a PowerShell live mode with no automatic
-  restart, the owner's choice on 2026-10-26. 8c, the Spot Testnet run, waits
-  on this host's clock (2.1 s ahead, `w32time` stopped) and an Ed25519
-  testnet key pair. The testnet market stream's address, which 8a first wrote
+  **8b, the live mode in `ops/`, is built** (`m8c-live-ops`): PowerShell,
+  one attempt and no restart, the owner's choice on 2026-10-26.
+  `ops/start-live.ps1` starts one symbol on Spot Testnet unless `-RealMoney`
+  says otherwise, and its supervisor holds the host's one-live-run lock and a
+  keep-awake request, writes the ending into `run.json` in words, and runs the
+  four after-run checks. The stop is `ops/stop-live.ps1`, through the binary's
+  new `--stop-file`, because no other process can give it a Ctrl-C on
+  Windows. The preflight runs `venue-check`, which gained `--qty`, `--rest`
+  and `--clock`, as gate 1 asks it. Tested by `ops/test-live.ps1`, every
+  check seen red under a break, and rehearsed end to end against
+  `fake-binance`, with all four after-run checks clean.
+
+  **What remains in (c) is 8c of `docs/live-run.md` §4 item 8**, the Spot
+  Testnet run. It waits on this host's clock (2.1 s ahead, `w32time`
+  stopped) and an Ed25519 testnet key pair, and `docs/live-run.md` §7,
+  *8c: what the owner types*, is the procedure. The testnet market stream's address, which 8a first wrote
   from memory, was checked against Binance's published testnet documentation
   before 8a merged. Mapping what `LiveVenue` has to fit (2026-10-14/15) found seven defects in
   shipped code, which went first, each on its own branch (#52 to #56, and see

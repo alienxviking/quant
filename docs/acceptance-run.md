@@ -117,6 +117,21 @@ powershell -ExecutionPolicy Bypass -File ops\start-run.ps1
 
 Then `ops\status.ps1` to check, `ops\stop-run.ps1` to end it early.
 
+**On Windows, `stop-run.ps1` does not end a recorder cleanly**, which was found
+while building M8's live mode (2026-10-27). It asks each recorder to finish with
+`CloseMainWindow`, and a recorder runs in the hidden console `start-run.ps1`
+starts its supervisor in, so there is no window to close. Tried against the live
+binary started the same way, the call returned `False` and the process ran on.
+The script then ends in its own "did not finish" message, and the kill it
+suggests leaves the last segment without a trailer. Until the recorder has a
+stop it can be given from outside, as the live binary has, let a Windows run end
+at its `-Days` or `-Minutes`: the duration limit is a clean exit. A live run has
+a harness of its own and a clean stop, in `docs/live-run.md` §7, *Running it*.
+
+The preflight's clock reading is `venue-check --clock`'s, round-trip corrected,
+and the preflight builds `venue-check` for it. It used to take now minus
+`serverTime` from one request, which counts the one-way latency as offset.
+
 `start-run` (either host) refuses to start on a preflight blocker. `--force`
 (`-Force` on Windows) overrides it and records that it did so in `run.json`,
 because a run started over a known problem should not be discovered to have been
