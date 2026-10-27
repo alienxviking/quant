@@ -28,9 +28,11 @@
                                produced: 0 agrees, 1 does not, 2 nothing
                                compared.
 
-    A run that recorded only, or refused its arguments, journals nothing, so
-    the three journal checks have nothing to read; that is said, and is not a
-    failure. A run that wrote a journal is held to all four.
+    A run that recorded only, or refused its arguments, journals nothing: it
+    leaves no journal, or an empty one, since the binary opens the file
+    before its gates decide. So the three journal checks have nothing to read;
+    that is said, and is not a failure. A run whose journal holds a line is
+    held to all four.
 
     The supervisor runs this when the binary has ended. Run it by hand to see
     the same verdicts again:
@@ -69,7 +71,8 @@ function Note {
     param([string] $Message)
     $line = "{0} {1}" -f (Get-UtcStamp), $Message
     Write-Host $line
-    Add-Content -Path $log -Value $line -Encoding utf8
+    # A shared append (shared-log.ps1): the status view reads this log.
+    if (-not (Add-SharedLine -Path $log -Line $line)) { Write-Host "  (the log could not take that line)" }
 }
 
 function Invoke-Check {
@@ -83,8 +86,9 @@ function Invoke-Check {
     if (-not (Test-Path $Exe)) {
         return @{ code = -1; out = $out; missing = $true }
     }
-    $quoted = @()
-    foreach ($argument in $Arguments) { $quoted += "`"$argument`"" }
+    # Quoted by the one rule (native-args.ps1), so a root with a space in it
+    # or ending in a backslash arrives as one argument.
+    $quoted = ConvertTo-NativeArguments $Arguments
     $process = Start-Process -FilePath $Exe -ArgumentList $quoted `
         -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
     $null = $process.Handle
@@ -99,7 +103,9 @@ function Verdict-Of {
 }
 
 $failures = 0
-$journalled = (-not [string]::IsNullOrWhiteSpace($journal)) -and (Test-Path $journal)
+# Written, not merely there: a run that recorded only leaves the empty file the
+# binary opened before its gates refused.
+$journalled = (-not [string]::IsNullOrWhiteSpace($journal)) -and (Test-Path $journal) -and ((Get-Item $journal).Length -gt 0)
 Note "checking the live run at $Root"
 
 # --- both captures -----------------------------------------------------------
@@ -131,7 +137,7 @@ if ($v.missing) {
 
 # --- the journal -------------------------------------------------------------
 if (-not $journalled) {
-    Note "NONE journal: there is none at $journal -- a run that recorded only, or never started, journals nothing"
+    Note "NONE journal: nothing is written at $journal -- a run that recorded only, or never started, journals nothing"
 } else {
     $checks = @(
         @{ name = 'reconcile'; exe = 'reconcile.exe'; args = @($journal)

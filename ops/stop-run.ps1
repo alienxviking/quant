@@ -30,8 +30,11 @@ $Root = (Resolve-Path $Root).Path
 # it would kill the live supervisor, which records how the run ended and holds
 # the host awake, then look for a recorder, find none, and report success
 # while live.exe went on trading. A recorder run's run.json has no mode.
-$probe = Join-Path $Root 'run.json'
-if ((Test-Path $probe) -and ((Get-Content $probe -Raw | ConvertFrom-Json).mode -eq 'live')) {
+# Read through live-common's Read-RunJson, which shares the file with the
+# live supervisor writing it rather than blocking that write.
+. (Join-Path $here 'live-common.ps1')
+$probe = Read-RunJson -Root $Root
+if ($null -ne $probe -and $probe.mode -eq 'live') {
     Write-Host 'a live run: stopping it with ops\stop-live.ps1'
     & (Join-Path $here 'stop-live.ps1') -Root $Root
     exit $LASTEXITCODE

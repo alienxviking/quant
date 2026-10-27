@@ -15,14 +15,17 @@
          deliberately, not something to paper over with a respawn.
       2  it refused its arguments. The same arguments would be refused again.
       3  a gate refused and it recorded only. A restart meets the same gate.
-      any other code: it was killed or crashed. The gates already refuse to
-         trade after an unclean stop with orders working, so a restart would
-         only record, and would bury the one log that says what happened.
+      killed: any ending the binary did not announce with its last line,
+         `exit      N`, whatever the code, since taskkill /F gives 1. The
+         gates already refuse to trade after an unclean stop with orders
+         working, so a restart would only record, and would bury the one log
+         that says what happened.
 
     So this is not a loop. It takes the one-live-run lock, holds the host
     awake, runs target\release\live.exe with exactly the arguments run.json
-    records, waits, writes the outcome in words into run.json and its log,
-    runs the after-run checks (check-live.ps1), and lets go of everything.
+    records, records whether the binary's gates passed, waits, writes the
+    outcome in words into run.json and its log, runs the after-run checks
+    (check-live.ps1), and lets go of everything.
 
     It reads what to run from run.json rather than from its own command line,
     for two reasons. powershell.exe -File cannot pass an array through
@@ -32,9 +35,13 @@
     used is copied into run.json too, from its banner: print what was used,
     not what was asked for.
 
-    The one writer of run.json once the run has started, so that no two
-    scripts race to rewrite it. stop-live.ps1 asks for a stop by creating the
-    stop file and writes nothing here.
+    The one writer of run.json once the run has started. Once the binary is
+    running, nothing about that bookkeeping may end this script: a write that
+    fails, because something holds run.json open past every retry, is logged
+    and the run is still waited for to its end. A supervisor that died there
+    would leave live.exe trading with nobody to record how it ended.
+    stop-live.ps1 asks for a stop by creating the stop file and writes nothing
+    here.
 
     Exit codes: the binary's own 0 to 3; 4 when it was killed or crashed; 5
     when this refused to start it (another live run holds the lock, a live.exe
@@ -65,21 +72,38 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Forc
 $log = Join-Path $logDir 'supervisor-live.log'
 
 function Note {
+    # Said and logged, by a shared append (shared-log.ps1): the status view,
+    # stop-live.ps1 and the tests read this log while it is written. A log
+    # still refused after the retries loses the line from the file, which is
+    # said here; it does not end the supervision.
     param([string] $Message)
     $line = "{0} {1}" -f (Get-UtcStamp), $Message
     Write-Host $line
-    Add-Content -Path $log -Value $line -Encoding utf8
+    if (-not (Add-SharedLine -Path $log -Line $line)) { Write-Host "  (the log could not take that line)" }
+}
+
+function Record {
+    # Fields into run.json, from the moment the binary is running: a failure
+    # is logged and survived, never thrown (the description says why).
+    param([Parameter(Mandatory)] [hashtable] $Fields, [Parameter(Mandatory)] [string] $What, [int] $RetrySeconds = 10)
+    try {
+        Set-RunField -Root $Root -Fields $Fields -RetrySeconds $RetrySeconds
+        return $true
+    } catch {
+        Note "WARNING: could not write $What into run.json: $($_.Exception.Message). The run goes on, and this supervisor still waits for it to end"
+        return $false
+    }
 }
 
 function Refuse {
     param([string] $Why)
     Note "REFUSED: $Why"
-    Set-RunField -Root $Root -Fields @{
+    [void](Record -What 'the refusal' -Fields @{
         supervisor = 'refused'
         outcome    = 'refused'
         outcome_meaning = $Why
         ended_at   = (Get-UtcStamp)
-    }
+    })
     exit 5
 }
 
@@ -110,9 +134,9 @@ try {
 
     $held = Enable-KeepAwake
     $system = [QuantKeepAwake]::SystemState()
-    if (($held -band $script:EsSystemRequired) -ne 0) {
+    if (Test-KeepAwakeHeld $held) {
         $awake = $held
-        Note "keep-awake held: this thread asks Windows not to sleep (thread $(Format-ExecutionState $held), system $(Format-ExecutionState $system)), until this supervisor ends"
+        Note "keep-awake held: this thread asks Windows not to sleep or turn the display off (thread $(Format-ExecutionState $held), system $(Format-ExecutionState $system)), until this supervisor ends"
     } else {
         Note "WARNING: keep-awake could not be held (thread $(Format-ExecutionState $held)); keep this host awake by hand"
     }
@@ -121,53 +145,94 @@ try {
     $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
     $out = Join-Path $logDir "live-$($manifest.symbol)-$stamp.log"
     $err = Join-Path $logDir "live-$($manifest.symbol)-$stamp.err"
-    # Every argument is quoted. Start-Process joins an ArgumentList array with
-    # spaces and quotes nothing, so an unquoted path with a space in it would
-    # arrive as two arguments.
-    $quoted = @()
-    foreach ($argument in @($manifest.live_args)) { $quoted += "`"$argument`"" }
+    # Every argument quoted by the one rule (native-args.ps1): Start-Process
+    # joins an ArgumentList with spaces and quotes nothing, and a plain pair
+    # of quotes around a value ending in a backslash escapes the closing one.
+    $quoted = ConvertTo-NativeArguments @($manifest.live_args)
 
     $startedAt = Get-Date
     # Not -Wait: the pid is wanted before the wait, for run.json and for
     # stop-live.ps1. Reading .Handle at once keeps the process handle, without
     # which Windows PowerShell 5.1 reports no exit code for a process started
     # without -Wait.
-    $process = Start-Process -FilePath $exe -ArgumentList $quoted `
-        -RedirectStandardOutput $out -RedirectStandardError $err `
-        -NoNewWindow -PassThru
-    $null = $process.Handle
-    Note "live pid $($process.Id) started, log $([System.IO.Path]::GetFileName($out))"
-    Set-RunField -Root $Root -Fields @{
-        supervisor     = 'running'
-        supervisor_pid = $PID
-        live_pid       = $process.Id
-        live_log       = $out
-        live_err       = $err
-        live_started_at = (Get-UtcStamp)
+    try {
+        $process = Start-Process -FilePath $exe -ArgumentList $quoted `
+            -RedirectStandardOutput $out -RedirectStandardError $err `
+            -NoNewWindow -PassThru
+        $null = $process.Handle
+    } catch {
+        Refuse "the binary could not be started: $($_.Exception.Message)"
     }
 
-    # The banner: everything the binary is about to do, before it does any of
-    # it. Copied into run.json once it is complete, which the blank line after
-    # it says, or whatever of it there is if the binary ends first.
-    $banner = @()
-    $deadline = (Get-Date).AddSeconds(30)
-    while ((Get-Date) -lt $deadline) {
-        $lines = @(Read-SharedLines -Path $out | Where-Object { -not $_.StartsWith('{') })
-        $blank = [array]::IndexOf($lines, '')
-        if ($blank -ge 0) { $banner = $lines[0..($blank - 1)]; break }
-        if ($process.HasExited) { $banner = $lines; break }
-        Start-Sleep -Milliseconds 200
-    }
-    if ($banner.Count -gt 0) {
-        Set-RunField -Root $Root -Fields @{ banner = $banner }
-        foreach ($line in $banner) { Note "  $line" }
+    # From here to WaitForExit nothing may throw: the binary is running, and
+    # only its end ends this script.
+    try {
+        Note "live pid $($process.Id) started, log $([System.IO.Path]::GetFileName($out))"
+        [void](Record -What 'the binary''s pid' -Fields @{
+            supervisor     = 'running'
+            supervisor_pid = $PID
+            live_pid       = $process.Id
+            live_log       = $out
+            live_err       = $err
+            live_started_at = (Get-UtcStamp)
+        })
+
+        # The banner: everything the binary is about to do, before it does any
+        # of it. Copied into run.json once it is complete, which the blank line
+        # after it says, or whatever of it there is if the binary ends first.
+        $banner = @()
+        $deadline = (Get-Date).AddSeconds(30)
+        while ((Get-Date) -lt $deadline) {
+            $lines = @(Read-SharedLines -Path $out | Where-Object { -not $_.StartsWith('{') })
+            $blank = [array]::IndexOf($lines, '')
+            if ($blank -ge 0) { $banner = $lines[0..($blank - 1)]; break }
+            if ($process.HasExited) { $banner = $lines; break }
+            Start-Sleep -Milliseconds 200
+        }
+        if ($banner.Count -gt 0) {
+            [void](Record -What 'the banner' -Fields @{ banner = $banner })
+            foreach ($line in $banner) { Note "  $line" }
+        }
+
+        # The gates: whether this run trades or only records, which the binary
+        # says the moment it knows, and which nothing else says until the run
+        # ends. A gate's refusal makes the whole afternoon a recording, so it
+        # is copied into run.json at once, for start-live.ps1 to say at the
+        # prompt and status.ps1 to show.
+        $gate = $null
+        while ($null -eq $gate) {
+            foreach ($line in (Read-SharedLines -Path $out)) {
+                if ($line -match '^trading\s+under run tag (\S+)') {
+                    $gate = @{ gates = 'passed'; run_tag = $Matches[1]; gate_line = $line }
+                    break
+                }
+                if ($line -match '^RECORD ONLY\s+(.*)$') {
+                    $gate = @{ gates = 'refused'; gate_line = $line; gate_refusal = $Matches[1] }
+                    break
+                }
+            }
+            if ($null -ne $gate -or $process.HasExited) { break }
+            Start-Sleep -Milliseconds 250
+        }
+        if ($null -ne $gate) {
+            if ($gate.gates -eq 'passed') {
+                Note "gates passed: trading under run tag $($gate.run_tag)"
+            } else {
+                Note "GATES REFUSED, RECORDING ONLY: $($gate.gate_refusal)"
+            }
+            [void](Record -What 'the gates'' answer' -Fields $gate)
+        }
+    } catch {
+        Note "WARNING: $($_.Exception.Message). The run goes on, and this supervisor still waits for it to end"
     }
 
     $process.WaitForExit()
     $code = $process.ExitCode
     $ranFor = [int]((Get-Date) - $startedAt).TotalSeconds
-    $outcome = Get-LiveOutcome -Code $code
-    $verdict = @(Read-SharedLines -Path $out | Where-Object { $_ -match '^verdict' }) -join ' '
+    $said = @(Read-SharedLines -Path $out)
+    $announced = Get-AnnouncedExit -Lines $said
+    $outcome = Get-LiveOutcome -Code $code -Announced $announced
+    $verdict = @($said | Where-Object { $_ -match '^verdict' }) -join ' '
 
     $stopFile = $manifest.stop_file
     $stopAsked = $null
@@ -179,32 +244,39 @@ try {
     if ($verdict) { Note "  $verdict" }
     if ($stopAsked) { Note "  a stop was asked for at $stopAsked (the stop file)" }
     Note 'not restarting: a live run is one attempt, whatever its ending (docs/live-run.md, "Where it runs")'
-    Set-RunField -Root $Root -Fields @{
+    # The ending is the one write that matters most, so it is tried for longer:
+    # stop-live.ps1 and status.ps1 wait on it.
+    [void](Record -What 'how the run ended' -RetrySeconds 120 -Fields @{
         supervisor      = 'finished'
         ended_at        = (Get-UtcStamp)
         exit_code       = $code
+        exit_announced  = $announced
         outcome         = $outcome.outcome
         outcome_meaning = $outcome.meaning
         verdict         = $verdict
         stop_requested_at = $stopAsked
         ran_for_seconds = $ranFor
-    }
+    })
 
     # The after-run checks, on what the run left: both capture trees verified,
     # and the journal reconciled, checked and replayed against the account
     # capture. Their verdict is recorded beside the outcome, never in place of
     # it: a run that stopped cleanly and a check that failed are two facts.
     Note 'after-run checks: ops\check-live.ps1'
-    & (Join-Path $here 'check-live.ps1') -Root $Root
     $checks = 'failed'
-    if ($LASTEXITCODE -eq 0) { $checks = 'clean' }
+    try {
+        & (Join-Path $here 'check-live.ps1') -Root $Root
+        if ($LASTEXITCODE -eq 0) { $checks = 'clean' }
+    } catch {
+        Note "the after-run checks could not run: $($_.Exception.Message)"
+    }
     Note "after-run checks $checks"
-    Set-RunField -Root $Root -Fields @{ checks = $checks }
+    [void](Record -What 'the after-run checks' -RetrySeconds 120 -Fields @{ checks = $checks })
 } finally {
     if ($null -ne $awake) {
         $was = Disable-KeepAwake
         $left = Get-ThreadAwakeState
-        if (($was -band $script:EsSystemRequired) -ne 0) {
+        if (Test-KeepAwakeHeld $was) {
             Note "keep-awake released (this thread held $(Format-ExecutionState $was), and holds $(Format-ExecutionState $left) now)"
         } else {
             Note "WARNING: keep-awake release found $(Format-ExecutionState $was) on this thread, not the request made; Windows releases it when this process ends"
@@ -215,5 +287,5 @@ try {
 }
 
 if ($null -eq $code) { exit 5 }
-if ($code -ge 0 -and $code -le 3) { exit $code }
-exit 4
+if ($outcome.outcome -eq 'killed') { exit 4 }
+exit $code

@@ -32,6 +32,13 @@ if ($null -eq $m -or $m.mode -ne 'live') {
     Write-Host "no live run.json at $Root"
     exit 1
 }
+# The root as start-live.ps1 spelt it, which is how its processes' command
+# lines name it.
+$runRoot = "$($m.root)"
+if ([string]::IsNullOrWhiteSpace($runRoot)) { $runRoot = $Root }
+# The supervisor, known by what it runs and not by its pid alone, which
+# Windows may since have handed to another process.
+$supervisorAlive = Test-HarnessProcess -Id $m.supervisor_pid -Script 'supervise-live.ps1' -Root $runRoot
 
 function Age {
     param([datetime] $When)
@@ -66,12 +73,27 @@ switch ("$($m.supervisor)") {
         Write-Host "REFUSED  the supervisor did not start the binary: $($m.outcome_meaning)"
     }
     'running' {
-        $live = Get-Process -Id $m.live_pid -ErrorAction SilentlyContinue
+        $live = Get-RunLiveProcess $m
         if ($null -ne $live) {
             $up = (Get-Date) - $live.StartTime
             Write-Host ("RUNNING  live pid {0}, up {1:0}h{2:00}m, {3} MB" -f $live.Id, [math]::Floor($up.TotalHours), $up.Minutes, [math]::Round($live.WorkingSet64 / 1MB))
-        } else {
+        } elseif ($supervisorAlive) {
             Write-Host "ENDING   live pid $($m.live_pid) has exited; the supervisor has not yet recorded how"
+        }
+        if (-not $supervisorAlive) {
+            # Nobody is left to write the ending: said, with what the binary's
+            # own log says, rather than shown as "ending" for ever.
+            $said = @()
+            if ($m.live_log) { $said = @(Read-SharedLines -Path "$($m.live_log)") }
+            $announced = Get-AnnouncedExit -Lines $said
+            Write-Host "LOST     the supervisor, pid $($m.supervisor_pid), is gone without recording how the run ended"
+            if ($null -ne $live) {
+                Write-Host "         live pid $($live.Id) runs on unsupervised: stop it with stop-live.ps1, then run check-live.ps1 by hand"
+            } elseif ($null -ne $announced) {
+                Write-Host "         the binary's log says it exited $announced; run check-live.ps1 by hand"
+            } else {
+                Write-Host "         the binary's log does not say it ended: it was killed too; run check-live.ps1 by hand"
+            }
         }
         if (Test-Path "$($m.stop_file)") {
             Write-Host "         a stop has been asked for (the stop file exists); the run is shutting down"
@@ -81,9 +103,18 @@ switch ("$($m.supervisor)") {
         Write-Host "STARTING the supervisor has not yet started the binary"
     }
 }
-$sup = $null
-if ($m.supervisor_pid) { $sup = Get-Process -Id $m.supervisor_pid -ErrorAction SilentlyContinue }
-if ($null -ne $sup) { Write-Host "         supervisor pid $($sup.Id) holds the one-live-run lock and the keep-awake request" }
+if ($supervisorAlive) { Write-Host "         supervisor pid $($m.supervisor_pid) holds the one-live-run lock and the keep-awake request" }
+
+# --- whether it trades -----------------------------------------------------------
+# The binary's gates answer within seconds of its start, and a refusal turns
+# the whole run into a recording; the supervisor copies the answer here.
+switch ("$($m.gates)") {
+    'passed'  { Write-Host "gates    passed: trading under run tag $($m.run_tag)" }
+    'refused' { Write-Host "gates    REFUSED, RECORDING ONLY, NOTHING TRADES: $($m.gate_refusal)" }
+    default {
+        if ("$($m.supervisor)" -eq 'running') { Write-Host 'gates    not yet answered: the binary has not said whether it trades' }
+    }
+}
 
 # --- the journal's last lines -----------------------------------------------
 Write-Host ""
@@ -134,8 +165,10 @@ if (Test-Path $verifyLog) {
 } else {
     Write-Host '  not run yet'
 }
+# Only once this run has ended: before that, there are no after-run checks of
+# its own to show.
 $checkLog = Join-Path $m.log_dir 'check-live.log'
-if (Test-Path $checkLog) {
+if ("$($m.supervisor)" -eq 'finished' -and (Test-Path $checkLog)) {
     Write-Host ""
     Write-Host "after-run checks"
     Get-Content $checkLog | Select-Object -Last 6 | ForEach-Object { Write-Host "  $_" }

@@ -21,7 +21,30 @@
     Unsigned, so it needs no credentials, which a recorder run does not have.
 
     Positive offset: this host is ahead of the venue, venue-check's sign.
+
+    Update-VenueCheck builds venue-check before it is asked, for fix-clock.ps1,
+    which is the first thing the 8c procedure runs: a binary left from an
+    earlier build may not know --clock at all, and then answers with its
+    usage, which reads as no clock.
 #>
+
+. (Join-Path $PSScriptRoot 'native-args.ps1')
+
+function Update-VenueCheck {
+    # cargo build of venue-check alone, redirected by cmd rather than by
+    # PowerShell (the 5.1 traps): its exit code and where its output went.
+    param([Parameter(Mandatory)] [string] $Repo)
+    $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+    $log = Join-Path $env:TEMP "quant-venue-check-build-$PID.log"
+    Push-Location $Repo
+    try {
+        cmd /c "cargo build --release -p quant-binance --bin venue-check > `"$log`" 2>&1"
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    return @{ code = $code; log = $log }
+}
 
 function Read-VenueClock {
     # A hashtable: ready (within a second), offset_ms and round_trip_ms when a
@@ -45,8 +68,7 @@ function Read-VenueClock {
     # Start-Process with its handle held, not -Wait and not a pipeline: the
     # native streams never reach PowerShell, which in 5.1 would wrap stderr
     # lines in ErrorRecords under ErrorActionPreference Stop.
-    $quoted = @()
-    foreach ($argument in $arguments) { $quoted += "`"$argument`"" }
+    $quoted = ConvertTo-NativeArguments $arguments
     $process = Start-Process -FilePath $Exe -ArgumentList $quoted `
         -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
     $null = $process.Handle
@@ -61,6 +83,13 @@ function Read-VenueClock {
     }
     $verdict = @($said | Where-Object { $_ -match '^verdict' }) -join ' '
     $detail = $verdict
+    if ([string]::IsNullOrWhiteSpace($detail)) {
+        # No verdict at all: an argument refused, which a build older than
+        # --clock does, or a crash. Its exit code and first line say which.
+        $first = @($said | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+        $detail = "venue-check exited $($process.ExitCode) without a verdict"
+        if ($first.Count -gt 0) { $detail += ": $($first[0])" }
+    }
     if ($null -ne $offset) { $detail = "${offset}ms from the venue, round-trip corrected (rtt ${rtt}ms)" }
     return @{
         ready = ($process.ExitCode -eq 0)

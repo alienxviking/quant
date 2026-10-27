@@ -18,6 +18,10 @@
     five seconds ahead, NOT READY, and the offset Read-VenueClock reports
     carries venue-check's sign (positive: this host is ahead).
 
+    And a venue-check that answers with no verdict, as one built before
+    --clock does: not ready, with its exit code and first line as the detail,
+    which is what fix-clock.ps1 prints.
+
     Needs target\release\venue-check.exe. Safe to run several copies at once:
     every listener is on a port of its own and nothing here is shared.
 
@@ -141,6 +145,28 @@ $probe.Start(); $deadPort = $probe.LocalEndpoint.Port; $probe.Stop()
 $clock = Read-VenueClock -Exe $exe -Base "http://127.0.0.1:$deadPort"
 Check 'a venue that does not answer is not ready' $false $clock.ready
 Check 'and gives no offset' $true ($null -eq $clock.offset_ms)
+
+# 4. A venue-check that does not know --clock, as one built before it did:
+#    it prints its usage and no verdict. The detail must still say what
+#    happened, with the code, rather than nothing at all.
+$old = Join-Path ([System.IO.Path]::GetTempPath()) ("quant-old-venue-check-{0}-{1}" -f $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $old -Force | Out-Null
+try {
+    $oldExe = Join-Path $old 'venue-check.exe'
+    Add-Type -OutputAssembly $oldExe -OutputType ConsoleApplication -TypeDefinition @'
+public static class OldVenueCheck {
+    public static int Main(string[] args) {
+        System.Console.Error.WriteLine("venue-check: an argument it does not take");
+        return 2;
+    }
+}
+'@
+    $clock = Read-VenueClock -Exe $oldExe
+} finally {
+    Remove-Item -Recurse -Force -LiteralPath $old -ErrorAction SilentlyContinue
+}
+Check 'a venue-check without --clock is not ready' $false $clock.ready
+Check 'and the detail says it exited 2 without a verdict, and what it said' $true ($clock.detail -match 'exited 2 without a verdict: venue-check: an argument it does not take')
 
 Write-Host ""
 Write-Host "$script:pass passed, $script:fail failed"

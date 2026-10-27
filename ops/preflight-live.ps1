@@ -241,8 +241,7 @@ if ($NoVenue) {
     if ($standIn) { $arguments += @('--rest', $Rest) }
     $out = Join-Path $env:TEMP "quant-preflight-venue-check-$PID.txt"
     $err = Join-Path $env:TEMP "quant-preflight-venue-check-$PID.err"
-    $quoted = @()
-    foreach ($argument in $arguments) { $quoted += "`"$argument`"" }
+    $quoted = ConvertTo-NativeArguments $arguments
     $process = Start-Process -FilePath (Join-Path $bin 'venue-check.exe') -ArgumentList $quoted `
         -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -PassThru
     $null = $process.Handle

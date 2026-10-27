@@ -31,9 +31,22 @@
          the time service.
       3. run.json: the run's parameters, the binary's exact arguments, the
          commit, the preflight's verdict, written before anything launches.
-      4. supervise-live.ps1 and verify-loop.ps1, detached and hidden, so this
-         window can be closed; and a wait until the supervisor has the lock
-         and the binary is running, so a refusal is said here.
+         An earlier run's run.json and after-run log at this root, which
+         -Resume or a run that never journalled leaves, are kept beside the
+         logs under that run's start time rather than written over.
+      4. supervise-live.ps1, detached and hidden, so this window can be
+         closed; a wait until the supervisor has the lock and the binary is
+         running, so a refusal is said here; and a wait until the binary's
+         gates have answered, so that a run which will only record is said
+         here too, rather than at the end of the afternoon.
+      5. verify-loop.ps1, detached, once the binary runs, and only then: a
+         refused start leaves nothing behind. It ends itself when run.json
+         says the run has.
+
+    Exit 0 when the binary runs and its gates passed, so it trades; 3 when it
+    runs and a gate refused, so it records only (stop it with stop-live.ps1,
+    or let it record); 4 when it runs and the gates had not answered within
+    -GateSeconds; 1 when nothing was started.
 
     Stop it with ops\stop-live.ps1, which asks the binary to stop cleanly
     through its stop file. Watch it with ops\status.ps1.
@@ -92,6 +105,9 @@ param(
     [switch] $Force,
     [int]    $VerifyEveryMinutes = 60,
     [int]    $FirstCheckSeconds = 300,
+    # How long to wait for the binary's gates to answer. They make signed
+    # requests of the venue, each bounded by the binary's own timeouts.
+    [int]    $GateSeconds = 180,
     # For the harness's own tests, which have no cargo build to wait for and
     # no venue to ask. Each is written into run.json when used.
     [switch] $SkipBuild,
@@ -119,7 +135,12 @@ if ($Minutes -le 0) { Write-Host 'not starting: -Minutes must be positive'; exit
 $environment = 'testnet'
 if ($RealMoney) { $environment = 'live' }
 if ([string]::IsNullOrWhiteSpace($Root)) { $Root = Join-Path $repo "data\$environment" }
+# One spelling of the root for every script and every command line: full, and
+# without a trailing backslash, which C:\runs\one\ and C:\runs\one would
+# otherwise make two roots to anything comparing them. A drive's own root
+# keeps its backslash, since C: alone means that drive's current directory.
 $Root = [System.IO.Path]::GetFullPath($Root)
+if ($Root.Length -gt 3) { $Root = $Root.TrimEnd('\') }
 $logDir = Join-Path $Root 'logs'
 
 Write-Host ""
@@ -252,6 +273,33 @@ $manifest = [ordered]@{
     host            = $env:COMPUTERNAME
     supervisor      = 'starting'
 }
+
+# An earlier run's record at this root is kept, not written over: -Resume
+# continues its journal, and a run that recorded only or never started leaves
+# a run.json and its logs behind. run.json, check-live.log and verify.log go
+# beside the logs under that run's own start time, so the root's copies are
+# always this run's, and the status view never shows an earlier run's verdict
+# under this one's.
+$previous = $null
+try { $previous = Read-RunJson -Root $Root } catch { $previous = $null }
+if ($null -ne $previous -or (Test-Path (Join-Path $Root 'run.json'))) {
+    $was = "$($previous.started_at)" -replace '[^0-9TZ]', ''
+    if ([string]::IsNullOrWhiteSpace($was)) { $was = 'unknown-' + $stamp }
+    $keptJson = Join-Path $logDir "run-$was.json"
+    Move-Item -LiteralPath (Join-Path $Root 'run.json') -Destination $keptJson -Force
+    foreach ($name in @('check-live', 'verify')) {
+        $earlier = Join-Path $logDir "$name.log"
+        if (Test-Path $earlier) { Move-Item -LiteralPath $earlier -Destination (Join-Path $logDir "$name-$was.log") -Force }
+    }
+    Write-Host "  kept the earlier run's record: $keptJson"
+}
+# A verify loop still watching this root belongs to an earlier run whose
+# supervisor died before it could say the run had ended: no live run holds the
+# lock and no live.exe runs, or the checks above would have refused. Found by
+# its command line, never by a pid an earlier run wrote down.
+$stale = @(Stop-VerifyLoops -Root $Root)
+if ($stale.Count -gt 0) { Write-Host "  stopped an earlier run's verify loop: pid $($stale -join ', ')" }
+
 Write-RunJson -Root $Root -Manifest $manifest
 
 Write-Host ""
@@ -268,56 +316,106 @@ Write-Host ""
 
 function Launch {
     param([string] $Script, [string[]] $Arguments, [string] $Label)
-    # Every argument quoted: Start-Process joins an ArgumentList with spaces
-    # and quotes nothing.
-    $quoted = @("`"$(Join-Path $here $Script)`"")
-    foreach ($argument in $Arguments) { $quoted += "`"$argument`"" }
-    $all = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File') + $quoted
+    # Every argument quoted by the one rule (native-args.ps1): Start-Process
+    # joins an ArgumentList with spaces and quotes nothing, and a root ending
+    # in a backslash would otherwise escape its own closing quote.
+    $all = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File') + (ConvertTo-NativeArguments (@((Join-Path $here $Script)) + $Arguments))
     $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $all -WindowStyle Hidden -PassThru
+    $null = $p.Handle
     Write-Host ("  started {0,-12} pid {1}" -f $Label, $p.Id)
     return $p
 }
 
+function Wait-RunJson {
+    # Until Holds is true of run.json, the supervisor has exited, or Seconds
+    # have passed: the manifest last read, and why the wait ended.
+    param([scriptblock] $Holds, [int] $Seconds)
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ($true) {
+        $now = Read-RunJson -Root $Root
+        if ($null -ne $now -and (& $Holds $now)) { return @{ manifest = $now; why = 'held' } }
+        if ($supervisor.HasExited) { return @{ manifest = (Read-RunJson -Root $Root); why = 'exited' } }
+        if ((Get-Date) -gt $deadline) { return @{ manifest = $now; why = 'timeout' } }
+        Start-Sleep -Milliseconds 200
+    }
+}
+
+function Say-Commands {
+    Write-Host "  watch    powershell -File ops\status.ps1 -Root `"$Root`""
+    Write-Host "  stop     powershell -File ops\stop-live.ps1 -Root `"$Root`""
+    Write-Host "  logs     $logDir"
+}
+
 $supervisor = Launch 'supervise-live.ps1' @('-Root', $Root) 'supervisor'
-$verifier = Launch 'verify-loop.ps1' @(
-    '-Root', $Root,
-    '-EndAt', $endsBy.ToString('o'),
-    '-LogDir', $logDir,
-    '-Journal', $journal,
-    '-IntervalSeconds', ($VerifyEveryMinutes * 60),
-    '-FirstCheckSeconds', $FirstCheckSeconds
-) 'verifier'
-Set-Content -Path (Join-Path $Root 'run.pids') -Value (@($supervisor.Id, $verifier.Id) -join "`n") -Encoding utf8
 
 # Until the supervisor has the lock and the binary is running, or has said it
 # will not: a detached refusal would otherwise be said to nobody.
-$deadline = (Get-Date).AddSeconds(60)
-$state = 'starting'
-while ((Get-Date) -lt $deadline) {
-    $now = Read-RunJson -Root $Root
-    if ($null -ne $now -and $now.supervisor -ne 'starting') { $state = $now.supervisor; break }
-    if ($supervisor.HasExited) { $state = 'exited'; break }
-    Start-Sleep -Milliseconds 200
-}
-$now = Read-RunJson -Root $Root
+$waited = Wait-RunJson -Seconds 60 -Holds { param($m) "$($m.supervisor)" -ne 'starting' }
+$now = $waited.manifest
+$state = "$($now.supervisor)"
+if ($waited.why -ne 'held' -and $state -eq 'starting') { $state = $waited.why }
 Write-Host ""
 switch ($state) {
-    'running' {
-        Write-Host "running: live pid $($now.live_pid). This window can be closed."
-    }
-    'finished' {
-        Write-Host "the run has already ended: $($now.outcome) -- $($now.outcome_meaning)"
-    }
     'refused' {
         Write-Host "NOT STARTED: the supervisor refused -- $($now.outcome_meaning)"
         exit 1
     }
+    'running' { }
+    'finished' { }
     default {
-        Write-Host "the supervisor has not reported ($state); read $logDir\supervisor-live.log"
+        Write-Host "NOT KNOWN TO HAVE STARTED: the supervisor has not reported ($state); read $logDir\supervisor-live.log"
         exit 1
     }
 }
-Write-Host "  watch    powershell -File ops\status.ps1 -Root `"$Root`""
-Write-Host "  stop     powershell -File ops\stop-live.ps1 -Root `"$Root`""
-Write-Host "  logs     $logDir"
-exit 0
+
+# The binary runs. Before this window is closed, whether it will trade: its
+# gates answer within seconds, and a refusal means the afternoon is a
+# recording, which is cheap to know now and dear to find out at the end.
+if ($state -eq 'running') {
+    $verifier = Launch 'verify-loop.ps1' @(
+        '-Root', $Root,
+        '-EndAt', $endsBy.ToString('o'),
+        '-LogDir', $logDir,
+        '-Journal', $journal,
+        '-IntervalSeconds', ($VerifyEveryMinutes * 60),
+        '-FirstCheckSeconds', $FirstCheckSeconds,
+        '-UntilRunEnds'
+    ) 'verifier'
+    Write-Host "  waiting up to ${GateSeconds}s for the binary's gates to answer"
+    $waited = Wait-RunJson -Seconds $GateSeconds -Holds { param($m) $null -ne $m.gates -or "$($m.supervisor)" -eq 'finished' }
+    $now = $waited.manifest
+}
+Write-Host ""
+if ("$($now.supervisor)" -eq 'finished') {
+    Write-Host "the run has already ended: $("$($now.outcome)".ToUpper()) -- $($now.outcome_meaning)"
+    if ($now.verdict) { Write-Host "  $($now.verdict)" }
+    Write-Host "  logs     $logDir"
+    switch ("$($now.outcome)") {
+        'stopped' { exit 0 }
+        'recorded-only' { exit 3 }
+        default { exit 1 }
+    }
+}
+switch ("$($now.gates)") {
+    'passed' {
+        Write-Host "TRADING: live pid $($now.live_pid), gates passed, run tag $($now.run_tag). This window can be closed."
+        Say-Commands
+        exit 0
+    }
+    'refused' {
+        Write-Host "######################################################################"
+        Write-Host "#  RECORDING ONLY, NOT TRADING: a gate refused                       #"
+        Write-Host "######################################################################"
+        Write-Host "  $($now.gate_refusal)"
+        Write-Host "  live pid $($now.live_pid) records the market for its $Minutes minute(s) and trades nothing."
+        Write-Host "  Stop it now with stop-live.ps1 if a recording is not what the afternoon is for."
+        Say-Commands
+        exit 3
+    }
+    default {
+        Write-Host "RUNNING, NOT YET KNOWN WHETHER IT TRADES: live pid $($now.live_pid) has not said whether its gates passed after ${GateSeconds}s."
+        Write-Host "  status.ps1 shows it the moment it does."
+        Say-Commands
+        exit 4
+    }
+}

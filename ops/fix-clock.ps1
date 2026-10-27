@@ -53,13 +53,23 @@ Write-Host ""
 # Confirmed the way the live binary reads it, round-trip corrected, by
 # venue-check --clock (venue-clock.ps1 says why). This used to be now minus
 # serverTime from one request, which folds the one-way latency into the
-# offset: the figure this script exists to fix, misread.
-. (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'venue-clock.ps1')
-$venueCheck = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'target\release\venue-check.exe'
+# offset: the figure this script exists to fix, misread. Built first: this
+# is step 1 of the 8c procedure, before anything else has built the
+# binaries, and a venue-check from before --clock answers with its usage.
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $here 'venue-clock.ps1')
+$repo = Split-Path -Parent $here
+$venueCheck = Join-Path $repo 'target\release\venue-check.exe'
+Write-Host "building venue-check, to read the clock with"
+$built = Update-VenueCheck -Repo $repo
+if ($built.code -ne 0) {
+    Write-Host "could not build venue-check (exit $($built.code), see $($built.log)); not confirming with an older build"
+    exit 1
+}
 $clock = Read-VenueClock -Exe $venueCheck
 if ($null -eq $clock.offset_ms) {
     Write-Host "could not confirm against the venue: $($clock.detail)"
-    Write-Host "(build it with cargo build --release -p quant-binance --bin venue-check, then run ops\preflight.ps1)"
+    Write-Host "(then run ops\preflight.ps1, which reads it the same way)"
 } else {
     Write-Host "offset against the venue: $($clock.detail) (positive means this host is ahead)"
     if ($clock.ready) {
