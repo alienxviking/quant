@@ -50,16 +50,21 @@ Write-Host ""
 w32tm /query /status
 
 Write-Host ""
-$before = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-try {
-    $venue = (Invoke-RestMethod -Uri 'https://api.binance.com/api/v3/time' -TimeoutSec 15).serverTime
-    $offset = $before - $venue
-    Write-Host "offset against the venue: ${offset}ms (positive means this host is ahead)"
-    if ([math]::Abs($offset) -le 1000) {
+# Confirmed the way the live binary reads it, round-trip corrected, by
+# venue-check --clock (venue-clock.ps1 says why). This used to be now minus
+# serverTime from one request, which folds the one-way latency into the
+# offset: the figure this script exists to fix, misread.
+. (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'venue-clock.ps1')
+$venueCheck = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'target\release\venue-check.exe'
+$clock = Read-VenueClock -Exe $venueCheck
+if ($null -eq $clock.offset_ms) {
+    Write-Host "could not confirm against the venue: $($clock.detail)"
+    Write-Host "(build it with cargo build --release -p quant-binance --bin venue-check, then run ops\preflight.ps1)"
+} else {
+    Write-Host "offset against the venue: $($clock.detail) (positive means this host is ahead)"
+    if ($clock.ready) {
         Write-Host "within the venue's own one-second tolerance. Good."
     } else {
         Write-Host "still outside one second. Check the configured time source: w32tm /query /source"
     }
-} catch {
-    Write-Host "could not reach the venue to confirm: $_"
 }
