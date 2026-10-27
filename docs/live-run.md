@@ -743,8 +743,9 @@ feature.
      clean stop another process has on Windows; `ops/check-live.ps1` runs the
      four after-run checks; and the preflight runs `venue-check`, signed and
      round-trip corrected, as the binary's first gate asks it. Tested by
-     `ops/test-live.ps1` (106 checks against a fake `live.exe`, each seen red
-     under a break) and `ops/test-venue-clock.ps1`, and rehearsed end to end,
+     `ops/test-live.ps1` (194 checks against a fake `live.exe` since two
+     reviews, each seen red under a break) and `ops/test-venue-clock.ps1`,
+     and rehearsed end to end,
      real harness and real binaries, against `fake-binance`, a local stand-in
      for all three endpoints: started through the preflight, a round trip,
      the verify loop's passes, the operator's stop, and `verify` on both
@@ -2123,15 +2124,17 @@ Windows PowerShell 5.1 (`powershell.exe`), from the repository's root.
 
 | script | what it does |
 |---|---|
-| `ops/start-live.ps1` | Refuses a second live run on the host, whatever `-Force` says. Runs the preflight. Writes `run.json` (the binary's exact arguments, the commit, the preflight's verdict, anything skipped) before anything launches. Starts the supervisor and the verify loop detached, and waits until the supervisor has the lock and the binary runs, so a refusal is said at the prompt. Spot Testnet unless `-RealMoney`, which it announces in a banner. |
+| `ops/start-live.ps1` | Refuses a second live run on the host, whatever `-Force` says. Runs the preflight. Keeps an earlier run's `run.json`, `check-live.log` and `verify.log` under that run's start time, then writes `run.json` (the binary's exact arguments, the commit, the preflight's verdict, anything skipped) before anything launches. Starts the supervisor detached, waits until it has the lock and the binary runs, then until the binary's gates answer, so that a refusal of either is said at the prompt: exit 0 trading, 3 recording only, 4 gates not yet answered, 1 nothing started. Starts the verify loop only once the binary runs. Spot Testnet unless `-RealMoney`, which it announces in a banner. |
 | `ops/preflight-live.ps1` | The build; one live run per host; `raw\` and `account\` empty and no journal, unless `-Resume`; disk; `BINANCE_API_KEY` and `BINANCE_ED25519_PRIVATE_KEY` present, named and never printed; `venue-check` as gate 1 asks it; `w32time` running; sleep, read only. |
-| `ops/supervise-live.ps1` | Runs `target\release\live.exe` once with `run.json`'s arguments, holding the one-live-run lock and a keep-awake request. Copies the binary's banner into `run.json`, writes how the run ended in words, never restarts, runs the after-run checks, and lets go of both. |
-| `ops/stop-live.ps1` | Creates the run's stop file, waits for the supervisor's verdict and says it. `ops/stop-run.ps1` hands a live root to it. |
+| `ops/supervise-live.ps1` | Runs `target\release\live.exe` once with `run.json`'s arguments, holding the one-live-run lock and a keep-awake request. Copies the binary's banner and its gates' answer into `run.json`, writes how the run ended in words, never restarts, runs the after-run checks, and lets go of both. Once the binary runs, no failed write of `run.json` can end it: each is logged and the binary is still waited for. |
+| `ops/stop-live.ps1` | Creates the run's stop file once the binary has read its arguments, waits for the supervisor's verdict and says it. A supervisor gone without one is said as `LOST`, with what the binary's log says. `ops/stop-run.ps1` hands a live root to it. |
 | `ops/check-live.ps1` | The after-run checks: `verify` on both trees, `reconcile`, `runlog check`, `replay-account`, each exit code in words. Run by the supervisor; run it by hand to see them again. |
-| `ops/status-live.ps1` | What `ops/status.ps1` shows for a live root: the outcome or what is running, the journal's last lines, both capture trees, the account stream's last `account` line, the verify loop and the after-run checks. |
-| `ops/verify-loop.ps1` | Unchanged for a recorder run; with `-Journal` it also runs `reconcile` and `runlog check` each pass, and `-IntervalSeconds` sets a cadence shorter than an hour. |
-| `ops/live-common.ps1` | What they share: the exit codes in words, the lock, the keep-awake request, `run.json`. |
-| `ops/test-live.ps1` | 106 checks against a fake `live.exe`, then `ops/test-venue-clock.ps1`. |
+| `ops/status-live.ps1` | What `ops/status.ps1` shows for a live root: the outcome or what is running, whether the gates passed, a supervisor that is gone, the journal's last lines, both capture trees, the account stream's last `account` line, the verify loop, and once the run has ended its after-run checks. |
+| `ops/verify-loop.ps1` | Unchanged for a recorder run but for its quoting; with `-Journal` it also runs `reconcile` and `runlog check` each pass, `-IntervalSeconds` sets a cadence shorter than an hour, and `-UntilRunEnds` stops it when `run.json` says the run has ended or its supervisor is gone. |
+| `ops/live-common.ps1` | What they share: the endings in words, the lock, which process is which, the keep-awake request, `run.json`. |
+| `ops/native-args.ps1` | The one rule for writing an argument onto a command line, which every launch here uses. |
+| `ops/shared-log.ps1` | Appending to a log that another process is reading, which `Add-Content` cannot do. |
+| `ops/test-live.ps1` | 194 checks against a fake `live.exe`, then `ops/test-venue-clock.ps1`'s 13. |
 | `ops/rehearse-live.ps1` | The rehearsal below, run under `fake-binance`. |
 
 **A script of its own, not a `-Live` switch on `start-run.ps1`.** The bash half
@@ -2146,10 +2149,37 @@ would put a branch in each of those, inside the scripts M1's week ran on, and
 **Every exit ends the run, in words.** `run.json` and `logs\supervisor-live.log`
 say which of five endings it was: `stopped` (0, traded and stopped cleanly),
 `failed` (1), `bad-argument` (2, nothing ran), `recorded-only` (3, a gate
-refused) and `killed` (any other code: the journal has no closing lines and the
-next run's last-session gate will refuse to trade until a person has looked).
-The supervisor's own exit is the binary's for 0 to 3, 4 for killed, and 5 when
-it refused to start the binary.
+refused) and `killed` (the journal has no closing lines and the next run's
+last-session gate will refuse to trade until a person has looked). The
+supervisor's own exit is the binary's for 0 to 3, 4 for killed, and 5 when it
+refused to start the binary.
+
+**A kill is an ending the binary did not announce, not a code.** Windows has no
+signals, so a kill is an exit code someone else chose, and `taskkill /F` and
+Task Manager's *End task* both choose 1, the binary's own code for a run that
+could not go on. Measured: `taskkill /F` gave 1 and `Stop-Process` gave -1. So
+the binary's last line on every path that returns is `exit      N`, and the
+harness calls an ending without that line, or with another number in it, a kill
+whatever its code. A test in `live.rs` pins the line's shape, and the rehearsal
+pins the harness reading the real binary's line, since it would otherwise
+report the clean stop as a kill.
+
+**Whether it trades is said at the prompt.** A gate that refuses makes the
+whole afternoon a recording, and the binary says so within seconds (`trading
+under run tag ...` or `RECORD ONLY ...`). The supervisor copies that line into
+`run.json`, `start-live.ps1` waits for it and says `TRADING` or, in a banner,
+`RECORDING ONLY, NOT TRADING` with the refusal, and the status view shows it.
+
+**`run.json` has one writer and many readers, and the readers matter.** On
+Windows a reader can stop a writer: a file open without `FILE_SHARE_DELETE`
+cannot be replaced, and `Move-Item -Force` deletes the old file before moving
+the new one in, so a reader in between finds nothing. Measured in tight loops
+before the fix, 140 of 1500 writes and 618 of 21399 reads failed, and a reader
+holding the file as `Get-Content` does killed the supervisor at the moment it
+recorded the binary's pid, leaving `live.exe` trading unwatched. Every reader
+now shares read, write and delete, the writer swaps the file in with
+`File.Replace`, both retry, and from the binary's start to its end the
+supervisor logs a failed write and goes on waiting.
 
 **One run per host.** The supervisor holds a named mutex, `Global\quant-live-run`,
 for its whole life; Windows releases it, abandoned, however the supervisor dies.
@@ -2170,10 +2200,15 @@ it. Each run gets a stop file of its own, `live-<stamp>.stop` in its root, and t
 binary refuses one that already exists.
 
 **Awake.** The supervisor calls `SetThreadExecutionState(ES_CONTINUOUS |
-ES_SYSTEM_REQUIRED)`, the Windows counterpart of `caffeinate -dimsu -w $$`, and
-releases it when it ends. No setting changes, and Windows drops the request if
-the supervisor dies. Its log shows the thread's state read back both times,
-`0x80000001` while held and `0x80000000` after. A test cannot read the request
+ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`, the Windows counterpart of
+`caffeinate -dimsu -w $$`, and releases it when it ends. The display is held
+as `caffeinate -d` holds it, and here it matters: this host sleeps by Modern
+Standby (*S0 Low Power Idle*, `powercfg /a`), which a laptop enters when the
+display goes off, so a request for the system alone is not known to keep it
+out. Whether it would have was not measured, and holding the display removes
+the question. No setting changes, and Windows drops the request if the
+supervisor dies. Its log shows the thread's state read back both times,
+`0x80000003` while held and `0x80000000` after. A test cannot read the request
 from outside the process: the system-wide state (`CallNtPowerInformation`) was
 already `0x00000001` on this host, held by something else, and `powercfg
 /requests` needs Administrator. So the tests read the supervisor's own reading
@@ -2199,6 +2234,9 @@ From the repository's root.
 ```powershell
 # 1. The clock, once, in an Administrator PowerShell. This host read about
 #    2.1 s ahead of Binance with w32time stopped, and gate 1 refuses past 1 s.
+#    It builds venue-check itself before reading the clock with it: nothing
+#    else has built the binaries yet, and one from before --clock answers
+#    with its usage, which used to print as an empty reason.
 powershell -ExecutionPolicy Bypass -File ops\fix-clock.ps1
 
 # 2. A Spot Testnet key pair, made once outside the repository and registered
@@ -2250,8 +2288,8 @@ reach Binance. It is the operator's sequence: `start-live.ps1` and its
 preflight, a round trip, the verify loop, `status.ps1`, `stop-live.ps1`, the
 after-run checks.
 
-Run on 2026-10-27 at `ce13636`, on this host. The key lines, the root shortened
-to `<scratch>`:
+Run on 2026-10-27 at `da1aa21`, after both reviews' fixes, on this host. The
+key lines, the root shortened to `<scratch>`:
 
 ```text
   ok   build                  release binaries present: live, venue-check, verify, reconcile, runlog, replay-account
@@ -2264,25 +2302,28 @@ to `<scratch>`:
          permission   POST /api/v3/order/test accepted a market buy of 0.001 BTCUSDT, the run's own order, and refused nothing: this API key may trade
   ok   venue-check            READY: clock, key, signature, permission to trade at this size, fees not in BNB
  note  time service           w32time is Stopped: the clock venue-check passed will drift through the run. As Administrator: ops\fix-clock.ps1
-running: live pid 55164. This window can be closed.
+  waiting up to 180s for the binary's gates to answer
+TRADING: live pid 55704, gates passed, run tag mvq8ssxp. This window can be closed.
 
 === 2. a round trip: two fills in the journal
   {"type":"filled",...,"client_order_id":1,...,"side":"buy","px":76655...
   {"type":"filled",...,"client_order_id":2,...,"side":"sell","px":7665...
 === 3. the verify loop, while the run goes on
-  03:10:42Z OK   verdict   every discontinuity is explained by a record in the capture
-  03:10:43Z WAIT reconcile: nothing to check yet
-  03:10:44Z OK   runlog: verdict   COMPLETE: every id minted from 1 to 3 was written down, ...
-  03:11:46Z OK   reconcile: verdict   AGREES: the engine's checkpoint matches this recompute
+  05:26:20Z OK   verdict   every discontinuity is explained by a record in the capture
+  05:26:21Z WAIT reconcile: nothing to check yet
+  05:26:22Z OK   runlog: verdict   COMPLETE: every id minted from 1 to 3 was written down, ...
+  05:27:24Z OK   reconcile: verdict   AGREES: the engine's checkpoint matches this recompute
 === 4. status.ps1, while it runs
-RUNNING  live pid 55164, up 0h01m, 11 MB
-         supervisor pid 48936 holds the one-live-run lock and the keep-awake request
-market   1 file(s), 6.5 KB, last written 5s ago
-account  1 file(s), 6.2 KB, last written 5s ago
+RUNNING  live pid 55704, up 0h01m, 11 MB
+         supervisor pid 57628 holds the one-live-run lock and the keep-awake request
+gates    passed: trading under run tag mvq8ssxp
+market   1 file(s), 6.5 KB, last written 6s ago
+account  1 file(s), 6.2 KB, last written 6s ago
 === 5. stop-live.ps1, the operator's stop
-asked the live run to stop: <scratch>\rehearsal-3\live-20261027-031026.stop
+asked the live run to stop: <scratch>\run1\live-20261027-052602.stop
 ENDED  STOPPED (exit 0)
-       verdict   STOPPED under run tag mvq3yeif, 0 order(s) working
+       verdict   STOPPED under run tag mvq8ssxp, 0 order(s) working
+stopped the verify loop, pid 42472
 === 6. how it ended, and the after-run checks
   OK   verify: verdict   every discontinuity is explained by a record in the capture  [sessions  2 in 2 segments (1 of the account stream)]
   OK   reconcile: the checkpoints agree with a recompute. verdict   AGREES: ...
@@ -2343,3 +2384,73 @@ its account stream, and its answers.
   parse error, because `$name:` reads as a drive-qualified variable. And a
   mutex is recursive, so `Test-LiveLockHeld` answers truly only from another
   process, which is how every caller asks.
+
+Two adversarial reviews of the branch then found what its own tests had not,
+each fixed with a test seen red under the break it guards:
+
+- **A reader could kill the supervisor.** `run.json` was replaced by
+  `Move-Item -Force` while three scripts read it, and the supervisor's writes
+  after the binary started had no `catch`. Held open as `Get-Content` holds it,
+  the file made the supervisor exit 1 with `live.exe` trading unwatched. Fixed
+  on both sides and on the supervisor, as *one writer and many readers* above
+  says. The first version of the fix then met the trap the next bullet names.
+- **PowerShell 5.1, a fifth trap.** `$null` passed to a .NET method's string
+  parameter arrives as `""`, so `File.Replace($temp, $path, $null)` refused
+  every write with *the path is not of a legal form*. `[NullString]::Value`
+  is the null it means. The supervisor survived every one of those failures,
+  which is the fix above showing itself before the bug was found.
+- **The same race, in the logs, found by the new test going intermittently
+  red.** The test holding `run.json` gave up waiting in three runs of eight,
+  under breaks that had nothing to do with it, and passed eight of eight on
+  its own. Captured, the supervisor's stdout said why: `Add-Content` could not
+  open `supervisor-live.log` while the test was reading it, and the line was
+  lost. One run lost `live exited 0`; another lost `live pid ... started`, the
+  line that counts the run's attempts, so that run read as never started.
+  Every live log is now appended through `ops/shared-log.ps1`, which shares
+  the file with its readers and retries, and a test holds a log open while a
+  line is appended, with `Add-Content` failing beside it.
+- **`taskkill /F` was reported as `failed`.** It ends a process with 1, the
+  binary's own code for a run that could not go on. Hence the `exit      N`
+  line (above).
+- **A refused gate looked like a normal run until it ended.** Now said at the
+  prompt, with `start-live.ps1` exit 3, and in the status view.
+- **A pid is not an identity.** `stop-live.ps1` killed any `powershell.exe`
+  whose pid `run.pids` named, Windows having perhaps given that pid to the
+  operator's own shell, and the status view said such a process held the lock.
+  Harness processes are now known by their command line, which names the
+  script and the run's root in quotes, so `run-1` does not match `run-10`;
+  `run.pids` is no longer written for a live run.
+- **A root ending in a backslash broke every argument after it.** Plain quotes
+  around `C:\runs\one\` end in `\"`, which the C runtime's rule reads as a
+  literal quote. One quoting rule, `ops/native-args.ps1`, is now used by every
+  launch, `verify-loop.ps1`'s own verify pass included, which had not quoted a
+  root with a space in it at all. `start-live.ps1` also drops a trailing
+  backslash, so every script spells the root one way.
+- **Verify loops outlived their runs.** After a kill, a refusal, or a
+  supervisor that never reported, the loop ran on to `ends_by`, writing lines
+  the status view showed as though the run were being watched, and `-Resume`
+  overwrote the only record of its pid. The loop now starts only once the
+  binary runs and ends itself when `run.json` says the run has, or its
+  supervisor is gone; `start-live.ps1` stops a stale one for its root.
+- **A lost supervisor was never said.** A killed supervisor left `run.json`
+  at `running` for ever. `stop-live.ps1` and the status view now say `LOST`,
+  with what the binary's own log says, and `stop-live.ps1` no longer suggests
+  `Stop-Process` for a pid that has already exited.
+- **A stop asked for while the supervisor was starting** created the stop file
+  before the binary existed, and the binary refused it as an argument. The
+  stop now waits for the banner, which the binary prints only once its
+  arguments are taken.
+- **`-Resume` wrote over the killed run's `run.json`.** It is kept now, with
+  that run's `check-live.log` and `verify.log`, under its start time.
+- **A run that recorded only leaves an empty journal**, which the binary opens
+  before its gates decide, so `check-live.ps1` would have held it to a capture
+  as a run that traded. An empty journal now counts as none.
+- **`fix-clock.ps1` read the clock with a stale `venue-check`.** Step 1 of 8c
+  runs before anything has built the binaries, and the one in the main
+  checkout was from 2026-10-13, before `--clock`: it printed its usage and the
+  confirmation said nothing at all. `fix-clock.ps1` now builds it first, and a
+  `venue-check` that gives no verdict is reported with its exit code and first
+  line. The build step needs Administrator to reach, so it is the one fix here
+  not exercised by a test.
+- **The keep-awake request did not hold the display**, which `caffeinate -d`
+  does and Modern Standby may need (*Awake*, above).

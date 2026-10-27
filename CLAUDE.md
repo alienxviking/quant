@@ -115,7 +115,7 @@ same Parquet. Full reasoning in `docs/data-contract.md`.
 
 **M0 through M7.5 are complete, and M8 is three slices in.** M5's fortnight ran
 2026-09-18 → 2026-10-02 and **passed**: paper P&L reproduced a backtest over the
-same window exactly, on both symbols, to the satoshi. 916 tests green in debug
+same window exactly, on both symbols, to the satoshi. 917 tests green in debug
 and release, clippy and fmt clean, ~80,800 lines of Rust across 13 crates.
 
 > **The work moved off the MacBook Air to the HP Omen on 2026-10-08, and the
@@ -2280,13 +2280,16 @@ first run here, with Binance's published example key against Spot Testnet,
 read the host **2409 ms ahead** and stopped before signing anything, which
 agrees with the 2.1 s above.
 
-**`ops/*.ps1` is record-only, and there is no live mode in either half.** The
-paper mode exists in the bash half alone, deliberately, and the bash half has
-only run on macOS: it uses BSD `date -u -r`, `caffeinate` and BSD `stat -f`, so
-it does not run under WSL unmodified, whatever this said before. An M8 run here
-needs a WSL or PowerShell port, rehearsed, and that is a slice of work that must
-not be written the night before a run. M8 plans an afternoon rather than 72
-hours, and the host still has to stay awake through it.
+**`ops/*.ps1` has a live mode (8b, `m8c-live-ops`), and it is how M8 runs
+here.** `ops/start-live.ps1` runs one symbol once, with no restart, holds a
+keep-awake request for the run's length, and stops through
+`ops/stop-live.ps1` and the binary's `--stop-file`, since nothing else can
+give a hidden console a Ctrl-C. It was rehearsed end to end against
+`fake-binance`, never against Binance; `docs/live-run.md` §7, *Running it*,
+is the procedure. The paper mode is still bash-only, and the bash half has
+only run on macOS (BSD `date -u -r`, `caffeinate`, BSD `stat -f`), so it does
+not run under WSL unmodified. A Windows recorder still cannot be stopped
+cleanly (*Still open*).
 
 ### 3. Where M8 is
 
@@ -2512,7 +2515,16 @@ and (b) are done, (a) only after a miss in the source, and (c) is part done:
   Windows. The preflight runs `venue-check`, which gained `--qty`, `--rest`
   and `--clock`, as gate 1 asks it. Tested by `ops/test-live.ps1`, every
   check seen red under a break, and rehearsed end to end against
-  `fake-binance`, with all four after-run checks clean.
+  `fake-binance`, with all four after-run checks clean. Two adversarial
+  reviews then found what those tests had not, the worst of it that a reader
+  holding `run.json` open could kill the supervisor and leave `live.exe`
+  trading unwatched, and that `taskkill /F` exits 1, the binary's own code for
+  a failed run, so the binary now ends every run with an `exit      N` line
+  and an ending without it is a kill. Also: a refused gate said only at the
+  end, pids trusted after Windows may have reused them, a root ending in a
+  backslash, verify loops outliving their runs, and `fix-clock.ps1` reading
+  the clock with a stale build. Each is fixed with a test seen red, and
+  listed in `docs/live-run.md` §7, *What building it corrected*.
 
   **What remains in (c) is 8c of `docs/live-run.md` §4 item 8**, the Spot
   Testnet run. It waits on this host's clock (2.1 s ahead, `w32time`
