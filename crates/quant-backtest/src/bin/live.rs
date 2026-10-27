@@ -70,6 +70,7 @@ use quant_backtest::live::{self, Endpoints, Environment, LiveConfig, LiveRun, Ou
 use quant_backtest::session::Settings;
 use quant_binance::account::AccountPolicy;
 use quant_binance::credentials::Credentials;
+use quant_binance::endpoint::NotLocal;
 use quant_core::fixed::{Notional, Qty};
 use quant_core::time::SystemClock;
 use quant_engine::Limits;
@@ -456,59 +457,21 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
 
 /// An endpoint override, if it begins with one of `schemes` and names a
 /// loopback host: a key pasted in its place does not, and is refused without
-/// being repeated.
-///
-/// Loopback only, because an override exists for a local stand-in and for
-/// nothing else. Any other host could be the other environment's: a testnet
-/// run with `--rest https://api.binance.com` would place real orders under a
-/// banner that says no money is at risk, and `--env live` with the testnet's
-/// market stream would trade real money on prices that are not the market's.
-/// `--env` is the one way to choose a venue, so the venue a run names is the
-/// venue it reaches.
+/// being repeated. The rule, and why it is loopback only, is
+/// `quant_binance::endpoint`'s, which `venue-check` holds its override to as
+/// well: `--env` is the one way to choose a venue.
 fn url(text: &str, schemes: &[&str]) -> Result<String, BadArgument> {
-    let Some(rest) = schemes.iter().find_map(|scheme| text.strip_prefix(scheme)) else {
-        return Err(BadArgument(format!(
+    quant_binance::endpoint::local_override(text, schemes).map_err(|why| match why {
+        NotLocal::Scheme => BadArgument(format!(
             "an endpoint begins with {}, and that one does not; not repeated here",
             schemes.join(" or ")
-        )));
-    };
-    if loopback(rest) {
-        Ok(text.to_owned())
-    } else {
-        Err(BadArgument(
+        )),
+        NotLocal::Host => BadArgument(
             "an endpoint override names a local stand-in, on 127.0.0.1, ::1 or localhost, and \
              that one does not; not repeated here. --env chooses the venue"
                 .to_owned(),
-        ))
-    }
-}
-
-/// Whether what follows a URL's scheme names a loopback host. Strict: a user
-/// part is refused outright (`127.0.0.1@elsewhere` is elsewhere), and a name
-/// counts only when it is exactly `localhost`, so `localhost.example` and
-/// `127.0.0.1.example` are not loopback.
-fn loopback(after_scheme: &str) -> bool {
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    if authority.contains('@') {
-        return false;
-    }
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        let Some((inside, after)) = bracketed.split_once(']') else {
-            return false;
-        };
-        return (after.is_empty() || after.starts_with(':'))
-            && inside
-                .parse::<std::net::Ipv6Addr>()
-                .is_ok_and(|ip| ip.is_loopback());
-    }
-    let host = authority.split(':').next().unwrap_or_default();
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::Ipv4Addr>()
-            .is_ok_and(|ip| ip.is_loopback())
+        ),
+    })
 }
 
 #[cfg(test)]
