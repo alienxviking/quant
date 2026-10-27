@@ -1808,18 +1808,6 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
 
 ### Still open
 
-- **zstd is four advisories behind, and the fix is a parquet bump.** The first
-  `cargo audit` (2026-10-27, `ci-audit-and-onboarding`) found eleven
-  vulnerabilities. Seven fell to `cargo update`, rustls's four among them. The
-  other four are zstd's and need zstd 0.14, which parquet 59 will not take, so
-  they sit in `.cargo/audit.toml` with the reason each does not reach us. Owed:
-  parquet and arrow to 60 (MSRV 1.85 → 1.88), zstd to 0.14 in `quant-storage`
-  and `quant-binance`, and the ignore list emptied. It touches both storage
-  tiers, so it is judged the way M2 was: `verify` over the captures and
-  `normalize --write --check` over the fortnight, event for event. A new
-  compressor writing different bytes is fine; reading the existing raw tier
-  back differently is not.
-
 - **A supervisor could start a doomed final attempt. Fixed (M8.a), and `ops/`
   has tests now.** `supervise.sh` broke its restart loop only on a clean exit
   within **30s** of the deadline; M5's paper binary finished and exited with
@@ -2060,6 +2048,33 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
   now. *A fixture of zeros proves far less than it looks like it does*, which is
   the M2.e lesson wearing yet another costume.
 
+- **zstd is current, and `cargo audit` passes nothing on trust.** The first
+  `cargo audit` (2026-10-27) left four zstd advisories in `.cargo/audit.toml`,
+  waiting on a parquet that would take zstd 0.14. Dependabot then delivered
+  both on its own: parquet and arrow 60 (#80), zstd 0.14 (#83). Main's lock
+  had carried three vulnerabilities and ten unsound notices against zstd 0.13
+  and zstd-safe 7; it now carries none, so the ignore list is deleted rather
+  than left matching nothing (`deps-msrv-and-audit`).
+
+  Judged the way M2 was, because it touches both storage tiers and only one
+  of them is disposable. `verify` reads both captures through zstd 0.14 to
+  the published counts, 70,545,346 and 97,937,822 frames, `missing 0`.
+  `normalize --check` reads the Parquet tiers written under parquet 59 and
+  zstd 0.13 and matches raw event for event, and a fresh `--write --check`
+  of the fortnight into a scratch root, raw linked in read-only, matches too:
+  50,158,468 and 47,770,284 events, and the merged final day's second parts,
+  3,991 and 5,079. The money check reads 824 fills and cash 31.64743842 off
+  both Parquet tiers.
+
+  **The bump also left `rust-version` lying, and nothing noticed.** It said
+  1.85 while parquet 60 needs 1.88 and uuid 1.29 (#81) needs 1.89. Under
+  `resolver = "2"` neither `cargo update` nor dependabot reads the number,
+  and CI builds on stable, so nothing failed. It is 1.89 now, which switched
+  on two clippy lints for what 1.87 stabilised: the book's mid, computed as
+  `(bid + ask) / 2` in four places, is `i64::midpoint`, which truncates the
+  same way and cannot overflow. **After a dependency bump, check the highest
+  `rust_version` in `cargo metadata`.**
+
 - CI's `Node.js 20 is deprecated` annotation on `actions/checkout@v4` is gone:
   both jobs moved to `@v5` (`ci-audit-and-onboarding`).
 
@@ -2165,10 +2180,13 @@ it passes, M7 is a debugger whose foundation is the thing under examination.
 - Rust edition 2021 on the **stable channel**, pinned by `rust-toolchain.toml`
   (the channel is pinned, not a version — whatever stable is when you build).
 - **`rust-version` is the floor our dependencies impose, not an aspiration.**
-  (Set 2026-09-02, 1.75 → 1.85.) Cargo's MSRV-aware resolver honours it when
-  choosing versions, so a stale one is not free: at 1.75 it silently held us to
+  (Set 2026-09-02, 1.75 → 1.85; 1.89 on 2026-10-27.) `cargo add` reads it when
+  choosing a version, so a stale one is not free: at 1.75 it silently held us to
   `parquet` 54 from early 2025 while 59 was current — for a promise nothing tests,
-  since CI runs `stable`. Raise it when a dependency we want requires it. Bumping
+  since CI runs `stable`. Under `resolver = "2"`, `cargo update` and dependabot
+  do **not** read it, so it can also fall *behind* the lock without anything
+  failing, as it did to parquet 60. Raise it when a dependency we want requires
+  it, and check `cargo metadata` after any dependency bump. Bumping
   it also un-blocks `clippy::incompatible_msrv`, which had been rejecting std APIs
   stabilised years ago (`Option::is_none_or`, 1.82).
 
