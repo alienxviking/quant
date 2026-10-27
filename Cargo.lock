@@ -1082,7 +1082,7 @@ dependencies = [
 name = "quant-binance"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "futures-util",
  "quant-book",
  "quant-core",
@@ -1152,7 +1152,7 @@ dependencies = [
 name = "quant-live"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "quant-binance",
  "quant-core",
  "quant-engine",

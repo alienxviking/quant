@@ -35,14 +35,14 @@ tracing = "0.1"
 # at the versions quant-binance already links, so they add no crate.
 serde_json = { version = "1", optional = true }
 ring = { version = "0.17", optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 
 [dev-dependencies]
 # The machine's tests write the venue's frames as the venue writes them, so
 # that every stream input goes through the real classifier and translator.
 serde_json = "1"
 ring = "0.17"
-base64 = "0.22"
+base64 = "0.23"
 # The shell's tests drive the worker on a runtime of their own, and feed the
 # account side through the real `AccountFeed` from a channel they hold.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
