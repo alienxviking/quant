@@ -5,7 +5,7 @@
 //!      [--cash N] [--qty N] [--minutes N | --hours N]
 //!      [--fast N] [--slow N] [--interval-secs N]
 //!      [--max-order N] [--max-position N] [--max-daily-loss N] [--max-orders N]
-//!      [--rest URL] [--ws-api URL] [--market-ws URL]
+//!      [--rest URL] [--ws-api URL] [--market-ws URL] [--stop-file PATH]
 //!
 //! live --symbol BTCUSDT                       # Spot Testnet, data/testnet
 //! live --symbol BTCUSDT --env live            # real money, data/live
@@ -40,6 +40,14 @@
 //! `--root` and `--journal` are given is printed, on purpose: any text is a
 //! legal path, so no rule could tell a key from a directory, and the banner
 //! is where the operator reads where the run writes.
+//!
+//! # Stopping it
+//!
+//! Ctrl-C at its console, or, with `--stop-file PATH`, the file at `PATH`
+//! appearing: either is a clean stop, with the cancels and the closing
+//! lines (`live::until_stopped` says why a harness on Windows needs the
+//! second). The file must not exist when the run begins, or the run would
+//! stop as soon as it started, so one that does is refused as an argument.
 //!
 //! # Credentials
 //!
@@ -94,6 +102,8 @@ struct Args {
     overridden: Vec<&'static str>,
     root: PathBuf,
     journal: PathBuf,
+    /// A file whose appearance stops the run, beside Ctrl-C.
+    stop_file: Option<PathBuf>,
     symbol: String,
     cash: Notional,
     qty: Qty,
@@ -161,7 +171,12 @@ fn main() -> ExitCode {
         clock: Arc::new(SystemClock),
     };
     let keys = Credentials::from_env;
-    match live::run(&config, &keys, journalled, tokio::signal::ctrl_c()) {
+    match live::run(
+        &config,
+        &keys,
+        journalled,
+        live::until_stopped(args.stop_file.clone()),
+    ) {
         Ok(run) => {
             let (code, line) = verdict(&run);
             if code == 1 {
@@ -245,6 +260,10 @@ fn banner(args: &Args) {
     );
     println!("root      {}", args.root.display());
     println!("journal   {}", args.journal.display());
+    match &args.stop_file {
+        Some(path) => println!("stop      Ctrl-C, or the file {} appearing", path.display()),
+        None => println!("stop      Ctrl-C"),
+    }
     println!("symbol    {}", args.symbol);
     println!("duration  {} minutes", args.minutes);
     println!(
@@ -259,12 +278,15 @@ const USAGE: &str = "usage: live --symbol SYM [--root PATH] [--env testnet|live]
             [--cash N] [--qty N] [--minutes N | --hours N]
             [--fast N] [--slow N] [--interval-secs N]
             [--max-order N] [--max-position N] [--max-daily-loss N] [--max-orders N]
-            [--rest URL] [--ws-api URL] [--market-ws URL]
+            [--rest URL] [--ws-api URL] [--market-ws URL] [--stop-file PATH]
 
 --env picks every endpoint at once and defaults to testnet: real money is
 spent only with --env live. --rest, --ws-api and --market-ws are for a local
 stand-in and take only a loopback host. Credentials come from BINANCE_API_KEY and
 BINANCE_ED25519_PRIVATE_KEY, as venue-check reads them.
+
+It stops cleanly on Ctrl-C, or, with --stop-file, when that file appears; the
+file must not exist when the run begins.
 
 Exit 0 when it traded and stopped clean; 1 when the run could not go on,
 the journal's failure included; 2 for an argument it does not take; 3 when a
@@ -285,6 +307,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
     let mut environment = Environment::Testnet;
     let (mut rest, mut ws_api, mut market_ws) = (None, None, None);
     let (mut root, mut journal, mut symbol) = (None, None, None);
+    let mut stop_file: Option<PathBuf> = None;
     let mut cash: Notional = "100".parse().expect("a valid amount");
     let mut qty: Qty = "0.001".parse().expect("a valid quantity");
     let mut minutes = DEFAULT_MINUTES;
@@ -343,6 +366,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
             }
             "--journal" => journal = Some(PathBuf::from(value()?)),
             "--root" => root = Some(PathBuf::from(value()?)),
+            "--stop-file" => stop_file = Some(PathBuf::from(value()?)),
             "--cash" => {
                 let text = value()?;
                 cash = text.parse().map_err(|_| number("--cash"))?;
@@ -437,12 +461,23 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
     }
     let root = root.unwrap_or_else(|| PathBuf::from("data").join(environment.name()));
     let journal = journal.unwrap_or_else(|| root.join(format!("live-{symbol}.jsonl")));
+    // A stop file already there would stop the run as soon as it began: the
+    // stop is polled from the run's first instant. Refused before anything
+    // runs, so a stale one left by an earlier run cannot end this one.
+    if stop_file.as_deref().is_some_and(std::path::Path::exists) {
+        return Err(BadArgument(
+            "--stop-file names a file that already exists, so the run would stop as soon as it \
+             began: remove it, or name another"
+                .to_owned(),
+        ));
+    }
     Ok(Some(Args {
         environment,
         endpoints,
         overridden,
         root,
         journal,
+        stop_file,
         symbol,
         cash,
         qty,
@@ -650,6 +685,29 @@ mod tests {
         ] {
             parsed(&["--symbol", "BTCUSDT", flag, &value]).expect_err(&value);
         }
+    }
+
+    #[test]
+    fn a_stop_file_is_taken_only_while_it_does_not_exist() {
+        let dir = std::env::temp_dir().join(format!("quant-live-bin-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory");
+        let path = dir.join("live.stop");
+        let given = path.to_str().expect("a path that is text");
+
+        assert_eq!(
+            parsed(&["--symbol", "BTCUSDT"]).expect("parses").stop_file,
+            None
+        );
+        let args = parsed(&["--symbol", "BTCUSDT", "--stop-file", given]).expect("parses");
+        assert_eq!(args.stop_file.as_deref(), Some(path.as_path()));
+
+        // One left by an earlier run would stop this one as it began.
+        std::fs::write(&path, b"stop").expect("a stale stop file");
+        let BadArgument(said) =
+            parsed(&["--symbol", "BTCUSDT", "--stop-file", given]).expect_err("refused");
+        assert!(said.contains("already exists"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

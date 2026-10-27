@@ -32,7 +32,10 @@ quant-live = { workspace = true }
 quant-storage = { workspace = true }
 # The strategy's notes are opaque JSON by design -- see `Strategy::take_notes`.
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# `time`, `macros` and `signal` for the live binary's stop: Ctrl-C, or a stop
+# file a harness creates (`live::until_stopped`). Features of a crate already
+# in the build, so they add none.
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
