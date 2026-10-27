@@ -108,8 +108,9 @@ jobs:
   # Fails on vulnerabilities only. An "unsound", "unmaintained" or "yanked"
   # notice is printed and passes, because it calls for a decision rather than a
   # fix, and a gate that blocks every PR on a decision nobody has made yet gets
-  # ignored. The advisories it is told to pass are in `.cargo/audit.toml`, each
-  # with the reason it does not reach this workspace.
+  # ignored. It is told to pass nothing. An exception, if one is ever needed,
+  # goes in `.cargo/audit.toml` with the reason the advisory does not reach
+  # this workspace, and leaves with the bump that fixes it.
   audit:
     runs-on: ubuntu-latest
 
