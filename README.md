@@ -244,10 +244,34 @@ that latency changes something, and deliberately not which direction.
 
 ```bash
 docker compose up -d          # Postgres (metadata only)
-cargo test --workspace        # all tests
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
 ```
+
+These are the commands CI runs, so a change that passes them here passes there.
+The environment variables the workspace reads are listed, with what each one is
+for, in [`.env.example`](.env.example).
+
+### Testing
+
+A fresh clone needs nothing but a Rust toolchain: `cargo test --workspace
+--all-features` builds the workspace and runs the whole suite. Unit tests live
+beside the code, in a `tests` module or a crate's `src/tests.rs`, because most of
+what they pin is private. Each crate's `tests/` directory holds the integration
+tests, which wire crates together or run a binary as a user would.
+
+Two kinds of test depend on the machine rather than the code:
+
+- **Postgres.** The `quant-meta` tests skip themselves when `QUANT_DATABASE_URL`
+  is unset. To run them, `docker compose up -d` and export the URL from
+  `.env.example`. CI always provides a database, which is the only reason
+  skipping is acceptable.
+- **Release.** Overflow checks are off in release builds, so CI runs the suite a
+  second time with `--release`. Run it locally after touching money arithmetic.
+
+CI runs both on Linux, and the suite again on Apple Silicon without the database
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ### Recording
 

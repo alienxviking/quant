@@ -1,0 +1,41 @@
+# Proposes dependency updates as pull requests, never as pushes, which is the
+# rule for every change to `main` (CLAUDE.md, Conventions). CI vouches for each
+# one exactly as it would for ours.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      # Arrow and parquet release together and must move together: the
+      # workspace pins all four at one major, and parquet's arrow writer only
+      # accepts arrays from its own arrow version. Bumped one at a time, each
+      # PR would fail to build on its own and pass only once all were merged.
+      # First, because a crate goes to the first group that matches it.
+      arrow:
+        patterns:
+          - "arrow-*"
+          - "parquet"
+      # Everything else that claims to be compatible, in one PR a week
+      # rather than one per crate. A major version stays its own PR, because
+      # it is the update most likely to need a code change.
+      compatible:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+      include: scope

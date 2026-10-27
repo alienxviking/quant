@@ -41,7 +41,7 @@ jobs:
       QUANT_DATABASE_URL: postgres://quant:quant_local_dev@localhost:5432/quant
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -81,7 +81,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -94,3 +94,33 @@ jobs:
       # part that a Linux-only CI would let rot.
       - name: Test
         run: cargo test --workspace --all-features
+
+  # Every crate in Cargo.lock against the RustSec advisory database. The lock
+  # file is the input, not the build, so this compiles nothing, needs no cache
+  # and no database, and finishes in seconds.
+  #
+  # Its own job rather than a step in `check`, because it can go red with no
+  # change to this repository: an advisory published tomorrow against a crate
+  # we already ship fails it. As a separate line in the PR's checks that reads
+  # as what it is -- something upstream changed -- instead of as one more way
+  # the gate failed, and it does not stop `check` reporting on the code.
+  #
+  # Fails on vulnerabilities only. An "unsound", "unmaintained" or "yanked"
+  # notice is printed and passes, because it calls for a decision rather than a
+  # fix, and a gate that blocks every PR on a decision nobody has made yet gets
+  # ignored. The advisories it is told to pass are in `.cargo/audit.toml`, each
+  # with the reason it does not reach this workspace.
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # A prebuilt binary. `cargo install cargo-audit` would compile it from
+      # source on every run, which costs minutes to save nothing.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit
+        run: cargo audit
