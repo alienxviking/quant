@@ -376,7 +376,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`) and item 7, its merge machine (`m8c-live-machine`) and its shell (`m8c-live-shell`); item 8 below remains |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`) and item 7, its merge machine (`m8c-live-machine`) and its shell (`m8c-live-shell`); and item 8's binary, 8a (`m8c-live-binary`). Item 8's `ops/` live mode (8b) and its Spot Testnet run (8c) remain |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -695,6 +695,56 @@ feature.
    on both data roots, and replaying the recorded account frames through the
    translator reproduces every venue-produced journal entry.
 
+   It is three pieces of work, and the first is done.
+
+   - **8a, the binary, is built** (`m8c-live-binary`), rehearsed against local
+     stand-ins for every endpoint: `quant-live::fixtures::rest` for REST,
+     `quant-binance::fake_venue` for the account side and
+     `quant-binance::fake_market`, new, for the market stream. Paper's session
+     is `quant-backtest::session`, and `paper` runs it unchanged, proven by
+     M5's own criterion: a rehearsal of paper's session against the local
+     market, normalized and backtested, reproduces its fills and cash exactly.
+     `Engine::cancel_working` is the stop's cancel through the record
+     (`docs/engine-contract.md` §11). The binary is `live`, its body
+     `quant-backtest::live::run`: `--env testnet` by default and `--env live`
+     only when typed, every endpoint overridable for a local stand-in on a
+     loopback host and nothing else; seven
+     gates before the capture, any of which fails into recording only; the
+     capture of both streams under one clock; and §1's shutdown order, the
+     closing lines only while the strict writer stands. The account replay
+     check is `replay-account` (`docs/run-log.md` §10). Accepted against the
+     stand-ins by `quant-explain`'s `tests/live_run.rs`: a full rehearsal that
+     passes the gates, trades one round trip, cancels nothing, and ends with
+     `reconcile` agreeing, `runlog check` complete, `quant-verify` clean on
+     both roots and the replay check agreeing (and disagreeing with a fill
+     deleted, a fee moved by one raw unit, a stamp by a nanosecond, or the
+     capture taken away); each gate failing in turn, recording
+     and never trading; a restart onto a journal that latched `Diverged` and
+     one after a stop that left an order working, each recording only; a stop
+     that cancels a resting order and settles its end; a journal that fails,
+     after which no order goes and no closing line is written; and a size
+     whose floored exit is under the minimum, refused. Every test seen red
+     under its break; what building it corrected is in §5, *LiveVenue,
+     decided before the code*, §8.
+   - **8b, the live mode in `ops/`, remains**, and the owner settled its
+     shape on 2026-10-26: a **PowerShell** live mode in the `.ps1` half, not a
+     WSL port, and **no automatic restart** (*Where it runs*, below). It
+     enforces one symbol, one process, one account, and is tested as
+     `ops/test-supervise.sh` tests the supervisor. With no restart, every
+     exit ends the run: 0 traded and stopped cleanly, 3 a refused gate
+     (recorded only), 1 a failure, and the harness says which, since a
+     restart into the same refusal or after a crash is what the owner ruled
+     out.
+   - **8c, the Spot Testnet run, remains**, and needs two things from the
+     owner: this host's clock fixed (it read 2.1 s ahead of Binance with
+     `w32time` stopped, and the venue-checks gate refuses past 1 s), and an
+     Ed25519 testnet key pair registered with Spot Testnet, loaded as
+     `venue-check --help` says. Its run is this item's acceptance. The
+     testnet market stream's address (`SPOT_TESTNET_WS`), which 8a first
+     wrote from memory, was checked against Binance's published testnet
+     documentation before 8a merged (`binance-spot-api-docs`,
+     `testnet/web-socket-streams.md:39-41`, commit `f4a9c0b`).
+
 Outside slice (c): resolving an in-doubt order by lookup is slice (d), criteria
 A, B and C as a binary are slice (e), and the run with criteria D and E is slice
 (f). Slice (e) needed one model change first, and it has landed (#64):
@@ -704,7 +754,17 @@ and M5 still reproduce. The model replay for criteria B and C runs with it on,
 or it predicts some exits a lot bigger than the ones live sends: not every exit,
 because one trip's dust tops up the next buy, but over M5's fortnight 42 of 412.
 
-### Where it runs, which is not yet settled
+### Where it runs
+
+**Settled by the owner on 2026-10-26:** the run happens on this Windows host,
+through a **PowerShell** live mode added to `ops/*.ps1`, with **no automatic
+restart**. PowerShell over WSL, because WSL2 keeps a clock of its own, which
+drifts after the host sleeps, and the clock is the one thing that stops this
+host trading at all; the bash half is macOS-only in any case (below). No
+restart, because a crash mid-order is criterion E's to exercise deliberately,
+and the gates already refuse to trade after an unclean stop with orders
+working. The paragraphs below are the reasoning as it stood before the
+decision.
 
 M5 ran on the MacBook Air, and `ops/`'s bash half is the only harness with a
 paper or live mode — the `.ps1` half is **record-only**, deliberately, because
@@ -1087,14 +1147,15 @@ record of what the venue said about the run's last orders.
 1. `run()` returns when the market source ends.
 2. The owner chose to cancel at a stop (§7, decision 3), so `Engine::cancel_working()`:
    for each working order, `on_cancel_requested` and then the venue's `cancel`,
-   at the engine's `now`, with no strategy call. Nothing can issue those cancels
-   today. The engine has no cancel of its own (`lib.rs:599-1113`), only
-   `Context::cancel` reaches the venue (`strategy.rs:278-284`), and only from a
-   strategy callback, which `settle` never makes. A cancel sent around the engine
-   would skip `on_cancel_requested`, and the journal would hold a `cancelled`
-   with no request behind it. So it is a seam addition, in item 8's pull request,
-   beside `settle` in `docs/engine-contract.md` §11, and its test asserts one
-   `cancel_requested` line per working order before any cancel reaches the venue.
+   at the engine's `now`, with no strategy call. Nothing could issue those
+   cancels before item 8. The engine had no cancel of its own, only
+   `Context::cancel` reaches the venue, and only from a strategy callback, which
+   `settle` never makes. A cancel sent around the engine would skip
+   `on_cancel_requested`, and the journal would hold a `cancelled` with no
+   request behind it. So it is a seam addition, built in item 8
+   (`m8c-live-binary`), beside `settle` in `docs/engine-contract.md` §11, and
+   its test asserts one `cancel_requested` line per working order before any
+   cancel reaches the venue.
 3. `settle()` until nothing is working or a deadline longer than `ORDER_TIMEOUT`
    passes (`lib.rs:700-704`), pausing `IDLE_TICK` when nothing came.
 4. `stop_sending()`, then `settle()` until `outstanding()` is zero **or a second
@@ -1104,7 +1165,10 @@ record of what the venue said about the run's last orders.
    zero for ever. Passing the deadline is logged as an error, and every order
    still unanswered is in `stopped.working`, which duty 6 then refuses to trade
    past.
-5. The closing checkpoint, `stopped { working }`, `balances`.
+5. The closing checkpoint, `stopped { working }`, `balances`, only while the
+   strict writer has not failed: a line written after a torn one would sit in
+   the middle of the file, where `read` refuses the whole journal. The writer's
+   `Latch` is what the binary writes them through (8a).
 6. Drop the engine: `orders` closes, the worker returns, and its `inbox` sender
    goes with it.
 7. Stop the listener, which seals the account capture.
@@ -1879,6 +1943,117 @@ The shell's:
   back the `AccountFeed`, as a live run wires it. The REST side is
   `quant-live::fixtures::rest`, a scripted server shared by both crates'
   tests, which acknowledges by default and matches nothing, as §5 asks.
+
+The binary's (item 8, 8a), each where the design was silent or the code
+showed it otherwise:
+
+- **`Check` has no way in, still, and 8a does not need one.** Nothing in 8a
+  rechecks during a run: the `Checked` is minted at startup, a run is an
+  afternoon, and an order refused `-1021` is a rejection with the venue's code
+  on its line and harmless (§3, `Unchecked`). So the input stays as §6 left
+  it, for whichever later item rechecks the clock or refetches
+  `exchangeInfo`, and adds the way in with the recheck.
+- **The baseline gate reads the balances; the lines are written after every
+  gate.** §6 duty 1 lists "the start `balances` line" among the gates. The
+  balances are fetched as the seventh gate, and `started`, with the run tag,
+  and `balances` are written only once all seven pass, through a latch that
+  stops at a failed append. A journal that cannot hold them is the baseline
+  gate's refusal: no baseline, no trading.
+- **A run that records only writes nothing to the journal, and opens no
+  account stream.** The design was silent. A `started` line from a run that
+  trades nothing would leave a session without a `stopped` line, which the
+  last-session gate (duty 6) would then refuse the next run over, for a run
+  that never sent an order. With no venue wired there is nothing to hear on
+  the account stream, and a key the checks refused may be unable to log on.
+  One case does leave such a session: `started` written and `balances` not.
+  The next run then refuses until a person has looked, which is the
+  conservative reading of a journal that failed mid-start.
+- **The venue is wired, and every credential read, before the first line.**
+  Review found two steps that could fail after `started` and `balances`
+  were written: wiring the venue, and reading the account listener's
+  credentials. Either would have left a session with no `stopped` line for
+  a run that sent nothing, and every later run would have refused at the
+  last-session gate, against the code's own comment. The listener's
+  credentials are now read in the baseline gate beside the closing
+  client's, and a venue that cannot be wired is the instrument's refusal;
+  both record only and leave the journal as it was. The wiring failure
+  cannot be reached today, since `exchangeInfo` refuses an empty asset name
+  and its definition is always Binance spot, so only the credentials have a
+  test.
+- **The stop is polled once as the run begins.** The binary's stop is
+  `tokio::signal::ctrl_c()`, which installs its handler on its first poll,
+  and the capture was the first to poll it. Review found that a Ctrl-C
+  before then took the system's default and killed the process: harmless
+  during the gates, but after `started` it left a session with no `stopped`
+  line, which the next run refused over. The run now polls its stop as soon
+  as its runtime exists, so a Ctrl-C at any point is a stop: the gates
+  finish, each bounded by its request timeout, and the run stops at once
+  with its session written whole.
+- **The last-session gate also refuses a journal with lines and no
+  `started` line**, whose last session cannot be read at all. No run reaches
+  that branch: the run-tag gate is asked first and refuses any journal with
+  lines and no tagged `started` line, as review pointed out. It is kept so
+  that the gate is right on its own, and only its unit test, which calls it
+  directly, shows it.
+- **The size check is a gate, once, at the best bid.** §2 asked the binary to
+  refuse a size whose exit falls under the minimum notional "at the current
+  mark". Before the capture there is no book, so the mark is the best bid of
+  a REST depth snapshot, the price a market exit sells at; the exit is the
+  entry less the standard tier's taker fee in the base, truncated as the
+  simulator truncates it, rounded down to the lot. A size that is not a whole
+  number of lots fails it too, where `MaCrossover::new` would otherwise
+  refuse it after the journal had been opened. It is not repeated per order:
+  a market that falls during the run can still put an exit under the
+  minimum, and the venue refuses that exit with its code on the line. The
+  margin §2 asks for beyond one lot, the move expected between entry and
+  exit, is the operator's to choose and is not checked.
+- **The trade probe is the run's own size.** `venue-check` probes at M5's
+  0.001; the live binary sends the same probe (`trade::probe`, moved into the
+  library so the two cannot drift) at the size it will trade, so that a
+  filter the run's orders would meet is met at the gate.
+- **The clock is read once, through the run's clock**, by `trade::read_clock`,
+  `venue-check`'s routine moved into the library: the offset the checks pass
+  with is the one every order and logon is stamped with.
+- **The run tag is the wall clock's milliseconds in base 36**, eight or nine
+  letters and digits, so that a journal begun a millisecond after a lost one
+  is under a different tag (§5).
+- **`stopped` and the closing checkpoint are stamped at the engine's last
+  instant**, `EngineStats::last_ts`, which runs to the last report the drain
+  booked, so no line of the session is stamped after them; and they are
+  `session::closing`, which `paper` writes too, as it always did.
+- **The environment defaults to Spot Testnet**, and every endpoint follows
+  it, so the run that spends no money is the one with no flag. The data root
+  defaults to `data/<env>`, so a testnet market never lands beside the real
+  one, and is given with `--root` rather than bare, so that an argument the
+  binary does not take is refused without being printed back.
+- **An endpoint override takes a loopback host only.** Overrides exist for a
+  local stand-in. A host that is not loopback could be the other
+  environment's, and review found that `--rest https://api.binance.com` on
+  the default testnet would place real orders under a banner saying no money
+  was at risk, as `--env live` with the testnet's market stream would trade
+  real money on prices that are not the market's. So `--env` is the only way
+  to choose a venue.
+- **A refused gate exits 3, and a failed journal exits 1.** A refused gate
+  is a run that did what it was told, recording, and said loudly why it did
+  not trade; a supervisor that restarted it would meet the same refusal, so
+  it is not a failure. It first exited 0, and review found two things wrong
+  with that: a harness could not tell a run that traded from one that only
+  recorded without reading its output, and a run whose strict writer had
+  failed, withholding every order and writing no closing line, also exited 0
+  with a verdict line that hid it. So 0 is a run that traded and stopped
+  clean, 1 a run that could not go on (the journal's failure included), 2 an
+  argument it does not take, and 3 a refused gate.
+- **The account replay check reads the REST answers back off the journal**,
+  as duty 7 says it must, and needs a stamp after which the stream was not
+  heard: the session's `stopped` line, stamped at the engine's last instant
+  (above). It replays the `Unheard` timer from each `fills_missed` raise,
+  which no line distinguishes from a hole's, safely: a hole's raise makes the
+  timer's a no-op. An acknowledged cancel writes no line and is not replayed
+  (`docs/run-log.md` §10).
+- **The account capture is a library function**, `capture::record_account`,
+  which `fake_venue`'s `Listening` now runs too, so the tests record through
+  the code a live run records through. It came with one test, because none of
+  the existing ones saw the tee's mark go missing from the wiring.
 
 ---
 

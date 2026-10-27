@@ -9,6 +9,19 @@ use core::fmt;
 /// Binance spot market-data endpoint.
 pub const SPOT_WS: &str = "wss://stream.binance.com:9443";
 
+/// Spot Testnet's market-data endpoint, for the rehearsal `docs/live-run.md`
+/// §5 runs before any real order.
+///
+/// "The base endpoint is: `wss://stream.testnet.binance.vision/ws`", with
+/// raw streams under `/ws/` and combined ones under `/stream`, which is the
+/// path [`StreamSpec::url`] builds (Binance's `binance-spot-api-docs`,
+/// `testnet/web-socket-streams.md:39-41` and `:183`, at commit `f4a9c0b`,
+/// 2026-10-20). It was first written from memory, because the pinned
+/// documentation was not to hand, and checked against that page before this
+/// branch was merged. Testnet's market is not the real one in any case: it is
+/// captured under a data root of its own.
+pub const SPOT_TESTNET_WS: &str = "wss://stream.testnet.binance.vision";
+
 /// One subscribed stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamKind {

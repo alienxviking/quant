@@ -9,6 +9,13 @@
 //! the stream's reports for it. The three checks `venue-check` runs always
 //! pass, so a test can mint a `Checked` against it.
 //!
+//! The public endpoints a run asks before it trades answer too, for item 8's
+//! rehearsals: the venue's clock (this host's), `BTCUSDT`'s rules
+//! ([`EXCHANGE_INFO`]), a depth snapshot ([`DEPTH`]) and the account's
+//! balances ([`ACCOUNT`]). [`Script::once`] answers the next request to a path
+//! otherwise, which is how a rehearsal makes one gate fail, and
+//! [`Script::always`] changes a path's standing answer.
+//!
 //! It is not an exchange (`docs/live-run.md` §5, *`LiveVenue`, decided before
 //! the code*, §5): it matches nothing and reports nothing on the stream. A fake
 //! that did would be a second model of the venue, to agree with the simulator
@@ -70,7 +77,46 @@ impl Reply {
 pub struct Script {
     pub orders: VecDeque<Reply>,
     pub cancels: VecDeque<Reply>,
+    /// One-off answers for any other path, each taken by the next request to
+    /// that path; an empty queue gives the path's standing answer.
+    pub paths: std::collections::BTreeMap<String, VecDeque<Reply>>,
+    /// Standing answers, a 200 with this body, for a path whose default
+    /// below will not do: a depth snapshot at another price, say.
+    pub bodies: std::collections::BTreeMap<String, String>,
 }
+
+impl Script {
+    /// The next request to `path` answered `reply`, once.
+    #[must_use]
+    pub fn once(mut self, path: &str, reply: Reply) -> Self {
+        self.paths
+            .entry(path.to_owned())
+            .or_default()
+            .push_back(reply);
+        self
+    }
+
+    /// Every request to `path` answered 200 with `body`.
+    #[must_use]
+    pub fn always(mut self, path: &str, body: &str) -> Self {
+        self.bodies.insert(path.to_owned(), body.to_owned());
+        self
+    }
+}
+
+/// What the account holds by default, which a live run's baseline reads:
+/// distinct amounts, so one read from the wrong place shows.
+pub const ACCOUNT: &str = r#"{"canTrade":true,"accountType":"SPOT","balances":[{"asset":"BNB","free":"0.00000000","locked":"0.00000000"},{"asset":"BTC","free":"0.50000000","locked":"0.00000000"},{"asset":"USDT","free":"1000.00000000","locked":"0.00000000"}],"permissions":["SPOT"]}"#;
+
+/// `BTCUSDT`'s rules by default, as `GET /api/v3/exchangeInfo` states them,
+/// with the filters the definition reads: [`super::btcusdt`]'s, so that a
+/// run wired from this answer trades the fixtures' instrument.
+pub const EXCHANGE_INFO: &str = r#"{"timezone":"UTC","serverTime":1789000000000,"rateLimits":[],"exchangeFilters":[],"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01000000","maxPrice":"1000000.00000000","tickSize":"0.01000000"},{"filterType":"LOT_SIZE","minQty":"0.00001000","maxQty":"9000.00000000","stepSize":"0.00001000"},{"filterType":"NOTIONAL","minNotional":"5.00000000","applyMinToMarket":true,"maxNotional":"9000000.00000000","applyMaxToMarket":false,"avgPriceMins":5}]}]}"#;
+
+/// The book by default, as `GET /api/v3/depth` answers: one level a side
+/// about the fixtures' price, at update id 100.
+pub const DEPTH: &str =
+    r#"{"lastUpdateId":100,"bids":[["76650.00","1.00000000"]],"asks":[["76651.00","1.00000000"]]}"#;
 
 /// A request the server read.
 #[derive(Debug, Clone)]
@@ -251,14 +297,19 @@ fn accept(
                 };
                 let reply = {
                     let mut shared = lock(shared);
-                    let queue = match (seen.path.as_str(), seen.method.as_str()) {
+                    let path = seen.path.clone();
+                    let standing = shared.script.bodies.get(&path).cloned();
+                    let queue = match (path.as_str(), seen.method.as_str()) {
                         (quant_binance::orders::ORDER_PATH, "POST") => {
                             Some(&mut shared.script.orders)
                         }
                         (quant_binance::orders::ORDER_PATH, _) => Some(&mut shared.script.cancels),
-                        _ => None,
+                        (other, _) => shared.script.paths.get_mut(other),
                     };
-                    let reply = queue.and_then(VecDeque::pop_front).unwrap_or(Reply::Ack);
+                    let reply = queue
+                        .and_then(VecDeque::pop_front)
+                        .or_else(|| standing.map(|body| Reply::Http { status: 200, body }))
+                        .unwrap_or(Reply::Ack);
                     shared.seen.push(seen.clone());
                     reply
                 };
@@ -367,7 +418,17 @@ fn ack(seen: &Seen) -> String {
             r#"{{"symbol":"{symbol}","origClientOrderId":"{}","orderId":{order_id},"orderListId":-1,"clientOrderId":"cancelMyOrder1","transactTime":1684804350068,"status":"CANCELED"}}"#,
             seen.param("origClientOrderId").unwrap_or_default()
         ),
-        ("/api/v3/account", _) => r#"{"canTrade":true,"balances":[]}"#.to_owned(),
+        ("/api/v3/account", _) => ACCOUNT.to_owned(),
+        ("/api/v3/exchangeInfo", _) => EXCHANGE_INFO.to_owned(),
+        ("/api/v3/depth", _) => DEPTH.to_owned(),
+        // The venue's clock is this host's: a rehearsal's clock check reads
+        // the host on time.
+        ("/api/v3/time", _) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            format!(r#"{{"serverTime":{now}}}"#)
+        }
         ("/api/v3/account/commission", _) => {
             r#"{"symbol":"BTCUSDT","discount":{"enabledForAccount":false,"enabledForSymbol":false,"discountAsset":"BNB","discount":"0.75000000"}}"#.to_owned()
         }

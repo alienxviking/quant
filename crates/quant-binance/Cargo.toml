@@ -106,9 +106,10 @@ quant-book = { workspace = true }
 zstd = "0.13"
 
 # `fake_venue`: a local stand-in for the WebSocket API's account side, which the
-# account listener's tests run against, here and in quant-verify. Never on in a
-# build that ships: it is a server that accepts any client, and nothing outside
-# a test has a reason to start one.
+# account listener's tests run against, here and in quant-verify; and
+# `fake_market`, one for the market stream, which a rehearsal of a paper or
+# live run captures from. Never on in a build that ships: each is a server that
+# accepts any client, and nothing outside a test has a reason to start one.
 [features]
 fake-venue = ["dep:zstd"]
 

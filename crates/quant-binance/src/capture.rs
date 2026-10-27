@@ -19,12 +19,25 @@
 //! metadata tier, the writer thread, the host-clock check, the periodic metrics,
 //! and the shutdown that seals a trailer so a clean stop is distinguishable from
 //! a kill.
+//!
+//! # Where, by which clock, and until when
+//!
+//! M8's live binary added three things to [`CaptureConfig`] and one way in,
+//! each defaulted to what `record` and `paper` always did. The endpoints, so
+//! that a run can capture Spot Testnet or a local stand-in
+//! (`crate::fake_market`) rather than the live venue. The clock, so that one
+//! clock stamps the market, the account stream and the request worker
+//! (`docs/live-run.md` §5, *`LiveVenue`, decided before the code*, §4, and §6
+//! duty 2). And [`run_until`], a stop that is not ctrl-c, which [`run`] now
+//! calls with ctrl-c.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::account::{listen, AccountPolicy, Stopped};
+use crate::credentials::Credentials;
 use crate::{connection, ConnectionPolicy, SnapshotClient, StreamSpec, SPOT_REST, SPOT_WS};
 use quant_core::event::GapCause;
 use quant_core::instrument::Exchange;
@@ -36,8 +49,8 @@ use quant_meta::{
 };
 use quant_recorder::{
     channel, format_session_id, run_writer, CaptureSession, FileStore, Ingress, IngressStats,
-    Metrics, MetricsLine, MetricsReporter, ObservedStore, SegmentReport, WriterOutcome,
-    DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
+    LastDropped, Metrics, MetricsLine, MetricsReporter, ObservedStore, SegmentReport,
+    WriterOutcome, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL,
 };
 use quant_storage::WriterOptions;
 use tokio::sync::mpsc::Sender as MetaSender;
@@ -216,21 +229,54 @@ pub struct CaptureConfig {
     pub root: PathBuf,
     /// Stop after this long. `None` runs until interrupted.
     pub limit: Option<Duration>,
+    /// Where the market stream is subscribed: [`SPOT_WS`] unless a run says
+    /// otherwise.
+    pub ws_base: String,
+    /// Where depth snapshots and the clock are asked for: [`SPOT_REST`]
+    /// unless a run says otherwise.
+    pub rest_base: String,
+    /// The clock every record is stamped by. A live run hands the same one to
+    /// its account stream and its request worker (`docs/live-run.md` §5,
+    /// *`LiveVenue`, decided before the code*, §4): one clock stamps
+    /// `local_recv_ts` everywhere. The wall clock unless a run says otherwise.
+    pub clock: Arc<dyn Clock>,
 }
 
 impl CaptureConfig {
+    /// The live venue's market stream and REST endpoints, stamped by the wall
+    /// clock: what `record` and `paper` have always captured.
     #[must_use]
     pub fn new(symbol: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
             symbol: symbol.into(),
             root: root.into(),
             limit: None,
+            ws_base: SPOT_WS.to_owned(),
+            rest_base: SPOT_REST.to_owned(),
+            clock: Arc::new(SystemClock),
         }
     }
 
     #[must_use]
     pub const fn for_at_most(mut self, limit: Duration) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Subscribe at `ws_base` and ask `rest_base` for snapshots instead: Spot
+    /// Testnet, or a local stand-in for a rehearsal.
+    #[must_use]
+    pub fn at(mut self, ws_base: impl Into<String>, rest_base: impl Into<String>) -> Self {
+        self.ws_base = ws_base.into();
+        self.rest_base = rest_base.into();
+        self
+    }
+
+    /// Stamp every record with `clock`, the one the rest of the run stamps
+    /// with.
+    #[must_use]
+    pub fn stamped_by(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 }
@@ -253,15 +299,40 @@ where
     S: quant_recorder::sink::RecordSink,
     F: FnOnce(quant_recorder::CaptureSender) -> S,
 {
+    run_until(config, wrap, tokio::signal::ctrl_c()).await
+}
+
+/// [`run`], stopped by `stop` rather than by ctrl-c: what a run that has its
+/// own way of being told to stop passes, a test among them.
+///
+/// `stop` completing with `Ok` is a requested shutdown, sealed as one; with
+/// `Err`, the capture stops and the error is returned, as [`run`] returns a
+/// failure to listen for ctrl-c.
+///
+/// # Errors
+///
+/// As [`run`].
+pub async fn run_until<S, F, Stop>(
+    config: CaptureConfig,
+    wrap: F,
+    stop: Stop,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: quant_recorder::sink::RecordSink,
+    F: FnOnce(quant_recorder::CaptureSender) -> S,
+    Stop: core::future::Future<Output = std::io::Result<()>>,
+{
     let CaptureConfig {
         symbol,
         root,
         limit,
+        ws_base,
+        rest_base,
+        clock,
     } = config;
 
     // The one and only clock. Everything that stamps a timestamp takes this, so
     // that the same code can be driven by a replayed event stream later.
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let started = clock.now();
 
     let session_id = *uuid::Uuid::new_v4().as_bytes();
@@ -333,7 +404,7 @@ where
     // deltas are recorded faithfully and can never be turned into a book, so a
     // recorder that quietly ran without one would produce a week of data that
     // looks complete and is not usable.
-    let snapshots = SnapshotClient::new(SPOT_REST, SNAPSHOT_TIMEOUT)?;
+    let snapshots = SnapshotClient::new(rest_base, SNAPSHOT_TIMEOUT)?;
     check_host_clock(&snapshots, clock.as_ref()).await;
     // The session id, not a path: with day rolling a run can produce several
     // files, and the session is what identifies them all. Each is logged as it
@@ -346,11 +417,11 @@ where
     );
 
     let outcome = tokio::select! {
-        result = connection::run(&spec, SPOT_WS, &mut ingress, &policy, Some(&snapshots)) => {
+        result = connection::run(&spec, &ws_base, &mut ingress, &policy, Some(&snapshots)) => {
             // Only returns on a fatal condition -- normal disconnects are gaps.
             result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
         }
-        result = tokio::signal::ctrl_c() => {
+        result = stop => {
             result?;
             info!("shutdown requested");
             Ok(())
@@ -401,6 +472,147 @@ where
     // Durability is FileStore's job: it fsyncs each segment as it is sealed, once
     // per file rather than per block.
     outcome
+}
+
+/// Where an account capture records, whom it listens to, and by which clock.
+#[derive(Debug, Clone)]
+pub struct AccountConfig {
+    /// Data root; the capture lands under `<root>/account/...`, never beside
+    /// the market's (`docs/live-run.md` §5).
+    pub root: PathBuf,
+    /// The WebSocket API: [`crate::account::SPOT_WS_API`], Spot Testnet's, or
+    /// a local stand-in.
+    pub url: String,
+    pub policy: AccountPolicy,
+    /// The host clock's measured offset from the venue's, positive when the
+    /// host is ahead: the same number the order path takes off, which every
+    /// logon is stamped with (`docs/live-run.md` §5, §6 duty 2).
+    pub offset_ms: i64,
+    /// The clock every record is stamped by: the run's one clock.
+    pub clock: Arc<dyn Clock>,
+}
+
+/// How an account capture ended.
+#[derive(Debug)]
+pub struct AccountCaptured {
+    /// Why the listener stopped by itself, or `None` when it was stopped.
+    pub stopped: Option<Stopped>,
+    pub stats: IngressStats,
+    /// The segments sealed, each with its trailer.
+    pub segments: Vec<SegmentReport>,
+}
+
+/// Why an account capture could not record or seal.
+#[derive(Debug)]
+pub enum AccountCaptureError {
+    /// The writer thread was gone before the session's opening gap.
+    WriterGone,
+    /// The writer thread panicked.
+    WriterPanicked,
+    /// The writer, or sealing the last segment, failed.
+    Storage(quant_storage::StorageError),
+}
+
+impl std::fmt::Display for AccountCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriterGone => f.write_str("the account capture's writer was gone at the start"),
+            Self::WriterPanicked => f.write_str("the account capture's writer thread panicked"),
+            Self::Storage(e) => write!(f, "the account capture could not write or seal: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AccountCaptureError {}
+
+/// Record the account stream into its own data root until `stop` completes
+/// or the listener stops for good, handing every record to `consumer` as
+/// well: the run's `AccountFeed`, behind a [`TeeSink`](quant_recorder::TeeSink)
+/// with the capture primary, as the market's engine copy is.
+///
+/// What a live run wires (`docs/live-run.md` §5, *`LiveVenue`, decided before
+/// the code*, §6 duties 2 and 3): one clock, the measured offset, and the tee
+/// marking its drops into `mark` so the feed tells a hole while the account
+/// is quiet ([`AccountFeed::new`](crate::account::AccountFeed::new) requires
+/// it). `mark` is optional only for a test that reads the consumer raw. The
+/// session's opening `Gap{RecorderRestart}` is recorded here, as
+/// [`run_until`] records the market's, and the capture is sealed with its
+/// trailer however listening ended, so a clean stop never reads as a crash.
+///
+/// # Errors
+///
+/// [`AccountCaptureError`], for a capture that could not be written or
+/// sealed. A listener that stopped by itself is not an error: it is
+/// [`AccountCaptured::stopped`], and the gap it recorded is the loss.
+pub async fn record_account<Stop>(
+    config: AccountConfig,
+    credentials: &Credentials,
+    consumer: std::sync::mpsc::SyncSender<quant_recorder::CaptureRecord>,
+    mark: Option<Arc<LastDropped>>,
+    stop: Stop,
+) -> Result<AccountCaptured, AccountCaptureError>
+where
+    Stop: core::future::Future<Output = ()>,
+{
+    let AccountConfig {
+        root,
+        url,
+        policy,
+        offset_ms,
+        clock,
+    } = config;
+    let mut session = CaptureSession::account(
+        FileStore::new(root),
+        Exchange::Binance,
+        Arc::clone(&clock),
+        WriterOptions::default(),
+    );
+    let metrics = Metrics::new(DEFAULT_CHANNEL_CAPACITY);
+    let (tx, rx) = channel(DEFAULT_CHANNEL_CAPACITY, Arc::clone(&metrics));
+    let writer = thread::Builder::new()
+        .name("capture-writer-account".to_owned())
+        .spawn(move || {
+            let outcome = run_writer(&rx, &mut session, DEFAULT_FLUSH_INTERVAL);
+            (outcome, session)
+        })
+        .map_err(|e| AccountCaptureError::Storage(quant_storage::StorageError::Io(e)))?;
+    let tee = quant_recorder::TeeSink::new(tx, consumer);
+    let tee = match mark {
+        Some(mark) => tee.marking_into(mark),
+        None => tee,
+    };
+    let mut ingress = Ingress::new(tee, clock, metrics);
+    // First record in every file, as for the market.
+    let opened = ingress.record_gap(GapCause::RecorderRestart);
+
+    let stopped = if opened.is_ok() {
+        tokio::select! {
+            stopped = listen(&url, credentials, &mut ingress, &policy, offset_ms) => Some(stopped),
+            () = stop => None,
+        }
+    } else {
+        None
+    };
+    let stats = ingress.stats();
+    // Closes the channel, which is how the writer knows to seal the trailer.
+    drop(ingress);
+    let (outcome, session) = tokio::task::spawn_blocking(move || writer.join())
+        .await
+        .map_err(|_| AccountCaptureError::WriterPanicked)?
+        .map_err(|_| AccountCaptureError::WriterPanicked)?;
+    outcome.map_err(AccountCaptureError::Storage)?;
+    let (segments, _store) = session.finish().map_err(AccountCaptureError::Storage)?;
+    if opened.is_err() {
+        return Err(AccountCaptureError::WriterGone);
+    }
+    if let Some(why) = &stopped {
+        error!(%why, "the account listener stopped by itself; the account is not heard");
+    }
+    Ok(AccountCaptured {
+        stopped,
+        stats,
+        segments,
+    })
 }
 
 /// Compare the host clock against the venue's, once, before recording starts.
@@ -561,5 +773,226 @@ async fn until(limit: Option<Duration>) {
     match limit {
         Some(d) => tokio::time::sleep(d).await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use quant_core::time::{ManualClock, Ts};
+    use quant_recorder::catalog;
+    use quant_storage::{FrameKind, RawReader};
+
+    use super::{record_account, run_until, AccountConfig, CaptureConfig};
+    use crate::account::{AccountFeed, AccountRecord, Polled};
+    use crate::fake_market::{self, FakeMarket};
+    use crate::fake_venue::{self, FakeVenue};
+    use quant_core::event::GapCause;
+    use quant_recorder::{account_catalog, LastDropped};
+
+    /// A data root of this test's own, named for this process and cleared, so
+    /// that a root a reused process id left behind is never read as this one.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "quant-binance-capture-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// A REST base nothing answers: a port bound and let go.
+    fn nowhere() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        format!("http://{}", listener.local_addr().expect("address"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capture_subscribes_where_it_is_told_stamps_by_the_clock_it_is_given_and_stops_when_asked(
+    ) {
+        // The three things a rehearsal needs of the capture that `record` and
+        // `paper` never did: another endpoint, another clock, and a stop that
+        // is not ctrl-c. Every record is stamped by the clock handed in, which
+        // a live run shares with its account stream and its request worker.
+        let root = scratch("endpoints");
+        let market = FakeMarket::start().await;
+        let at = Ts::from_nanos(1_789_000_000_000_000_000);
+        let clock = Arc::new(ManualClock::new(at));
+        let frames = [
+            fake_market::trade("BTCUSDT", 1, "76650.12", "0.01", 1_000),
+            fake_market::trade("BTCUSDT", 2, "76650.13", "0.02", 1_001),
+        ];
+        for frame in &frames {
+            market.send(frame);
+        }
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let config = CaptureConfig::new("BTCUSDT", &root)
+            .at(market.url(), nowhere())
+            .stamped_by(clock);
+        // A second consumer, as paper's engine is, to see the records arrive:
+        // the capture's own file is not readable until it is sealed.
+        let (side_tx, side) = std::sync::mpsc::sync_channel(64);
+        let capture = run_until(
+            config,
+            |tx| quant_recorder::TeeSink::new(tx, side_tx),
+            async {
+                let _ = stopped.await;
+                Ok(())
+            },
+        );
+        let drive = async {
+            market
+                .until("both frames sent", Duration::from_secs(20), |m| {
+                    m.sent().len() == frames.len()
+                })
+                .await;
+            // Sent is not recorded. Wait until ingress has handed both on, the
+            // session's opening gap first: what ingress has taken, the writer
+            // seals on the way out.
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut handed = 0;
+            while handed < 1 + frames.len() {
+                assert!(std::time::Instant::now() < deadline, "not handed on");
+                match side.try_recv() {
+                    Ok(_) => handed += 1,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
+                }
+            }
+            let _ = stop.send(());
+        };
+        let (outcome, ()) = tokio::time::timeout(
+            Duration::from_secs(30),
+            Box::pin(async { tokio::join!(capture, drive) }),
+        )
+        .await
+        .expect("the capture stops when asked");
+        outcome.expect("a clean stop");
+
+        let cat = catalog(&root);
+        assert_eq!(cat.sessions.len(), 1);
+        let mut read = Vec::new();
+        for entry in &cat.sessions[0].segments {
+            let file = std::fs::File::open(&entry.path).expect("open");
+            let mut reader = RawReader::open(std::io::BufReader::new(file)).expect("a capture");
+            let (frames, truncation) = reader.read_all().expect("readable");
+            assert_eq!(truncation, None);
+            assert!(reader.is_finalized(), "sealed, as a clean stop seals");
+            read.extend(frames);
+        }
+        let payloads: Vec<String> = read
+            .iter()
+            .filter(|f| f.kind == FrameKind::VenuePayload)
+            .map(|f| String::from_utf8(f.payload.clone()).expect("text"))
+            .collect();
+        assert_eq!(payloads, frames, "the venue's bytes, verbatim and in order");
+        assert!(
+            read.iter().all(|f| f.local_recv_ts == at),
+            "every record stamped by the clock handed in: {:?}",
+            read.iter().map(|f| f.local_recv_ts).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            market.targets(),
+            ["/stream?streams=btcusdt@trade/btcusdt@depth@100ms"],
+            "subscribed at the base it was given, to the streams M1 records"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_account_capture_opens_with_its_gap_and_marks_what_its_consumer_missed() {
+        // The two things a live run's account capture must wire that a
+        // listener alone does not: the session's opening gap, and the tee
+        // marking its drops so the feed tells a hole while the account is
+        // quiet (docs/live-run.md section 5, section 6 duty 3). A consumer
+        // with room for one record and never drained takes the opening gap
+        // and misses the subscription's answer; the account then says
+        // nothing, and the feed must still say it missed something.
+        let root = scratch("account");
+        let venue = FakeVenue::start(fake_venue::Script::default()).await;
+        let (consumer, records) = std::sync::mpsc::sync_channel(1);
+        let mark = Arc::new(LastDropped::default());
+        let dropped = Arc::clone(&mark);
+        let mut feed = AccountFeed::new(records, Arc::clone(&mark));
+        let config = AccountConfig {
+            root: root.clone(),
+            url: venue.url().to_owned(),
+            policy: fake_venue::quick_policy(),
+            offset_ms: 0,
+            clock: Arc::new(quant_core::time::SystemClock),
+        };
+        let credentials = venue.credentials();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let capture = record_account(config, &credentials, consumer, Some(mark), async {
+            let _ = stopped.await;
+        });
+        let drive = async {
+            venue
+                .until("the subscription", Duration::from_secs(20), |log| {
+                    log.asked("userDataStream.subscribe") >= 1
+                })
+                .await;
+            // Not a poll until the tee has dropped something. The venue being
+            // asked is not the answer being recorded: polled before the answer
+            // reached the tee, the consumer would have room for it again and
+            // nothing would be missed, which is the race this test once lost
+            // under load (one full-suite run in fourteen).
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while dropped.get().is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the tee never dropped the subscription's answer"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let mut read = Vec::new();
+            while !read.iter().any(|r| {
+                matches!(
+                    r,
+                    AccountRecord::Blind {
+                        cause: GapCause::LocalOverflow,
+                        ..
+                    }
+                )
+            }) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the feed never told the hole: {read:?}"
+                );
+                match feed.poll() {
+                    Polled::Record(record) => read.push(record),
+                    Polled::Empty | Polled::Closed => {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }
+            }
+            let _ = stop.send(());
+            read
+        };
+        let (captured, read) = tokio::time::timeout(
+            Duration::from_secs(30),
+            Box::pin(async { tokio::join!(capture, drive) }),
+        )
+        .await
+        .expect("the capture stops when asked");
+        let captured = captured.expect("recorded and sealed");
+        assert_eq!(captured.stopped, None, "stopped, not refused");
+        assert!(
+            matches!(
+                read.first(),
+                Some(AccountRecord::Blind {
+                    cause: GapCause::RecorderRestart,
+                    ..
+                })
+            ),
+            "the session opens with its gap: {read:?}"
+        );
+        let cat = account_catalog(&root);
+        assert_eq!(cat.sessions.len(), 1, "under the account's own root");
+        assert!(!captured.segments.is_empty(), "sealed");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

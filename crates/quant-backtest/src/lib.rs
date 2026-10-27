@@ -15,10 +15,19 @@
 //!
 //! So the strategy is not trying to be good. It is trying to be *attributable*:
 //! simple enough that any surprise in the result is the harness's fault.
+//!
+//! # And the sessions that run it
+//!
+//! [`session`] is the session that captures a market and trades on it from one
+//! ingress, generic over the venue: `paper`'s, extracted so that [`live`], the
+//! `live` binary's body, runs the same path with `LiveVenue` behind it.
 
+pub mod account_replay;
 pub mod equity;
+pub mod live;
 pub mod ma;
 pub mod record;
+pub mod session;
 
 pub use equity::{EquityCurve, EquityPoint, Recorded};
 pub use ma::{MaConfig, MaConfigError, MaCrossover};

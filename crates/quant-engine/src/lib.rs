@@ -713,6 +713,39 @@ where
         }
     }
 
+    /// After [`Self::run`]: ask the venue to cancel every order the engine is
+    /// still working, lowest id first, and call no strategy method. Returns
+    /// the orders it asked about.
+    ///
+    /// How a live run stops (`docs/live-run.md` §5, *`LiveVenue`, decided
+    /// before the code*, §1 step 2, and the owner's decision 3 in §7): an
+    /// order left resting can fill after the record has stopped, so a stop
+    /// cancels what rests and then [`Self::settle`]s until the ends arrive.
+    /// Cancelling is not flattening: a position stays where it is.
+    ///
+    /// Each cancel goes the way a strategy's does, through the record first:
+    /// `on_cancel_requested`, then the venue's `cancel`, both at the engine's
+    /// clock. A cancel sent around the engine would skip the record, and the
+    /// journal would then hold a `cancelled` line with no request behind it.
+    /// Nothing else could issue these: only `Context::cancel` reaches the
+    /// venue, and only from a strategy callback, which a stop must not make
+    /// -- the market the strategy trades on has ended, and a decision taken
+    /// during the drain is one no replay has.
+    ///
+    /// Against the simulator a stop has no use for it; neither `backtest` nor
+    /// `paper` calls it.
+    pub fn cancel_working(&mut self) -> Vec<ClientOrderId> {
+        let working = self.working();
+        for &client_order_id in &working {
+            if let Some(observer) = self.observer.as_mut() {
+                observer.on_cancel_requested(client_order_id, self.now);
+            }
+            self.ledger.stats.cancels += 1;
+            self.venue.cancel(client_order_id, self.now);
+        }
+        working
+    }
+
     /// Orders the engine is still working, lowest id first: sent, and not yet
     /// heard to have ended.
     #[must_use]

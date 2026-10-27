@@ -49,7 +49,11 @@ quant-backtest = { workspace = true }
 # runtime for the request worker and the listener.
 quant-binance = { workspace = true, features = ["fake-venue"] }
 quant-sim = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+# Item 8's rehearsals (`tests/live_run.rs`) end with the verifier over both
+# data roots, as the acceptance asks. A dev-dependency in this direction only:
+# nothing here may become a dependency of `quant-verify`.
+quant-verify = { workspace = true }
 
 [lints]
 workspace = true
