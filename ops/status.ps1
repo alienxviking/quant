@@ -26,6 +26,18 @@ if (-not (Test-Path $Root)) {
 $Root   = (Resolve-Path $Root).Path
 $logDir = Join-Path $Root 'logs'
 
+# A live run is the live harness's (start-live.ps1) and has a manifest of its
+# own shape, so status-live.ps1 shows it. A recorder run's run.json has no
+# mode, and everything below is unchanged for it.
+# Read through live-common's Read-RunJson, which shares the file with the
+# live supervisor writing it rather than blocking that write.
+. (Join-Path $here 'live-common.ps1')
+$probe = Read-RunJson -Root $Root
+if ($null -ne $probe -and $probe.mode -eq 'live') {
+    & (Join-Path $here 'status-live.ps1') -Root $Root
+    exit $LASTEXITCODE
+}
+
 $manifestPath = Join-Path $Root 'run.json'
 if (Test-Path $manifestPath) {
     $m = Get-Content $manifestPath -Raw | ConvertFrom-Json

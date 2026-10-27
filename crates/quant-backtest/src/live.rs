@@ -565,6 +565,48 @@ where
     }
 }
 
+/// How often [`stop_file_appears`] looks for its file.
+pub const STOP_FILE_POLL: Duration = Duration::from_millis(250);
+
+/// The binary's stop: Ctrl-C, or `stop_file` appearing when one is named.
+///
+/// Ctrl-C is how a person at the run's console stops it, and it is not a way
+/// another process can stop it on Windows. A console control event reaches
+/// only the processes attached to the console it is raised in, so a harness
+/// that started the binary in a hidden console of its own has no clean way to
+/// raise one there; `CloseMainWindow`, which `ops/stop-run.ps1` uses on the
+/// recorder, finds no window to close for a process in a hidden console, and
+/// would raise `CTRL_CLOSE_EVENT` rather than Ctrl-C if it did; and
+/// `Stop-Process` is a kill, which skips the cancels and the closing lines
+/// and leaves the capture's last segment without a trailer. So the harness
+/// names a file, and creates it to stop the run: the stop then takes the
+/// same path a Ctrl-C does, polled from the run's first instant
+/// (`Primed`), and the run ends cleanly with its closing lines.
+pub async fn until_stopped(stop_file: Option<PathBuf>) -> std::io::Result<()> {
+    let ctrl_c = tokio::signal::ctrl_c();
+    match stop_file {
+        None => ctrl_c.await,
+        Some(path) => tokio::select! {
+            stopped = ctrl_c => stopped,
+            stopped = stop_file_appears(path) => stopped,
+        },
+    }
+}
+
+/// Complete once `path` exists, looking every [`STOP_FILE_POLL`].
+///
+/// A path that cannot be looked at counts as absent rather than as a stop or
+/// an error: a stop file is how a person asks for a stop, so nothing but its
+/// appearance may end a run that is trading, and Ctrl-C still works beside
+/// it.
+pub async fn stop_file_appears(path: PathBuf) -> std::io::Result<()> {
+    while !path.exists() {
+        tokio::time::sleep(STOP_FILE_POLL).await;
+    }
+    info!(stop_file = %path.display(), "the stop file appeared: stopping");
+    Ok(())
+}
+
 /// The market capture a run makes, whether or not it trades.
 fn market_config(config: &LiveConfig) -> CaptureConfig {
     let market = CaptureConfig::new(config.symbol.clone(), config.root.clone())

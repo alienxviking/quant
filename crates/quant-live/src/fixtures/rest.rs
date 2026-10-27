@@ -185,6 +185,18 @@ impl RestVenue {
     /// If it cannot bind.
     #[must_use]
     pub fn start(script: Script) -> Self {
+        Self::start_for(script, LIFETIME)
+    }
+
+    /// [`Self::start`], stopping by itself after `lifetime` rather than
+    /// [`LIFETIME`]: for a rehearsal of the live harness, whose run lasts
+    /// minutes, where a test's lasts seconds.
+    ///
+    /// # Panics
+    ///
+    /// If it cannot bind.
+    #[must_use]
+    pub fn start_for(script: Script, lifetime: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.set_nonblocking(true).expect("a listener to poll");
         let base = format!("http://{}", listener.local_addr().expect("address"));
@@ -200,7 +212,7 @@ impl RestVenue {
                 Arc::clone(&stop),
                 Arc::clone(&released),
             );
-            std::thread::spawn(move || accept(&listener, &shared, &stop, &released))
+            std::thread::spawn(move || accept(&listener, &shared, &stop, &released, lifetime))
         };
         Self {
             base,
@@ -285,8 +297,9 @@ fn accept(
     shared: &Arc<Mutex<Shared>>,
     stop: &Arc<AtomicBool>,
     released: &Arc<AtomicUsize>,
+    lifetime: Duration,
 ) {
-    let deadline = Instant::now() + LIFETIME;
+    let deadline = Instant::now() + lifetime;
     let mut connections = Vec::new();
     let mut holds = 0_usize;
     while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {

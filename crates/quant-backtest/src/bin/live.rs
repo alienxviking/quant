@@ -5,7 +5,7 @@
 //!      [--cash N] [--qty N] [--minutes N | --hours N]
 //!      [--fast N] [--slow N] [--interval-secs N]
 //!      [--max-order N] [--max-position N] [--max-daily-loss N] [--max-orders N]
-//!      [--rest URL] [--ws-api URL] [--market-ws URL]
+//!      [--rest URL] [--ws-api URL] [--market-ws URL] [--stop-file PATH]
 //!
 //! live --symbol BTCUSDT                       # Spot Testnet, data/testnet
 //! live --symbol BTCUSDT --env live            # real money, data/live
@@ -41,6 +41,14 @@
 //! legal path, so no rule could tell a key from a directory, and the banner
 //! is where the operator reads where the run writes.
 //!
+//! # Stopping it
+//!
+//! Ctrl-C at its console, or, with `--stop-file PATH`, the file at `PATH`
+//! appearing: either is a clean stop, with the cancels and the closing
+//! lines (`live::until_stopped` says why a harness on Windows needs the
+//! second). The file must not exist when the run begins, or the run would
+//! stop as soon as it started, so one that does is refused as an argument.
+//!
 //! # Credentials
 //!
 //! From the environment only, as `venue-check` reads them:
@@ -59,6 +67,17 @@
 //!   refusal, so it must end supervision on 3 as on 0. Distinct from 0, so
 //!   that a harness can tell a run that traded from one that only recorded
 //!   without reading its output.
+//!
+//! Every path that returns says so first, as the last line on stdout:
+//! `exit      N`, with `N` the code it is about to exit with. A process ended
+//! from outside never gets to write it, and that is the point. Windows has no
+//! signals, so a kill is an exit code someone else chose: `taskkill /F` and
+//! Task Manager's *End task* end a process with **1**, this binary's own code
+//! for a run that could not go on. Without the line a harness cannot tell
+//! "the journal failed and every order was withheld" from "somebody killed it
+//! mid-order", and those want different things from the person who reads it.
+//! `ops/live-common.ps1` reads the line, and calls an ending the binary did not
+//! announce a kill whatever its code.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -70,6 +89,7 @@ use quant_backtest::live::{self, Endpoints, Environment, LiveConfig, LiveRun, Ou
 use quant_backtest::session::Settings;
 use quant_binance::account::AccountPolicy;
 use quant_binance::credentials::Credentials;
+use quant_binance::endpoint::NotLocal;
 use quant_core::fixed::{Notional, Qty};
 use quant_core::time::SystemClock;
 use quant_engine::Limits;
@@ -93,6 +113,8 @@ struct Args {
     overridden: Vec<&'static str>,
     root: PathBuf,
     journal: PathBuf,
+    /// A file whose appearance stops the run, beside Ctrl-C.
+    stop_file: Option<PathBuf>,
     symbol: String,
     cash: Notional,
     qty: Qty,
@@ -111,13 +133,26 @@ struct Args {
 struct BadArgument(String);
 
 fn main() -> ExitCode {
+    let code = live_main();
+    println!("{}", ended(code));
+    ExitCode::from(code)
+}
+
+/// The last line the binary writes, naming the code it exits with. The
+/// module docs say why; `ops/live-common.ps1` reads it, and a test pins it.
+fn ended(code: u8) -> String {
+    format!("exit      {code}")
+}
+
+/// The run, to the code it ends with.
+fn live_main() -> u8 {
     let args = match parse_args(std::env::args_os().skip(1)) {
         Ok(Some(args)) => args,
-        Ok(None) => return ExitCode::SUCCESS,
+        Ok(None) => return 0,
         Err(BadArgument(why)) => {
             eprintln!("{why}");
             eprintln!("{USAGE}");
-            return ExitCode::from(2);
+            return 2;
         }
     };
     // JSON, so the metrics line is a value rather than prose, as paper's is.
@@ -138,7 +173,7 @@ fn main() -> ExitCode {
                 "the journal {} could not be read or opened: {e}",
                 args.journal.display()
             );
-            return ExitCode::FAILURE;
+            return 1;
         }
     };
     let config = LiveConfig {
@@ -160,19 +195,24 @@ fn main() -> ExitCode {
         clock: Arc::new(SystemClock),
     };
     let keys = Credentials::from_env;
-    match live::run(&config, &keys, journalled, tokio::signal::ctrl_c()) {
+    match live::run(
+        &config,
+        &keys,
+        journalled,
+        live::until_stopped(args.stop_file.clone()),
+    ) {
         Ok(run) => {
             let (code, line) = verdict(&run);
             if code == 1 {
                 error!(verdict = %line, "the live run could not go on");
             }
             println!("{line}");
-            ExitCode::from(code)
+            code
         }
         Err(e) => {
             error!(error = %e, "the live run stopped");
             eprintln!("the live run stopped: {e}");
-            ExitCode::FAILURE
+            1
         }
     }
 }
@@ -244,6 +284,10 @@ fn banner(args: &Args) {
     );
     println!("root      {}", args.root.display());
     println!("journal   {}", args.journal.display());
+    match &args.stop_file {
+        Some(path) => println!("stop      Ctrl-C, or the file {} appearing", path.display()),
+        None => println!("stop      Ctrl-C"),
+    }
     println!("symbol    {}", args.symbol);
     println!("duration  {} minutes", args.minutes);
     println!(
@@ -258,12 +302,15 @@ const USAGE: &str = "usage: live --symbol SYM [--root PATH] [--env testnet|live]
             [--cash N] [--qty N] [--minutes N | --hours N]
             [--fast N] [--slow N] [--interval-secs N]
             [--max-order N] [--max-position N] [--max-daily-loss N] [--max-orders N]
-            [--rest URL] [--ws-api URL] [--market-ws URL]
+            [--rest URL] [--ws-api URL] [--market-ws URL] [--stop-file PATH]
 
 --env picks every endpoint at once and defaults to testnet: real money is
 spent only with --env live. --rest, --ws-api and --market-ws are for a local
 stand-in and take only a loopback host. Credentials come from BINANCE_API_KEY and
 BINANCE_ED25519_PRIVATE_KEY, as venue-check reads them.
+
+It stops cleanly on Ctrl-C, or, with --stop-file, when that file appears; the
+file must not exist when the run begins.
 
 Exit 0 when it traded and stopped clean; 1 when the run could not go on,
 the journal's failure included; 2 for an argument it does not take; 3 when a
@@ -284,6 +331,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
     let mut environment = Environment::Testnet;
     let (mut rest, mut ws_api, mut market_ws) = (None, None, None);
     let (mut root, mut journal, mut symbol) = (None, None, None);
+    let mut stop_file: Option<PathBuf> = None;
     let mut cash: Notional = "100".parse().expect("a valid amount");
     let mut qty: Qty = "0.001".parse().expect("a valid quantity");
     let mut minutes = DEFAULT_MINUTES;
@@ -342,6 +390,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
             }
             "--journal" => journal = Some(PathBuf::from(value()?)),
             "--root" => root = Some(PathBuf::from(value()?)),
+            "--stop-file" => stop_file = Some(PathBuf::from(value()?)),
             "--cash" => {
                 let text = value()?;
                 cash = text.parse().map_err(|_| number("--cash"))?;
@@ -436,12 +485,23 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
     }
     let root = root.unwrap_or_else(|| PathBuf::from("data").join(environment.name()));
     let journal = journal.unwrap_or_else(|| root.join(format!("live-{symbol}.jsonl")));
+    // A stop file already there would stop the run as soon as it began: the
+    // stop is polled from the run's first instant. Refused before anything
+    // runs, so a stale one left by an earlier run cannot end this one.
+    if stop_file.as_deref().is_some_and(std::path::Path::exists) {
+        return Err(BadArgument(
+            "--stop-file names a file that already exists, so the run would stop as soon as it \
+             began: remove it, or name another"
+                .to_owned(),
+        ));
+    }
     Ok(Some(Args {
         environment,
         endpoints,
         overridden,
         root,
         journal,
+        stop_file,
         symbol,
         cash,
         qty,
@@ -456,64 +516,26 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Option<Args>, 
 
 /// An endpoint override, if it begins with one of `schemes` and names a
 /// loopback host: a key pasted in its place does not, and is refused without
-/// being repeated.
-///
-/// Loopback only, because an override exists for a local stand-in and for
-/// nothing else. Any other host could be the other environment's: a testnet
-/// run with `--rest https://api.binance.com` would place real orders under a
-/// banner that says no money is at risk, and `--env live` with the testnet's
-/// market stream would trade real money on prices that are not the market's.
-/// `--env` is the one way to choose a venue, so the venue a run names is the
-/// venue it reaches.
+/// being repeated. The rule, and why it is loopback only, is
+/// `quant_binance::endpoint`'s, which `venue-check` holds its override to as
+/// well: `--env` is the one way to choose a venue.
 fn url(text: &str, schemes: &[&str]) -> Result<String, BadArgument> {
-    let Some(rest) = schemes.iter().find_map(|scheme| text.strip_prefix(scheme)) else {
-        return Err(BadArgument(format!(
+    quant_binance::endpoint::local_override(text, schemes).map_err(|why| match why {
+        NotLocal::Scheme => BadArgument(format!(
             "an endpoint begins with {}, and that one does not; not repeated here",
             schemes.join(" or ")
-        )));
-    };
-    if loopback(rest) {
-        Ok(text.to_owned())
-    } else {
-        Err(BadArgument(
+        )),
+        NotLocal::Host => BadArgument(
             "an endpoint override names a local stand-in, on 127.0.0.1, ::1 or localhost, and \
              that one does not; not repeated here. --env chooses the venue"
                 .to_owned(),
-        ))
-    }
-}
-
-/// Whether what follows a URL's scheme names a loopback host. Strict: a user
-/// part is refused outright (`127.0.0.1@elsewhere` is elsewhere), and a name
-/// counts only when it is exactly `localhost`, so `localhost.example` and
-/// `127.0.0.1.example` are not loopback.
-fn loopback(after_scheme: &str) -> bool {
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    if authority.contains('@') {
-        return false;
-    }
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        let Some((inside, after)) = bracketed.split_once(']') else {
-            return false;
-        };
-        return (after.is_empty() || after.starts_with(':'))
-            && inside
-                .parse::<std::net::Ipv6Addr>()
-                .is_ok_and(|ip| ip.is_loopback());
-    }
-    let host = authority.split(':').next().unwrap_or_default();
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::Ipv4Addr>()
-            .is_ok_and(|ip| ip.is_loopback())
+        ),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, verdict, Args, BadArgument, RECORDED_ONLY};
+    use super::{ended, parse_args, verdict, Args, BadArgument, RECORDED_ONLY};
     use quant_backtest::live::{Environment, Gate, LiveRun, Outcome, Refusal, Traded};
     use quant_binance::capture::AccountCaptured;
     use quant_binance::user_data::RunTag;
@@ -690,6 +712,29 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_file_is_taken_only_while_it_does_not_exist() {
+        let dir = std::env::temp_dir().join(format!("quant-live-bin-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory");
+        let path = dir.join("live.stop");
+        let given = path.to_str().expect("a path that is text");
+
+        assert_eq!(
+            parsed(&["--symbol", "BTCUSDT"]).expect("parses").stop_file,
+            None
+        );
+        let args = parsed(&["--symbol", "BTCUSDT", "--stop-file", given]).expect("parses");
+        assert_eq!(args.stop_file.as_deref(), Some(path.as_path()));
+
+        // One left by an earlier run would stop this one as it began.
+        std::fs::write(&path, b"stop").expect("a stale stop file");
+        let BadArgument(said) =
+            parsed(&["--symbol", "BTCUSDT", "--stop-file", given]).expect_err("refused");
+        assert!(said.contains("already exists"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_number_each_numeric_flag_takes_is_taken() {
         // The other side of the refusal above: each flag still parses the
         // value it is for, so the refusal is about the value and not the flag.
@@ -784,6 +829,23 @@ mod tests {
             let (code, line) = verdict(&run);
             assert_eq!(code, 1, "{line}");
             assert!(line.contains("market capture"), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_last_line_names_the_exit_code_in_the_shape_the_harness_reads() {
+        // ops/live-common.ps1 matches '^exit\s+(-?\d+)$' and compares the
+        // number with the code the process really ended with; a run whose
+        // line it cannot find is reported as killed. So the shape is the
+        // contract, and every code the binary has must produce it.
+        assert_eq!(ended(0), "exit      0");
+        assert_eq!(ended(3), "exit      3");
+        for code in [0_u8, 1, 2, 3] {
+            let line = ended(code);
+            let rest = line.strip_prefix("exit").expect("starts with exit");
+            assert!(rest.starts_with(char::is_whitespace), "{line}");
+            assert_eq!(rest.trim().parse::<u8>(), Ok(code), "{line}");
+            assert!(!line.contains(['\r', '\n']), "one line: {line:?}");
         }
     }
 }

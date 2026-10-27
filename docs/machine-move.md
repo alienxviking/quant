@@ -254,19 +254,22 @@ host). That example is `preflight.sh`'s, whose midpoint arithmetic is right.
 `venue-check`'s own correction had the wrong sign, putting it off by a full round
 trip, until `m8b-venue-check-offset`.
 
-**The ops harness, and this is the real gap.** `ops/*.ps1` is **record-only**.
-The paper mode exists in the bash half alone, deliberately: *"an untested paper
-mode there would be exactly the harness-never-run M1 warns about"*. There is no
-live mode in either half yet; slice (c)'s last pull request adds one. This said
-the bash harness runs under WSL unmodified. It does not, because it has only ever
-run on macOS and uses BSD `date -u -r`, `caffeinate` and BSD `stat -f`. So an M8
-run on the Omen needs a WSL port or a PowerShell port, rehearsed either way, and
-that is a slice of work in its own right that must not be written the night
-before a run.
+**The ops harness.** `ops/*.ps1` records and, since 8b (`m8c-live-ops`), runs
+a live session: `ops/start-live.ps1` and its siblings, one attempt and no
+restart, tested by `ops/test-live.ps1` and rehearsed end to end against
+`fake-binance` (`docs/live-run.md` §7). The paper mode is still in the bash
+half alone, deliberately: *"an untested paper mode there would be exactly the
+harness-never-run M1 warns about"*. This once said the bash harness runs under
+WSL unmodified. It does not, because it has only ever run on macOS and uses BSD
+`date -u -r`, `caffeinate` and BSD `stat -f`, which is why the live mode was
+written for PowerShell rather than ported.
 
-Whichever port, the host has to stay awake for the run. M8 plans an afternoon,
-not 72 hours (`docs/live-run.md` §2), and `caffeinate` has no Windows equivalent:
-that is Windows power settings, not a script.
+The host has to stay awake for the run. M8 plans an afternoon, not 72 hours
+(`docs/live-run.md` §2). The live supervisor holds a keep-awake request for its
+life, `SetThreadExecutionState` with the system and the display required, which
+is `caffeinate -dimsu`'s counterpart and changes no setting. It does not beat a
+closed lid, a sleep someone asks for, or a restart Windows Update forces; those
+stay the operator's.
 
 ---
 

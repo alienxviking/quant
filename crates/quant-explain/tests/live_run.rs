@@ -933,6 +933,69 @@ fn a_stop_that_comes_before_the_capture_ends_the_run_cleanly() {
 }
 
 #[test]
+fn a_stop_file_stops_a_trading_run_as_ctrl_c_does() {
+    // The harness's stop on Windows, where another process cannot raise a
+    // Ctrl-C in the run's console: the binary's own stop, with a file named.
+    // A run that has passed its gates goes on trading while the file is
+    // absent, and once it appears ends cleanly, its session written whole.
+    let rig = Rig::new(Script::default());
+    let stop_file = rig.dir.join("live.stop");
+    let config = rig.config("0.001");
+    let journalled = rig.journalled();
+    let account = Arc::clone(&rig.account);
+    let watched = stop_file.clone();
+    let thread = std::thread::spawn(move || {
+        let keys = move || Ok(account.credentials());
+        live::run(
+            &config,
+            &keys,
+            journalled,
+            live::until_stopped(Some(watched)),
+        )
+    });
+    let running = Running {
+        thread: Some(thread),
+        stop: None,
+    };
+    rig.trading();
+    rig.journalled_line("the session's start", |e| {
+        matches!(e, JournalEntry::Started { .. })
+    });
+    // Several looks at a file that is not there have not stopped it.
+    let looked = Instant::now();
+    until("several looks for the stop file", || {
+        looked.elapsed() >= live::STOP_FILE_POLL * 4
+    });
+    assert!(
+        !running.thread.as_ref().expect("running").is_finished(),
+        "the run stopped with no stop file"
+    );
+    assert!(!rig
+        .entries()
+        .iter()
+        .any(|e| matches!(e, JournalEntry::Stopped { .. })));
+
+    std::fs::write(&stop_file, b"stop").expect("the stop file");
+    let traded = traded(running.join());
+    assert_eq!(traded.drained.working, Vec::new());
+    assert!(traded.account.is_ok(), "{:?}", traded.account);
+    let entries = rig.entries();
+    assert!(entries
+        .iter()
+        .any(|e| matches!(e, JournalEntry::Stopped { working, .. } if working.is_empty())));
+    assert!(
+        matches!(entries.last(), Some(JournalEntry::Balances { .. })),
+        "the closing lines: {entries:#?}"
+    );
+    assert_eq!(
+        live::last_session_gate(&entries),
+        Ok(()),
+        "the next run may trade"
+    );
+    assert_eq!(verified_clean(&rig.root), 2, "both captures sealed");
+}
+
+#[test]
 fn a_clean_stop_cancels_a_resting_order_and_settles_its_end() {
     let rig = Rig::new(Script::default());
     let running = rig.start(rig.config("0.001"), rig.journalled());

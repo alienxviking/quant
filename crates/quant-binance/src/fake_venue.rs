@@ -364,6 +364,24 @@ impl FakeVenue {
         Credentials::new(self.api_key.clone(), &self.private_key).expect("a key ring made")
     }
 
+    /// The two variables a child process reads these credentials from, with
+    /// their values: [`Credentials::KEY_VAR`] and
+    /// [`Credentials::PRIVATE_KEY_VAR`], as the live binary and `venue-check`
+    /// read them.
+    ///
+    /// For a rehearsal that runs the real binaries against this venue in
+    /// processes of their own (`quant-backtest`'s `fake-binance` example),
+    /// and for nothing else: the values go into a child's environment and
+    /// are never printed or written. The key was generated in this process
+    /// for this venue and is valid nowhere else.
+    #[must_use]
+    pub fn child_environment(&self) -> [(&'static str, String); 2] {
+        [
+            (Credentials::KEY_VAR, self.api_key.clone()),
+            (Credentials::PRIVATE_KEY_VAR, self.private_key.clone()),
+        ]
+    }
+
     /// Credentials with this venue's API key and a private key it has never
     /// seen: what a wrong key file would give.
     #[must_use]

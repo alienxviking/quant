@@ -31,6 +31,35 @@
 
 .PARAMETER LogDir
     Where the verification log goes.
+
+.PARAMETER Journal
+    A live run's journal (start-live.ps1 passes it). Each pass then also runs
+    reconcile and runlog check on it, which is how a live run's record is
+    watched while it is written: a journal that has stopped agreeing with
+    itself should cost minutes, not the afternoon. Without it, nothing about
+    the loop changes: a recorder run has no journal to read.
+
+      reconcile     0 agrees, 2 no checkpoint yet (WAIT, not an alarm), 1 not
+      runlog check  0 complete, 2 nothing to check yet (WAIT), 1 not
+
+    A torn last line is normal for a journal being written, and both read it
+    as the tail of an open file rather than as damage. The account replay
+    needs the account capture sealed, so it runs once, after the run, in
+    check-live.ps1.
+
+.PARAMETER IntervalSeconds
+    How often to check, in seconds, in place of IntervalHours: a live run is
+    an afternoon, not a week, and its rehearsal is minutes. Zero, the
+    default, leaves IntervalHours in charge.
+
+.PARAMETER UntilRunEnds
+    A live run's (start-live.ps1 passes it): stop as soon as the root's
+    run.json says the run has ended, or that its supervisor is gone, rather
+    than at EndAt. A live run can end hours early, by a stop, a gate, a
+    failure or a kill, and a loop left running after it would go on writing
+    verify.log lines that the status view shows as though the run were being
+    watched. Read every couple of seconds, between passes and during the
+    sleeps. Without it nothing about the loop changes.
 #>
 [CmdletBinding()]
 param(
@@ -40,11 +69,19 @@ param(
     [int] $IntervalHours = 6,
     # How long to wait before the first check. A misconfiguration shows up in the
     # first few minutes, and that is the failure most worth catching early.
-    [int] $FirstCheckSeconds = 300
+    [int] $FirstCheckSeconds = 300,
+    [string] $Journal,
+    [int] $IntervalSeconds = 0,
+    [switch] $UntilRunEnds
 )
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Every argument quoted by one rule, so that a root with a space in it, or
+# ending in a backslash, reaches verify as one argument.
+. (Join-Path $here 'native-args.ps1')
+. (Join-Path $here 'shared-log.ps1')
+if ($UntilRunEnds) { . (Join-Path $here 'live-common.ps1') }
 $repo = Resolve-Path (Join-Path $here '..')
 $exe  = Join-Path $repo 'target\release\verify.exe'
 $log  = Join-Path $LogDir 'verify.log'
@@ -59,20 +96,91 @@ function Note {
     param([string] $Message)
     $line = "{0} {1}" -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $Message
     Write-Host $line
-    Add-Content -Path $log -Value $line -Encoding utf8
+    # A shared append (shared-log.ps1): status.ps1 reads this log while the
+    # loop writes it, and Add-Content loses a line to a reader.
+    if (-not (Add-SharedLine -Path $log -Line $line)) { Write-Host "  (the log could not take that line)" }
 }
 
 # Only reconcile if a database was configured. Without one the flag exits 2 every
 # time, which would train whoever reads this log to ignore a non-zero code -- the
 # same reason warnings do not fail a verification run.
 $useReconcile = -not [string]::IsNullOrWhiteSpace($env:QUANT_DATABASE_URL)
-Note "verifying $Root every ${IntervalHours}h until $($EndAt.ToUniversalTime().ToString('u')), reconcile=$useReconcile"
+$intervalSecondsNow = $IntervalHours * 3600
+$cadence = "${IntervalHours}h"
+if ($IntervalSeconds -gt 0) { $intervalSecondsNow = $IntervalSeconds; $cadence = "${IntervalSeconds}s" }
+$watchJournal = -not [string]::IsNullOrWhiteSpace($Journal)
+$journalNote = ''
+if ($watchJournal) { $journalNote = ", journal $Journal" }
+Note "verifying $Root every $cadence until $($EndAt.ToUniversalTime().ToString('u')), reconcile=$useReconcile$journalNote"
+
+# A live run's journal, read the two ways that can be read while it is still
+# being written. Each binary's output kept in a file of its own, as verify's is.
+function Watch-Journal {
+    param([string] $Stamp)
+    if (-not (Test-Path $Journal)) {
+        Note "WAIT $([System.IO.Path]::GetFileName($Journal)): not written yet"
+        return
+    }
+    $checks = @(
+        @{ name = 'reconcile'; exe = (Join-Path $repo 'target\release\reconcile.exe'); arguments = @($Journal) },
+        @{ name = 'runlog'; exe = (Join-Path $repo 'target\release\runlog.exe'); arguments = @('check', $Journal) }
+    )
+    foreach ($check in $checks) {
+        $jout = Join-Path $LogDir "$($check.name)-$Stamp.txt"
+        $jerr = Join-Path $LogDir "$($check.name)-$Stamp.err"
+        if (-not (Test-Path $check.exe)) {
+            Note "FAIL $($check.name): no release binary at $($check.exe)"
+            continue
+        }
+        $quoted = ConvertTo-NativeArguments $check.arguments
+        $p = Start-Process -FilePath $check.exe -ArgumentList $quoted `
+            -RedirectStandardOutput $jout -RedirectStandardError $jerr `
+            -NoNewWindow -Wait -PassThru
+        $said = (Get-Content $jout -ErrorAction SilentlyContinue | Select-String '^verdict') -join ''
+        switch ($p.ExitCode) {
+            0 { Note "OK   $($check.name): $said" }
+            2 { Note "WAIT $($check.name): nothing to check yet" }
+            default { Note "FAIL $($check.name) exit $($p.ExitCode): $said" }
+        }
+    }
+}
+
+# With -UntilRunEnds, whether the live run this loop watches is over: its
+# run.json says it ended or was refused, or names a supervisor that is no
+# longer running. The supervisor's own process is asked by id alone: a reused
+# id can only keep this loop going until EndAt, which is what it did before.
+function Test-RunEnded {
+    if (-not $UntilRunEnds) { return $null }
+    try { $m = Read-RunJson -Root $Root } catch { return $null }
+    if ($null -eq $m) { return $null }
+    $state = "$($m.supervisor)"
+    if ($state -eq 'finished' -or $state -eq 'refused') { return "the run has ended ($($m.outcome))" }
+    if ("$($m.supervisor_pid)" -match '^\d+$' -and $null -eq (Get-Process -Id ([int]$m.supervisor_pid) -ErrorAction SilentlyContinue)) {
+        return "the run's supervisor, pid $($m.supervisor_pid), is gone"
+    }
+    return $null
+}
+
+# Sleep, waking every two seconds to ask whether the run has ended: the reason
+# it has, or $null when the sleep ran its course.
+function Wait-Seconds {
+    param([double] $Seconds)
+    $until = (Get-Date).AddSeconds($Seconds)
+    while ($true) {
+        $ended = Test-RunEnded
+        if ($null -ne $ended) { return $ended }
+        $left = ($until - (Get-Date)).TotalMilliseconds
+        if ($left -le 0) { return $null }
+        if (-not $UntilRunEnds) { Start-Sleep -Milliseconds ([int]$left); return $null }
+        Start-Sleep -Milliseconds ([int][math]::Min(2000, $left))
+    }
+}
 
 # A first pass shortly after the start, because the failure worth catching early
 # is a misconfiguration, and that shows up in the first few minutes.
-Start-Sleep -Seconds $FirstCheckSeconds
+$ended = Wait-Seconds $FirstCheckSeconds
 
-while ((Get-Date).ToUniversalTime() -lt $EndAt.ToUniversalTime()) {
+while ($null -eq $ended -and (Get-Date).ToUniversalTime() -lt $EndAt.ToUniversalTime()) {
     $stamp  = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
     $out    = Join-Path $LogDir "verify-$stamp.txt"
     $errOut = Join-Path $LogDir "verify-$stamp.err"
@@ -80,7 +188,7 @@ while ((Get-Date).ToUniversalTime() -lt $EndAt.ToUniversalTime()) {
     $arguments = @($Root)
     if ($useReconcile) { $arguments += '--reconcile' }
 
-    $process = Start-Process -FilePath $exe -ArgumentList $arguments `
+    $process = Start-Process -FilePath $exe -ArgumentList (ConvertTo-NativeArguments $arguments) `
         -RedirectStandardOutput $out -RedirectStandardError $errOut `
         -NoNewWindow -Wait -PassThru
 
@@ -98,9 +206,17 @@ while ((Get-Date).ToUniversalTime() -lt $EndAt.ToUniversalTime()) {
         }
     }
 
+    if ($watchJournal) {
+        Watch-Journal $stamp
+    }
+
     $remaining = ($EndAt.ToUniversalTime() - (Get-Date).ToUniversalTime()).TotalSeconds
     if ($remaining -le 60) { break }
-    Start-Sleep -Seconds ([math]::Min($IntervalHours * 3600, $remaining))
+    $ended = Wait-Seconds ([math]::Min($intervalSecondsNow, $remaining))
 }
 
-Note "verification loop finished"
+if ($null -ne $ended) {
+    Note "verification loop finished: $ended, and the after-run checks have the last word"
+} else {
+    Note "verification loop finished"
+}

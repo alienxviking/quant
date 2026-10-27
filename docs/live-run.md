@@ -148,10 +148,14 @@ independent because two `SimulatedVenue`s are. Two live processes share one
 exchange balance while holding two private `Portfolio`s and two daily-loss
 budgets, neither of which can see the other's fills — so each would permit its
 full budget against a balance the other is also spending. One symbol, one
-process, one account, to be enforced by a live mode of `ops/start-run.sh` rather
-than left to care. That mode does not exist yet: `supervise.sh` accepts only
-`record` and `paper`, and `start-run.sh` defaults to two symbols. Slice (c)'s last
-pull request adds it, tested the way `ops/test-supervise.sh` tests the supervisor.
+process, one account, enforced by the live mode rather than left to care. That
+mode is the PowerShell harness's `ops/start-live.ps1` (8b, §7, *Running it*),
+not a mode of `ops/start-run.sh` as this said before the owner chose PowerShell
+(*Where it runs*): it takes one `-Symbol`, refuses to start while another live
+supervisor holds the host's one-live-run lock or any `live.exe` runs, whatever
+`-Force` says, and its supervisor holds that lock for its whole life, so a
+second one started past the check is refused too. Tested the way
+`ops/test-supervise.sh` tests the supervisor, by `ops/test-live.ps1`.
 
 **Not a second way to fold our own records — but `runlog diff` as it stands
 cannot be the criterion, and saying otherwise would have made M8 vacuous.**
@@ -376,7 +380,7 @@ Engine"*.
 |---|---|---|
 | a | The engine can receive what a venue says | **done** — wake on either input (`next_event_timeout`), forward-only clock. `LiveSource`'s half was missed (§1) and landed in `m8a-live-source-idles` (#52) |
 | b | Credentials, signing, and refusing to run without them | **done** — `Credentials`, `TradeClient`, `venue-check`; reworked for Ed25519 in slice (c), `m8c-ed25519-credentials` (§5) |
-| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`) and item 7, its merge machine (`m8c-live-machine`) and its shell (`m8c-live-shell`); and item 8's binary, 8a (`m8c-live-binary`). Item 8's `ops/` live mode (8b) and its Spot Testnet run (8c) remain |
+| c | `LiveVenue`: submit, cancel, and the user-data stream | **part done**: `FeeAsset`, the translator (`user_data.rs`), the order encoder and classifier (`orders.rs`), the order transport (`TradeClient::place_order`, `cancel_order`), the instrument from the venue (#60), the engine seam (#65), the account stream's frame kind (#63), the journal's entries (item 4, `m8c-journal-live`), item 4's readers (`m8c-journal-readers`) and the account listener (item 6, `m8c-account-stream`) and item 7, its merge machine (`m8c-live-machine`) and its shell (`m8c-live-shell`); and item 8's binary, 8a (`m8c-live-binary`), and its PowerShell live mode in `ops/`, 8b (`m8c-live-ops`, §7, *Running it*). Item 8's Spot Testnet run (8c) remains |
 | d | The indeterminate window | `InDoubt`, recovery by `origClientOrderId` |
 | e | Reconciliation against the venue | criteria A, B, C as a binary |
 | f | The run, and the lifecycle checklist | criterion D, criterion E |
@@ -695,7 +699,7 @@ feature.
    on both data roots, and replaying the recorded account frames through the
    translator reproduces every venue-produced journal entry.
 
-   It is three pieces of work, and the first is done.
+   It is three pieces of work, and the first two are done.
 
    - **8a, the binary, is built** (`m8c-live-binary`), rehearsed against local
      stand-ins for every endpoint: `quant-live::fixtures::rest` for REST,
@@ -726,20 +730,35 @@ feature.
      whose floored exit is under the minimum, refused. Every test seen red
      under its break; what building it corrected is in §5, *LiveVenue,
      decided before the code*, §8.
-   - **8b, the live mode in `ops/`, remains**, and the owner settled its
-     shape on 2026-10-26: a **PowerShell** live mode in the `.ps1` half, not a
-     WSL port, and **no automatic restart** (*Where it runs*, below). It
-     enforces one symbol, one process, one account, and is tested as
-     `ops/test-supervise.sh` tests the supervisor. With no restart, every
-     exit ends the run: 0 traded and stopped cleanly, 3 a refused gate
-     (recorded only), 1 a failure, and the harness says which, since a
-     restart into the same refusal or after a crash is what the owner ruled
-     out.
+   - **8b, the live mode in `ops/`, is built** (`m8c-live-ops`), in the
+     shape the owner settled on 2026-10-26: a **PowerShell** live mode in the
+     `.ps1` half, not a WSL port, and **no automatic restart** (*Where it
+     runs*, below). `ops/start-live.ps1` starts one symbol on Spot Testnet
+     unless `-RealMoney` names real money; `ops/supervise-live.ps1` runs the
+     binary once, under the host's one-live-run lock and a keep-awake
+     request, and writes how it ended into `run.json` and its log in words,
+     0 stopped, 1 failed, 2 bad argument, 3 recorded only, anything else
+     killed, never restarting; `ops/stop-live.ps1` stops it cleanly through a
+     stop file the binary now watches beside Ctrl-C (`--stop-file`), the one
+     clean stop another process has on Windows; `ops/check-live.ps1` runs the
+     four after-run checks; and the preflight runs `venue-check`, signed and
+     round-trip corrected, as the binary's first gate asks it. Tested by
+     `ops/test-live.ps1` (194 checks against a fake `live.exe` since two
+     reviews, each seen red under a break) and `ops/test-venue-clock.ps1`,
+     and rehearsed end to end,
+     real harness and real binaries, against `fake-binance`, a local stand-in
+     for all three endpoints: started through the preflight, a round trip,
+     the verify loop's passes, the operator's stop, and `verify` on both
+     trees, `reconcile`, `runlog check` and `replay-account` all clean. §7,
+     *Running it*, is the procedure, the rehearsal's transcript and what
+     building it corrected.
    - **8c, the Spot Testnet run, remains**, and needs two things from the
      owner: this host's clock fixed (it read 2.1 s ahead of Binance with
      `w32time` stopped, and the venue-checks gate refuses past 1 s), and an
      Ed25519 testnet key pair registered with Spot Testnet, loaded as
-     `venue-check --help` says. Its run is this item's acceptance. The
+     `venue-check --help` says. Its run is this item's acceptance, and §7,
+     *8c: what the owner types*, is the whole of it, from the Administrator
+     prompt to the stop. The
      testnet market stream's address (`SPOT_TESTNET_WS`), which 8a first
      wrote from memory, was checked against Binance's published testnet
      documentation before 8a merged (`binance-spot-api-docs`,
@@ -762,9 +781,10 @@ restart**. PowerShell over WSL, because WSL2 keeps a clock of its own, which
 drifts after the host sleeps, and the clock is the one thing that stops this
 host trading at all; the bash half is macOS-only in any case (below). No
 restart, because a crash mid-order is criterion E's to exercise deliberately,
-and the gates already refuse to trade after an unclean stop with orders
-working. The paragraphs below are the reasoning as it stood before the
-decision.
+and the gates already refuse to trade after an unclean stop with orders working.
+Built as 8b, and §7, *Running it*, is how to run it. The paragraphs below are
+the reasoning as it stood before the decision, when the `.ps1` half was still
+record-only.
 
 M5 ran on the MacBook Air, and `ops/`'s bash half is the only harness with a
 paper or live mode — the `.ps1` half is **record-only**, deliberately, because
@@ -2091,3 +2111,346 @@ for the strategy — and it is bounded by being a single order, once.
 run exercises has been exercised before against a simulated venue. The honest
 summary of the risk is that the platform is well tested against a venue that
 agrees with it, and has never once been tested against one that does not.
+
+---
+
+## 7. Running it: the PowerShell live mode (8b)
+
+Built as `m8c-live-ops`, in the shape the owner settled on 2026-10-26 (*Where it
+runs*): the `.ps1` half, and no automatic restart. Everything below runs under
+Windows PowerShell 5.1 (`powershell.exe`), from the repository's root.
+
+### The scripts
+
+| script | what it does |
+|---|---|
+| `ops/start-live.ps1` | Refuses a second live run on the host, whatever `-Force` says. Runs the preflight. Keeps an earlier run's `run.json`, `check-live.log` and `verify.log` under that run's start time, then writes `run.json` (the binary's exact arguments, the commit, the preflight's verdict, anything skipped) before anything launches. Starts the supervisor detached, waits until it has the lock and the binary runs, then until the binary's gates answer, so that a refusal of either is said at the prompt: exit 0 trading, 3 recording only, 4 gates not yet answered, 1 nothing started. Starts the verify loop only once the binary runs. Spot Testnet unless `-RealMoney`, which it announces in a banner. |
+| `ops/preflight-live.ps1` | The build; one live run per host; `raw\` and `account\` empty and no journal, unless `-Resume`; disk; `BINANCE_API_KEY` and `BINANCE_ED25519_PRIVATE_KEY` present, named and never printed; `venue-check` as gate 1 asks it; `w32time` running; sleep, read only. |
+| `ops/supervise-live.ps1` | Runs `target\release\live.exe` once with `run.json`'s arguments, holding the one-live-run lock and a keep-awake request. Copies the binary's banner and its gates' answer into `run.json`, writes how the run ended in words, never restarts, runs the after-run checks, and lets go of both. Once the binary runs, no failed write of `run.json` can end it: each is logged and the binary is still waited for. |
+| `ops/stop-live.ps1` | Creates the run's stop file once the binary has read its arguments, waits for the supervisor's verdict and says it. A supervisor gone without one is said as `LOST`, with what the binary's log says. `ops/stop-run.ps1` hands a live root to it. |
+| `ops/check-live.ps1` | The after-run checks: `verify` on both trees, `reconcile`, `runlog check`, `replay-account`, each exit code in words. Run by the supervisor; run it by hand to see them again. |
+| `ops/status-live.ps1` | What `ops/status.ps1` shows for a live root: the outcome or what is running, whether the gates passed, a supervisor that is gone, the journal's last lines, both capture trees, the account stream's last `account` line, the verify loop, and once the run has ended its after-run checks. |
+| `ops/verify-loop.ps1` | Unchanged for a recorder run but for its quoting; with `-Journal` it also runs `reconcile` and `runlog check` each pass, `-IntervalSeconds` sets a cadence shorter than an hour, and `-UntilRunEnds` stops it when `run.json` says the run has ended or its supervisor is gone. |
+| `ops/live-common.ps1` | What they share: the endings in words, the lock, which process is which, the keep-awake request, `run.json`. |
+| `ops/native-args.ps1` | The one rule for writing an argument onto a command line, which every launch here uses. |
+| `ops/shared-log.ps1` | Appending to a log that another process is reading, which `Add-Content` cannot do. |
+| `ops/test-live.ps1` | 194 checks against a fake `live.exe`, then `ops/test-venue-clock.ps1`'s 13. |
+| `ops/rehearse-live.ps1` | The rehearsal below, run under `fake-binance`. |
+
+**A script of its own, not a `-Live` switch on `start-run.ps1`.** The bash half
+parameterised its paper mode because paper differs from recording by one argv.
+A live run differs in nearly everything `start-run.ps1` decides: one symbol where
+it loops over two, one attempt where its supervisor is a restart loop, minutes
+where it counts days, a preflight that signs with a key, a stop that cannot be a
+console event, and a rule against a second run anywhere on the host. A switch
+would put a branch in each of those, inside the scripts M1's week ran on, and
+"the record harness is unchanged" would stop being an empty diff.
+
+**Every exit ends the run, in words.** `run.json` and `logs\supervisor-live.log`
+say which of five endings it was: `stopped` (0, traded and stopped cleanly),
+`failed` (1), `bad-argument` (2, nothing ran), `recorded-only` (3, a gate
+refused) and `killed` (the journal has no closing lines and the next run's
+last-session gate will refuse to trade until a person has looked). The
+supervisor's own exit is the binary's for 0 to 3, 4 for killed, and 5 when it
+refused to start the binary.
+
+**A kill is an ending the binary did not announce, not a code.** Windows has no
+signals, so a kill is an exit code someone else chose, and `taskkill /F` and
+Task Manager's *End task* both choose 1, the binary's own code for a run that
+could not go on. Measured: `taskkill /F` gave 1 and `Stop-Process` gave -1. So
+the binary's last line on every path that returns is `exit      N`, and the
+harness calls an ending without that line, or with another number in it, a kill
+whatever its code. A test in `live.rs` pins the line's shape, and the rehearsal
+pins the harness reading the real binary's line, since it would otherwise
+report the clean stop as a kill.
+
+**Whether it trades is said at the prompt.** A gate that refuses makes the
+whole afternoon a recording, and the binary says so within seconds (`trading
+under run tag ...` or `RECORD ONLY ...`). The supervisor copies that line into
+`run.json`, `start-live.ps1` waits for it and says `TRADING` or, in a banner,
+`RECORDING ONLY, NOT TRADING` with the refusal, and the status view shows it.
+
+**`run.json` has one writer and many readers, and the readers matter.** On
+Windows a reader can stop a writer: a file open without `FILE_SHARE_DELETE`
+cannot be replaced, and `Move-Item -Force` deletes the old file before moving
+the new one in, so a reader in between finds nothing. Measured in tight loops
+before the fix, 140 of 1500 writes and 618 of 21399 reads failed, and a reader
+holding the file as `Get-Content` does killed the supervisor at the moment it
+recorded the binary's pid, leaving `live.exe` trading unwatched. Every reader
+now shares read, write and delete, the writer swaps the file in with
+`File.Replace`, both retry, and from the binary's start to its end the
+supervisor logs a failed write and goes on waiting.
+
+**One run per host.** The supervisor holds a named mutex, `Global\quant-live-run`,
+for its whole life; Windows releases it, abandoned, however the supervisor dies.
+`start-live.ps1` and the preflight ask first, and also refuse while any
+`live.exe` runs, started by hand or from another checkout, since all of them
+would share the one account.
+
+**The stop.** The binary stops cleanly on Ctrl-C, and no other process can give
+it one on Windows. A console control event reaches only the processes attached
+to the console it is raised in, and the binary runs in the hidden console its
+supervisor was started in. `CloseMainWindow`, which `ops/stop-run.ps1` uses on
+the recorder, was tried against the real binary started that way: its
+`MainWindowHandle` was 0, the call returned `False`, the binary kept running
+until it was killed, exit `-1`, and its journal had no `stopped` line. So the
+binary takes `--stop-file PATH` and watches that file beside Ctrl-C, on the same
+stop path (`quant_backtest::live::until_stopped`), and `stop-live.ps1` creates
+it. Each run gets a stop file of its own, `live-<stamp>.stop` in its root, and the
+binary refuses one that already exists.
+
+**Awake.** The supervisor calls `SetThreadExecutionState(ES_CONTINUOUS |
+ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`, the Windows counterpart of
+`caffeinate -dimsu -w $$`, and releases it when it ends. The display is held
+as `caffeinate -d` holds it, and here it matters: this host sleeps by Modern
+Standby (*S0 Low Power Idle*, `powercfg /a`), which a laptop enters when the
+display goes off, so a request for the system alone is not known to keep it
+out. Whether it would have was not measured, and holding the display removes
+the question. No setting changes, and Windows drops the request if the
+supervisor dies. Its log shows the thread's state read back both times,
+`0x80000003` while held and `0x80000000` after. A test cannot read the request
+from outside the process: the system-wide state (`CallNtPowerInformation`) was
+already `0x00000001` on this host, held by something else, and `powercfg
+/requests` needs Administrator. So the tests read the supervisor's own reading
+and the functions in their own thread. It does not beat a closed lid, a sleep
+someone asks for, or a restart Windows Update forces; for an afternoon those
+are the operator's: lid open, on mains, updates paused.
+
+**What the preflight leaves to the binary.** Gates 2 to 7 (`live.rs`): the
+instrument, the run tag, a latch, the last session, the size, the baseline. A
+refusal from any of them records only and exits 3, and the supervisor says so.
+The preflight asks gate 1's question early, with `venue-check`, which reads the clock
+with the gate's `read_clock` and `ClockSample::best_of` and makes the same three
+signed requests `TradeClient::checked` makes for the gate, at the run's `-Qty`. Without that, a bad clock or a key that cannot trade
+would cost an afternoon of recording only. What no gate sees: the build, the
+host's other runs, a dirty root or an existing journal (the binary resumes any
+journal it finds), disk, `w32time`. `w32time` stopped blocks a run on a real
+venue and is only a note against a local stand-in, whose clock is this host's.
+
+### 8c: what the owner types
+
+From the repository's root.
+
+```powershell
+# 1. The clock, once, in an Administrator PowerShell. This host read about
+#    2.1 s ahead of Binance with w32time stopped, and gate 1 refuses past 1 s.
+#    It builds venue-check itself before reading the clock with it: nothing
+#    else has built the binaries yet, and one from before --clock answers
+#    with its usage, which used to print as an empty reason.
+powershell -ExecutionPolicy Bypass -File ops\fix-clock.ps1
+
+# 2. A Spot Testnet key pair, made once outside the repository and registered
+#    with Spot Testnet; `venue-check --help` has the commands. Then, in the
+#    shell that will start the run:
+$env:BINANCE_API_KEY = "<the Spot Testnet API key>"
+$env:BINANCE_ED25519_PRIVATE_KEY = Get-Content -Raw "$env:USERPROFILE\.binance\ed25519.pem"
+
+# 3. Optional, and what the preflight runs anyway:
+cargo run --release -p quant-binance --bin venue-check -- --testnet
+
+# 4. Start. Spot Testnet, BTCUSDT, 240 minutes, M5's strategy and limits.
+powershell -ExecutionPolicy Bypass -File ops\start-live.ps1 -Symbol BTCUSDT
+
+# 5. Watch.
+powershell -File ops\status.ps1 -Root data\testnet
+
+# 6. Stop. This window or another; the run is detached.
+powershell -File ops\stop-live.ps1 -Root data\testnet
+```
+
+The preflight builds the release binaries itself. The run writes to
+`data\testnet`, which must hold no capture and no journal. After the stop,
+`run.json` says how it ended and `logs\check-live.log` holds the four after-run
+checks. Those are three of item 8's acceptance criteria: `reconcile` agrees,
+`verify` is clean on both data roots, and the account replay reproduces every
+venue-produced entry. The fourth, criterion D's states 1, 2, 4 and 6, is read
+off the journal. Real money is the same command with `-RealMoney`, a live key
+pair and `data\live`, and not before 8c has passed.
+
+### The rehearsal
+
+```powershell
+cargo build --release -p quant-backtest --example fake-binance
+target\release\examples\fake-binance.exe -- powershell -NoProfile -ExecutionPolicy Bypass -File ops\rehearse-live.ps1
+```
+
+`fake-binance` (an example of `quant-backtest`, so no build that ships contains
+it) starts the three stand-ins the tests use on loopback ports: the REST
+fixture, `fake_venue` for the WebSocket API (it checks each logon's Ed25519
+signature) and `fake_market`. It walks the touch a dollar every 400 ms and
+answers every order as a market order filled at the touch, a buy's fee in BTC,
+a sell's in USDT. A cancel always finds its order filled, so the REST side
+refuses it with `-2011`, as the venue would. It then runs the rehearsal with the
+three addresses and a key pair it generated in process in the child's
+environment, and nowhere else. `rehearse-live.ps1` refuses to start without
+those addresses, and every override is loopback-only, so the rehearsal cannot
+reach Binance. It is the operator's sequence: `start-live.ps1` and its
+preflight, a round trip, the verify loop, `status.ps1`, `stop-live.ps1`, the
+after-run checks.
+
+Run on 2026-10-27 at `da1aa21`, after both reviews' fixes, on this host. The
+key lines, the root shortened to `<scratch>`:
+
+```text
+  ok   build                  release binaries present: live, venue-check, verify, reconcile, runlog, replay-account
+  ok   one live run           no other live run on this host
+  ok   capture root           raw\ and account\ hold no capture
+  ok   journal                none yet: a fresh journal and a fresh run tag
+  ok   credentials            BINANCE_API_KEY is set
+  ok   credentials            BINANCE_ED25519_PRIVATE_KEY is set
+         clock        -1 ms from the venue (positive: this host is ahead), limit 1000 ms
+         permission   POST /api/v3/order/test accepted a market buy of 0.001 BTCUSDT, the run's own order, and refused nothing: this API key may trade
+  ok   venue-check            READY: clock, key, signature, permission to trade at this size, fees not in BNB
+ note  time service           w32time is Stopped: the clock venue-check passed will drift through the run. As Administrator: ops\fix-clock.ps1
+  waiting up to 180s for the binary's gates to answer
+TRADING: live pid 55704, gates passed, run tag mvq8ssxp. This window can be closed.
+
+=== 2. a round trip: two fills in the journal
+  {"type":"filled",...,"client_order_id":1,...,"side":"buy","px":76655...
+  {"type":"filled",...,"client_order_id":2,...,"side":"sell","px":7665...
+=== 3. the verify loop, while the run goes on
+  05:26:20Z OK   verdict   every discontinuity is explained by a record in the capture
+  05:26:21Z WAIT reconcile: nothing to check yet
+  05:26:22Z OK   runlog: verdict   COMPLETE: every id minted from 1 to 3 was written down, ...
+  05:27:24Z OK   reconcile: verdict   AGREES: the engine's checkpoint matches this recompute
+=== 4. status.ps1, while it runs
+RUNNING  live pid 55704, up 0h01m, 11 MB
+         supervisor pid 57628 holds the one-live-run lock and the keep-awake request
+gates    passed: trading under run tag mvq8ssxp
+market   1 file(s), 6.5 KB, last written 6s ago
+account  1 file(s), 6.2 KB, last written 6s ago
+=== 5. stop-live.ps1, the operator's stop
+asked the live run to stop: <scratch>\run1\live-20261027-052602.stop
+ENDED  STOPPED (exit 0)
+       verdict   STOPPED under run tag mvq8ssxp, 0 order(s) working
+stopped the verify loop, pid 42472
+=== 6. how it ended, and the after-run checks
+  OK   verify: verdict   every discontinuity is explained by a record in the capture  [sessions  2 in 2 segments (1 of the account stream)]
+  OK   reconcile: the checkpoints agree with a recompute. verdict   AGREES: ...
+  OK   runlog: the journal accounts for every decision. verdict   COMPLETE: every id minted from 1 to 23 was written down, ...
+  OK   replay-account: the account capture reproduces every venue line. verdict   AGREES: ...
+  after-run checks clean
+REHEARSAL PASSED: started through the preflight, traded a round trip (23 fill(s) in all), watched, stopped cleanly by its stop file, and every after-run check clean
+fake-binance  done: 23 order(s) filled, 0 cancel(s) refused, 1 market connection(s)
+```
+
+An earlier run stopped with an order in flight. The stop's `cancel_working` sent
+its cancel, the fake refused it `-2011`, the journal wrote `cancel_refused
+{ not_open }`, and all four checks were still clean. That is the venue's answer
+for an order that filled before its cancel landed, met here before the testnet.
+
+What a rehearsal against stand-ins cannot show is everything 8c is for: the
+Ed25519 signer and the trade probe against the real venue, the testnet's market,
+its account stream, and its answers.
+
+### What building it corrected
+
+- **The record harness's stop is not a clean stop on Windows.** `stop-run.ps1`
+  asks each recorder to finish with `CloseMainWindow`, and against a process in
+  the hidden console the harness starts it in, that finds no window. Measured on
+  the live binary started the same way, it returned `False` and the process ran
+  on. So `stop-run.ps1` ends in its own "did not finish" message, and a recorder
+  run on Windows can only be ended by a kill or by its duration limit. Not
+  changed here: the recorder has no stop file, and the record harness was to
+  stay as it is. It is in `CLAUDE.md`'s *Still open*. Until then a Windows
+  recorder run should be left to reach its duration.
+- **`stop-run.ps1` pointed at a live root would have reported success.** It
+  kills the supervisors first and then looks for `record`, so against a live run
+  it would have killed the supervisor that records the outcome and holds the
+  host awake, found no recorder, exited 0, and left `live.exe` trading. A live
+  `run.json` now sends it to `stop-live.ps1`. `status.ps1` likewise hands over
+  to `status-live.ps1`.
+- **The `.ps1` preflight's clock was the naive one.** `preflight.ps1` and
+  `fix-clock.ps1` took now minus `serverTime` from one request. Both now ask
+  `venue-check --clock`, the binary's own round-trip-corrected reading, rather
+  than carry a third copy of the midpoint arithmetic. That is the one change to
+  the record harness's behaviour.
+- **`venue-check` could not check what the run would do.** Its trade probe was
+  fixed at 0.001 and it reached only the two real venues. It now takes `--qty`,
+  `--rest` (loopback only, under the same rule as the live binary's overrides,
+  now in `quant_binance::endpoint`) and `--clock`.
+- **§2 put the live mode in `ops/start-run.sh`.** It is `ops/start-live.ps1`,
+  for the owner's reason and for the reason above.
+- **The fake's first answer to a cancel was wrong.** It answered `CANCELED` on
+  the stream for an order it had already filled. The machine coped, and the
+  checks were clean, but no venue says that. It now refuses the cancel with
+  `-2011`, which the classifier reads as `not_open`.
+- **PowerShell 5.1, four more traps.** `Get-Content` returns strings carrying
+  `PSPath`, `PSDrive` and the rest as note properties, and `ConvertTo-Json`
+  wrote them into `run.json`: 318 KB for a two-line banner. Lines are now read
+  through a plain `StreamReader`, and a test bounds `run.json`'s size. One line
+  out of a pipeline is a bare string, and a bare string indexed at 0 is its
+  first character, so the commit was recorded as `c`. `"$journal: ..."` is a
+  parse error, because `$name:` reads as a drive-qualified variable. And a
+  mutex is recursive, so `Test-LiveLockHeld` answers truly only from another
+  process, which is how every caller asks.
+
+Two adversarial reviews of the branch then found what its own tests had not,
+each fixed with a test seen red under the break it guards:
+
+- **A reader could kill the supervisor.** `run.json` was replaced by
+  `Move-Item -Force` while three scripts read it, and the supervisor's writes
+  after the binary started had no `catch`. Held open as `Get-Content` holds it,
+  the file made the supervisor exit 1 with `live.exe` trading unwatched. Fixed
+  on both sides and on the supervisor, as *one writer and many readers* above
+  says. The first version of the fix then met the trap the next bullet names.
+- **PowerShell 5.1, a fifth trap.** `$null` passed to a .NET method's string
+  parameter arrives as `""`, so `File.Replace($temp, $path, $null)` refused
+  every write with *the path is not of a legal form*. `[NullString]::Value`
+  is the null it means. The supervisor survived every one of those failures,
+  which is the fix above showing itself before the bug was found.
+- **The same race, in the logs, found by the new test going intermittently
+  red.** The test holding `run.json` gave up waiting in three runs of eight,
+  under breaks that had nothing to do with it, and passed eight of eight on
+  its own. Captured, the supervisor's stdout said why: `Add-Content` could not
+  open `supervisor-live.log` while the test was reading it, and the line was
+  lost. One run lost `live exited 0`; another lost `live pid ... started`, the
+  line that counts the run's attempts, so that run read as never started.
+  Every live log is now appended through `ops/shared-log.ps1`, which shares
+  the file with its readers and retries, and a test holds a log open while a
+  line is appended, with `Add-Content` failing beside it.
+- **`taskkill /F` was reported as `failed`.** It ends a process with 1, the
+  binary's own code for a run that could not go on. Hence the `exit      N`
+  line (above).
+- **A refused gate looked like a normal run until it ended.** Now said at the
+  prompt, with `start-live.ps1` exit 3, and in the status view.
+- **A pid is not an identity.** `stop-live.ps1` killed any `powershell.exe`
+  whose pid `run.pids` named, Windows having perhaps given that pid to the
+  operator's own shell, and the status view said such a process held the lock.
+  Harness processes are now known by their command line, which names the
+  script and the run's root in quotes, so `run-1` does not match `run-10`;
+  `run.pids` is no longer written for a live run.
+- **A root ending in a backslash broke every argument after it.** Plain quotes
+  around `C:\runs\one\` end in `\"`, which the C runtime's rule reads as a
+  literal quote. One quoting rule, `ops/native-args.ps1`, is now used by every
+  launch, `verify-loop.ps1`'s own verify pass included, which had not quoted a
+  root with a space in it at all. `start-live.ps1` also drops a trailing
+  backslash, so every script spells the root one way.
+- **Verify loops outlived their runs.** After a kill, a refusal, or a
+  supervisor that never reported, the loop ran on to `ends_by`, writing lines
+  the status view showed as though the run were being watched, and `-Resume`
+  overwrote the only record of its pid. The loop now starts only once the
+  binary runs and ends itself when `run.json` says the run has, or its
+  supervisor is gone; `start-live.ps1` stops a stale one for its root.
+- **A lost supervisor was never said.** A killed supervisor left `run.json`
+  at `running` for ever. `stop-live.ps1` and the status view now say `LOST`,
+  with what the binary's own log says, and `stop-live.ps1` no longer suggests
+  `Stop-Process` for a pid that has already exited.
+- **A stop asked for while the supervisor was starting** created the stop file
+  before the binary existed, and the binary refused it as an argument. The
+  stop now waits for the banner, which the binary prints only once its
+  arguments are taken.
+- **`-Resume` wrote over the killed run's `run.json`.** It is kept now, with
+  that run's `check-live.log` and `verify.log`, under its start time.
+- **A run that recorded only leaves an empty journal**, which the binary opens
+  before its gates decide, so `check-live.ps1` would have held it to a capture
+  as a run that traded. An empty journal now counts as none.
+- **`fix-clock.ps1` read the clock with a stale `venue-check`.** Step 1 of 8c
+  runs before anything has built the binaries, and the one in the main
+  checkout was from 2026-10-13, before `--clock`: it printed its usage and the
+  confirmation said nothing at all. `fix-clock.ps1` now builds it first, and a
+  `venue-check` that gives no verdict is reported with its exit code and first
+  line. The build step needs Administrator to reach, so it is the one fix here
+  not exercised by a test.
+- **The keep-awake request did not hold the display**, which `caffeinate -d`
+  does and Modern Standby may need (*Awake*, above).

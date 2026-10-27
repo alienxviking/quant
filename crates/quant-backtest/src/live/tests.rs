@@ -222,3 +222,26 @@ fn the_journal_s_directory_is_made_when_a_fresh_root_has_none() {
     drop(again);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_stop_file_stops_only_once_it_exists() {
+    // Both sides of the boundary: still waiting after several looks while the
+    // file is absent, and done within a bound once it appears.
+    let dir = std::env::temp_dir().join(format!("quant-backtest-stop-file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a directory");
+    let path = dir.join("live.stop");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let mut stop = Box::pin(super::stop_file_appears(path.clone()));
+        let absent = tokio::time::timeout(super::STOP_FILE_POLL * 4, stop.as_mut()).await;
+        assert!(absent.is_err(), "it stopped with no stop file");
+        std::fs::write(&path, b"stop").expect("the stop file");
+        let present = tokio::time::timeout(std::time::Duration::from_secs(10), stop.as_mut()).await;
+        assert!(matches!(present, Ok(Ok(()))), "the stop file was not seen");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}

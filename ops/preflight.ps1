@@ -72,7 +72,7 @@ $buildLog = Join-Path $env:TEMP 'quant-preflight-build.log'
 # never sees the native streams at all, and `$LASTEXITCODE` still comes back.
 Push-Location $repo
 try {
-    cmd /c "cargo build --release -p quant-binance --bin record -p quant-verify --bin verify > `"$buildLog`" 2>&1"
+    cmd /c "cargo build --release -p quant-binance --bin record --bin venue-check -p quant-verify --bin verify > `"$buildLog`" 2>&1"
     $buildExit = $LASTEXITCODE
 } finally {
     Pop-Location
@@ -89,17 +89,20 @@ if ($buildExit -ne 0) {
 # link. It does not corrupt the capture -- every timestamp is shifted equally, so
 # ordering and dispatch are unaffected -- but it makes one of the six acceptance
 # criteria unmeasurable, which is reason enough not to start a week's run on it.
-try {
-    $before = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    $venue  = (Invoke-RestMethod -Uri 'https://api.binance.com/api/v3/time' -TimeoutSec 15).serverTime
-    $offset = $before - $venue
-    if ([math]::Abs($offset) -gt $MaxClockOffsetMs) {
-        Report 'host clock' "${offset}ms from the venue (limit ${MaxClockOffsetMs}ms) -- run ops\fix-clock.ps1 as admin" 'blocker'
-    } else {
-        Report 'host clock' "${offset}ms from the venue" 'ok'
-    }
-} catch {
-    Report 'host clock' "could not reach the venue to check: $_" 'blocker'
+#
+# Read round-trip corrected, by venue-check --clock (venue-clock.ps1 says why).
+# This used to be now minus serverTime from one request, which folds the
+# one-way latency into the offset and can block a run over a clock that is
+# fine. venue-check is built above for this alone; the reading is unsigned and
+# needs no credentials.
+. (Join-Path $here 'venue-clock.ps1')
+$clock = Read-VenueClock -Exe (Join-Path $repo 'target\release\venue-check.exe')
+if ($null -eq $clock.offset_ms) {
+    Report 'host clock' "could not read the venue's clock: $($clock.detail)" 'blocker'
+} elseif ([math]::Abs($clock.offset_ms) -gt $MaxClockOffsetMs) {
+    Report 'host clock' "$($clock.detail) (limit ${MaxClockOffsetMs}ms) -- run ops\fix-clock.ps1 as admin" 'blocker'
+} else {
+    Report 'host clock' $clock.detail 'ok'
 }
 
 $w32 = Get-Service w32time -ErrorAction SilentlyContinue
