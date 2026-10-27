@@ -21,7 +21,7 @@ serde_json = "1"
 # Block compression. The bulk (non-streaming) API is the point: each block is
 # independently decompressable, so damage to one block cannot destroy the rest
 # of the file.
-zstd = "0.13"
+zstd = "0.14"
 
 # Per-block integrity. CRC32 rather than a cryptographic hash because we are
 # detecting disk and truncation faults, not defending against an adversary who
