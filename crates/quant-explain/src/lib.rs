@@ -189,9 +189,10 @@ impl BookAt {
     #[must_use]
     pub fn mid(&self) -> Option<quant_core::fixed::Px> {
         let (bid, ask) = (self.bid.as_ref()?, self.ask.as_ref()?);
-        Some(quant_core::fixed::Px::from_raw(
-            (bid.px.raw() + ask.px.raw()) / 2,
-        ))
+        Some(quant_core::fixed::Px::from_raw(i64::midpoint(
+            bid.px.raw(),
+            ask.px.raw(),
+        )))
     }
 
     /// The spread, when both sides exist.

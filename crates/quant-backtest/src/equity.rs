@@ -136,7 +136,7 @@ impl<S: Strategy> Recorded<S> {
     fn sample(&mut self, ctx: &Context<'_>) {
         let mark = ctx.book(self.instrument).and_then(|book| {
             let (bid, ask) = (book.best_bid()?, book.best_ask()?);
-            Some(Px::from_raw((bid.px.raw() + ask.px.raw()) / 2))
+            Some(Px::from_raw(i64::midpoint(bid.px.raw(), ask.px.raw())))
         });
         self.curve.points.push(EquityPoint {
             ts: ctx.now(),

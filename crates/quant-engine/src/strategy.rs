@@ -184,7 +184,7 @@ impl<'a> Context<'a> {
         // than guess -- see `RiskLayer::check`.
         let mark = self.book(request.instrument).and_then(|book| {
             let (bid, ask) = (book.best_bid()?, book.best_ask()?);
-            Some(Px::from_raw((bid.px.raw() + ask.px.raw()) / 2))
+            Some(Px::from_raw(i64::midpoint(bid.px.raw(), ask.px.raw())))
         });
         let refusal = self.risk.check(&request, mark, self.now);
         // Before the refusal it caused, so the file reads in the order things

@@ -336,9 +336,9 @@ impl MaCrossover {
     /// worth, and the two need no distinguishing here.
     fn mid(book: &Book) -> Option<Px> {
         let (bid, ask) = (book.best_bid()?, book.best_ask()?);
-        // Averaging two `1e8`-scaled prices needs no widening: their sum is at
-        // most twice a price, nowhere near `i64`.
-        Some(Px::from_raw((bid.px.raw() + ask.px.raw()) / 2))
+        // `i64::midpoint` cannot overflow and truncates toward zero, as the
+        // `(bid + ask) / 2` it replaced did, so no mid moved.
+        Some(Px::from_raw(i64::midpoint(bid.px.raw(), ask.px.raw())))
     }
 
     /// Simple average of the newest `n` samples, if there are that many.
